@@ -2,7 +2,7 @@
 name = "unirust"
 version = "0.1.0"
 edition = "2021"
-description = "A general-purpose, temporal-first entity mastering and conflict-resolution engine"
+description = "High-performance temporal entity resolution engine with conflict detection, knowledge graph export, and perspective-weighted data mastering for multi-source datasets."
 authors = ["unirust contributors"]
 license = "MIT"
 repository = "https://github.com/unirust/unirust"

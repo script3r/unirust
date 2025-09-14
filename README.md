@@ -1,5 +1,9 @@
 # Unirust
 
+<div align="center">
+  <img src="unirust.png" alt="Unirust Logo" width="350" height="350">
+</div>
+
 A general-purpose, temporal-first entity mastering and conflict-resolution engine written in Rust.
 
 ## Overview
