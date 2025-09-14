@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# Generated files
+*.dot
+*.png
+*.svg
+*.pdf
+output.txt
+knowledge_graph*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
