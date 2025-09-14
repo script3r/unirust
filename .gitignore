@@ -4,7 +4,6 @@ Cargo.lock
 
 # Generated files
 *.dot
-*.png
 *.svg
 *.pdf
 output.txt
