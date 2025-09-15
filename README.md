@@ -10,6 +10,37 @@ A general-purpose, temporal-first entity mastering and conflict-resolution engin
 
 Unirust provides precise temporal modeling, entity resolution, and conflict detection with strong guarantees about temporal correctness and auditability. It's designed to handle complex entity mastering scenarios where data comes from multiple sources with different perspectives and temporal validity periods.
 
+## Motivation
+
+Traditional entity resolution algorithms ignore temporal information, leading to incorrect merges and lost historical context. When data from multiple sources arrives at different times or has overlapping validity periods, standard approaches fail to maintain temporal consistency.
+
+### Use Cases
+
+**Customer Data Management**
+- Merge CRM, e-commerce, and support records while preserving interaction timelines
+- Resolve conflicts when customers change contact information over time
+- Maintain accurate customer journey mapping across touchpoints
+
+**Financial Services**
+- Consolidate trading accounts and positions from multiple systems with different update frequencies
+- Track entity relationships and ownership changes for compliance and risk management
+- Detect suspicious patterns through temporal entity evolution analysis
+
+**Identity and Access Management**
+- Merge user identities across systems while maintaining access history
+- Resolve conflicts when user attributes change at different times
+- Provide complete audit trails for security governance
+
+**Healthcare Systems**
+- Merge patient records from different hospitals while preserving medical history integrity
+- Resolve conflicts when patient information is updated asynchronously
+- Ensure temporal consistency for critical medical decisions
+
+**Master Data Management**
+- Create golden records that preserve temporal context and source attribution
+- Handle data quality issues from asynchronous updates across systems
+- Maintain lineage and provenance for regulatory compliance
+
 ## Features
 
 - **Temporal Model**: Precise interval-based time modeling with Allen's interval relations
@@ -137,24 +168,7 @@ The linker uses several optimization techniques for high performance:
 - **Parallel Processing**: Adaptive parallelization for loosely coupled entities with high overlap
 - **Smart Thresholding**: Automatically chooses sequential vs parallel processing based on block size
 
-Benchmark results show significant performance improvements, especially for high-overlap scenarios (up to 140% throughput increase).
-
-## Project Status
-
-Unirust is in active development. The core functionality is stable and well-tested, but the API may evolve as we add new features and optimizations.
-
-### Current Version: 0.1.0
-
-- ✅ Core entity resolution with temporal modeling
-- ✅ Conflict detection and reporting
-- ✅ Knowledge graph export
-- ✅ High-performance blocking algorithm
-- ✅ Comprehensive test suite
-- 🔄 API stabilization
-- 🔄 Additional export formats
-- 🔄 Performance optimizations
-- 📋 Documentation improvements
-- 📋 More examples and tutorials
+Benchmark results demonstrate improved performance, particularly for high-overlap scenarios with parallel processing.
 
 ## Examples
 
