@@ -1,13 +1,13 @@
 //! # Disjoint Set Union (DSU) with Temporal Guards
-//! 
+//!
 //! Implements Union-Find data structure with temporal validation to ensure
 //! that merges only occur when temporal constraints are satisfied.
 
-use crate::model::{RecordId, ClusterId};
+use crate::model::{ClusterId, RecordId};
 use crate::temporal::Interval;
 // use anyhow::Result;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// A temporal guard that validates whether two records can be merged
@@ -157,16 +157,23 @@ impl TemporalDSU {
 
         // Perform the union
         self.union(root_a, root_b);
-        
+
         // Add the guard to both records
         self.guards.get_mut(&a).unwrap().push(guard.clone());
         self.guards.get_mut(&b).unwrap().push(guard);
 
-        MergeResult::Success { guard: self.guards[&a].last().unwrap().clone() }
+        MergeResult::Success {
+            guard: self.guards[&a].last().unwrap().clone(),
+        }
     }
 
     /// Check for temporal conflicts between two records
-    fn check_temporal_conflict(&self, a: RecordId, b: RecordId, _guard: &TemporalGuard) -> Option<TemporalConflict> {
+    fn check_temporal_conflict(
+        &self,
+        a: RecordId,
+        b: RecordId,
+        _guard: &TemporalGuard,
+    ) -> Option<TemporalConflict> {
         // Get all guards for both records
         let empty_vec = Vec::new();
         let guards_a = self.guards.get(&a).unwrap_or(&empty_vec);
@@ -178,7 +185,8 @@ impl TemporalDSU {
                 if crate::temporal::is_overlapping(&guard_a.interval, &guard_b.interval) {
                     if guard_a.reason != guard_b.reason {
                         return Some(TemporalConflict::new(
-                            crate::temporal::intersect(&guard_a.interval, &guard_b.interval).unwrap(),
+                            crate::temporal::intersect(&guard_a.interval, &guard_b.interval)
+                                .unwrap(),
                             "conflicting_guards".to_string(),
                             vec![guard_a.reason.clone(), guard_b.reason.clone()],
                         ));
@@ -208,18 +216,21 @@ impl TemporalDSU {
     /// Get all clusters
     pub fn get_clusters(&mut self) -> Clusters {
         let mut cluster_map: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-        
+
         let record_ids: Vec<RecordId> = self.parent.keys().cloned().collect();
         for record_id in record_ids {
             let root = self.find(record_id);
-            cluster_map.entry(root).or_insert_with(Vec::new).push(record_id);
+            cluster_map
+                .entry(root)
+                .or_insert_with(Vec::new)
+                .push(record_id);
         }
 
         let mut clusters = Vec::new();
         for (root, records) in cluster_map {
             let cluster_id = ClusterId(self.next_cluster_id);
             self.next_cluster_id += 1;
-            
+
             clusters.push(Cluster {
                 id: cluster_id,
                 root,
@@ -244,17 +255,26 @@ impl TemporalDSU {
 
     /// Get guards for a record
     pub fn get_guards(&self, record_id: RecordId) -> &[TemporalGuard] {
-        self.guards.get(&record_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.guards
+            .get(&record_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get conflicts for a record
     pub fn get_conflicts(&self, record_id: RecordId) -> &[TemporalConflict] {
-        self.conflicts.get(&record_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.conflicts
+            .get(&record_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Add a conflict to a record
     pub fn add_conflict(&mut self, record_id: RecordId, conflict: TemporalConflict) {
-        self.conflicts.entry(record_id).or_insert_with(Vec::new).push(conflict);
+        self.conflicts
+            .entry(record_id)
+            .or_insert_with(Vec::new)
+            .push(conflict);
     }
 
     /// Get the number of clusters
@@ -317,7 +337,9 @@ pub struct Clusters {
 impl Clusters {
     /// Create a new clusters collection
     pub fn new() -> Self {
-        Self { clusters: Vec::new() }
+        Self {
+            clusters: Vec::new(),
+        }
     }
 
     /// Add a cluster
@@ -375,7 +397,7 @@ mod tests {
     fn test_add_record() {
         let mut dsu = TemporalDSU::new();
         let record_id = RecordId(1);
-        
+
         dsu.add_record(record_id);
         assert_eq!(dsu.find(record_id), record_id);
     }
@@ -385,15 +407,15 @@ mod tests {
         let mut dsu = TemporalDSU::new();
         let record_a = RecordId(1);
         let record_b = RecordId(2);
-        
+
         dsu.add_record(record_a);
         dsu.add_record(record_b);
-        
+
         let guard = TemporalGuard::new(
             Interval::new(100, 200).unwrap(),
             "identity_key_match".to_string(),
         );
-        
+
         let result = dsu.try_merge(record_a, record_b, guard);
         assert!(matches!(result, MergeResult::Success { .. }));
         assert!(dsu.same_cluster(record_a, record_b));
@@ -404,17 +426,17 @@ mod tests {
         let mut dsu = TemporalDSU::new();
         let record_a = RecordId(1);
         let record_b = RecordId(2);
-        
+
         dsu.add_record(record_a);
         dsu.add_record(record_b);
-        
+
         let guard = TemporalGuard::new(
             Interval::new(100, 200).unwrap(),
             "identity_key_match".to_string(),
         );
-        
+
         dsu.try_merge(record_a, record_b, guard);
-        
+
         let clusters = dsu.get_clusters();
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters.clusters[0].records.len(), 2);
@@ -425,10 +447,10 @@ mod tests {
         let mut dsu = TemporalDSU::new();
         let record_a = RecordId(1);
         let record_b = RecordId(2);
-        
+
         dsu.add_record(record_a);
         dsu.add_record(record_b);
-        
+
         // Add conflicting guards
         let guard1 = TemporalGuard::new(
             Interval::new(100, 200).unwrap(),
@@ -438,15 +460,15 @@ mod tests {
             Interval::new(150, 250).unwrap(),
             "strong_identifier_mismatch".to_string(),
         );
-        
+
         dsu.guards.get_mut(&record_a).unwrap().push(guard1);
         dsu.guards.get_mut(&record_b).unwrap().push(guard2);
-        
+
         let guard = TemporalGuard::new(
             Interval::new(100, 200).unwrap(),
             "identity_key_match".to_string(),
         );
-        
+
         let result = dsu.try_merge(record_a, record_b, guard);
         assert!(matches!(result, MergeResult::Blocked { .. }));
     }
@@ -454,16 +476,12 @@ mod tests {
     #[test]
     fn test_cluster_operations() {
         let mut clusters = Clusters::new();
-        
-        let cluster = Cluster::new(
-            ClusterId(1),
-            RecordId(1),
-            vec![RecordId(1), RecordId(2)],
-        );
-        
+
+        let cluster = Cluster::new(ClusterId(1), RecordId(1), vec![RecordId(1), RecordId(2)]);
+
         clusters.add_cluster(cluster);
         assert_eq!(clusters.len(), 1);
-        
+
         let found_cluster = clusters.get_cluster(ClusterId(1));
         assert!(found_cluster.is_some());
         assert_eq!(found_cluster.unwrap().len(), 2);
@@ -472,79 +490,68 @@ mod tests {
     #[test]
     fn test_union_find_functionality() {
         let mut dsu = TemporalDSU::new();
-        
+
         // Add entity 1
         dsu.add_record(RecordId(1));
         assert_eq!(dsu.find(RecordId(1)), RecordId(1));
         assert_eq!(dsu.num_clusters(), 1);
         assert_eq!(dsu.rank[&RecordId(1)], 0);
-        
+
         // Add entity 101 and union 1 with 101
         dsu.add_record(RecordId(101));
-        let guard1 = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
+        let guard1 = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
         let result = dsu.try_merge(RecordId(1), RecordId(101), guard1);
         assert!(matches!(result, MergeResult::Success { .. }));
-        
+
         let root1 = dsu.find(RecordId(1));
         let root101 = dsu.find(RecordId(101));
         assert_eq!(root1, root101);
         assert_eq!(dsu.num_clusters(), 1);
         assert_eq!(dsu.rank[&root1], 1);
-        
+
         // Add entity 2
         dsu.add_record(RecordId(2));
         assert_eq!(dsu.find(RecordId(2)), RecordId(2));
         assert_eq!(dsu.num_clusters(), 2);
         assert_eq!(dsu.rank[&RecordId(2)], 0);
-        
+
         // Union 2 with 101 (which is now in cluster 1)
-        let guard2 = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
+        let guard2 = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
         let result = dsu.try_merge(RecordId(2), RecordId(101), guard2);
         assert!(matches!(result, MergeResult::Success { .. }));
-        
+
         let root = dsu.find(RecordId(1));
         assert_eq!(dsu.find(RecordId(101)), root);
         assert_eq!(dsu.find(RecordId(2)), root);
         assert_eq!(dsu.num_clusters(), 1);
         assert_eq!(dsu.rank[&root], 1);
-        
+
         // Add entity 102 and union 2 with 102
         dsu.add_record(RecordId(102));
-        let guard3 = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
+        let guard3 = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
         let result = dsu.try_merge(RecordId(2), RecordId(102), guard3);
         assert!(matches!(result, MergeResult::Success { .. }));
-        
+
         let root = dsu.find(RecordId(1));
         assert_eq!(dsu.find(RecordId(102)), root);
         assert_eq!(dsu.find(RecordId(2)), root);
         assert_eq!(dsu.num_clusters(), 1);
         assert_eq!(dsu.rank[&root], 1);
-        
+
         // Add entity 3 and create a chain
         dsu.add_record(RecordId(3));
         assert_eq!(dsu.num_clusters(), 2);
-        
+
         // Add entities and union 3 with multiple entities
         let entities_to_union = vec![103, 113, 123, 133, 143];
         for entity_id in entities_to_union {
             dsu.add_record(RecordId(entity_id));
-            let guard = TemporalGuard::new(
-                Interval::new(0, 1000).unwrap(),
-                "test_union".to_string(),
-            );
+            let guard =
+                TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
             let result = dsu.try_merge(RecordId(3), RecordId(entity_id), guard);
             assert!(matches!(result, MergeResult::Success { .. }));
         }
-        
+
         // Verify all entities in cluster 3
         let root3 = dsu.find(RecordId(3));
         assert_eq!(dsu.find(RecordId(103)), root3);
@@ -554,36 +561,31 @@ mod tests {
         assert_eq!(dsu.find(RecordId(143)), root3);
         // The rank should be 1 because we did multiple unions with equal ranks
         assert_eq!(dsu.rank[&root3], 1);
-        
+
         // Union cluster 1 with cluster 3
-        let guard4 = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
+        let guard4 = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
         let result = dsu.try_merge(RecordId(1), RecordId(103), guard4);
         assert!(matches!(result, MergeResult::Success { .. }));
-        
+
         let final_root = dsu.find(RecordId(1));
         assert_eq!(dsu.num_clusters(), 1);
         // The rank should be 2 because we're merging two rank-1 clusters
         assert_eq!(dsu.rank[&final_root], 2);
-        
+
         // Add entity 4 and create another cluster
         dsu.add_record(RecordId(4));
         assert_eq!(dsu.num_clusters(), 2);
-        
+
         // Add entities and union 4 with multiple entities
         let entities_to_union = vec![104, 114, 124];
         for entity_id in entities_to_union {
             dsu.add_record(RecordId(entity_id));
-            let guard = TemporalGuard::new(
-                Interval::new(0, 1000).unwrap(),
-                "test_union".to_string(),
-            );
+            let guard =
+                TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
             let result = dsu.try_merge(RecordId(4), RecordId(entity_id), guard);
             assert!(matches!(result, MergeResult::Success { .. }));
         }
-        
+
         // Final verification
         assert_eq!(dsu.num_clusters(), 2);
     }
@@ -591,29 +593,26 @@ mod tests {
     #[test]
     fn test_union_find_path_compression() {
         let mut dsu = TemporalDSU::new();
-        
+
         // Create a chain: 1 -> 2 -> 3 -> 4
         dsu.add_record(RecordId(1));
         dsu.add_record(RecordId(2));
         dsu.add_record(RecordId(3));
         dsu.add_record(RecordId(4));
-        
-        let guard = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
-        
+
+        let guard = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
+
         // Union in sequence
         dsu.try_merge(RecordId(1), RecordId(2), guard.clone());
         dsu.try_merge(RecordId(2), RecordId(3), guard.clone());
         dsu.try_merge(RecordId(3), RecordId(4), guard.clone());
-        
+
         // All should point to the same root
         let root = dsu.find(RecordId(1));
         assert_eq!(dsu.find(RecordId(2)), root);
         assert_eq!(dsu.find(RecordId(3)), root);
         assert_eq!(dsu.find(RecordId(4)), root);
-        
+
         // After path compression, all should directly point to root
         assert_eq!(dsu.parent[&RecordId(1)], root);
         assert_eq!(dsu.parent[&RecordId(2)], root);
@@ -624,36 +623,33 @@ mod tests {
     #[test]
     fn test_union_find_rank_optimization() {
         let mut dsu = TemporalDSU::new();
-        
+
         // Create two trees with different ranks
         dsu.add_record(RecordId(1));
         dsu.add_record(RecordId(2));
         dsu.add_record(RecordId(3));
         dsu.add_record(RecordId(4));
-        
-        let guard = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
-        
+
+        let guard = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
+
         // Create tree 1: 1 -> 2
         dsu.try_merge(RecordId(1), RecordId(2), guard.clone());
         let root1 = dsu.find(RecordId(1));
         assert_eq!(dsu.rank[&root1], 1);
-        
+
         // Create tree 2: 3 -> 4
         dsu.try_merge(RecordId(3), RecordId(4), guard.clone());
         let root3 = dsu.find(RecordId(3));
         assert_eq!(dsu.rank[&root3], 1);
-        
+
         // Union the two trees - should attach smaller rank to larger rank
         dsu.try_merge(RecordId(1), RecordId(3), guard.clone());
-        
+
         // Both should point to the same root
         let root1 = dsu.find(RecordId(1));
         let root3 = dsu.find(RecordId(3));
         assert_eq!(root1, root3);
-        
+
         // The root should have rank 2 (incremented since ranks were equal)
         let root_rank = dsu.rank[&root1];
         assert_eq!(root_rank, 2);
@@ -662,27 +658,24 @@ mod tests {
     #[test]
     fn test_union_find_same_cluster() {
         let mut dsu = TemporalDSU::new();
-        
+
         dsu.add_record(RecordId(1));
         dsu.add_record(RecordId(2));
         dsu.add_record(RecordId(3));
-        
-        let guard = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
-        
+
+        let guard = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
+
         // Initially, all records are in different clusters
         assert!(!dsu.same_cluster(RecordId(1), RecordId(2)));
         assert!(!dsu.same_cluster(RecordId(1), RecordId(3)));
         assert!(!dsu.same_cluster(RecordId(2), RecordId(3)));
-        
+
         // Union 1 and 2
         dsu.try_merge(RecordId(1), RecordId(2), guard.clone());
         assert!(dsu.same_cluster(RecordId(1), RecordId(2)));
         assert!(!dsu.same_cluster(RecordId(1), RecordId(3)));
         assert!(!dsu.same_cluster(RecordId(2), RecordId(3)));
-        
+
         // Union 2 and 3
         dsu.try_merge(RecordId(2), RecordId(3), guard.clone());
         assert!(dsu.same_cluster(RecordId(1), RecordId(2)));
@@ -693,30 +686,27 @@ mod tests {
     #[test]
     fn test_union_find_cluster_count() {
         let mut dsu = TemporalDSU::new();
-        
+
         // Start with 5 separate records
         for i in 1..=5 {
             dsu.add_record(RecordId(i));
         }
         assert_eq!(dsu.num_clusters(), 5);
-        
-        let guard = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
-        
+
+        let guard = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
+
         // Union 1 and 2
         dsu.try_merge(RecordId(1), RecordId(2), guard.clone());
         assert_eq!(dsu.num_clusters(), 4);
-        
+
         // Union 3 and 4
         dsu.try_merge(RecordId(3), RecordId(4), guard.clone());
         assert_eq!(dsu.num_clusters(), 3);
-        
+
         // Union 1 and 3 (merges two clusters)
         dsu.try_merge(RecordId(1), RecordId(3), guard.clone());
         assert_eq!(dsu.num_clusters(), 2);
-        
+
         // Union 5 with the big cluster
         dsu.try_merge(RecordId(1), RecordId(5), guard.clone());
         assert_eq!(dsu.num_clusters(), 1);
@@ -725,37 +715,35 @@ mod tests {
     #[test]
     fn test_union_find_get_clusters() {
         let mut dsu = TemporalDSU::new();
-        
+
         dsu.add_record(RecordId(1));
         dsu.add_record(RecordId(2));
         dsu.add_record(RecordId(3));
         dsu.add_record(RecordId(4));
-        
-        let guard = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
-        
+
+        let guard = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
+
         // Create two clusters: {1, 2} and {3, 4}
         dsu.try_merge(RecordId(1), RecordId(2), guard.clone());
         dsu.try_merge(RecordId(3), RecordId(4), guard.clone());
-        
+
         let clusters = dsu.get_clusters();
         assert_eq!(clusters.len(), 2);
-        
+
         // Each cluster should have 2 records
         for cluster in &clusters.clusters {
             assert_eq!(cluster.records.len(), 2);
         }
-        
+
         // Verify all records are accounted for
-        let mut all_records: Vec<RecordId> = clusters.clusters
+        let mut all_records: Vec<RecordId> = clusters
+            .clusters
             .iter()
             .flat_map(|c| c.records.iter())
             .cloned()
             .collect();
         all_records.sort();
-        
+
         let expected = vec![RecordId(1), RecordId(2), RecordId(3), RecordId(4)];
         assert_eq!(all_records, expected);
     }
@@ -763,18 +751,15 @@ mod tests {
     #[test]
     fn test_union_find_self_union() {
         let mut dsu = TemporalDSU::new();
-        
+
         dsu.add_record(RecordId(1));
-        
-        let guard = TemporalGuard::new(
-            Interval::new(0, 1000).unwrap(),
-            "test_union".to_string(),
-        );
-        
+
+        let guard = TemporalGuard::new(Interval::new(0, 1000).unwrap(), "test_union".to_string());
+
         // Union a record with itself should be a no-op
         let result = dsu.try_merge(RecordId(1), RecordId(1), guard);
         assert!(matches!(result, MergeResult::Success { .. }));
-        
+
         assert_eq!(dsu.find(RecordId(1)), RecordId(1));
         assert_eq!(dsu.num_clusters(), 1);
     }
@@ -782,32 +767,29 @@ mod tests {
     #[test]
     fn test_union_find_guards_tracking() {
         let mut dsu = TemporalDSU::new();
-        
+
         dsu.add_record(RecordId(1));
         dsu.add_record(RecordId(2));
-        
-        let guard1 = TemporalGuard::new(
-            Interval::new(0, 100).unwrap(),
-            "guard1".to_string(),
-        );
-        let guard2 = TemporalGuard::new(
-            Interval::new(100, 200).unwrap(),
-            "guard2".to_string(),
-        );
-        
+
+        let guard1 = TemporalGuard::new(Interval::new(0, 100).unwrap(), "guard1".to_string());
+        let guard2 = TemporalGuard::new(Interval::new(100, 200).unwrap(), "guard2".to_string());
+
         // Union with first guard
         dsu.try_merge(RecordId(1), RecordId(2), guard1.clone());
-        
+
         // Add another guard to record 1
-        dsu.guards.get_mut(&RecordId(1)).unwrap().push(guard2.clone());
-        
+        dsu.guards
+            .get_mut(&RecordId(1))
+            .unwrap()
+            .push(guard2.clone());
+
         // Check guards are tracked
         let guards_1 = dsu.get_guards(RecordId(1));
         let guards_2 = dsu.get_guards(RecordId(2));
-        
+
         assert_eq!(guards_1.len(), 2);
         assert_eq!(guards_2.len(), 1);
-        
+
         assert_eq!(guards_1[0].reason, "guard1");
         assert_eq!(guards_1[1].reason, "guard2");
         assert_eq!(guards_2[0].reason, "guard1");

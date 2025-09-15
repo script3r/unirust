@@ -1,8 +1,8 @@
 //! # Store Module
-//! 
+//!
 //! Provides storage and management for records, with efficient indexing and retrieval.
 
-use crate::model::{Record, RecordId, StringInterner, AttrId, ValueId};
+use crate::model::{AttrId, Record, RecordId, StringInterner, ValueId};
 use crate::temporal::Interval;
 use anyhow::Result;
 use hashbrown::HashMap;
@@ -34,12 +34,16 @@ impl Store {
         for mut record in records {
             // Intern all attribute and value strings
             for descriptor in &mut record.descriptors {
-                let attr_str = self.interner.get_attr(descriptor.attr)
+                let attr_str = self
+                    .interner
+                    .get_attr(descriptor.attr)
                     .unwrap_or(&"unknown".to_string())
                     .clone();
                 descriptor.attr = self.interner.intern_attr(&attr_str);
-                
-                let value_str = self.interner.get_value(descriptor.value)
+
+                let value_str = self
+                    .interner
+                    .get_value(descriptor.value)
                     .unwrap_or(&"unknown".to_string())
                     .clone();
                 descriptor.value = self.interner.intern_value(&value_str);
@@ -95,9 +99,10 @@ impl Store {
         self.records
             .values()
             .filter(|record| {
-                record.descriptors.iter().any(|d| {
-                    crate::temporal::is_overlapping(&d.interval, &interval)
-                })
+                record
+                    .descriptors
+                    .iter()
+                    .any(|d| crate::temporal::is_overlapping(&d.interval, &interval))
             })
             .collect()
     }
@@ -154,7 +159,7 @@ impl AttributeValueIndex {
     /// Build the index from a store
     pub fn build(&mut self, store: &Store) {
         self.index.clear();
-        
+
         for record in store.get_all_records() {
             for descriptor in &record.descriptors {
                 let key = (descriptor.attr, descriptor.value);
@@ -167,11 +172,12 @@ impl AttributeValueIndex {
     }
 
     /// Get records that have a specific attribute-value pair
-    pub fn get_records_with_value(&self, attr: AttrId, value: ValueId) -> Vec<(RecordId, Interval)> {
-        self.index
-            .get(&(attr, value))
-            .cloned()
-            .unwrap_or_default()
+    pub fn get_records_with_value(
+        &self,
+        attr: AttrId,
+        value: ValueId,
+    ) -> Vec<(RecordId, Interval)> {
+        self.index.get(&(attr, value)).cloned().unwrap_or_default()
     }
 
     /// Get records that have a specific attribute-value pair in a time interval
@@ -227,7 +233,7 @@ impl TemporalIndex {
     /// Build the index from a store
     pub fn build(&mut self, store: &Store) {
         self.index.clear();
-        
+
         for record in store.get_all_records() {
             for descriptor in &record.descriptors {
                 self.index
@@ -241,13 +247,13 @@ impl TemporalIndex {
     /// Get records that have descriptors in a time interval
     pub fn get_records_in_interval(&self, interval: Interval) -> Vec<RecordId> {
         let mut result = Vec::new();
-        
+
         for (index_interval, record_ids) in &self.index {
             if crate::temporal::is_overlapping(index_interval, &interval) {
                 result.extend(record_ids);
             }
         }
-        
+
         result.sort();
         result.dedup();
         result
@@ -262,7 +268,7 @@ impl TemporalIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RecordIdentity, Descriptor};
+    use crate::model::{Descriptor, RecordIdentity};
     use crate::temporal::Interval;
 
     #[test]
@@ -275,13 +281,13 @@ mod tests {
     #[test]
     fn test_add_records() {
         let mut store = Store::new();
-        
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
             vec![],
         );
-        
+
         store.add_records(vec![record]).unwrap();
         assert_eq!(store.len(), 1);
     }
@@ -289,24 +295,28 @@ mod tests {
     #[test]
     fn test_get_records_by_entity_type() {
         let mut store = Store::new();
-        
+
         let person_record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
             vec![],
         );
-        
+
         let org_record = Record::new(
             RecordId(2),
-            RecordIdentity::new("organization".to_string(), "crm".to_string(), "456".to_string()),
+            RecordIdentity::new(
+                "organization".to_string(),
+                "crm".to_string(),
+                "456".to_string(),
+            ),
             vec![],
         );
-        
+
         store.add_records(vec![person_record, org_record]).unwrap();
-        
+
         let person_records = store.get_records_by_entity_type("person");
         assert_eq!(person_records.len(), 1);
-        
+
         let org_records = store.get_records_by_entity_type("organization");
         assert_eq!(org_records.len(), 1);
     }
@@ -315,20 +325,20 @@ mod tests {
     fn test_attribute_value_index() {
         let mut store = Store::new();
         let mut interner = StringInterner::new();
-        
+
         let name_attr = interner.intern_attr("name");
         let name_value = interner.intern_value("John Doe");
-        
+
         let descriptor = Descriptor::new(name_attr, name_value, Interval::new(100, 200).unwrap());
-        
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
             vec![descriptor],
         );
-        
+
         store.add_records(vec![record]).unwrap();
-        
+
         let index = AttributeValueIndex::from_store(&store);
         let records = index.get_records_with_value(name_attr, name_value);
         assert_eq!(records.len(), 1);
@@ -337,21 +347,17 @@ mod tests {
     #[test]
     fn test_temporal_index() {
         let mut store = Store::new();
-        
-        let descriptor = Descriptor::new(
-            AttrId(1),
-            ValueId(1),
-            Interval::new(100, 200).unwrap(),
-        );
-        
+
+        let descriptor = Descriptor::new(AttrId(1), ValueId(1), Interval::new(100, 200).unwrap());
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
             vec![descriptor],
         );
-        
+
         store.add_records(vec![record]).unwrap();
-        
+
         let index = TemporalIndex::from_store(&store);
         let records = index.get_records_in_interval(Interval::new(150, 180).unwrap());
         assert_eq!(records.len(), 1);

@@ -1,26 +1,26 @@
 //! # Unirust
-//! 
+//!
 //! A general-purpose, temporal-first entity mastering and conflict-resolution engine.
-//! 
+//!
 //! This library provides precise temporal modeling, entity resolution, and conflict detection
 //! with strong guarantees about temporal correctness and auditability.
 
-pub mod temporal;
-pub mod model;
-pub mod index;
-pub mod dsu;
-pub mod linker;
 pub mod conflicts;
+pub mod dsu;
 pub mod graph;
-pub mod store;
+pub mod index;
+pub mod linker;
+pub mod model;
 pub mod ontology;
+pub mod store;
+pub mod temporal;
 pub mod utils;
 
 // Re-export main types for convenience
-pub use model::{Record, RecordId, ClusterId, RecordIdentity, Descriptor};
-pub use temporal::Interval;
-pub use store::Store;
+pub use model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 pub use ontology::Ontology;
+pub use store::Store;
+pub use temporal::Interval;
 
 /// Main API for entity mastering
 pub struct Unirust {
@@ -49,12 +49,19 @@ impl Unirust {
     }
 
     /// Detect conflicts in the given clusters
-    pub fn detect_conflicts(&self, clusters: &dsu::Clusters) -> anyhow::Result<Vec<conflicts::Observation>> {
+    pub fn detect_conflicts(
+        &self,
+        clusters: &dsu::Clusters,
+    ) -> anyhow::Result<Vec<conflicts::Observation>> {
         conflicts::detect_conflicts(&self.store, clusters, &self.ontology)
     }
 
     /// Export the knowledge graph
-    pub fn export_graph(&self, clusters: &dsu::Clusters, observations: &[conflicts::Observation]) -> anyhow::Result<graph::KnowledgeGraph> {
+    pub fn export_graph(
+        &self,
+        clusters: &dsu::Clusters,
+        observations: &[conflicts::Observation],
+    ) -> anyhow::Result<graph::KnowledgeGraph> {
         graph::export_graph(&self.store, clusters, observations, &self.ontology)
     }
 }

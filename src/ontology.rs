@@ -1,9 +1,9 @@
 //! # Ontology Module
-//! 
+//!
 //! Defines the ontology rules for entity mastering, including identity keys,
 //! strong identifiers, crosswalks, and constraints.
 
-use crate::model::{AttrId, PerspectiveScopedId, CanonicalId};
+use crate::model::{AttrId, CanonicalId, PerspectiveScopedId};
 use crate::temporal::Interval;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -70,7 +70,11 @@ pub struct Crosswalk {
 
 impl Crosswalk {
     /// Create a new crosswalk
-    pub fn new(perspective_id: PerspectiveScopedId, canonical_id: CanonicalId, interval: Interval) -> Self {
+    pub fn new(
+        perspective_id: PerspectiveScopedId,
+        canonical_id: CanonicalId,
+        interval: Interval,
+    ) -> Self {
         Self {
             perspective_id,
             canonical_id,
@@ -84,16 +88,10 @@ impl Crosswalk {
 pub enum Constraint {
     /// Unique constraint: no two records can have different values for this attribute
     /// within the same cluster over overlapping time intervals
-    Unique {
-        attribute: AttrId,
-        name: String,
-    },
+    Unique { attribute: AttrId, name: String },
     /// Unique within perspective: no two records from the same perspective can have
     /// different values for this attribute over overlapping time intervals
-    UniqueWithinPerspective {
-        attribute: AttrId,
-        name: String,
-    },
+    UniqueWithinPerspective { attribute: AttrId, name: String },
 }
 
 impl Constraint {
@@ -179,7 +177,8 @@ impl Ontology {
 
     /// Add an entity type
     pub fn add_entity_type(&mut self, entity_type: EntityType) {
-        self.entity_types.insert(entity_type.name.clone(), entity_type);
+        self.entity_types
+            .insert(entity_type.name.clone(), entity_type);
     }
 
     /// Get identity keys for a specific entity type
@@ -235,11 +234,18 @@ impl Ontology {
 
     /// Get the weight for a perspective
     pub fn get_perspective_weight(&self, perspective: &str) -> u32 {
-        self.perspective_weights.get(perspective).copied().unwrap_or(0)
+        self.perspective_weights
+            .get(perspective)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Compare two perspectives by weight (higher weight = higher precedence)
-    pub fn compare_perspectives(&self, perspective_a: &str, perspective_b: &str) -> std::cmp::Ordering {
+    pub fn compare_perspectives(
+        &self,
+        perspective_a: &str,
+        perspective_b: &str,
+    ) -> std::cmp::Ordering {
         let weight_a = self.get_perspective_weight(perspective_a);
         let weight_b = self.get_perspective_weight(perspective_b);
         weight_b.cmp(&weight_a) // Higher weight comes first
@@ -251,18 +257,27 @@ impl Ontology {
     }
 
     /// Set permanent attributes for a perspective
-    pub fn set_perspective_permanent_attributes(&mut self, perspective: String, attributes: Vec<AttrId>) {
-        self.perspective_permanent_attributes.insert(perspective, attributes);
+    pub fn set_perspective_permanent_attributes(
+        &mut self,
+        perspective: String,
+        attributes: Vec<AttrId>,
+    ) {
+        self.perspective_permanent_attributes
+            .insert(perspective, attributes);
     }
 
     /// Get permanent attributes for a perspective
     pub fn get_perspective_permanent_attributes(&self, perspective: &str) -> Vec<AttrId> {
-        self.perspective_permanent_attributes.get(perspective).cloned().unwrap_or_default()
+        self.perspective_permanent_attributes
+            .get(perspective)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Check if an attribute is permanent for a perspective
     pub fn is_permanent_attribute(&self, perspective: &str, attribute: AttrId) -> bool {
-        self.get_perspective_permanent_attributes(perspective).contains(&attribute)
+        self.get_perspective_permanent_attributes(perspective)
+            .contains(&attribute)
     }
 
     /// Get the authoritative perspective for an attribute (highest weight with permanent attribute)
@@ -363,16 +378,16 @@ mod tests {
     #[test]
     fn test_ontology_creation() {
         let mut ontology = Ontology::new();
-        
+
         let name_attr = AttrId(1);
         let email_attr = AttrId(2);
-        
+
         let identity_key = IdentityKey::new(vec![name_attr, email_attr], "name_email".to_string());
         ontology.add_identity_key(identity_key);
-        
+
         let strong_id = StrongIdentifier::new(email_attr, "email_unique".to_string());
         ontology.add_strong_identifier(strong_id);
-        
+
         assert_eq!(ontology.identity_keys.len(), 1);
         assert_eq!(ontology.strong_identifiers.len(), 1);
     }
@@ -381,10 +396,10 @@ mod tests {
     fn test_identity_key_matching() {
         let name_attr = AttrId(1);
         let email_attr = AttrId(2);
-        
+
         let key1 = IdentityKey::new(vec![name_attr, email_attr], "key1".to_string());
         let key2 = IdentityKey::new(vec![email_attr, name_attr], "key2".to_string());
-        
+
         let interval = Interval::new(100, 200).unwrap();
         assert!(key1.matches(&key2, interval));
     }
@@ -394,9 +409,9 @@ mod tests {
         let perspective_id = PerspectiveScopedId::new("crm".to_string(), "123".to_string());
         let canonical_id = CanonicalId::new("canonical_123".to_string());
         let interval = Interval::new(100, 200).unwrap();
-        
+
         let crosswalk = Crosswalk::new(perspective_id, canonical_id, interval);
-        
+
         assert_eq!(crosswalk.perspective_id.perspective, "crm");
         assert_eq!(crosswalk.perspective_id.uid, "123");
         assert_eq!(crosswalk.canonical_id.value, "canonical_123");
@@ -405,12 +420,13 @@ mod tests {
     #[test]
     fn test_constraint_creation() {
         let attr = AttrId(1);
-        
+
         let unique_constraint = Constraint::unique(attr, "unique_name".to_string());
         assert_eq!(unique_constraint.attribute(), attr);
         assert_eq!(unique_constraint.name(), "unique_name");
-        
-        let perspective_constraint = Constraint::unique_within_perspective(attr, "unique_within_perspective".to_string());
+
+        let perspective_constraint =
+            Constraint::unique_within_perspective(attr, "unique_within_perspective".to_string());
         assert_eq!(perspective_constraint.attribute(), attr);
         assert_eq!(perspective_constraint.name(), "unique_within_perspective");
     }
@@ -422,9 +438,9 @@ mod tests {
         let interval = Interval::new(100, 200).unwrap();
         let participants = vec![crate::model::RecordId(1), crate::model::RecordId(2)];
         let details = "Two records have different names".to_string();
-        
+
         let violation = ConstraintViolation::new(constraint, interval, participants, details);
-        
+
         assert_eq!(violation.constraint.attribute(), attr);
         assert_eq!(violation.interval, interval);
         assert_eq!(violation.participants.len(), 2);

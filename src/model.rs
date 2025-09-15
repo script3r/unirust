@@ -1,5 +1,5 @@
 //! # Data Model
-//! 
+//!
 //! Core data structures for entity mastering and conflict resolution.
 //! Includes record identification, descriptors, and string interning for efficiency.
 
@@ -69,16 +69,11 @@ impl RecordIdentity {
             uid,
         }
     }
-
-    /// Get a string representation of the identity
-    pub fn to_string(&self) -> String {
-        format!("{}:{}:{}", self.entity_type, self.perspective, self.uid)
-    }
 }
 
 impl fmt::Display for RecordIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{}:{}:{}", self.entity_type, self.perspective, self.uid)
     }
 }
 
@@ -96,7 +91,11 @@ pub struct Descriptor {
 impl Descriptor {
     /// Create a new descriptor
     pub fn new(attr: AttrId, value: ValueId, interval: Interval) -> Self {
-        Self { attr, value, interval }
+        Self {
+            attr,
+            value,
+            interval,
+        }
     }
 }
 
@@ -123,10 +122,7 @@ impl Record {
 
     /// Get descriptors for a specific attribute
     pub fn descriptors_for_attr(&self, attr: AttrId) -> Vec<&Descriptor> {
-        self.descriptors
-            .iter()
-            .filter(|d| d.attr == attr)
-            .collect()
+        self.descriptors.iter().filter(|d| d.attr == attr).collect()
     }
 
     /// Get descriptors that overlap with a given interval
@@ -170,10 +166,10 @@ impl StringInterner {
 
         let id = AttrId(self.next_attr_id);
         self.next_attr_id += 1;
-        
+
         self.attr_to_id.insert(attr.to_string(), id);
         self.id_to_attr.insert(id, attr.to_string());
-        
+
         id
     }
 
@@ -185,10 +181,10 @@ impl StringInterner {
 
         let id = ValueId(self.next_value_id);
         self.next_value_id += 1;
-        
+
         self.value_to_id.insert(value.to_string(), id);
         self.id_to_value.insert(id, value.to_string());
-        
+
         id
     }
 
@@ -302,14 +298,11 @@ mod tests {
     #[test]
     fn test_record_creation() {
         let id = RecordId(1);
-        let identity = RecordIdentity::new(
-            "person".to_string(),
-            "crm".to_string(),
-            "123".to_string(),
-        );
+        let identity =
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string());
         let descriptors = vec![];
         let record = Record::new(id, identity, descriptors);
-        
+
         assert_eq!(record.id, id);
         assert_eq!(record.identity.entity_type, "person");
         assert_eq!(record.identity.perspective, "crm");
@@ -319,14 +312,14 @@ mod tests {
     #[test]
     fn test_string_interner() {
         let mut interner = StringInterner::new();
-        
+
         let attr1 = interner.intern_attr("name");
         let attr2 = interner.intern_attr("email");
         let attr1_again = interner.intern_attr("name");
-        
+
         assert_eq!(attr1, attr1_again);
         assert_ne!(attr1, attr2);
-        
+
         assert_eq!(interner.get_attr(attr1), Some(&"name".to_string()));
         assert_eq!(interner.get_attr(attr2), Some(&"email".to_string()));
     }
@@ -338,17 +331,17 @@ mod tests {
         let email_attr = interner.intern_attr("email");
         let name_value = interner.intern_value("John Doe");
         let email_value = interner.intern_value("john@example.com");
-        
+
         let key1 = IdentityKey::new(vec![
             KeyValue::new(name_attr, name_value),
             KeyValue::new(email_attr, email_value),
         ]);
-        
+
         let key2 = IdentityKey::new(vec![
             KeyValue::new(email_attr, email_value),
             KeyValue::new(name_attr, name_value),
         ]);
-        
+
         let interval = Interval::new(100, 200).unwrap();
         assert!(key1.matches(&key2, interval));
     }
@@ -360,22 +353,22 @@ mod tests {
         let email_attr = interner.intern_attr("email");
         let name_value = interner.intern_value("John Doe");
         let email_value = interner.intern_value("john@example.com");
-        
+
         let descriptors = vec![
             Descriptor::new(name_attr, name_value, Interval::new(100, 200).unwrap()),
             Descriptor::new(email_attr, email_value, Interval::new(150, 250).unwrap()),
         ];
-        
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
             descriptors,
         );
-        
+
         let name_descriptors = record.descriptors_for_attr(name_attr);
         assert_eq!(name_descriptors.len(), 1);
         assert_eq!(name_descriptors[0].attr, name_attr);
-        
+
         let interval_descriptors = record.descriptors_in_interval(Interval::new(120, 180).unwrap());
         assert_eq!(interval_descriptors.len(), 2);
     }

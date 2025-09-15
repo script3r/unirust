@@ -1,14 +1,14 @@
 //! # Knowledge Graph Module
-//! 
+//!
 //! Provides export functionality for the knowledge graph, including SAME_AS edges
 //! and CONFLICTS_WITH edges with temporal provenance.
 
-use crate::model::{RecordId, ClusterId, AttrId, ValueId};
-use crate::temporal::Interval;
-use crate::store::Store;
-use crate::dsu::Clusters;
 use crate::conflicts::Observation;
+use crate::dsu::Clusters;
+use crate::model::{AttrId, ClusterId, RecordId, ValueId};
 use crate::ontology::Ontology;
+use crate::store::Store;
+use crate::temporal::Interval;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -216,29 +216,38 @@ impl KnowledgeGraph {
     /// Export the graph as JSONL
     pub fn to_jsonl(&self) -> Result<String> {
         let mut lines = Vec::new();
-        
+
         // Add metadata line
         let metadata_line = serde_json::to_string(&self.metadata)?;
-        lines.push(format!("{{\"type\": \"metadata\", \"data\": {}}}", metadata_line));
-        
+        lines.push(format!(
+            "{{\"type\": \"metadata\", \"data\": {}}}",
+            metadata_line
+        ));
+
         // Add nodes
         for node in &self.nodes {
             let node_line = serde_json::to_string(&node)?;
             lines.push(format!("{{\"type\": \"node\", \"data\": {}}}", node_line));
         }
-        
+
         // Add SAME_AS edges
         for edge in &self.same_as_edges {
             let edge_line = serde_json::to_string(&edge)?;
-            lines.push(format!("{{\"type\": \"same_as\", \"data\": {}}}", edge_line));
+            lines.push(format!(
+                "{{\"type\": \"same_as\", \"data\": {}}}",
+                edge_line
+            ));
         }
-        
+
         // Add CONFLICTS_WITH edges
         for edge in &self.conflicts_with_edges {
             let edge_line = serde_json::to_string(&edge)?;
-            lines.push(format!("{{\"type\": \"conflicts_with\", \"data\": {}}}", edge_line));
+            lines.push(format!(
+                "{{\"type\": \"conflicts_with\", \"data\": {}}}",
+                edge_line
+            ));
         }
-        
+
         Ok(lines.join("\n"))
     }
 
@@ -266,22 +275,28 @@ impl GraphExporter {
         _ontology: &Ontology,
     ) -> Result<KnowledgeGraph> {
         let mut graph = KnowledgeGraph::new();
-        
+
         // Add metadata
         graph.add_metadata("version".to_string(), "1.0".to_string());
         graph.add_metadata("timestamp".to_string(), chrono::Utc::now().to_rfc3339());
         graph.add_metadata("num_records".to_string(), store.len().to_string());
         graph.add_metadata("num_clusters".to_string(), clusters.len().to_string());
-        
+
         // Add record nodes
         for record in store.get_all_records() {
             let mut node = GraphNode::record(record.id);
-            node = node.with_property("entity_type".to_string(), record.identity.entity_type.clone());
-            node = node.with_property("perspective".to_string(), record.identity.perspective.clone());
+            node = node.with_property(
+                "entity_type".to_string(),
+                record.identity.entity_type.clone(),
+            );
+            node = node.with_property(
+                "perspective".to_string(),
+                record.identity.perspective.clone(),
+            );
             node = node.with_property("uid".to_string(), record.identity.uid.clone());
             graph.add_node(node);
         }
-        
+
         // Add cluster nodes
         for cluster in &clusters.clusters {
             let mut node = GraphNode::cluster(cluster.id);
@@ -289,7 +304,7 @@ impl GraphExporter {
             node = node.with_property("root_record".to_string(), cluster.root.to_string());
             graph.add_node(node);
         }
-        
+
         // Add SAME_AS edges from clusters
         for cluster in &clusters.clusters {
             if cluster.len() > 1 {
@@ -307,7 +322,7 @@ impl GraphExporter {
                 }
             }
         }
-        
+
         // Add CONFLICTS_WITH edges from observations
         for observation in observations {
             match observation {
@@ -317,7 +332,7 @@ impl GraphExporter {
                         for j in i + 1..conflict.values.len() {
                             let value_a = &conflict.values[i];
                             let value_b = &conflict.values[j];
-                            
+
                             for record_a in &value_a.participants {
                                 for record_b in &value_b.participants {
                                     let edge = ConflictsWithEdge::new(
@@ -352,7 +367,12 @@ impl GraphExporter {
                         }
                     }
                 }
-                Observation::Merge { records, cluster: _cluster, interval, reason } => {
+                Observation::Merge {
+                    records,
+                    cluster: _cluster,
+                    interval,
+                    reason,
+                } => {
                     // Create SAME_AS edges for successful merges
                     if records.len() >= 2 {
                         for i in 0..records.len() {
@@ -370,7 +390,7 @@ impl GraphExporter {
                 }
             }
         }
-        
+
         Ok(graph)
     }
 }
@@ -398,7 +418,7 @@ mod tests {
             Interval::new(100, 200).unwrap(),
             "identity_key_match".to_string(),
         );
-        
+
         assert_eq!(edge.source, RecordId(1));
         assert_eq!(edge.target, RecordId(2));
         assert_eq!(edge.reason, "identity_key_match");
@@ -415,7 +435,7 @@ mod tests {
             "value_mismatch".to_string(),
             vec![ValueId(1), ValueId(2)],
         );
-        
+
         assert_eq!(edge.source, RecordId(1));
         assert_eq!(edge.target, RecordId(2));
         assert_eq!(edge.attribute, AttrId(1));
@@ -433,10 +453,10 @@ mod tests {
     #[test]
     fn test_knowledge_graph_creation() {
         let mut graph = KnowledgeGraph::new();
-        
+
         let node = GraphNode::record(RecordId(1));
         graph.add_node(node);
-        
+
         let edge = SameAsEdge::new(
             RecordId(1),
             RecordId(2),
@@ -444,7 +464,7 @@ mod tests {
             "identity_key_match".to_string(),
         );
         graph.add_same_as_edge(edge);
-        
+
         assert_eq!(graph.num_nodes(), 1);
         assert_eq!(graph.num_same_as_edges(), 1);
     }

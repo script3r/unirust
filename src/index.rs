@@ -1,11 +1,11 @@
 //! # Indexing Module
-//! 
+//!
 //! Provides efficient indexing for identity keys, crosswalks, and temporal data
 //! to enable fast lookup during entity resolution and conflict detection.
 
-    use crate::model::{RecordId, KeyValue, CanonicalId};
+use crate::model::{CanonicalId, KeyValue, RecordId};
+use crate::ontology::{Crosswalk, IdentityKey};
 use crate::temporal::Interval;
-use crate::ontology::{IdentityKey, Crosswalk};
 use anyhow::Result;
 use hashbrown::HashMap;
 // use rayon::prelude::*;
@@ -40,19 +40,20 @@ impl IdentityKeyIndex {
 
         for record in records {
             let entity_type = &record.identity.entity_type;
-            
+
             // Get identity keys for this entity type
             let identity_keys = ontology.identity_keys_for_type(entity_type);
-            
+
             for identity_key in identity_keys {
                 // Extract key values and their intervals from the record
-                let key_values_with_intervals = self.extract_key_values_with_intervals(record, identity_key)?;
-                
+                let key_values_with_intervals =
+                    self.extract_key_values_with_intervals(record, identity_key)?;
+
                 if !key_values_with_intervals.is_empty() {
                     // Use the first key value set for the index key
                     let key_values = key_values_with_intervals[0].0.clone();
                     let key = (entity_type.clone(), key_values);
-                    
+
                     // Add all intervals for this key
                     for (_, interval) in key_values_with_intervals {
                         self.index
@@ -60,7 +61,7 @@ impl IdentityKeyIndex {
                             .or_insert_with(Vec::new)
                             .push((record.id, interval));
                     }
-                    
+
                     // Add to record keys
                     self.record_keys
                         .entry(record.id)
@@ -73,7 +74,6 @@ impl IdentityKeyIndex {
         Ok(())
     }
 
-
     /// Extract key values with their intervals from a record for a given identity key
     fn extract_key_values_with_intervals(
         &self,
@@ -81,10 +81,11 @@ impl IdentityKeyIndex {
         identity_key: &IdentityKey,
     ) -> Result<Vec<(Vec<KeyValue>, Interval)>> {
         let mut results = Vec::new();
-        
+
         // Group descriptors by their intervals
-        let mut descriptors_by_interval: HashMap<Interval, Vec<&crate::model::Descriptor>> = HashMap::new();
-        
+        let mut descriptors_by_interval: HashMap<Interval, Vec<&crate::model::Descriptor>> =
+            HashMap::new();
+
         for attr in &identity_key.attributes {
             // Find descriptors for this attribute
             let descriptors: Vec<_> = record
@@ -92,12 +93,12 @@ impl IdentityKeyIndex {
                 .iter()
                 .filter(|d| d.attr == *attr)
                 .collect();
-            
+
             if descriptors.is_empty() {
                 // Missing required attribute for identity key
                 continue;
             }
-            
+
             // Group by interval
             for descriptor in descriptors {
                 descriptors_by_interval
@@ -106,12 +107,12 @@ impl IdentityKeyIndex {
                     .push(descriptor);
             }
         }
-        
+
         // Create key value sets for each interval
         for (interval, descriptors) in descriptors_by_interval {
             let mut key_values = Vec::new();
             let mut has_all_attributes = true;
-            
+
             for attr in &identity_key.attributes {
                 if let Some(descriptor) = descriptors.iter().find(|d| d.attr == *attr) {
                     key_values.push(KeyValue::new(*attr, descriptor.value));
@@ -120,12 +121,12 @@ impl IdentityKeyIndex {
                     break;
                 }
             }
-            
+
             if has_all_attributes {
                 results.push((key_values, interval));
             }
         }
-        
+
         Ok(results)
     }
 
@@ -149,7 +150,10 @@ impl IdentityKeyIndex {
 
     /// Get all indexed entity types
     pub fn get_entity_types(&self) -> HashSet<String> {
-        self.index.keys().map(|(entity_type, _)| entity_type.clone()).collect()
+        self.index
+            .keys()
+            .map(|(entity_type, _)| entity_type.clone())
+            .collect()
     }
 
     /// Get all key values for an entity type
@@ -236,7 +240,7 @@ impl CrosswalkIndex {
     /// Find crosswalks that overlap with a given interval
     pub fn find_overlapping(&self, interval: Interval) -> Vec<&Crosswalk> {
         let mut result = Vec::new();
-        
+
         for crosswalks in self.perspective_index.values() {
             for crosswalk in crosswalks {
                 if crate::temporal::is_overlapping(&crosswalk.interval, &interval) {
@@ -244,7 +248,7 @@ impl CrosswalkIndex {
                 }
             }
         }
-        
+
         result
     }
 }
@@ -274,19 +278,19 @@ impl TemporalIndex {
 
         for record in records {
             let mut record_intervals = Vec::new();
-            
+
             for descriptor in &record.descriptors {
                 let interval = descriptor.interval;
-                
+
                 // Index by interval
                 self.interval_index
                     .entry(interval)
                     .or_insert_with(Vec::new)
                     .push(record.id);
-                
+
                 record_intervals.push(interval);
             }
-            
+
             self.record_intervals.insert(record.id, record_intervals);
         }
     }
@@ -294,13 +298,13 @@ impl TemporalIndex {
     /// Find records that overlap with a given interval
     pub fn find_overlapping_records(&self, interval: Interval) -> Vec<RecordId> {
         let mut result = Vec::new();
-        
+
         for (index_interval, record_ids) in &self.interval_index {
             if crate::temporal::is_overlapping(index_interval, &interval) {
                 result.extend(record_ids);
             }
         }
-        
+
         result.sort();
         result.dedup();
         result
@@ -350,13 +354,13 @@ impl IndexManager {
     ) -> Result<()> {
         // Build identity key index
         self.identity_key_index.build(records, ontology)?;
-        
+
         // Build crosswalk index
         self.crosswalk_index.build(&ontology.crosswalks);
-        
+
         // Build temporal index
         self.temporal_index.build(records);
-        
+
         Ok(())
     }
 
@@ -367,8 +371,10 @@ impl IndexManager {
         key_values: &[KeyValue],
         interval: Interval,
     ) -> Vec<RecordId> {
-        let matching_records = self.identity_key_index.find_matching_records(entity_type, key_values);
-        
+        let matching_records = self
+            .identity_key_index
+            .find_matching_records(entity_type, key_values);
+
         matching_records
             .into_iter()
             .filter(|(_, record_interval)| {
@@ -398,21 +404,21 @@ impl Default for IndexManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Record, RecordIdentity, Descriptor, AttrId, ValueId, PerspectiveScopedId};
-    use crate::ontology::{Ontology, IdentityKey};
+    use crate::model::{AttrId, Descriptor, PerspectiveScopedId, Record, RecordIdentity, ValueId};
+    use crate::ontology::{IdentityKey, Ontology};
     use crate::temporal::Interval;
 
     #[test]
     fn test_identity_key_index() {
         let mut index = IdentityKeyIndex::new();
-        
+
         let mut ontology = Ontology::new();
         let name_attr = AttrId(1);
         let email_attr = AttrId(2);
-        
+
         let identity_key = IdentityKey::new(vec![name_attr, email_attr], "name_email".to_string());
         ontology.add_identity_key(identity_key);
-        
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
@@ -421,14 +427,14 @@ mod tests {
                 Descriptor::new(email_attr, ValueId(2), Interval::new(100, 200).unwrap()),
             ],
         );
-        
+
         index.build(&[record], &ontology).unwrap();
-        
+
         let key_values = vec![
             KeyValue::new(name_attr, ValueId(1)),
             KeyValue::new(email_attr, ValueId(2)),
         ];
-        
+
         let matches = index.find_matching_records("person", &key_values);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, RecordId(1));
@@ -437,18 +443,18 @@ mod tests {
     #[test]
     fn test_crosswalk_index() {
         let mut index = CrosswalkIndex::new();
-        
+
         let crosswalk = Crosswalk::new(
             PerspectiveScopedId::new("crm".to_string(), "123".to_string()),
             CanonicalId::new("canonical_123".to_string()),
             Interval::new(100, 200).unwrap(),
         );
-        
+
         index.build(&[crosswalk]);
-        
+
         let found = index.find_by_perspective("crm");
         assert_eq!(found.len(), 1);
-        
+
         let found_by_uid = index.find_by_perspective_uid("crm", "123");
         assert!(found_by_uid.is_some());
     }
@@ -456,7 +462,7 @@ mod tests {
     #[test]
     fn test_temporal_index() {
         let mut index = TemporalIndex::new();
-        
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
@@ -465,9 +471,9 @@ mod tests {
                 Descriptor::new(AttrId(2), ValueId(2), Interval::new(150, 250).unwrap()),
             ],
         );
-        
+
         index.build(&[record]);
-        
+
         let overlapping = index.find_overlapping_records(Interval::new(120, 180).unwrap());
         assert_eq!(overlapping.len(), 1);
         assert_eq!(overlapping[0], RecordId(1));
@@ -476,27 +482,31 @@ mod tests {
     #[test]
     fn test_index_manager() {
         let mut manager = IndexManager::new();
-        
+
         let mut ontology = Ontology::new();
         let name_attr = AttrId(1);
         let identity_key = IdentityKey::new(vec![name_attr], "name".to_string());
         ontology.add_identity_key(identity_key);
-        
+
         let record = Record::new(
             RecordId(1),
             RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
-            vec![Descriptor::new(name_attr, ValueId(1), Interval::new(100, 200).unwrap())],
+            vec![Descriptor::new(
+                name_attr,
+                ValueId(1),
+                Interval::new(100, 200).unwrap(),
+            )],
         );
-        
+
         manager.build_all(&[record], &ontology).unwrap();
-        
+
         let key_values = vec![KeyValue::new(name_attr, ValueId(1))];
         let matches = manager.find_matching_records_in_interval(
             "person",
             &key_values,
             Interval::new(120, 180).unwrap(),
         );
-        
+
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], RecordId(1));
     }
