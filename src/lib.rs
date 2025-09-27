@@ -8,6 +8,7 @@
 pub mod conflicts;
 pub mod dsu;
 pub mod graph;
+pub mod grpc_server;
 pub mod index;
 pub mod linker;
 pub mod model;

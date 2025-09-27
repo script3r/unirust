@@ -1,0 +1,292 @@
+syntax = "proto3";
+
+package unirust.v1;
+
+// Temporal interval definition
+message Interval {
+    int64 start = 1;
+    int64 end = 2;
+}
+
+// Record identity
+message RecordIdentity {
+    string entity_type = 1;
+    string perspective = 2;
+    string uid = 3;
+}
+
+// Temporal descriptor
+message Descriptor {
+    string attribute = 1;
+    string value = 2;
+    Interval interval = 3;
+}
+
+// Record definition
+message Record {
+    uint32 id = 1;
+    RecordIdentity identity = 2;
+    repeated Descriptor descriptors = 3;
+}
+
+// Identity key for entity matching
+message IdentityKey {
+    repeated string attributes = 1;
+    string name = 2;
+}
+
+// Strong identifier definition
+message StrongIdentifier {
+    string attribute = 1;
+    string name = 2;
+}
+
+// Crosswalk definition
+message Crosswalk {
+    PerspectiveScopedId perspective_id = 1;
+    CanonicalId canonical_id = 2;
+    Interval interval = 3;
+}
+
+message PerspectiveScopedId {
+    string perspective = 1;
+    string uid = 2;
+}
+
+message CanonicalId {
+    string value = 1;
+}
+
+// Constraint definition
+message Constraint {
+    oneof constraint_type {
+        UniqueConstraint unique = 1;
+        UniqueWithinPerspectiveConstraint unique_within_perspective = 2;
+    }
+}
+
+message UniqueConstraint {
+    string attribute = 1;
+    string name = 2;
+}
+
+message UniqueWithinPerspectiveConstraint {
+    string attribute = 1;
+    string name = 2;
+}
+
+// Entity type definition
+message EntityType {
+    string name = 1;
+    repeated string attributes = 2;
+    bool requires_strong_identifier = 3;
+}
+
+// Ontology definition
+message Ontology {
+    repeated IdentityKey identity_keys = 1;
+    repeated StrongIdentifier strong_identifiers = 2;
+    repeated Crosswalk crosswalks = 3;
+    repeated Constraint constraints = 4;
+    repeated EntityType entity_types = 5;
+    map<string, uint32> perspective_weights = 6;
+    map<string, PerspectiveAttributes> perspective_permanent_attributes = 7;
+}
+
+message PerspectiveAttributes {
+    repeated string attributes = 1;
+}
+
+// Cluster definition
+message Cluster {
+    uint32 id = 1;
+    repeated uint32 records = 2;
+}
+
+message Clusters {
+    repeated Cluster clusters = 1;
+}
+
+// Conflict definitions
+message ConflictValue {
+    string value = 1;
+    repeated uint32 participants = 2;
+}
+
+message DirectConflict {
+    string kind = 1;
+    string attribute = 2;
+    Interval interval = 3;
+    repeated ConflictValue values = 4;
+}
+
+message IndirectConflict {
+    string kind = 1;
+    string cause = 2;
+    optional string attribute = 3;
+    Interval interval = 4;
+    string status = 5;
+    map<string, string> details = 6;
+}
+
+message MergeObservation {
+    repeated uint32 records = 1;
+    Interval interval = 2;
+    string reason = 3;
+}
+
+message Observation {
+    oneof observation_type {
+        DirectConflict direct_conflict = 1;
+        IndirectConflict indirect_conflict = 2;
+        MergeObservation merge = 3;
+    }
+}
+
+// Knowledge graph definitions
+message Node {
+    string id = 1;
+    string node_type = 2;
+    map<string, string> properties = 3;
+}
+
+message Edge {
+    string from_node = 1;
+    string to_node = 2;
+    string edge_type = 3;
+    map<string, string> properties = 4;
+}
+
+message KnowledgeGraph {
+    repeated Node nodes = 1;
+    repeated Edge edges = 2;
+}
+
+// API Request/Response messages
+message CreateOntologyRequest {
+    Ontology ontology = 1;
+}
+
+message CreateOntologyResponse {
+    string session_id = 1;
+    bool success = 2;
+    string message = 3;
+}
+
+message IngestRecordsRequest {
+    string session_id = 1;
+    repeated Record records = 2;
+}
+
+message IngestRecordsResponse {
+    bool success = 1;
+    string message = 2;
+    uint32 records_ingested = 3;
+}
+
+message BuildClustersRequest {
+    string session_id = 1;
+    bool use_optimized = 2;
+}
+
+message BuildClustersResponse {
+    bool success = 1;
+    string message = 2;
+    Clusters clusters = 3;
+}
+
+message DetectConflictsRequest {
+    string session_id = 1;
+    Clusters clusters = 2;
+}
+
+message DetectConflictsResponse {
+    bool success = 1;
+    string message = 2;
+    repeated Observation observations = 3;
+}
+
+message ExportKnowledgeGraphRequest {
+    string session_id = 1;
+    Clusters clusters = 2;
+    repeated Observation observations = 3;
+}
+
+message ExportKnowledgeGraphResponse {
+    bool success = 1;
+    string message = 2;
+    KnowledgeGraph graph = 3;
+}
+
+message ExportFormatsRequest {
+    string session_id = 1;
+    Clusters clusters = 2;
+    repeated Observation observations = 3;
+    repeated string formats = 4; // "jsonl", "dot", "text_summary"
+}
+
+message ExportFormatsResponse {
+    bool success = 1;
+    string message = 2;
+    map<string, string> exports = 3; // format -> content
+}
+
+message GetSessionInfoRequest {
+    string session_id = 1;
+}
+
+message GetSessionInfoResponse {
+    bool success = 1;
+    string message = 2;
+    string session_id = 3;
+    uint32 record_count = 4;
+    bool has_ontology = 5;
+    repeated string available_attributes = 6;
+    repeated string available_perspectives = 7;
+}
+
+message ListSessionsRequest {
+}
+
+message ListSessionsResponse {
+    repeated string session_ids = 1;
+}
+
+message DeleteSessionRequest {
+    string session_id = 1;
+}
+
+message DeleteSessionResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// Health check
+message HealthCheckRequest {
+}
+
+message HealthCheckResponse {
+    string status = 1;
+    string version = 2;
+}
+
+// The main Unirust service
+service UnirustService {
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+    
+    // Session management
+    rpc CreateOntology(CreateOntologyRequest) returns (CreateOntologyResponse);
+    rpc GetSessionInfo(GetSessionInfoRequest) returns (GetSessionInfoResponse);
+    rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+    rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+    
+    // Core workflow methods
+    rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
+    rpc BuildClusters(BuildClustersRequest) returns (BuildClustersResponse);
+    rpc DetectConflicts(DetectConflictsRequest) returns (DetectConflictsResponse);
+    rpc ExportKnowledgeGraph(ExportKnowledgeGraphRequest) returns (ExportKnowledgeGraphResponse);
+    
+    // Export utilities
+    rpc ExportFormats(ExportFormatsRequest) returns (ExportFormatsResponse);
+}
