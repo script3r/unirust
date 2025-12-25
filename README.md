@@ -73,9 +73,9 @@ flowchart LR
     R5["R5 (mobile:mobile_001)\nJohn Doe\njohn.doe@example.com\n555-0000\n123-45-6789"]
   end
 
-  R1 ---|SAME_AS (-inf..+inf)| R2
-  R1 ---|SAME_AS (-inf..+inf)| R4
-  R2 ---|SAME_AS (-inf..+inf)| R4
+  R1 ---|SAME_AS all_time| R2
+  R1 ---|SAME_AS all_time| R4
+  R2 ---|SAME_AS all_time| R4
 
   R1 -. "CONFLICTS attr:2 150-200" .- R2
   R1 -. "CONFLICTS attr:2 180-200" .- R4
