@@ -160,6 +160,12 @@ impl ConflictDetails {
     }
 }
 
+impl Default for ConflictDetails {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An observation of a conflict or merge
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Observation {
@@ -265,16 +271,16 @@ impl ConflictDetector {
     ) -> Result<Vec<DirectConflict>> {
         let mut conflicts = Vec::new();
 
-        // Group descriptors by attribute
-        let mut descriptors_by_attr: HashMap<AttrId, Vec<&Descriptor>> = HashMap::new();
+        // Group descriptors by attribute, keeping record IDs for participants.
+        let mut descriptors_by_attr: HashMap<AttrId, Vec<(RecordId, &Descriptor)>> = HashMap::new();
 
         for record_id in &cluster.records {
             if let Some(record) = store.get_record(*record_id) {
                 for descriptor in &record.descriptors {
                     descriptors_by_attr
                         .entry(descriptor.attr)
-                        .or_insert_with(Vec::new)
-                        .push(descriptor);
+                        .or_default()
+                        .push((*record_id, descriptor));
                 }
             }
         }
@@ -288,7 +294,8 @@ impl ConflictDetector {
         Ok(conflicts)
     }
 
-    /// Detect intra-entity conflicts (conflicts within a single entity)
+    /// Detect intra-entity conflicts (conflicts within a single entity).
+    /// Only strong-identifier attributes are considered for intra-entity checks.
     fn detect_intra_entity_conflicts(
         store: &Store,
         ontology: &Ontology,
@@ -302,7 +309,7 @@ impl ConflictDetector {
             for descriptor in &record.descriptors {
                 descriptors_by_attr
                     .entry(descriptor.attr)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(descriptor);
             }
 
@@ -332,12 +339,13 @@ impl ConflictDetector {
         let mut conflicts = Vec::new();
 
         // Group descriptors by value (like Java: values.keySet())
-        let mut descriptors_by_value: HashMap<ValueId, Vec<&Descriptor>> = HashMap::new();
+        let mut descriptors_by_value: HashMap<ValueId, Vec<(RecordId, &Descriptor)>> =
+            HashMap::new();
         for descriptor in descriptors {
             descriptors_by_value
                 .entry(descriptor.value)
-                .or_insert_with(Vec::new)
-                .push(descriptor);
+                .or_default()
+                .push((entity_id, descriptor));
         }
 
         // Check for overlapping intervals with different values within this entity
@@ -375,23 +383,24 @@ impl ConflictDetector {
         Ok(conflicts)
     }
 
-    /// Detect conflicts for a specific attribute
+    /// Detect conflicts for a specific attribute.
     fn detect_conflicts_for_attribute(
-        descriptors: Vec<&Descriptor>,
+        descriptors: Vec<(RecordId, &Descriptor)>,
         attribute: AttrId,
     ) -> Result<Vec<DirectConflict>> {
         let mut conflicts = Vec::new();
 
         // Group descriptors by value
-        let mut descriptors_by_value: HashMap<ValueId, Vec<&Descriptor>> = HashMap::new();
-        for descriptor in descriptors {
+        let mut descriptors_by_value: HashMap<ValueId, Vec<(RecordId, &Descriptor)>> =
+            HashMap::new();
+        for (record_id, descriptor) in descriptors {
             descriptors_by_value
                 .entry(descriptor.value)
-                .or_insert_with(Vec::new)
-                .push(descriptor);
+                .or_default()
+                .push((record_id, descriptor));
         }
 
-        // Check for overlapping intervals with different values
+        // Check for overlapping intervals with different values.
         let values: Vec<ValueId> = descriptors_by_value.keys().cloned().collect();
         for i in 0..values.len() {
             for j in i + 1..values.len() {
@@ -405,15 +414,11 @@ impl ConflictDetector {
                 let overlaps = Self::find_overlapping_intervals(descs_a, descs_b);
 
                 for overlap in overlaps {
+                    let participants_a = descs_a.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                    let participants_b = descs_b.iter().map(|(id, _)| *id).collect::<Vec<_>>();
                     let conflict_values = vec![
-                        ConflictValue::new(
-                            value_a,
-                            vec![RecordId(0)], // Placeholder - would need actual record IDs
-                        ),
-                        ConflictValue::new(
-                            value_b,
-                            vec![RecordId(1)], // Placeholder - would need actual record IDs
-                        ),
+                        ConflictValue::new(value_a, participants_a),
+                        ConflictValue::new(value_b, participants_b),
                     ];
 
                     let conflict = DirectConflict::new(
@@ -432,13 +437,13 @@ impl ConflictDetector {
 
     /// Find overlapping intervals between two sets of descriptors
     fn find_overlapping_intervals(
-        descs_a: &[&Descriptor],
-        descs_b: &[&Descriptor],
+        descs_a: &[(RecordId, &Descriptor)],
+        descs_b: &[(RecordId, &Descriptor)],
     ) -> Vec<Interval> {
         let mut overlaps = Vec::new();
 
-        for desc_a in descs_a {
-            for desc_b in descs_b {
+        for (_, desc_a) in descs_a {
+            for (_, desc_b) in descs_b {
                 if let Some(overlap) =
                     crate::temporal::intersect(&desc_a.interval, &desc_b.interval)
                 {
@@ -486,7 +491,7 @@ impl ConflictDetector {
                             if !key_values.is_empty() {
                                 clusters_by_identity
                                     .entry(key_values)
-                                    .or_insert_with(Vec::new)
+                                    .or_default()
                                     .push(cluster);
                             }
                         }
@@ -496,13 +501,12 @@ impl ConflictDetector {
         }
 
         // Check for indirect conflicts within each identity key group
-        for (_identity_key_values, clusters_with_same_identity) in clusters_by_identity {
+        for (key_values, clusters_with_same_identity) in clusters_by_identity {
             if clusters_with_same_identity.len() > 1 {
                 // Multiple clusters with the same identity key - potential indirect conflict
                 // Check if they have conflicting strong identifiers
 
                 let mut has_strong_id_conflict = false;
-                let mut conflicting_attributes = Vec::new();
 
                 // Check all pairs of clusters with the same identity key
                 for i in 0..clusters_with_same_identity.len() {
@@ -515,15 +519,6 @@ impl ConflictDetector {
                             store, cluster_a, cluster_b, ontology,
                         ) {
                             has_strong_id_conflict = true;
-
-                            // Find the conflicting attributes
-                            if let Some(conflicting_attr) =
-                                Self::find_conflicting_strong_id_attributes(
-                                    store, cluster_a, cluster_b, ontology,
-                                )
-                            {
-                                conflicting_attributes.push(conflicting_attr);
-                            }
                         }
                     }
                 }
@@ -531,11 +526,13 @@ impl ConflictDetector {
                 if has_strong_id_conflict {
                     // Create indirect conflict for each cluster that couldn't merge
                     for cluster in clusters_with_same_identity {
+                        let interval = Self::interval_for_key_values(store, cluster, &key_values)
+                            .unwrap_or_else(|| Interval::new(0, 1).unwrap());
                         let conflict = IndirectConflict::new(
                             "indirect".to_string(),
                             "strong_id_conflict".to_string(),
                             None,
-                            Interval::new(86400, 432000).unwrap(), // 1-5 days in seconds
+                            interval,
                             ConflictParticipants::new(vec![], Some(cluster.records.clone())),
                             "auto_resolved".to_string(),
                             ConflictDetails::new(),
@@ -649,48 +646,6 @@ impl ConflictDetector {
         attrs
     }
 
-    /// Find conflicting strong identifier attributes between two clusters
-    fn find_conflicting_strong_id_attributes(
-        store: &Store,
-        cluster_a: &crate::dsu::Cluster,
-        cluster_b: &crate::dsu::Cluster,
-        ontology: &Ontology,
-    ) -> Option<AttrId> {
-        // Get records from both clusters
-        let records_a: Vec<_> = cluster_a
-            .records
-            .iter()
-            .filter_map(|&id| store.get_record(id))
-            .collect();
-        let records_b: Vec<_> = cluster_b
-            .records
-            .iter()
-            .filter_map(|&id| store.get_record(id))
-            .collect();
-
-        // Find the first conflicting attribute
-        for record_a in &records_a {
-            for record_b in &records_b {
-                if record_a.identity.perspective != record_b.identity.perspective {
-                    let strong_attrs_a = Self::get_strong_identifier_attributes(record_a, ontology);
-                    let strong_attrs_b = Self::get_strong_identifier_attributes(record_b, ontology);
-
-                    if !strong_attrs_a.is_empty()
-                        && !strong_attrs_b.is_empty()
-                        && strong_attrs_a.is_disjoint(&strong_attrs_b)
-                    {
-                        // Return the first different attribute
-                        if let Some(&attr) = strong_attrs_a.iter().next() {
-                            return Some(attr);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     /// Get values for a specific attribute from a record within a time interval
     fn get_values_for_attribute(
         record: &Record,
@@ -705,6 +660,36 @@ impl ConflictDetector {
             })
             .map(|desc| desc.value)
             .collect()
+    }
+
+    fn interval_for_key_values(
+        store: &Store,
+        cluster: &crate::dsu::Cluster,
+        key_values: &[KeyValue],
+    ) -> Option<Interval> {
+        let mut min_start: Option<i64> = None;
+        let mut max_end: Option<i64> = None;
+
+        for record_id in &cluster.records {
+            let record = store.get_record(*record_id)?;
+            for key_value in key_values {
+                for descriptor in &record.descriptors {
+                    if descriptor.attr == key_value.attr && descriptor.value == key_value.value {
+                        min_start = Some(min_start.map_or(descriptor.interval.start, |current| {
+                            current.min(descriptor.interval.start)
+                        }));
+                        max_end = Some(max_end.map_or(descriptor.interval.end, |current| {
+                            current.max(descriptor.interval.end)
+                        }));
+                    }
+                }
+            }
+        }
+
+        match (min_start, max_end) {
+            (Some(start), Some(end)) if start < end => Interval::new(start, end).ok(),
+            _ => None,
+        }
     }
 
     /// Detect constraint violations
@@ -767,7 +752,7 @@ impl ConflictDetector {
                 if let Some(record) = store.get_record(*record_id) {
                     perspective_records
                         .entry(record.identity.perspective.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(*record_id);
                 }
             }
@@ -789,7 +774,7 @@ impl ConflictDetector {
                         if descriptor.attr == attribute {
                             descriptors_by_value
                                 .entry(descriptor.value)
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push((descriptor, *record_id));
                         }
                     }
@@ -876,7 +861,8 @@ impl ConflictDetector {
         let mut violations = Vec::new();
 
         // Group descriptors by value
-        let mut descriptors_by_value: HashMap<ValueId, Vec<&Descriptor>> = HashMap::new();
+        let mut descriptors_by_value: HashMap<ValueId, Vec<(RecordId, &Descriptor)>> =
+            HashMap::new();
 
         for record_id in &cluster.records {
             if let Some(record) = store.get_record(*record_id) {
@@ -884,8 +870,8 @@ impl ConflictDetector {
                     if descriptor.attr == attribute {
                         descriptors_by_value
                             .entry(descriptor.value)
-                            .or_insert_with(Vec::new)
-                            .push(descriptor);
+                            .or_default()
+                            .push((*record_id, descriptor));
                     }
                 }
             }
@@ -905,11 +891,13 @@ impl ConflictDetector {
                 let overlaps = Self::find_overlapping_intervals(descs_a, descs_b);
 
                 for overlap in overlaps {
-                    let participants = vec![
-                        // This should be the actual record IDs, not attribute IDs
-                        RecordId(0), // Placeholder
-                        RecordId(1), // Placeholder
-                    ];
+                    let mut participants = descs_a
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(descs_b.iter().map(|(id, _)| *id))
+                        .collect::<Vec<_>>();
+                    participants.sort();
+                    participants.dedup();
 
                     let violation = ConstraintViolation::new(
                         Constraint::unique(attribute, name.to_string()),

@@ -125,17 +125,16 @@ impl fmt::Display for Interval {
 
 impl PartialOrd for Interval {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Order by start time, then by end time
-        match self.start.cmp(&other.start) {
-            Ordering::Equal => Some(self.end.cmp(&other.end)),
-            other => Some(other),
-        }
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for Interval {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        match self.start.cmp(&other.start) {
+            Ordering::Equal => self.end.cmp(&other.end),
+            ordering => ordering,
+        }
     }
 }
 
@@ -306,7 +305,7 @@ pub fn coalesce_same_value<T: Clone + PartialEq>(
         // If values are different, start a new interval
         if current.1 != *value {
             result.push(current);
-            current = (interval.clone(), value.clone());
+            current = (*interval, value.clone());
             continue;
         }
 
@@ -316,7 +315,7 @@ pub fn coalesce_same_value<T: Clone + PartialEq>(
         } else {
             // No overlap, start a new interval
             result.push(current);
-            current = (interval.clone(), value.clone());
+            current = (*interval, value.clone());
         }
     }
 

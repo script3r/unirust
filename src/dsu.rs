@@ -182,15 +182,14 @@ impl TemporalDSU {
         // Check for overlapping guards with conflicting reasons
         for guard_a in guards_a {
             for guard_b in guards_b {
-                if crate::temporal::is_overlapping(&guard_a.interval, &guard_b.interval) {
-                    if guard_a.reason != guard_b.reason {
-                        return Some(TemporalConflict::new(
-                            crate::temporal::intersect(&guard_a.interval, &guard_b.interval)
-                                .unwrap(),
-                            "conflicting_guards".to_string(),
-                            vec![guard_a.reason.clone(), guard_b.reason.clone()],
-                        ));
-                    }
+                if crate::temporal::is_overlapping(&guard_a.interval, &guard_b.interval)
+                    && guard_a.reason != guard_b.reason
+                {
+                    return Some(TemporalConflict::new(
+                        crate::temporal::intersect(&guard_a.interval, &guard_b.interval).unwrap(),
+                        "conflicting_guards".to_string(),
+                        vec![guard_a.reason.clone(), guard_b.reason.clone()],
+                    ));
                 }
             }
         }
@@ -213,17 +212,15 @@ impl TemporalDSU {
         }
     }
 
-    /// Get all clusters
+    /// Get all clusters.
+    /// Cluster IDs are assigned on demand and are not stable across calls.
     pub fn get_clusters(&mut self) -> Clusters {
         let mut cluster_map: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
 
         let record_ids: Vec<RecordId> = self.parent.keys().cloned().collect();
         for record_id in record_ids {
             let root = self.find(record_id);
-            cluster_map
-                .entry(root)
-                .or_insert_with(Vec::new)
-                .push(record_id);
+            cluster_map.entry(root).or_default().push(record_id);
         }
 
         let mut clusters = Vec::new();
@@ -241,7 +238,8 @@ impl TemporalDSU {
         Clusters { clusters }
     }
 
-    /// Get the cluster ID for a record
+    /// Get the cluster ID for a record.
+    /// This recomputes clusters and assigns new IDs each call.
     pub fn get_cluster_id(&mut self, record_id: RecordId) -> Option<ClusterId> {
         let root = self.find(record_id);
         // Find the cluster that contains this root
@@ -271,10 +269,7 @@ impl TemporalDSU {
 
     /// Add a conflict to a record
     pub fn add_conflict(&mut self, record_id: RecordId, conflict: TemporalConflict) {
-        self.conflicts
-            .entry(record_id)
-            .or_insert_with(Vec::new)
-            .push(conflict);
+        self.conflicts.entry(record_id).or_default().push(conflict);
     }
 
     /// Get the number of clusters

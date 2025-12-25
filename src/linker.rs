@@ -39,6 +39,12 @@ impl OptimizedLinker {
     }
 }
 
+impl Default for OptimizedLinker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Public function to build clusters (compatibility with old API)
 pub fn build_clusters(store: &Store, ontology: &Ontology) -> Result<Clusters> {
     OptimizedLinker::build_clusters_optimized(store, ontology)
@@ -74,8 +80,9 @@ impl OptimizedLinker {
 
         let all_edges = all_edges?;
 
-        // First, check for conflicts between all pairs of records in the same blocks
-        // This prevents merging records that would create unresolvable conflicts
+        // First, check for conflicts between all pairs of records in the same blocks.
+        // Note: this only covers pairs that share an identity block; it is a heuristic
+        // guardrail before full merge processing.
         let mut unresolvable_conflicts = std::collections::HashSet::new();
 
         for block in &blocks {
@@ -101,7 +108,7 @@ impl OptimizedLinker {
             }
         }
 
-        // Process edges sequentially (DSU operations must be sequential)
+        // Process edges sequentially (DSU operations must be sequential).
         for edge in all_edges {
             // Check if this pair has an unresolvable conflict
             if unresolvable_conflicts.contains(&(edge.record_a, edge.record_b)) {
@@ -181,7 +188,7 @@ impl OptimizedLinker {
         for record in records {
             records_by_type
                 .entry(record.identity.entity_type.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(record);
         }
 
@@ -198,10 +205,7 @@ impl OptimizedLinker {
 
                     for record in type_records {
                         if let Some(key_values) = self.extract_key_values(record, identity_key) {
-                            records_by_key
-                                .entry(key_values)
-                                .or_insert_with(Vec::new)
-                                .push(record);
+                            records_by_key.entry(key_values).or_default().push(record);
                         }
                     }
 
@@ -224,7 +228,8 @@ impl OptimizedLinker {
         Ok(blocks)
     }
 
-    /// Generate edges for a specific block (O(k²) where k << n)
+    /// Generate edges for a specific block (O(k²) where k << n).
+    /// For large blocks we materialize record pairs to drive parallel work.
     fn generate_edges_for_block(
         &self,
         block: &IdentityBlock,
@@ -236,7 +241,7 @@ impl OptimizedLinker {
             return self.generate_edges_for_block_sequential(block, store, ontology);
         }
 
-        // For larger blocks, use parallel processing
+        // For larger blocks, use parallel processing.
         let record_pairs: Vec<(usize, usize)> = (0..block.record_ids.len())
             .flat_map(|i| (i + 1..block.record_ids.len()).map(move |j| (i, j)))
             .collect();
@@ -346,7 +351,9 @@ impl OptimizedLinker {
         Some(key_values)
     }
 
-    /// Check for strong identifier conflicts
+    /// Check for strong identifier conflicts.
+    /// The interval parameter is currently unused; overlap checks are derived
+    /// from descriptor intervals directly.
     fn check_strong_identifier_conflict(
         &self,
         store: &Store,
@@ -360,8 +367,8 @@ impl OptimizedLinker {
 
         // Check strong identifiers for conflicts
         for strong_id in ontology.strong_identifiers_for_type(&record_a.identity.entity_type) {
-            let descriptor_a = self.get_strong_identifier_descriptor(&record_a, strong_id);
-            let descriptor_b = self.get_strong_identifier_descriptor(&record_b, strong_id);
+            let descriptor_a = self.get_strong_identifier_descriptor(record_a, strong_id);
+            let descriptor_b = self.get_strong_identifier_descriptor(record_b, strong_id);
 
             // Only check for conflicts if both records have values for this strong identifier
             if let (Some(desc_a), Some(desc_b)) = (descriptor_a, descriptor_b) {
@@ -375,23 +382,19 @@ impl OptimizedLinker {
                         let weight_b =
                             ontology.get_perspective_weight(&record_b.identity.perspective);
 
-                        if weight_a > weight_b {
+                        if weight_a != weight_b {
                             return Some(ConflictResolution::Resolvable(()));
-                        } else if weight_b > weight_a {
-                            return Some(ConflictResolution::Resolvable(()));
-                        } else {
-                            // Equal weights - check if there are other resolution mechanisms
-                            // For now, we'll be conservative and only mark as unresolvable
-                            // if both records are from the same perspective with equal weights
-                            if record_a.identity.perspective == record_b.identity.perspective {
-                                // Same perspective with equal weights - unresolvable
-                                return Some(ConflictResolution::Unresolvable);
-                            } else {
-                                // Different perspectives with equal weights - might be resolvable through other means
-                                // Let the normal clustering process handle this
-                                return None;
-                            }
                         }
+                        // Equal weights - check if there are other resolution mechanisms
+                        // For now, we'll be conservative and only mark as unresolvable
+                        // if both records are from the same perspective with equal weights
+                        if record_a.identity.perspective == record_b.identity.perspective {
+                            // Same perspective with equal weights - unresolvable
+                            return Some(ConflictResolution::Unresolvable);
+                        }
+                        // Different perspectives with equal weights - might be resolvable through other means
+                        // Let the normal clustering process handle this
+                        return None;
                     }
                     // If temporal intervals don't overlap, there's no conflict
                 }
@@ -408,12 +411,10 @@ impl OptimizedLinker {
         record: &'a Record,
         strong_id: &crate::ontology::StrongIdentifier,
     ) -> Option<&'a crate::model::Descriptor> {
-        for descriptor in &record.descriptors {
-            if descriptor.attr == strong_id.attribute {
-                return Some(descriptor);
-            }
-        }
-        None
+        record
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.attr == strong_id.attribute)
     }
 
     /// Check if two temporal intervals overlap
@@ -458,11 +459,9 @@ impl OptimizedLinker {
             return false;
         }
 
-        // Check if merging these clusters would create transitive conflicts
-        // We need to check if any record in cluster A would conflict with any record in cluster B
-
-        // For now, use a simplified approach: check if record A would conflict with record B
-        // In a full implementation, we'd get all records in both clusters and check all pairs
+        // Check if merging these clusters would create transitive conflicts.
+        // This uses a simplified representative-pair check instead of all-pairs
+        // across both clusters; it is conservative but not exhaustive.
         if let Some(ConflictResolution::Unresolvable) = self.check_strong_identifier_conflict(
             store,
             ontology,
@@ -476,7 +475,8 @@ impl OptimizedLinker {
         false
     }
 
-    /// Post-process clusters to split those with unresolvable conflicts
+    /// Post-process clusters to split those with unresolvable conflicts.
+    /// This is a heuristic fallback used to support specific conflict tests.
     fn split_clusters_with_unresolvable_conflicts(
         &self,
         store: &Store,
@@ -593,7 +593,8 @@ impl OptimizedLinker {
         })
     }
 
-    /// Determine if conflict splitting should be applied based on the scenario
+    /// Determine if conflict splitting should be applied based on the scenario.
+    /// This uses a narrow heuristic for known test fixtures.
     fn should_apply_conflict_splitting(&self, store: &Store, ontology: &Ontology) -> bool {
         let records = store.get_all_records();
 
@@ -703,6 +704,12 @@ impl LinkingResult {
             suppressed_merges: Vec::new(),
             clusters: Clusters::new(),
         }
+    }
+}
+
+impl Default for LinkingResult {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

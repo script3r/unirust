@@ -154,7 +154,7 @@ pub fn export_to_text_summary(
                 ));
             }
         }
-        summary.push_str("\n");
+        summary.push('\n');
     }
 
     // Observations summary
@@ -169,7 +169,7 @@ pub fn export_to_text_summary(
         }
     }
 
-    summary.push_str(&format!("Relationships:\n"));
+    summary.push_str("Relationships:\n");
     summary.push_str(&format!("  SAME_AS: {} relationships\n", same_as_count));
     summary.push_str(&format!("  CONFLICTS: {} relationships\n", conflict_count));
 
@@ -201,7 +201,7 @@ pub fn generate_graph_visualizations(
     // Generate PNG
     let png_filename = format!("{}.png", base_filename);
     let png_result = std::process::Command::new("dot")
-        .args(&["-Tpng", &dot_filename, "-o", &png_filename])
+        .args(["-Tpng", &dot_filename, "-o", &png_filename])
         .output();
 
     match png_result {
@@ -222,7 +222,7 @@ pub fn generate_graph_visualizations(
     // Generate SVG
     let svg_filename = format!("{}.svg", base_filename);
     let svg_result = std::process::Command::new("dot")
-        .args(&["-Tsvg", &dot_filename, "-o", &svg_filename])
+        .args(["-Tsvg", &dot_filename, "-o", &svg_filename])
         .output();
 
     match svg_result {

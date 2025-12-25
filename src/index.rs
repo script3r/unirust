@@ -11,11 +11,13 @@ use hashbrown::HashMap;
 // use rayon::prelude::*;
 use std::collections::HashSet;
 
+type IdentityIndexMap = HashMap<(String, Vec<KeyValue>), Vec<(RecordId, Interval)>>;
+
 /// Index for identity key lookups
 #[derive(Debug, Clone)]
 pub struct IdentityKeyIndex {
     /// Maps (entity_type, key_values) -> list of (record_id, interval)
-    index: HashMap<(String, Vec<KeyValue>), Vec<(RecordId, Interval)>>,
+    index: IdentityIndexMap,
     /// Maps record_id -> list of identity keys
     record_keys: HashMap<RecordId, Vec<IdentityKey>>,
 }
@@ -50,22 +52,17 @@ impl IdentityKeyIndex {
                     self.extract_key_values_with_intervals(record, identity_key)?;
 
                 if !key_values_with_intervals.is_empty() {
-                    // Use the first key value set for the index key
-                    let key_values = key_values_with_intervals[0].0.clone();
-                    let key = (entity_type.clone(), key_values);
-
-                    // Add all intervals for this key
-                    for (_, interval) in key_values_with_intervals {
+                    for (key_values, interval) in key_values_with_intervals {
+                        let key = (entity_type.clone(), key_values);
                         self.index
-                            .entry(key.clone())
-                            .or_insert_with(Vec::new)
+                            .entry(key)
+                            .or_default()
                             .push((record.id, interval));
                     }
 
-                    // Add to record keys
                     self.record_keys
                         .entry(record.id)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(identity_key.clone());
                 }
             }
@@ -103,7 +100,7 @@ impl IdentityKeyIndex {
             for descriptor in descriptors {
                 descriptors_by_interval
                     .entry(descriptor.interval)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(descriptor);
             }
         }
@@ -166,6 +163,12 @@ impl IdentityKeyIndex {
     }
 }
 
+impl Default for IdentityKeyIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Index for crosswalk lookups
 #[derive(Debug, Clone)]
 pub struct CrosswalkIndex {
@@ -197,13 +200,13 @@ impl CrosswalkIndex {
             // Index by perspective
             self.perspective_index
                 .entry(crosswalk.perspective_id.perspective.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(crosswalk.clone());
 
             // Index by canonical ID
             self.canonical_index
                 .entry(crosswalk.canonical_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(crosswalk.clone());
 
             // Index by perspective and UID
@@ -253,6 +256,12 @@ impl CrosswalkIndex {
     }
 }
 
+impl Default for CrosswalkIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Index for temporal data
 #[derive(Debug, Clone)]
 pub struct TemporalIndex {
@@ -285,7 +294,7 @@ impl TemporalIndex {
                 // Index by interval
                 self.interval_index
                     .entry(interval)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(record.id);
 
                 record_intervals.push(interval);
@@ -322,6 +331,12 @@ impl TemporalIndex {
     pub fn find_records_in_time_range(&self, start: i64, end: i64) -> Vec<RecordId> {
         let interval = Interval::new(start, end).unwrap();
         self.find_overlapping_records(interval)
+    }
+}
+
+impl Default for TemporalIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

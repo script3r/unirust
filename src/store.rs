@@ -8,6 +8,8 @@ use anyhow::Result;
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
 
+type AttributeValuePairs = Vec<((AttrId, ValueId), Vec<(RecordId, Interval)>)>;
+
 /// Main storage for records and metadata
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -165,7 +167,7 @@ impl AttributeValueIndex {
                 let key = (descriptor.attr, descriptor.value);
                 self.index
                     .entry(key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((record.id, descriptor.interval));
             }
         }
@@ -202,8 +204,14 @@ impl AttributeValueIndex {
     }
 
     /// Get all attribute-value pairs
-    pub fn get_all_pairs(&self) -> Vec<((AttrId, ValueId), Vec<(RecordId, Interval)>)> {
+    pub fn get_all_pairs(&self) -> AttributeValuePairs {
         self.index.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+}
+
+impl Default for AttributeValueIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -238,7 +246,7 @@ impl TemporalIndex {
             for descriptor in &record.descriptors {
                 self.index
                     .entry(descriptor.interval)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(record.id);
             }
         }
@@ -262,6 +270,12 @@ impl TemporalIndex {
     /// Get all time intervals
     pub fn get_all_intervals(&self) -> Vec<Interval> {
         self.index.keys().cloned().collect()
+    }
+}
+
+impl Default for TemporalIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

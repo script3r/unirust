@@ -1,6 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::hint::black_box;
 use std::time::Duration;
 use unirust::linker::build_clusters_optimized;
 use unirust::model::{Descriptor, Record, RecordId, RecordIdentity};
@@ -27,18 +28,18 @@ fn generate_test_records(store: &mut Store, count: u32, overlap_probability: f64
 
     for i in 1..=count {
         let perspectives = ["crm", "erp", "web", "mobile", "api"];
-        let perspective = perspectives[rng.gen_range(0..perspectives.len())];
+        let perspective = perspectives[rng.random_range(0..perspectives.len())];
         let uid = format!("{}_{:06}", perspective, i);
         let identity = RecordIdentity::new("person".to_string(), perspective.to_string(), uid);
 
-        let start = rng.gen_range(0..1000);
-        let end = start + rng.gen_range(1..100);
+        let start = rng.random_range(0..1000);
+        let end = start + rng.random_range(1..100);
         let interval = Interval::new(start, end).unwrap();
 
         let mut descriptors = Vec::new();
 
         // Use shared values based on overlap probability
-        if rng.gen_bool(overlap_probability) {
+        if rng.random_bool(overlap_probability) {
             descriptors.push(Descriptor::new(name_attr, name_value1, interval));
             descriptors.push(Descriptor::new(email_attr, email_value1, interval));
         } else {
@@ -51,23 +52,23 @@ fn generate_test_records(store: &mut Store, count: u32, overlap_probability: f64
         }
 
         // Phone - some shared, some unique
-        if rng.gen_bool(0.5) {
+        if rng.random_bool(0.5) {
             descriptors.push(Descriptor::new(phone_attr, phone_value1, interval));
         } else {
-            let phone = format!("555-{:04}", rng.gen_range(1000..9999));
+            let phone = format!("555-{:04}", rng.random_range(1000..9999));
             let phone_value = store.interner_mut().intern_value(&phone);
             descriptors.push(Descriptor::new(phone_attr, phone_value, interval));
         }
 
         // SSN - mostly shared for strong clustering
-        if rng.gen_bool(0.8) {
+        if rng.random_bool(0.8) {
             descriptors.push(Descriptor::new(ssn_attr, ssn_value1, interval));
         } else {
             let ssn = format!(
                 "{:03}-{:02}-{:04}",
-                rng.gen_range(100..999),
-                rng.gen_range(10..99),
-                rng.gen_range(1000..9999)
+                rng.random_range(100..999),
+                rng.random_range(10..99),
+                rng.random_range(1000..9999)
             );
             let ssn_value = store.interner_mut().intern_value(&ssn);
             descriptors.push(Descriptor::new(ssn_attr, ssn_value, interval));
