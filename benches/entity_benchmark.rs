@@ -3,11 +3,11 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::Duration;
-use unirust::linker::build_clusters_optimized;
-use unirust::model::{Descriptor, Record, RecordId, RecordIdentity};
-use unirust::ontology::{IdentityKey, Ontology, StrongIdentifier};
-use unirust::temporal::Interval;
-use unirust::*;
+use unirust_rs::linker::build_clusters_optimized;
+use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
+use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
+use unirust_rs::temporal::Interval;
+use unirust_rs::*;
 
 /// Generate test records with controlled overlap patterns
 fn generate_test_records(store: &mut Store, count: u32, overlap_probability: f64) -> Vec<Record> {

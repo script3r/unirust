@@ -3,12 +3,12 @@
 //! Demonstrates the core functionality of unirust with a simple example
 //! showing entity resolution, conflict detection, and knowledge graph export.
 
-use unirust::linker::build_clusters_optimized;
-use unirust::model::{Descriptor, Record, RecordId, RecordIdentity};
-use unirust::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
-use unirust::temporal::Interval;
-use unirust::utils;
-use unirust::*;
+use unirust_rs::linker::build_clusters_optimized;
+use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
+use unirust_rs::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
+use unirust_rs::temporal::Interval;
+use unirust_rs::utils;
+use unirust_rs::*;
 
 fn main() -> anyhow::Result<()> {
     println!("=== Unirust Basic Example ===\n");
