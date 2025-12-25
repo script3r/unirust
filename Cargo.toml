@@ -5,7 +5,9 @@ edition = "2021"
 description = "High-performance temporal entity resolution engine with conflict detection, knowledge graph export, and perspective-weighted data mastering for multi-source datasets."
 authors = ["unirust contributors"]
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/unirust/unirust"
+documentation = "https://docs.rs/unirust"
 keywords = ["entity-resolution", "temporal", "data-deduplication", "conflict-resolution"]
 categories = ["data-structures", "algorithms"]
 
