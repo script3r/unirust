@@ -92,7 +92,7 @@ cargo run --example basic_example
 
 ```toml
 [dependencies]
-unirust = "0.1.0"
+unirust-rs = "0.1.0"
 ```
 
 ## Development
