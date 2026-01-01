@@ -7,11 +7,50 @@ use crate::model::{CanonicalId, KeyValue, RecordId};
 use crate::ontology::{Crosswalk, IdentityKey};
 use crate::temporal::Interval;
 use anyhow::Result;
-use hashbrown::HashMap;
-// use rayon::prelude::*;
+use hashbrown::{Equivalent, HashMap};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
-type IdentityIndexMap = HashMap<(String, Vec<KeyValue>), Vec<(RecordId, Interval)>>;
+type IdentityIndexMap = HashMap<IdentityIndexKey, CandidateList>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IdentityIndexKey {
+    entity_type: String,
+    key_values: Vec<KeyValue>,
+}
+
+struct IdentityIndexKeyRef<'a> {
+    entity_type: &'a str,
+    key_values: &'a [KeyValue],
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateList {
+    entries: Vec<(RecordId, Interval)>,
+}
+
+impl CandidateList {
+    fn insert(&mut self, entry: (RecordId, Interval)) {
+        self.entries.push(entry);
+    }
+
+    fn as_slice(&self) -> &[(RecordId, Interval)] {
+        self.entries.as_slice()
+    }
+}
+
+impl<'a> Hash for IdentityIndexKeyRef<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.entity_type.hash(state);
+        self.key_values.hash(state);
+    }
+}
+
+impl<'a> Equivalent<IdentityIndexKey> for IdentityIndexKeyRef<'a> {
+    fn equivalent(&self, key: &IdentityIndexKey) -> bool {
+        self.entity_type == key.entity_type && self.key_values == key.key_values
+    }
+}
 
 /// Index for identity key lookups
 #[derive(Debug, Clone)]
@@ -53,11 +92,14 @@ impl IdentityKeyIndex {
 
                 if !key_values_with_intervals.is_empty() {
                     for (key_values, interval) in key_values_with_intervals {
-                        let key = (entity_type.clone(), key_values);
+                        let key = IdentityIndexKey {
+                            entity_type: entity_type.clone(),
+                            key_values,
+                        };
                         self.index
                             .entry(key)
                             .or_default()
-                            .push((record.id, interval));
+                            .insert((record.id, interval));
                     }
 
                     self.record_keys
@@ -72,19 +114,14 @@ impl IdentityKeyIndex {
     }
 
     /// Extract key values with their intervals from a record for a given identity key
-    fn extract_key_values_with_intervals(
+    pub(crate) fn extract_key_values_with_intervals(
         &self,
         record: &crate::model::Record,
         identity_key: &IdentityKey,
     ) -> Result<Vec<(Vec<KeyValue>, Interval)>> {
-        let mut results = Vec::new();
-
-        // Group descriptors by their intervals
-        let mut descriptors_by_interval: HashMap<Interval, Vec<&crate::model::Descriptor>> =
-            HashMap::new();
+        let mut partials: Vec<(Vec<KeyValue>, Interval)> = Vec::new();
 
         for attr in &identity_key.attributes {
-            // Find descriptors for this attribute
             let descriptors: Vec<_> = record
                 .descriptors
                 .iter()
@@ -92,50 +129,94 @@ impl IdentityKeyIndex {
                 .collect();
 
             if descriptors.is_empty() {
-                // Missing required attribute for identity key
+                return Ok(Vec::new());
+            }
+
+            if partials.is_empty() {
+                for descriptor in descriptors {
+                    partials.push((
+                        vec![KeyValue::new(*attr, descriptor.value)],
+                        descriptor.interval,
+                    ));
+                }
                 continue;
             }
 
-            // Group by interval
-            for descriptor in descriptors {
-                descriptors_by_interval
-                    .entry(descriptor.interval)
-                    .or_default()
-                    .push(descriptor);
-            }
-        }
-
-        // Create key value sets for each interval
-        for (interval, descriptors) in descriptors_by_interval {
-            let mut key_values = Vec::new();
-            let mut has_all_attributes = true;
-
-            for attr in &identity_key.attributes {
-                if let Some(descriptor) = descriptors.iter().find(|d| d.attr == *attr) {
-                    key_values.push(KeyValue::new(*attr, descriptor.value));
-                } else {
-                    has_all_attributes = false;
-                    break;
+            let mut next = Vec::new();
+            for (key_values, interval) in &partials {
+                for descriptor in &descriptors {
+                    if let Some(overlap) =
+                        crate::temporal::intersect(interval, &descriptor.interval)
+                    {
+                        let mut next_key_values = key_values.clone();
+                        next_key_values.push(KeyValue::new(*attr, descriptor.value));
+                        next.push((next_key_values, overlap));
+                    }
                 }
             }
 
-            if has_all_attributes {
-                results.push((key_values, interval));
+            partials = next;
+            if partials.is_empty() {
+                break;
             }
         }
 
-        Ok(results)
+        Ok(partials)
     }
+
+    /// Add a single record to the index.
+    pub fn add_record(
+        &mut self,
+        record: &crate::model::Record,
+        ontology: &crate::ontology::Ontology,
+    ) -> Result<()> {
+        let entity_type = &record.identity.entity_type;
+        let identity_keys = ontology.identity_keys_for_type(entity_type);
+
+        for identity_key in identity_keys {
+            let key_values_with_intervals =
+                self.extract_key_values_with_intervals(record, identity_key)?;
+
+            if !key_values_with_intervals.is_empty() {
+                for (key_values, interval) in key_values_with_intervals {
+                    let key = IdentityIndexKey {
+                        entity_type: entity_type.clone(),
+                        key_values,
+                    };
+                    self.index
+                        .entry(key)
+                        .or_default()
+                        .insert((record.id, interval));
+                }
+
+                self.record_keys
+                    .entry(record.id)
+                    .or_default()
+                    .push(identity_key.clone());
+            }
+        }
+
+        Ok(())
+    }
+
 
     /// Find records that match a given identity key
     pub fn find_matching_records(
         &self,
         entity_type: &str,
         key_values: &[KeyValue],
-    ) -> Vec<(RecordId, Interval)> {
-        let key = (entity_type.to_string(), key_values.to_vec());
-        self.index.get(&key).cloned().unwrap_or_default()
+    ) -> &[(RecordId, Interval)] {
+        let key = IdentityIndexKeyRef {
+            entity_type,
+            key_values,
+        };
+        self.index
+            .get(&key)
+            .map(|values| values.as_slice())
+            .unwrap_or(&[])
     }
+
+    /// Find records that could overlap before the interval end.
 
     /// Get all identity keys for a record
     pub fn get_record_keys(&self, record_id: RecordId) -> Vec<IdentityKey> {
@@ -149,7 +230,7 @@ impl IdentityKeyIndex {
     pub fn get_entity_types(&self) -> HashSet<String> {
         self.index
             .keys()
-            .map(|(entity_type, _)| entity_type.clone())
+            .map(|key| key.entity_type.clone())
             .collect()
     }
 
@@ -157,8 +238,8 @@ impl IdentityKeyIndex {
     pub fn get_key_values_for_type(&self, entity_type: &str) -> Vec<Vec<KeyValue>> {
         self.index
             .iter()
-            .filter(|((et, _), _)| et == entity_type)
-            .map(|((_, key_values), _)| key_values.clone())
+            .filter(|(key, _)| key.entity_type == entity_type)
+            .map(|(key, _)| key.key_values.clone())
             .collect()
     }
 }
@@ -391,11 +472,11 @@ impl IndexManager {
             .find_matching_records(entity_type, key_values);
 
         matching_records
-            .into_iter()
+            .iter()
             .filter(|(_, record_interval)| {
                 crate::temporal::is_overlapping(record_interval, &interval)
             })
-            .map(|(record_id, _)| record_id)
+            .map(|(record_id, _)| *record_id)
             .collect()
     }
 

@@ -10,7 +10,51 @@ use std::collections::BTreeMap;
 
 type AttributeValuePairs = Vec<((AttrId, ValueId), Vec<(RecordId, Interval)>)>;
 
-/// Main storage for records and metadata
+/// Persistence abstraction for records and metadata.
+pub trait RecordStore: Send + Sync {
+    /// Add a single record and return its assigned ID.
+    fn add_record(&mut self, record: Record) -> Result<RecordId>;
+
+    /// Add records to the store.
+    fn add_records(&mut self, records: Vec<Record>) -> Result<()> {
+        for record in records {
+            self.add_record(record)?;
+        }
+        Ok(())
+    }
+
+    /// Get a record by ID.
+    fn get_record(&self, id: RecordId) -> Option<&Record>;
+
+    /// Get all records.
+    fn get_all_records<'a>(&'a self) -> Vec<&'a Record>;
+
+    /// Get records for a specific entity type.
+    fn get_records_by_entity_type<'a>(&'a self, entity_type: &str) -> Vec<&'a Record>;
+
+    /// Get records for a specific perspective.
+    fn get_records_by_perspective<'a>(&'a self, perspective: &str) -> Vec<&'a Record>;
+
+    /// Get records that have descriptors for a specific attribute.
+    fn get_records_with_attribute<'a>(&'a self, attr: AttrId) -> Vec<&'a Record>;
+
+    /// Get records that have descriptors overlapping with a time interval.
+    fn get_records_in_interval<'a>(&'a self, interval: Interval) -> Vec<&'a Record>;
+
+    /// Get the string interner.
+    fn interner(&self) -> &StringInterner;
+
+    /// Get a mutable reference to the string interner.
+    fn interner_mut(&mut self) -> &mut StringInterner;
+
+    /// Get the number of records.
+    fn len(&self) -> usize;
+
+    /// Check if the store is empty.
+    fn is_empty(&self) -> bool;
+}
+
+/// Main in-memory storage for records and metadata
 #[derive(Debug, Clone)]
 pub struct Store {
     /// All records indexed by ID
@@ -31,33 +75,35 @@ impl Store {
         }
     }
 
+    /// Add a single record to the store and return its assigned ID.
+    pub fn add_record(&mut self, mut record: Record) -> Result<RecordId> {
+        // Intern all attribute and value strings
+        for descriptor in &mut record.descriptors {
+            if self.interner.get_attr(descriptor.attr).is_none() {
+                descriptor.attr = self.interner.intern_attr("unknown");
+            }
+            if self.interner.get_value(descriptor.value).is_none() {
+                descriptor.value = self.interner.intern_value("unknown");
+            }
+        }
+
+        // Assign a new record ID if not already set
+        if record.id.0 == 0 {
+            record.id = RecordId(self.next_record_id);
+            self.next_record_id += 1;
+        } else {
+            self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+        }
+
+        let record_id = record.id;
+        self.records.insert(record.id, record);
+        Ok(record_id)
+    }
+
     /// Add records to the store
     pub fn add_records(&mut self, records: Vec<Record>) -> Result<()> {
-        for mut record in records {
-            // Intern all attribute and value strings
-            for descriptor in &mut record.descriptors {
-                let attr_str = self
-                    .interner
-                    .get_attr(descriptor.attr)
-                    .unwrap_or(&"unknown".to_string())
-                    .clone();
-                descriptor.attr = self.interner.intern_attr(&attr_str);
-
-                let value_str = self
-                    .interner
-                    .get_value(descriptor.value)
-                    .unwrap_or(&"unknown".to_string())
-                    .clone();
-                descriptor.value = self.interner.intern_value(&value_str);
-            }
-
-            // Assign a new record ID if not already set
-            if record.id.0 == 0 {
-                record.id = RecordId(self.next_record_id);
-                self.next_record_id += 1;
-            }
-
-            self.records.insert(record.id, record);
+        for record in records {
+            self.add_record(record)?;
         }
         Ok(())
     }
@@ -136,6 +182,56 @@ impl Default for Store {
     }
 }
 
+impl RecordStore for Store {
+    fn add_record(&mut self, record: Record) -> Result<RecordId> {
+        Store::add_record(self, record)
+    }
+
+    fn add_records(&mut self, records: Vec<Record>) -> Result<()> {
+        Store::add_records(self, records)
+    }
+
+    fn get_record(&self, id: RecordId) -> Option<&Record> {
+        Store::get_record(self, id)
+    }
+
+    fn get_all_records<'a>(&'a self) -> Vec<&'a Record> {
+        Store::get_all_records(self)
+    }
+
+    fn get_records_by_entity_type<'a>(&'a self, entity_type: &str) -> Vec<&'a Record> {
+        Store::get_records_by_entity_type(self, entity_type)
+    }
+
+    fn get_records_by_perspective<'a>(&'a self, perspective: &str) -> Vec<&'a Record> {
+        Store::get_records_by_perspective(self, perspective)
+    }
+
+    fn get_records_with_attribute<'a>(&'a self, attr: AttrId) -> Vec<&'a Record> {
+        Store::get_records_with_attribute(self, attr)
+    }
+
+    fn get_records_in_interval<'a>(&'a self, interval: Interval) -> Vec<&'a Record> {
+        Store::get_records_in_interval(self, interval)
+    }
+
+    fn interner(&self) -> &StringInterner {
+        Store::interner(self)
+    }
+
+    fn interner_mut(&mut self) -> &mut StringInterner {
+        Store::interner_mut(self)
+    }
+
+    fn len(&self) -> usize {
+        Store::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        Store::is_empty(self)
+    }
+}
+
 /// Index for efficient lookup of records by attribute-value pairs
 #[derive(Debug, Clone)]
 pub struct AttributeValueIndex {
@@ -152,14 +248,14 @@ impl AttributeValueIndex {
     }
 
     /// Build the index from a store
-    pub fn from_store(store: &Store) -> Self {
+    pub fn from_store(store: &dyn RecordStore) -> Self {
         let mut index = Self::new();
         index.build(store);
         index
     }
 
     /// Build the index from a store
-    pub fn build(&mut self, store: &Store) {
+    pub fn build(&mut self, store: &dyn RecordStore) {
         self.index.clear();
 
         for record in store.get_all_records() {
@@ -232,14 +328,14 @@ impl TemporalIndex {
     }
 
     /// Build the index from a store
-    pub fn from_store(store: &Store) -> Self {
+    pub fn from_store(store: &dyn RecordStore) -> Self {
         let mut index = Self::new();
         index.build(store);
         index
     }
 
     /// Build the index from a store
-    pub fn build(&mut self, store: &Store) {
+    pub fn build(&mut self, store: &dyn RecordStore) {
         self.index.clear();
 
         for record in store.get_all_records() {

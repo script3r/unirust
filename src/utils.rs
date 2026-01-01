@@ -5,13 +5,13 @@
 use crate::conflicts::Observation;
 use crate::dsu::Clusters;
 use crate::ontology::Ontology;
-use crate::Store;
+use crate::store::RecordStore;
 use anyhow::Result;
 use std::collections::HashSet;
 
 /// Export the knowledge graph to DOT format for visualization
 pub fn export_to_dot(
-    store: &Store,
+    store: &dyn RecordStore,
     clusters: &Clusters,
     observations: &[Observation],
     _ontology: &Ontology,
@@ -124,7 +124,7 @@ pub fn export_to_dot(
 
 /// Export the knowledge graph to a simplified text format
 pub fn export_to_text_summary(
-    store: &Store,
+    store: &dyn RecordStore,
     clusters: &Clusters,
     observations: &[Observation],
 ) -> Result<String> {
@@ -185,7 +185,7 @@ pub fn save_dot_to_file(dot_content: &str, filename: &str) -> Result<()> {
 
 /// Generate and save graph visualizations
 pub fn generate_graph_visualizations(
-    store: &Store,
+    store: &dyn RecordStore,
     clusters: &Clusters,
     observations: &[Observation],
     ontology: &Ontology,

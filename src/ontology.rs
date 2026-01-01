@@ -312,6 +312,9 @@ pub struct EntityType {
     pub name: String,
     /// The attributes that can be used for this entity type
     pub attributes: Vec<AttrId>,
+    /// Preferred attributes to compose cluster keys (ordered)
+    #[serde(default)]
+    pub key_attributes: Vec<AttrId>,
     /// Whether this entity type requires a strong identifier
     pub requires_strong_identifier: bool,
 }
@@ -322,6 +325,22 @@ impl EntityType {
         Self {
             name,
             attributes,
+            key_attributes: Vec::new(),
+            requires_strong_identifier,
+        }
+    }
+
+    /// Create a new entity type with explicit key attributes
+    pub fn with_key_attributes(
+        name: String,
+        attributes: Vec<AttrId>,
+        key_attributes: Vec<AttrId>,
+        requires_strong_identifier: bool,
+    ) -> Self {
+        Self {
+            name,
+            attributes,
+            key_attributes,
             requires_strong_identifier,
         }
     }

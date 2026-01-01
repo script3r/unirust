@@ -3,11 +3,9 @@
 //! Demonstrates the core functionality of unirust with a simple example
 //! showing entity resolution, conflict detection, and knowledge graph export.
 
-use unirust_rs::linker::build_clusters_optimized;
 use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
 use unirust_rs::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use unirust_rs::temporal::Interval;
-use unirust_rs::utils;
 use unirust_rs::*;
 
 fn main() -> anyhow::Result<()> {
@@ -135,17 +133,22 @@ fn main() -> anyhow::Result<()> {
         ],
     );
 
-    store.add_records(vec![record1, record2, record3, record4, record5])?;
-    println!("Added 5 records to the store");
+    let mut unirust = Unirust::with_store(ontology.clone(), store);
+    let mut last_graph = None;
+    for record in vec![record1, record2, record3, record4, record5] {
+        let update = unirust.stream_record_update_graph(record)?;
+        last_graph = Some(update.graph);
+    }
+    println!("Streamed 5 records into the store");
 
-    // Build clusters using entity resolution (optimized)
-    let clusters = build_clusters_optimized(&store, &ontology)?;
+    // Build clusters using streaming entity resolution
+    let clusters = unirust.build_clusters()?;
     println!("Built {} clusters", clusters.len());
 
     for (i, cluster) in clusters.clusters.iter().enumerate() {
         println!("  Cluster {}: {} records", i + 1, cluster.records.len());
         for record_id in &cluster.records {
-            if let Some(record) = store.get_record(*record_id) {
+            if let Some(record) = unirust.get_record(*record_id) {
                 println!(
                     "    - {} ({}:{})",
                     record_id, record.identity.perspective, record.identity.uid
@@ -155,7 +158,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Detect conflicts
-    let observations = conflicts::detect_conflicts(&store, &clusters, &ontology)?;
+    let observations = unirust.detect_conflicts(&clusters)?;
     println!("\nDetected {} observations", observations.len());
 
     for (i, observation) in observations.iter().enumerate() {
@@ -193,7 +196,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Export knowledge graph
-    let graph = graph::export_graph(&store, &clusters, &observations, &ontology)?;
+    let graph = last_graph.unwrap_or_else(|| {
+        unirust
+            .export_graph(&clusters, &observations)
+            .expect("Graph export failed")
+    });
     println!("\nExported knowledge graph:");
     println!("  - {} nodes", graph.num_nodes());
     println!("  - {} SAME_AS edges", graph.num_same_as_edges());
@@ -208,22 +215,16 @@ fn main() -> anyhow::Result<()> {
     println!("{}", jsonl);
 
     // Export to DOT format for graph visualization
-    let dot = utils::export_to_dot(&store, &clusters, &observations, &ontology)?;
+    let dot = unirust.export_dot(&clusters, &observations)?;
     println!("\nKnowledge graph exported to DOT format:");
     println!("{}", dot);
 
     // Generate graph visualizations
     println!("\nGenerating graph visualizations...");
-    utils::generate_graph_visualizations(
-        &store,
-        &clusters,
-        &observations,
-        &ontology,
-        "knowledge_graph",
-    )?;
+    unirust.generate_graph_visualizations(&clusters, &observations, "knowledge_graph")?;
 
     // Export text summary
-    let summary = utils::export_to_text_summary(&store, &clusters, &observations)?;
+    let summary = unirust.export_text_summary(&clusters, &observations)?;
     println!("\n{}", summary);
 
     println!("\n=== Example completed successfully! ===");

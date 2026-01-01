@@ -119,6 +119,11 @@ impl TemporalDSU {
         self.conflicts.insert(record_id, Vec::new());
     }
 
+    /// Check if a record exists in the DSU.
+    pub fn has_record(&self, record_id: RecordId) -> bool {
+        self.parent.contains_key(&record_id)
+    }
+
     /// Find the root of a record (with path compression)
     pub fn find(&mut self, record_id: RecordId) -> RecordId {
         if self.parent[&record_id] != record_id {

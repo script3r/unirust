@@ -6,7 +6,7 @@
 use crate::dsu::Clusters;
 use crate::model::{AttrId, ClusterId, Descriptor, KeyValue, Record, RecordId, ValueId};
 use crate::ontology::{Constraint, ConstraintViolation, IdentityKey, Ontology};
-use crate::store::Store;
+use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
 use hashbrown::HashMap;
@@ -219,7 +219,7 @@ pub struct ConflictDetector;
 impl ConflictDetector {
     /// Detect all conflicts in the given clusters
     pub fn detect_conflicts(
-        store: &Store,
+        store: &dyn RecordStore,
         clusters: &Clusters,
         ontology: &Ontology,
     ) -> Result<Vec<Observation>> {
@@ -265,7 +265,7 @@ impl ConflictDetector {
     }
     /// Detect direct conflicts within a cluster
     fn detect_direct_conflicts(
-        store: &Store,
+        store: &dyn RecordStore,
         cluster: &crate::dsu::Cluster,
         _ontology: &Ontology,
     ) -> Result<Vec<DirectConflict>> {
@@ -297,7 +297,7 @@ impl ConflictDetector {
     /// Detect intra-entity conflicts (conflicts within a single entity).
     /// Only strong-identifier attributes are considered for intra-entity checks.
     fn detect_intra_entity_conflicts(
-        store: &Store,
+        store: &dyn RecordStore,
         ontology: &Ontology,
     ) -> Result<Vec<DirectConflict>> {
         let mut conflicts = Vec::new();
@@ -463,7 +463,7 @@ impl ConflictDetector {
 
     /// Detect indirect conflicts (suppressed merges)
     fn detect_indirect_conflicts(
-        store: &Store,
+        store: &dyn RecordStore,
         clusters: &Clusters,
         ontology: &Ontology,
     ) -> Result<Vec<IndirectConflict>> {
@@ -572,7 +572,7 @@ impl ConflictDetector {
 
     /// Check if two clusters have conflicting strong identifiers
     fn clusters_have_conflicting_strong_ids(
-        store: &Store,
+        store: &dyn RecordStore,
         cluster_a: &crate::dsu::Cluster,
         cluster_b: &crate::dsu::Cluster,
         ontology: &Ontology,
@@ -663,7 +663,7 @@ impl ConflictDetector {
     }
 
     fn interval_for_key_values(
-        store: &Store,
+        store: &dyn RecordStore,
         cluster: &crate::dsu::Cluster,
         key_values: &[KeyValue],
     ) -> Option<Interval> {
@@ -694,7 +694,7 @@ impl ConflictDetector {
 
     /// Detect constraint violations
     fn detect_constraint_violations(
-        store: &Store,
+        store: &dyn RecordStore,
         clusters: &Clusters,
         ontology: &Ontology,
     ) -> Result<Vec<ConstraintViolation>> {
@@ -729,7 +729,7 @@ impl ConflictDetector {
 
     /// Check unique constraints across all clusters
     fn check_unique_constraint_across_clusters(
-        store: &Store,
+        store: &dyn RecordStore,
         clusters: &Clusters,
         attribute: AttrId,
         name: &str,
@@ -783,40 +783,45 @@ impl ConflictDetector {
 
             // Check for overlapping intervals with the same value within this perspective
             for (value, descriptors_with_records) in descriptors_by_value {
-                if descriptors_with_records.len() > 1 {
-                    // Check for overlapping intervals between records in different clusters
-                    for i in 0..descriptors_with_records.len() {
-                        for j in i + 1..descriptors_with_records.len() {
-                            let (desc_a, record_a) = descriptors_with_records[i];
-                            let (desc_b, record_b) = descriptors_with_records[j];
+                if descriptors_with_records.len() <= 1 {
+                    continue;
+                }
 
-                            // Only check for violations if records are in different clusters
-                            let cluster_a = record_to_cluster.get(&record_a).unwrap();
-                            let cluster_b = record_to_cluster.get(&record_b).unwrap();
+                let mut entries: Vec<_> = descriptors_with_records
+                    .iter()
+                    .filter_map(|(descriptor, record_id)| {
+                        record_to_cluster
+                            .get(record_id)
+                            .copied()
+                            .map(|cluster_idx| (descriptor, *record_id, cluster_idx))
+                    })
+                    .collect();
 
-                            if cluster_a != cluster_b {
-                                // Check if the intervals overlap
-                                if desc_a.interval.start < desc_b.interval.end
-                                    && desc_b.interval.start < desc_a.interval.end
-                                {
-                                    // Found overlapping intervals with the same value across different clusters
-                                    let overlap_start =
-                                        std::cmp::max(desc_a.interval.start, desc_b.interval.start);
-                                    let overlap_end =
-                                        std::cmp::min(desc_a.interval.end, desc_b.interval.end);
-                                    let overlap_interval =
-                                        crate::temporal::Interval::new(overlap_start, overlap_end)
-                                            .unwrap();
+                entries.sort_by_key(|(descriptor, _, _)| descriptor.interval.start);
 
-                                    let violation = ConstraintViolation::new(
-                                        Constraint::unique(attribute, name.to_string()),
-                                        overlap_interval,
-                                        vec![record_a, record_b],
-                                        format!("Multiple entities have the same unique value {} in overlapping time periods", value.0),
-                                    );
-                                    violations.push(violation);
-                                }
-                            }
+                for i in 0..entries.len() {
+                    let (desc_a, record_a, cluster_a) = entries[i];
+                    for j in (i + 1)..entries.len() {
+                        let (desc_b, record_b, cluster_b) = entries[j];
+                        if desc_b.interval.start >= desc_a.interval.end {
+                            break;
+                        }
+                        if cluster_a == cluster_b {
+                            continue;
+                        }
+                        if let Some(overlap) =
+                            crate::temporal::intersect(&desc_a.interval, &desc_b.interval)
+                        {
+                            let violation = ConstraintViolation::new(
+                                Constraint::unique(attribute, name.to_string()),
+                                overlap,
+                                vec![record_a, record_b],
+                                format!(
+                                    "Multiple entities have the same unique value {} in overlapping time periods",
+                                    value.0
+                                ),
+                            );
+                            violations.push(violation);
                         }
                     }
                 }
@@ -828,7 +833,7 @@ impl ConflictDetector {
 
     /// Check a constraint in a specific cluster
     fn check_constraint_in_cluster(
-        store: &Store,
+        store: &dyn RecordStore,
         cluster: &crate::dsu::Cluster,
         constraint: &Constraint,
     ) -> Result<Vec<ConstraintViolation>> {
@@ -853,7 +858,7 @@ impl ConflictDetector {
 
     /// Check unique constraint
     fn check_unique_constraint(
-        store: &Store,
+        store: &dyn RecordStore,
         cluster: &crate::dsu::Cluster,
         attribute: AttrId,
         name: &str,
@@ -918,7 +923,7 @@ impl ConflictDetector {
 
     /// Check unique within perspective constraint
     fn check_unique_within_perspective_constraint(
-        store: &Store,
+        store: &dyn RecordStore,
         cluster: &crate::dsu::Cluster,
         attribute: AttrId,
         name: &str,
@@ -931,7 +936,7 @@ impl ConflictDetector {
 
 /// Public function to detect conflicts
 pub fn detect_conflicts(
-    store: &Store,
+    store: &dyn RecordStore,
     clusters: &Clusters,
     ontology: &Ontology,
 ) -> Result<Vec<Observation>> {
@@ -943,7 +948,443 @@ mod tests {
     use super::*;
     use crate::model::{Descriptor, Record, RecordIdentity};
     use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
+    use crate::store::Store;
     use crate::temporal::Interval;
+
+    // PRESET_JSON_START
+    /*
+    [
+      {
+        "id": "test_direct_conflict_creation",
+        "label": "Direct conflict creation (no records)",
+        "identityKeys": [],
+        "conflictAttrs": [],
+        "description": "No records are loaded; the graph should be empty and the stats should remain at zero.",
+        "records": []
+      },
+      {
+        "id": "test_indirect_conflict_creation",
+        "label": "Indirect conflict creation (no records)",
+        "identityKeys": [],
+        "conflictAttrs": [],
+        "description": "No records are loaded; use this to confirm the graph clears cleanly between runs.",
+        "records": []
+      },
+      {
+        "id": "test_observation_creation",
+        "label": "Observation creation (no records)",
+        "identityKeys": [],
+        "conflictAttrs": [],
+        "description": "Empty dataset; nothing should render besides the layout and legend.",
+        "records": []
+      },
+      {
+        "id": "test_conflict_detection",
+        "label": "Conflict detection (empty store)",
+        "identityKeys": [],
+        "conflictAttrs": [],
+        "description": "Empty dataset; verify that no same-as or conflict edges appear.",
+        "records": []
+      },
+      {
+        "id": "test_can_handle_indirect_conflict",
+        "label": "Indirect conflict handling (name/country + phone/employee_id)",
+        "identityKeys": ["name", "country"],
+        "conflictAttrs": ["phone", "employee_id"],
+        "description": "Three records share name+country; two CRM records disagree on phone over the same interval. Expect a same-as link across all three and a red phone conflict between the CRM records.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "name", "value": "John Doe", "start": 86400, "end": 432000 },
+              { "attr": "country", "value": "US", "start": 86400, "end": 432000 },
+              { "attr": "phone", "value": "555-1111", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "name", "value": "John Doe", "start": 86400, "end": 432000 },
+              { "attr": "country", "value": "US", "start": 86400, "end": 432000 },
+              { "attr": "phone", "value": "555-2222", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R3",
+            "uid": "3",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "name", "value": "John Doe", "start": 86400, "end": 432000 },
+              { "attr": "country", "value": "US", "start": 86400, "end": 432000 },
+              { "attr": "employee_id", "value": "EMP001", "start": 86400, "end": 432000 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_can_resolve_person_identity_conflicts",
+        "label": "Person identity conflicts (EMP001 vs EMP002)",
+        "identityKeys": ["name", "country"],
+        "conflictAttrs": ["employee_id", "email"],
+        "description": "Two HR records share name+country but overlap with different employee_id and email values. Expect a same-as link and red conflict edges during the overlapping years.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "employee_id", "value": "EMP001", "start": 1388966400, "end": 1613520000 },
+              { "attr": "country", "value": "RU", "start": 1388966400, "end": 1613520000 },
+              { "attr": "currency", "value": "RUB", "start": 1388966400, "end": 1613520000 },
+              { "attr": "name", "value": "John Smith", "start": 1388966400, "end": 1613520000 },
+              { "attr": "department", "value": "Engineering", "start": 1388966400, "end": 1613520000 },
+              { "attr": "email", "value": "john.smith@company.com", "start": 1388966400, "end": 1613520000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "employee_id", "value": "EMP002", "start": 1047340800, "end": 1438560000 },
+              { "attr": "country", "value": "RU", "start": 1047340800, "end": 1438560000 },
+              { "attr": "currency", "value": "RUB", "start": 1047340800, "end": 1320105600 },
+              { "attr": "currency", "value": "USD", "start": 1320105600, "end": 1438560000 },
+              { "attr": "name", "value": "John Smith", "start": 1047340800, "end": 1438560000 },
+              { "attr": "department", "value": "Engineering", "start": 1047628800, "end": 1438560000 },
+              { "attr": "email", "value": "j.smith@corp.com", "start": 1047340800, "end": 1438560000 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_can_resolve_temporal_identity_conflicts",
+        "label": "Temporal identity conflicts (name/email changes)",
+        "identityKeys": ["name", "country"],
+        "conflictAttrs": ["employee_id", "phone", "email"],
+        "description": "Three records span different eras with matching name+country. Expect them to cluster via time-sliced same-as links but show no red conflicts because values do not overlap.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "employee_id", "value": "H6TJG4721", "start": 851990400, "end": 1613520000 },
+              { "attr": "country", "value": "CH", "start": 851990400, "end": 1613520000 },
+              { "attr": "currency", "value": "CHF", "start": 851990400, "end": 1613520000 },
+              { "attr": "name", "value": "CH0002092614", "start": 851990400, "end": 1211760000 },
+              { "attr": "name", "value": "CH0039821084", "start": 1211760000, "end": 1613520000 },
+              { "attr": "department", "value": "XSWX", "start": 1363564800, "end": 1613520000 },
+              { "attr": "email", "value": "4582526", "start": 851990400, "end": 1211760000 },
+              { "attr": "email", "value": "B39HW28", "start": 1211760000, "end": 1613520000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "phone", "value": "17518", "start": 978307200, "end": 1007078400 },
+              { "attr": "country", "value": "CH", "start": 978307200, "end": 1007078400 },
+              { "attr": "currency", "value": "CHF", "start": 978307200, "end": 1007078400 },
+              { "attr": "name", "value": "CH0002092614", "start": 978307200, "end": 1007078400 }
+            ]
+          },
+          {
+            "id": "R3",
+            "uid": "3",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "phone", "value": "4688", "start": 795484800, "end": 944006400 },
+              { "attr": "country", "value": "CH", "start": 795484800, "end": 944006400 },
+              { "attr": "currency", "value": "CHF", "start": 795484800, "end": 944006400 },
+              { "attr": "name", "value": "CH0002092614", "start": 795484800, "end": 944006400 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_can_resolve_name_change_conflicts",
+        "label": "Name change conflicts (AVESCO timeline)",
+        "identityKeys": ["name", "country"],
+        "conflictAttrs": ["employee_id", "phone", "email"],
+        "description": "One long-lived record with multiple name changes aligns with a shorter CRM record. Expect a same-as link without red conflicts, highlighting the name timeline.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "employee_id", "value": "X7W5YMBX4", "start": 851990400, "end": 1482451200 },
+              { "attr": "country", "value": "GB", "start": 851990400, "end": 1482451200 },
+              { "attr": "currency", "value": "GBP", "start": 851990400, "end": 1482451200 },
+              { "attr": "name", "value": "GB0000653229", "start": 851990400, "end": 1482451200 },
+              { "attr": "department", "value": "XLON", "start": 1363564800, "end": 1482451200 },
+              { "attr": "email", "value": "john.doe@company.com", "start": 851990400, "end": 1482451200 },
+              { "attr": "type", "value": "COMMON STOCK-S", "start": 851990400, "end": 1482451200 },
+              { "attr": "name", "value": "INVESTINMEDIA", "start": 851990400, "end": 1179705600 },
+              { "attr": "name", "value": "AVESCO GROUP", "start": 1179705600, "end": 1241136000 },
+              { "attr": "name", "value": "AVESCO GROUP PLC", "start": 1241136000, "end": 1482451200 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "phone", "value": "64541", "start": 946684800, "end": 1022889600 },
+              { "attr": "country", "value": "GB", "start": 946684800, "end": 1022889600 },
+              { "attr": "currency", "value": "GBP", "start": 946684800, "end": 1022889600 },
+              { "attr": "name", "value": "GB0000653229", "start": 946684800, "end": 1022889600 },
+              { "attr": "department", "value": "XLON", "start": 1019520000, "end": 1022889600 },
+              { "attr": "type", "value": "COMMON", "start": 980985600, "end": 1022889600 },
+              { "attr": "name", "value": "AVESCO", "start": 946684800, "end": 1022889600 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_can_detect_intra_entity_conflicts",
+        "label": "Intra-entity SSN conflicts (10 records)",
+        "identityKeys": [],
+        "conflictAttrs": ["ssn"],
+        "description": "Each record contains two overlapping SSNs. Expect red self-loop conflicts on every record card in the graph.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R3",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R4",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R5",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R6",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R7",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R8",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R9",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R10",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "ssn", "value": "123-45-6789", "start": 86400, "end": 432000 },
+              { "attr": "ssn", "value": "987-65-4321", "start": 86400, "end": 432000 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_can_detect_cross_entity_conflicts",
+        "label": "Cross-entity email conflicts (same perspective)",
+        "identityKeys": [],
+        "conflictAttrs": ["email"],
+        "description": "Two records in the same perspective share the same email. Expect a red conflict edge even without a same-as link.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "email", "value": "john.doe@company.com", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "email", "value": "john.doe@company.com", "start": 86400, "end": 432000 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_cross_entity_perspective_grouping",
+        "label": "Cross-entity email (different perspectives)",
+        "identityKeys": [],
+        "conflictAttrs": ["email"],
+        "description": "Two records share the same email but sit in different perspectives. Expect no red conflict edge because uniqueness is scoped per perspective.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "email", "value": "john.doe@company.com", "start": 86400, "end": 432000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "email", "value": "john.doe@company.com", "start": 86400, "end": 432000 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "test_can_resolve_extend_descriptor_start_dating_for_national_rv_holding_edge_case",
+        "label": "National RV holding edge case (descriptor start dating)",
+        "identityKeys": ["ssn", "country"],
+        "conflictAttrs": ["employee_id", "phone", "email"],
+        "description": "Two records overlap only on a short SSN window. Expect a narrow same-as link with no red conflicts, highlighting the shorter attribute intervals.",
+        "records": [
+          {
+            "id": "R1",
+            "uid": "1",
+            "entityType": "person",
+            "perspective": "hr_system",
+            "descriptors": [
+              { "attr": "employee_id", "value": "D61Y3AJC7", "start": 851990400, "end": 1283040000 },
+              { "attr": "country", "value": "US", "start": 851990400, "end": 1283040000 },
+              { "attr": "currency", "value": "USD", "start": 851990400, "end": 1283040000 },
+              { "attr": "ssn", "value": "637277104", "start": 851990400, "end": 1283040000 },
+              { "attr": "name", "value": "US6372771047", "start": 851990400, "end": 1283040000 },
+              { "attr": "email", "value": "jane.smith@company.com", "start": 851990400, "end": 1283040000 }
+            ]
+          },
+          {
+            "id": "R2",
+            "uid": "2",
+            "entityType": "person",
+            "perspective": "crm_system",
+            "descriptors": [
+              { "attr": "phone", "value": "63819", "start": 899078400, "end": 1022889600 },
+              { "attr": "country", "value": "US", "start": 899078400, "end": 1022889600 },
+              { "attr": "currency", "value": "USD", "start": 899078400, "end": 1022889600 },
+              { "attr": "ssn", "value": "637277104", "start": 1022803200, "end": 1022889600 },
+              { "attr": "name", "value": "US6372771047", "start": 1022803200, "end": 1022889600 },
+              { "attr": "email", "value": "jane.smith@company.com", "start": 1022803200, "end": 1022889600 }
+            ]
+          }
+        ]
+      }
+    ]
+    */
+    // PRESET_JSON_END
+    fn assert_streaming_conflicts_match<F>(
+        base_store: &Store,
+        ontology: &Ontology,
+        records: Vec<Record>,
+        batch_assert: F,
+    ) where
+        F: Fn(&Store, &Clusters, &[Observation]),
+    {
+        let mut stream_store = base_store.clone();
+        let mut streamer = crate::linker::StreamingLinker::new(&stream_store, ontology).unwrap();
+        for record in records {
+            let record_id = stream_store.add_record(record).unwrap();
+            streamer
+                .link_record(&stream_store, ontology, record_id)
+                .unwrap();
+        }
+
+        let streaming_clusters = streamer
+            .clusters_with_conflict_splitting(&stream_store, ontology)
+            .unwrap();
+        let streaming_observations =
+            detect_conflicts(&stream_store, &streaming_clusters, ontology).unwrap();
+
+        batch_assert(&stream_store, &streaming_clusters, &streaming_observations);
+    }
 
     #[test]
     fn test_direct_conflict_creation() {
@@ -998,12 +1439,13 @@ mod tests {
     #[test]
     fn test_conflict_detection() {
         let store = Store::new();
-        let clusters = Clusters::new();
         let ontology = Ontology::new();
 
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
-        assert!(observations.is_empty());
+        assert_streaming_conflicts_match(&store, &ontology, Vec::new(), |store, clusters, observations| {
+            assert!(store.is_empty());
+            assert!(clusters.is_empty());
+            assert!(observations.is_empty());
+        });
     }
 
     #[test]
@@ -1079,8 +1521,7 @@ mod tests {
             ],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2, entity3]).unwrap();
+        let records = vec![entity1, entity2, entity3];
 
         // Set up ontology with identity keys and strong identifiers
         let identity_key =
@@ -1112,78 +1553,73 @@ mod tests {
             .set_perspective_permanent_attributes("hr_system".to_string(), vec![employee_id_attr]);
         ontology.set_perspective_permanent_attributes("crm_system".to_string(), vec![phone_attr]);
 
-        // Build clusters - this should create separate clusters due to strong identifier conflicts
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
-
-        // Verify that we have separate clusters due to conflicts
-        assert_eq!(
-            clusters.clusters.len(),
-            3,
-            "Should have 3 separate clusters due to strong identifier conflicts"
-        );
-
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
-
-        // Verify that we have indirect conflicts
-        let indirect_conflicts: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict) => Some(conflict),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            !indirect_conflicts.is_empty(),
-            "Should have indirect conflicts due to strong identifier conflicts"
-        );
-
-        // Verify conflict details
-        for conflict in &indirect_conflicts {
-            assert_eq!(conflict.kind, "indirect");
-            assert!(
-                conflict.cause.contains("strong_id_conflict")
-                    || conflict.cause.contains("constraint_violation")
-            );
-            assert_eq!(conflict.interval, time_interval);
-            assert_eq!(conflict.status, "auto_resolved");
-        }
-
-        // Verify that each cluster contains only one record
-        for cluster in &clusters.clusters {
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Verify that we have separate clusters due to conflicts
             assert_eq!(
-                cluster.records.len(),
-                1,
-                "Each cluster should contain only one record due to conflicts"
+                clusters.clusters.len(),
+                3,
+                "Should have 3 separate clusters due to strong identifier conflicts"
             );
-        }
 
-        // Verify that the records are in separate clusters
-        let cluster_ids: std::collections::HashSet<_> =
-            clusters.clusters.iter().map(|c| c.id).collect();
-        assert_eq!(cluster_ids.len(), 3, "Should have 3 distinct clusters");
+            // Verify that we have indirect conflicts
+            let indirect_conflicts: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict) => Some(conflict),
+                    _ => None,
+                })
+                .collect();
 
-        // Verify that each record is in its own cluster
-        let mut record_clusters = std::collections::HashMap::new();
-        for cluster in &clusters.clusters {
-            for &record_id in &cluster.records {
-                record_clusters.insert(record_id, cluster.id);
+            assert!(
+                !indirect_conflicts.is_empty(),
+                "Should have indirect conflicts due to strong identifier conflicts"
+            );
+
+            // Verify conflict details
+            for conflict in &indirect_conflicts {
+                assert_eq!(conflict.kind, "indirect");
+                assert!(
+                    conflict.cause.contains("strong_id_conflict")
+                        || conflict.cause.contains("constraint_violation")
+                );
+                assert_eq!(conflict.interval, time_interval);
+                assert_eq!(conflict.status, "auto_resolved");
             }
-        }
 
-        assert_eq!(
-            record_clusters.len(),
-            3,
-            "All 3 records should be in clusters"
-        );
-        assert!(
-            record_clusters
-                .values()
-                .all(|&id| cluster_ids.contains(&id)),
-            "All records should be in valid clusters"
-        );
+            // Verify that each cluster contains only one record
+            for cluster in &clusters.clusters {
+                assert_eq!(
+                    cluster.records.len(),
+                    1,
+                    "Each cluster should contain only one record due to conflicts"
+                );
+            }
+
+            // Verify that the records are in separate clusters
+            let cluster_ids: std::collections::HashSet<_> =
+                clusters.clusters.iter().map(|c| c.id).collect();
+            assert_eq!(cluster_ids.len(), 3, "Should have 3 distinct clusters");
+
+            // Verify that each record is in its own cluster
+            let mut record_clusters = std::collections::HashMap::new();
+            for cluster in &clusters.clusters {
+                for &record_id in &cluster.records {
+                    record_clusters.insert(record_id, cluster.id);
+                }
+            }
+
+            assert_eq!(
+                record_clusters.len(),
+                3,
+                "All 3 records should be in clusters"
+            );
+            assert!(
+                record_clusters
+                    .values()
+                    .all(|&id| cluster_ids.contains(&id)),
+                "All records should be in valid clusters"
+            );
+        });
     }
 
     #[test]
@@ -1277,8 +1713,7 @@ mod tests {
             ],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2]).unwrap();
+        let records = vec![entity1, entity2];
 
         // Set up ontology with identity keys and strong identifiers
         let identity_key =
@@ -1310,76 +1745,71 @@ mod tests {
             .set_perspective_permanent_attributes("hr_system".to_string(), vec![employee_id_attr]);
         ontology.set_perspective_permanent_attributes("crm_system".to_string(), vec![phone_attr]);
 
-        // Build clusters - should create separate clusters due to strong identifier conflicts
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
-
-        // Verify that we have separate clusters due to conflicts
-        assert_eq!(
-            clusters.clusters.len(),
-            2,
-            "Should have 2 separate clusters due to strong identifier conflicts"
-        );
-
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
-
-        // Verify that we have indirect conflicts
-        let indirect_conflicts: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict) => Some(conflict),
-                _ => None,
-            })
-            .collect();
-
-        // With the optimized linker, records with strong identifier conflicts are kept separate
-        // so there should be no indirect conflicts detected
-        assert_eq!(indirect_conflicts.len(), 0, "No indirect conflicts should be detected when records are kept separate due to strong identifier conflicts");
-
-        // Verify conflict details
-        for conflict in &indirect_conflicts {
-            assert_eq!(conflict.kind, "indirect");
-            assert!(
-                conflict.cause.contains("strong_id_conflict")
-                    || conflict.cause.contains("constraint_violation")
-            );
-            assert_eq!(conflict.status, "auto_resolved");
-        }
-
-        // Verify that each cluster contains only one record
-        for cluster in &clusters.clusters {
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Verify that we have separate clusters due to conflicts
             assert_eq!(
-                cluster.records.len(),
-                1,
-                "Each cluster should contain only one record due to conflicts"
+                clusters.clusters.len(),
+                2,
+                "Should have 2 separate clusters due to strong identifier conflicts"
             );
-        }
 
-        // Verify that the records are in separate clusters
-        let cluster_ids: std::collections::HashSet<_> =
-            clusters.clusters.iter().map(|c| c.id).collect();
-        assert_eq!(cluster_ids.len(), 2, "Should have 2 distinct clusters");
+            // Verify that we have indirect conflicts
+            let indirect_conflicts: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict) => Some(conflict),
+                    _ => None,
+                })
+                .collect();
 
-        // Verify that each record is in its own cluster
-        let mut record_clusters = std::collections::HashMap::new();
-        for cluster in &clusters.clusters {
-            for &record_id in &cluster.records {
-                record_clusters.insert(record_id, cluster.id);
+            // With the optimized linker, records with strong identifier conflicts are kept separate
+            // so there should be no indirect conflicts detected
+            assert_eq!(indirect_conflicts.len(), 0, "No indirect conflicts should be detected when records are kept separate due to strong identifier conflicts");
+
+            // Verify conflict details
+            for conflict in &indirect_conflicts {
+                assert_eq!(conflict.kind, "indirect");
+                assert!(
+                    conflict.cause.contains("strong_id_conflict")
+                        || conflict.cause.contains("constraint_violation")
+                );
+                assert_eq!(conflict.status, "auto_resolved");
             }
-        }
 
-        assert_eq!(
-            record_clusters.len(),
-            2,
-            "All 2 records should be in clusters"
-        );
-        assert!(
-            record_clusters
-                .values()
-                .all(|&id| cluster_ids.contains(&id)),
-            "All records should be in valid clusters"
-        );
+            // Verify that each cluster contains only one record
+            for cluster in &clusters.clusters {
+                assert_eq!(
+                    cluster.records.len(),
+                    1,
+                    "Each cluster should contain only one record due to conflicts"
+                );
+            }
+
+            // Verify that the records are in separate clusters
+            let cluster_ids: std::collections::HashSet<_> =
+                clusters.clusters.iter().map(|c| c.id).collect();
+            assert_eq!(cluster_ids.len(), 2, "Should have 2 distinct clusters");
+
+            // Verify that each record is in its own cluster
+            let mut record_clusters = std::collections::HashMap::new();
+            for cluster in &clusters.clusters {
+                for &record_id in &cluster.records {
+                    record_clusters.insert(record_id, cluster.id);
+                }
+            }
+
+            assert_eq!(
+                record_clusters.len(),
+                2,
+                "All 2 records should be in clusters"
+            );
+            assert!(
+                record_clusters
+                    .values()
+                    .all(|&id| cluster_ids.contains(&id)),
+                "All records should be in valid clusters"
+            );
+        });
     }
 
     #[test]
@@ -1496,8 +1926,7 @@ mod tests {
             ],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2, entity3]).unwrap();
+        let records = vec![entity1, entity2, entity3];
 
         // Set up ontology with identity keys and strong identifiers
         let identity_key =
@@ -1532,61 +1961,56 @@ mod tests {
             .set_perspective_permanent_attributes("hr_system".to_string(), vec![employee_id_attr]);
         ontology.set_perspective_permanent_attributes("crm_system".to_string(), vec![phone_attr]);
 
-        // Build clusters - should merge all three entities into one cluster
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Build clusters - should merge all three entities into one cluster
+            assert_eq!(
+                clusters.clusters.len(),
+                1,
+                "Should have 1 cluster with all three records merged"
+            );
 
-        // Verify that we have one cluster with all three records
-        assert_eq!(
-            clusters.clusters.len(),
-            1,
-            "Should have 1 cluster with all three records merged"
-        );
+            // Verify that the cluster contains all three records
+            let cluster = &clusters.clusters[0];
+            assert_eq!(
+                cluster.records.len(),
+                3,
+                "Cluster should contain all 3 records"
+            );
 
-        // Verify that the cluster contains all three records
-        let cluster = &clusters.clusters[0];
-        assert_eq!(
-            cluster.records.len(),
-            3,
-            "Cluster should contain all 3 records"
-        );
+            let record_ids: std::collections::HashSet<_> = cluster.records.iter().collect();
+            assert!(
+                record_ids.contains(&RecordId(1)),
+                "Cluster should contain record 1"
+            );
+            assert!(
+                record_ids.contains(&RecordId(2)),
+                "Cluster should contain record 2"
+            );
+            assert!(
+                record_ids.contains(&RecordId(3)),
+                "Cluster should contain record 3"
+            );
 
-        let record_ids: std::collections::HashSet<_> = cluster.records.iter().collect();
-        assert!(
-            record_ids.contains(&RecordId(1)),
-            "Cluster should contain record 1"
-        );
-        assert!(
-            record_ids.contains(&RecordId(2)),
-            "Cluster should contain record 2"
-        );
-        assert!(
-            record_ids.contains(&RecordId(3)),
-            "Cluster should contain record 3"
-        );
+            // Verify that we have no indirect conflicts (since they should merge)
+            let indirect_conflicts: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict) => Some(conflict),
+                    _ => None,
+                })
+                .collect();
 
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
+            // Should have no indirect conflicts since the records should merge
+            assert_eq!(
+                indirect_conflicts.len(),
+                0,
+                "Should have no indirect conflicts since records should merge"
+            );
 
-        // Verify that we have no indirect conflicts (since they should merge)
-        let indirect_conflicts: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict) => Some(conflict),
-                _ => None,
-            })
-            .collect();
-
-        // Should have no indirect conflicts since the records should merge
-        assert_eq!(
-            indirect_conflicts.len(),
-            0,
-            "Should have no indirect conflicts since records should merge"
-        );
-
-        // The key test is that all three records are in the same cluster
-        // This represents the successful merging that the test expects
-        // (equivalent to 2 'is_same_as' relationships in the knowledge graph)
+            // The key test is that all three records are in the same cluster
+            // This represents the successful merging that the test expects
+            // (equivalent to 2 'is_same_as' relationships in the knowledge graph)
+        });
     }
 
     #[test]
@@ -1707,8 +2131,7 @@ mod tests {
             ],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2]).unwrap();
+        let records = vec![entity1, entity2];
 
         // Set up ontology with identity keys and strong identifiers
         let identity_key =
@@ -1735,57 +2158,52 @@ mod tests {
             .set_perspective_permanent_attributes("hr_system".to_string(), vec![employee_id_attr]);
         ontology.set_perspective_permanent_attributes("crm_system".to_string(), vec![phone_attr]);
 
-        // Build clusters - should merge both entities into one cluster
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Build clusters - should merge both entities into one cluster
+            assert_eq!(
+                clusters.clusters.len(),
+                1,
+                "Should have 1 cluster with both records merged"
+            );
 
-        // Verify that we have one cluster with both records
-        assert_eq!(
-            clusters.clusters.len(),
-            1,
-            "Should have 1 cluster with both records merged"
-        );
+            // Verify that the cluster contains both records
+            let cluster = &clusters.clusters[0];
+            assert_eq!(
+                cluster.records.len(),
+                2,
+                "Cluster should contain both records"
+            );
 
-        // Verify that the cluster contains both records
-        let cluster = &clusters.clusters[0];
-        assert_eq!(
-            cluster.records.len(),
-            2,
-            "Cluster should contain both records"
-        );
+            let record_ids: std::collections::HashSet<_> = cluster.records.iter().collect();
+            assert!(
+                record_ids.contains(&RecordId(1)),
+                "Cluster should contain record 1"
+            );
+            assert!(
+                record_ids.contains(&RecordId(2)),
+                "Cluster should contain record 2"
+            );
 
-        let record_ids: std::collections::HashSet<_> = cluster.records.iter().collect();
-        assert!(
-            record_ids.contains(&RecordId(1)),
-            "Cluster should contain record 1"
-        );
-        assert!(
-            record_ids.contains(&RecordId(2)),
-            "Cluster should contain record 2"
-        );
+            // Verify that we have no indirect conflicts (since they should merge)
+            let indirect_conflicts: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict) => Some(conflict),
+                    _ => None,
+                })
+                .collect();
 
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
+            // Should have no indirect conflicts since the records should merge
+            assert_eq!(
+                indirect_conflicts.len(),
+                0,
+                "Should have no indirect conflicts since records should merge"
+            );
 
-        // Verify that we have no indirect conflicts (since they should merge)
-        let indirect_conflicts: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict) => Some(conflict),
-                _ => None,
-            })
-            .collect();
-
-        // Should have no indirect conflicts since the records should merge
-        assert_eq!(
-            indirect_conflicts.len(),
-            0,
-            "Should have no indirect conflicts since records should merge"
-        );
-
-        // The key test is that both records are in the same cluster
-        // This represents the successful merging that the test expects
-        // (equivalent to 1 'is_same_as' relationship in the knowledge graph)
+            // The key test is that both records are in the same cluster
+            // This represents the successful merging that the test expects
+            // (equivalent to 1 'is_same_as' relationship in the knowledge graph)
+        });
     }
 
     #[test]
@@ -1830,8 +2248,7 @@ mod tests {
             records.push(record);
         }
 
-        // Add records to store
-        store.add_records(records).unwrap();
+        let records = records;
 
         // Set up ontology with SSN as a strong identifier
         let ssn_constraint = Constraint::unique(ssn_attr, "unique_ssn".to_string());
@@ -1843,55 +2260,50 @@ mod tests {
         // Set perspective weight
         ontology.set_perspective_weight("hr_system".to_string(), 100);
 
-        // Build clusters
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, _clusters, observations| {
+            // Should have multiple conflict observations
+            // Each record with conflicting SSN values should generate observations
+            // Our implementation detects conflicts per record for more granular reporting
+            assert!(
+                observations.len() > 0,
+                "Should have conflict observations for conflicting SSN values"
+            );
 
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
+            // Our implementation creates multiple observations (one per record with conflicts).
+            // This provides more detailed conflict reporting, which is valuable for debugging and analysis.
 
-        // Should have multiple conflict observations
-        // Each record with conflicting SSN values should generate observations
-        // Our implementation detects conflicts per record for more granular reporting
-        assert!(
-            observations.len() > 0,
-            "Should have conflict observations for conflicting SSN values"
-        );
+            // Verify we have direct conflicts (intra-record conflicts)
+            let direct_conflicts: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::DirectConflict(conflict) => Some(conflict),
+                    _ => None,
+                })
+                .collect();
 
-        // Our implementation creates multiple observations (one per record with conflicts).
-        // This provides more detailed conflict reporting, which is valuable for debugging and analysis.
+            assert!(
+                direct_conflicts.len() > 0,
+                "Should have direct conflict observations for intra-record conflicts"
+            );
 
-        // Verify we have direct conflicts (intra-record conflicts)
-        let direct_conflicts: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::DirectConflict(conflict) => Some(conflict),
-                _ => None,
-            })
-            .collect();
+            // Verify we have constraint violations (strong identifier violations)
+            let constraint_violations: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict)
+                        if conflict.kind == "constraint_violation" =>
+                    {
+                        Some(conflict)
+                    }
+                    _ => None,
+                })
+                .collect();
 
-        assert!(
-            direct_conflicts.len() > 0,
-            "Should have direct conflict observations for intra-record conflicts"
-        );
-
-        // Verify we have constraint violations (strong identifier violations)
-        let constraint_violations: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict)
-                    if conflict.kind == "constraint_violation" =>
-                {
-                    Some(conflict)
-                }
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            constraint_violations.len() > 0,
-            "Should have constraint violation observations for email conflicts"
-        );
+            assert!(
+                constraint_violations.len() > 0,
+                "Should have constraint violation observations for email conflicts"
+            );
+        });
     }
 
     #[test]
@@ -1937,8 +2349,7 @@ mod tests {
             vec![Descriptor::new(email_attr, email_value, interval)],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2]).unwrap();
+        let records = vec![entity1, entity2];
 
         // Set up ontology with email as a strong identifier
         let email_constraint = Constraint::unique(email_attr, "unique_email".to_string());
@@ -1950,66 +2361,61 @@ mod tests {
         // Set perspective weight
         ontology.set_perspective_weight("hr_system".to_string(), 100);
 
-        // Build clusters
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Should have 2 separate clusters (entities should NOT be merged)
+            assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities with same email but different UIDs should not be merged");
 
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
-
-        // Should have 2 separate clusters (entities should NOT be merged)
-        assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities with same email but different UIDs should not be merged");
-
-        // Verify that the clusters contain the correct records
-        let mut found_entity1 = false;
-        let mut found_entity2 = false;
-        for cluster in &clusters.clusters {
-            if cluster.records.len() == 1 {
-                if cluster.records.contains(&RecordId(1)) {
-                    found_entity1 = true;
-                }
-                if cluster.records.contains(&RecordId(2)) {
-                    found_entity2 = true;
+            // Verify that the clusters contain the correct records
+            let mut found_entity1 = false;
+            let mut found_entity2 = false;
+            for cluster in &clusters.clusters {
+                if cluster.records.len() == 1 {
+                    if cluster.records.contains(&RecordId(1)) {
+                        found_entity1 = true;
+                    }
+                    if cluster.records.contains(&RecordId(2)) {
+                        found_entity2 = true;
+                    }
                 }
             }
-        }
-        assert!(found_entity1, "Should find entity 1 in its own cluster");
-        assert!(found_entity2, "Should find entity 2 in its own cluster");
+            assert!(found_entity1, "Should find entity 1 in its own cluster");
+            assert!(found_entity2, "Should find entity 2 in its own cluster");
 
-        // Should have conflict observations for the duplicate email values
-        assert!(
-            observations.len() > 0,
-            "Should have conflict observations for duplicate email values"
-        );
+            // Should have conflict observations for the duplicate email values
+            assert!(
+                observations.len() > 0,
+                "Should have conflict observations for duplicate email values"
+            );
 
-        // Verify we have constraint violations (strong identifier violations)
-        let constraint_violations: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict)
-                    if conflict.kind == "constraint_violation" =>
-                {
-                    Some(conflict)
-                }
-                _ => None,
-            })
-            .collect();
+            // Verify we have constraint violations (strong identifier violations)
+            let constraint_violations: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict)
+                        if conflict.kind == "constraint_violation" =>
+                    {
+                        Some(conflict)
+                    }
+                    _ => None,
+                })
+                .collect();
 
-        assert!(
-            constraint_violations.len() > 0,
-            "Should have constraint violation observations for duplicate email values"
-        );
+            assert!(
+                constraint_violations.len() > 0,
+                "Should have constraint violation observations for duplicate email values"
+            );
 
-        // Verify the constraint violation is for the email attribute
-        let email_violations: Vec<_> = constraint_violations
-            .iter()
-            .filter(|violation| violation.attribute == Some(email_attr))
-            .collect();
+            // Verify the constraint violation is for the email attribute
+            let email_violations: Vec<_> = constraint_violations
+                .iter()
+                .filter(|violation| violation.attribute == Some(email_attr))
+                .collect();
 
-        assert!(
-            email_violations.len() > 0,
-            "Should have email constraint violations"
-        );
+            assert!(
+                email_violations.len() > 0,
+                "Should have email constraint violations"
+            );
+        });
     }
 
     #[test]
@@ -2053,8 +2459,7 @@ mod tests {
             vec![Descriptor::new(email_attr, email_value, interval)],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2]).unwrap();
+        let records = vec![entity1, entity2];
 
         // Set up ontology with email as a strong identifier
         let email_constraint = Constraint::unique(email_attr, "unique_email".to_string());
@@ -2067,18 +2472,13 @@ mod tests {
         ontology.set_perspective_weight("hr_system".to_string(), 100);
         ontology.set_perspective_weight("crm_system".to_string(), 90);
 
-        // Build clusters
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Should have 2 separate clusters (entities should NOT be merged)
+            assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities from different perspectives should not be merged");
 
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
-
-        // Should have 2 separate clusters (entities should NOT be merged)
-        assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities from different perspectives should not be merged");
-
-        // Should have NO conflict observations (different perspectives can have same unique values)
-        assert_eq!(observations.len(), 0, "Should have no conflict observations - entities from different perspectives can have the same unique identifier");
+            // Should have NO conflict observations (different perspectives can have same unique values)
+            assert_eq!(observations.len(), 0, "Should have no conflict observations - entities from different perspectives can have the same unique identifier");
+        });
     }
 
     #[test]
@@ -2160,8 +2560,7 @@ mod tests {
             ],
         );
 
-        // Add records to store
-        store.add_records(vec![entity1, entity2]).unwrap();
+        let records = vec![entity1, entity2];
 
         // Set up ontology with identity keys and strong identifiers
         let identity_key =
@@ -2188,58 +2587,53 @@ mod tests {
             .set_perspective_permanent_attributes("hr_system".to_string(), vec![employee_id_attr]);
         ontology.set_perspective_permanent_attributes("crm_system".to_string(), vec![phone_attr]);
 
-        // Build clusters - should merge both entities into one cluster
-        let clusters = crate::linker::build_clusters(&store, &ontology).unwrap();
+        assert_streaming_conflicts_match(&store, &ontology, records, |_, clusters, observations| {
+            // Build clusters - should merge both entities into one cluster
+            assert_eq!(
+                clusters.clusters.len(),
+                1,
+                "Should have 1 cluster with both records merged"
+            );
 
-        // Verify that we have one cluster with both records
-        assert_eq!(
-            clusters.clusters.len(),
-            1,
-            "Should have 1 cluster with both records merged"
-        );
+            // Verify that the cluster contains both records
+            let cluster = &clusters.clusters[0];
+            assert_eq!(
+                cluster.records.len(),
+                2,
+                "Cluster should contain both records"
+            );
 
-        // Verify that the cluster contains both records
-        let cluster = &clusters.clusters[0];
-        assert_eq!(
-            cluster.records.len(),
-            2,
-            "Cluster should contain both records"
-        );
+            let record_ids: std::collections::HashSet<_> = cluster.records.iter().collect();
+            assert!(
+                record_ids.contains(&RecordId(1)),
+                "Cluster should contain record 1"
+            );
+            assert!(
+                record_ids.contains(&RecordId(2)),
+                "Cluster should contain record 2"
+            );
 
-        let record_ids: std::collections::HashSet<_> = cluster.records.iter().collect();
-        assert!(
-            record_ids.contains(&RecordId(1)),
-            "Cluster should contain record 1"
-        );
-        assert!(
-            record_ids.contains(&RecordId(2)),
-            "Cluster should contain record 2"
-        );
+            // Verify that we have no indirect conflicts (since they should merge)
+            let indirect_conflicts: Vec<_> = observations
+                .iter()
+                .filter_map(|obs| match obs {
+                    Observation::IndirectConflict(conflict) => Some(conflict),
+                    _ => None,
+                })
+                .collect();
 
-        // Detect conflicts
-        let observations =
-            ConflictDetector::detect_conflicts(&store, &clusters, &ontology).unwrap();
+            // Should have no indirect conflicts since the records should merge
+            assert_eq!(
+                indirect_conflicts.len(),
+                0,
+                "Should have no indirect conflicts since records should merge"
+            );
 
-        // Verify that we have no indirect conflicts (since they should merge)
-        let indirect_conflicts: Vec<_> = observations
-            .iter()
-            .filter_map(|obs| match obs {
-                Observation::IndirectConflict(conflict) => Some(conflict),
-                _ => None,
-            })
-            .collect();
-
-        // Should have no indirect conflicts since the records should merge
-        assert_eq!(
-            indirect_conflicts.len(),
-            0,
-            "Should have no indirect conflicts since records should merge"
-        );
-
-        // The key test is that both records are in the same cluster
-        // This represents the successful merging that the test expects
-        // (equivalent to 1 'is_same_as' relationship in the knowledge graph)
-        // The effective start date should be before 1999-01-01, which means the merge
-        // should be based on the overlapping time period between the two entities
+            // The key test is that both records are in the same cluster
+            // This represents the successful merging that the test expects
+            // (equivalent to 1 'is_same_as' relationship in the knowledge graph)
+            // The effective start date should be before 1999-01-01, which means the merge
+            // should be based on the overlapping time period between the two entities
+        });
     }
 }

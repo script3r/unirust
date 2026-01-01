@@ -1,9 +1,8 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::Duration;
-use unirust_rs::linker::build_clusters_optimized;
 use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
 use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
 use unirust_rs::temporal::Interval;
@@ -115,32 +114,45 @@ fn benchmark_entity_resolution(c: &mut Criterion) {
         (5000, 0.01), // 5000 entities, 1% overlap
         (5000, 0.10), // 5000 entities, 10% overlap
         (5000, 0.30), // 5000 entities, 30% overlap
+        (1_000_000, 0.01), // 1M entities, 1% overlap
     ];
 
     for (entity_count, overlap_prob) in test_configs {
         group.throughput(Throughput::Elements(entity_count as u64));
         group.sample_size(10);
+        if entity_count >= 100_000 {
+            group.warm_up_time(Duration::from_secs(2));
+            group.measurement_time(Duration::from_secs(45));
+        } else {
+            group.warm_up_time(Duration::from_secs(3));
+            group.measurement_time(Duration::from_secs(10));
+        }
 
-        // Optimized algorithm benchmark
+        // Streaming algorithm benchmark
+        let mut base_store = Store::new();
+        let ontology = create_test_ontology(&mut base_store);
+        let records = generate_test_records(&mut base_store, entity_count, overlap_prob);
+
         group.bench_with_input(
             BenchmarkId::new(
-                "optimized",
+                "streaming",
                 format!(
                     "{}_entities_{}%_overlap",
                     entity_count,
                     (overlap_prob * 100.0) as u32
                 ),
             ),
-            &(entity_count, overlap_prob),
-            |b, &(entity_count, overlap_prob)| {
-                b.iter(|| {
-                    let mut store = Store::new();
-                    let ontology = create_test_ontology(&mut store);
-                    let records = generate_test_records(&mut store, entity_count, overlap_prob);
-                    store.add_records(records).unwrap();
-
-                    black_box(build_clusters_optimized(&store, &ontology).unwrap())
-                })
+            &(base_store, ontology, records),
+            |b, input| {
+                let (base_store, ontology, records) = input;
+                b.iter_batched(
+                    || (base_store.clone(), ontology.clone(), records.clone()),
+                    |(store, ontology, records)| {
+                        let mut unirust = Unirust::with_store(ontology, store);
+                        black_box(unirust.stream_records(records).unwrap())
+                    },
+                    BatchSize::SmallInput,
+                )
             },
         );
     }

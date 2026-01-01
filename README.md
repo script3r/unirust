@@ -11,11 +11,13 @@ A temporal-first entity mastering and conflict-resolution engine in Rust.
 - Model records with explicit validity intervals.
 - Resolve entities across multiple sources and perspectives.
 - Detect direct and indirect conflicts.
-- Export a knowledge graph for auditing and visualization.
+- Incrementally maintain a knowledge graph for auditing and visualization.
+- Persist a conflict-free golden copy per cluster for downstream consumption.
+- Query master entities for descriptors over time with conflict-aware results.
 
 ## How the basic example flows
 
-The `examples/basic_example.rs` program creates five person records from CRM/ERP/Web/Mobile, defines identity rules (name+email) and a strong identifier (SSN), resolves clusters, detects conflicts, and exports a graph.
+The `examples/basic_example.rs` program streams five person records from CRM/ERP/Web/Mobile, defines identity rules (name+email) and a strong identifier (SSN), resolves clusters, detects conflicts, and keeps an incrementally updated graph.
 
 ```mermaid
 flowchart LR
@@ -40,7 +42,7 @@ flowchart LR
   R5 --> Store
 
   Ontology[Ontology\nIdentity key: name+email\nStrong ID: SSN\nConstraint: unique email]
-  Store --> Linker[Entity resolution\nbuild_clusters_optimized]
+  Store --> Linker[Streaming linker\nlink_record]
   Ontology --> Linker
 
   Linker --> Clusters[Clusters]
@@ -49,7 +51,7 @@ flowchart LR
   Ontology --> Conflicts
 
   Conflicts --> Observations[Observations]
-  Observations --> Graph[Knowledge graph]
+  Observations --> Graph[Incremental knowledge graph]
   Graph --> Outputs[JSONL / DOT / PNG-SVG / text summary]
 ```
 
@@ -88,6 +90,58 @@ flowchart LR
 cargo run --example basic_example
 ```
 
+Stream into Minitao:
+
+```bash
+cargo run --example stream_to_minitao
+```
+
+Stream to a running Minitao server:
+
+```bash
+cargo run --example stream_to_minitao_server
+```
+
+## Persist the knowledge graph (Minitao)
+
+Use the Minitao SQLite storage backend to persist the incrementally updated graph.
+
+```rust
+use std::sync::Arc;
+
+use minitao::storage::sqlite::SqliteStorage;
+use unirust_rs::minitao_store::MinitaoGraphWriter;
+
+let storage = Arc::new(SqliteStorage::new("unirust_graph.db")?);
+let writer = MinitaoGraphWriter::new(storage);
+
+// After streaming records and building a graph update:
+writer.apply_graph(&update.graph).await?;
+```
+
+## Query master entities
+
+```rust
+use unirust_rs::{QueryDescriptor, QueryOutcome, Interval};
+
+match unirust.query_master_entities(
+    &[
+        QueryDescriptor { attr: org_attr, value: org_value },
+        QueryDescriptor { attr: role_attr, value: role_admin },
+    ],
+    Interval::new(0, 30)?,
+)? {
+    QueryOutcome::Matches(matches) => {
+        // Each interval is guaranteed to map to a single master entity.
+        // matches[i].golden includes the conflict-free golden descriptors for that cluster.
+        // matches[i].cluster_key provides a human-friendly stable key for the cluster.
+    }
+    QueryOutcome::Conflict(conflict) => {
+        // Overlapping clusters; conflict.descriptors includes overlap intervals.
+    }
+}
+```
+
 ## Add to your project
 
 ```toml
@@ -100,6 +154,8 @@ unirust-rs = "0.1.0"
 ```bash
 cargo test
 ```
+
+Architecture notes: see `DESIGN.md`.
 
 ## License
 

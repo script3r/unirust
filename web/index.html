@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Unirust KG Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <div class="toast" id="toast" aria-live="polite"></div>
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Unirust • Streaming KG Studio</p>
+          <h1>Build entities in time and watch the graph evolve.</h1>
+          <p class="subhead">
+            Add, mutate, and remove records. Resolve identity keys, surface conflicts,
+            and copy a clean debug snapshot for an agent.
+          </p>
+        </div>
+        <div class="hero-card">
+          <div class="hero-stat">
+            <span class="label">Records</span>
+            <strong id="stat-records">0</strong>
+          </div>
+          <div class="hero-stat">
+            <span class="label">Clusters</span>
+            <strong id="stat-clusters">0</strong>
+          </div>
+          <div class="hero-stat">
+            <span class="label">Conflicts</span>
+            <strong id="stat-conflicts">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Entity Store</h2>
+            <button class="button ghost" id="add-record">Add record</button>
+          </div>
+
+          <div class="settings">
+            <div>
+              <label>Ontology preset</label>
+              <div class="range">
+                <select id="ontology-preset">
+                  <option value="iam">IAM (email identity, access roles)</option>
+                  <option value="custom">Custom</option>
+                </select>
+                <button class="button ghost" id="apply-preset">Apply</button>
+              </div>
+              <small>Load recommended identity/conflict attributes.</small>
+            </div>
+            <div>
+              <label>Identity key attributes</label>
+              <input id="identity-keys" type="text" value="email" />
+              <small>Comma-separated attributes that define identity.</small>
+            </div>
+            <div>
+              <label>Conflict attributes</label>
+              <input id="conflict-attrs" type="text" value="email,phone,ssn" />
+              <small>Attributes used to surface conflicts.</small>
+            </div>
+            <div>
+              <label>View time range</label>
+              <div class="range">
+                <input id="view-start" type="text" value="0" readonly />
+                <span>→</span>
+                <input id="view-end" type="text" value="Infinity" readonly />
+              </div>
+              <small>Fixed to show all intervals.</small>
+            </div>
+          </div>
+
+          <div class="record-list" id="record-list"></div>
+        </section>
+
+        <section class="panel graph-panel">
+          <div class="panel-header">
+            <h2>Knowledge Graph</h2>
+            <div class="toggle">
+              <button class="button ghost" id="refresh-graph">Refresh</button>
+            </div>
+          </div>
+
+          <div class="graph-stage">
+            <div id="graph"></div>
+          </div>
+
+          <p class="graph-description" id="graph-description">
+            Load a preset to see a guided interpretation of the graph.
+          </p>
+
+          <div class="golden-summary" id="golden-summary">
+            <p class="golden-empty">Golden record will appear after clustering.</p>
+          </div>
+
+          <div class="edge-details" id="edge-details">
+            <p class="edge-title">Edge details</p>
+            <p class="edge-empty">Hover a conflict edge to inspect interval and values.</p>
+            <div class="edge-body hidden">
+              <div><span>Type:</span> <strong id="edge-type"></strong></div>
+              <div><span>Attr:</span> <strong id="edge-attr"></strong></div>
+              <div><span>Values:</span> <strong id="edge-values"></strong></div>
+              <div><span>Interval:</span> <strong id="edge-interval"></strong></div>
+              <div><span>Records:</span> <strong id="edge-records"></strong></div>
+            </div>
+          </div>
+
+          <div class="legend">
+            <span><i class="dot cluster"></i>Cluster</span>
+            <span><i class="dot record"></i>Record</span>
+            <span><i class="dot attr"></i>Attribute</span>
+            <span><i class="line same"></i>Same-As</span>
+            <span><i class="line attr"></i>Descriptor</span>
+            <span><i class="line conflict"></i>Conflict</span>
+          </div>
+        </section>
+
+        <section class="panel debug-panel">
+          <div class="panel-header">
+            <h2>Debug Output</h2>
+            <div class="toggle">
+              <button class="button" id="copy-debug">Copy JSON</button>
+            </div>
+          </div>
+
+          <div class="debug-tabs">
+            <button class="tab active" data-tab="summary">Summary</button>
+            <button class="tab" data-tab="records">Records</button>
+            <button class="tab" data-tab="graph">Graph</button>
+            <button class="tab" data-tab="events">Events</button>
+            <button class="tab" data-tab="presets">Presets</button>
+          </div>
+
+          <div class="debug-content">
+            <pre id="debug-summary" class="debug-pane"></pre>
+            <pre id="debug-records" class="debug-pane hidden"></pre>
+            <pre id="debug-graph" class="debug-pane hidden"></pre>
+            <pre id="debug-events" class="debug-pane hidden"></pre>
+            <div id="debug-presets" class="debug-pane hidden">
+              <div class="preset-controls">
+                <select id="preset-select"></select>
+                <div class="preset-buttons">
+                  <button class="button ghost" id="load-preset">Load preset</button>
+                  <button class="button ghost" id="append-preset">Append preset</button>
+                </div>
+              </div>
+              <p class="preset-note">
+                These presets mirror conflict test scenarios. You can also paste JSON below.
+              </p>
+              <textarea id="preset-json" spellcheck="false" rows="8"></textarea>
+              <div class="preset-buttons">
+                <button class="button" id="load-json">Load JSON</button>
+                <button class="button ghost" id="clear-records">Clear records</button>
+              </div>
+              <p class="preset-note">
+                Load a KnowledgeGraph JSON to render the persisted golden copy.
+              </p>
+              <textarea id="graph-json" spellcheck="false" rows="6"></textarea>
+              <div class="preset-buttons">
+                <button class="button ghost" id="load-graph-json">Load graph JSON</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="record-template">
+      <article class="record-card">
+        <header>
+          <div>
+            <input class="record-id" type="text" placeholder="Record ID" />
+            <input class="record-uid" type="text" placeholder="UID" />
+          </div>
+          <button class="button danger remove-record">Remove</button>
+        </header>
+
+        <div class="record-meta">
+          <input class="record-entity" type="text" placeholder="Entity type" value="person" />
+          <input class="record-perspective" type="text" placeholder="Perspective" value="crm" />
+        </div>
+
+        <div class="descriptor-list"></div>
+
+        <button class="button ghost add-descriptor">Add descriptor</button>
+      </article>
+    </template>
+
+    <template id="descriptor-template">
+      <div class="descriptor">
+        <input class="descriptor-attr" type="text" placeholder="attr" />
+        <input class="descriptor-value" type="text" placeholder="value" />
+        <input class="descriptor-start" type="number" placeholder="start" />
+        <input class="descriptor-end" type="number" placeholder="end" />
+        <button class="button ghost remove-descriptor">✕</button>
+      </div>
+    </template>
+
+    <script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

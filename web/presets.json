@@ -1,0 +1,1667 @@
+[
+  {
+    "id": "test_direct_conflict_creation",
+    "label": "Direct conflict creation (no records)",
+    "identityKeys": [],
+    "conflictAttrs": [],
+    "description": "No records are loaded; the graph should be empty and the stats should remain at zero.",
+    "records": [],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "0",
+        "num_records": "0",
+        "timestamp": "2026-01-01T19:32:04.682431753+00:00",
+        "version": "1.0"
+      },
+      "nodes": [],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_indirect_conflict_creation",
+    "label": "Indirect conflict creation (no records)",
+    "identityKeys": [],
+    "conflictAttrs": [],
+    "description": "No records are loaded; use this to confirm the graph clears cleanly between runs.",
+    "records": [],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "0",
+        "num_records": "0",
+        "timestamp": "2026-01-01T19:32:04.682455927+00:00",
+        "version": "1.0"
+      },
+      "nodes": [],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_observation_creation",
+    "label": "Observation creation (no records)",
+    "identityKeys": [],
+    "conflictAttrs": [],
+    "description": "Empty dataset; nothing should render besides the layout and legend.",
+    "records": [],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "0",
+        "num_records": "0",
+        "timestamp": "2026-01-01T19:32:04.682462032+00:00",
+        "version": "1.0"
+      },
+      "nodes": [],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_conflict_detection",
+    "label": "Conflict detection (empty store)",
+    "identityKeys": [],
+    "conflictAttrs": [],
+    "description": "Empty dataset; verify that no same-as or conflict edges appear.",
+    "records": [],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "0",
+        "num_records": "0",
+        "timestamp": "2026-01-01T19:32:04.682466238+00:00",
+        "version": "1.0"
+      },
+      "nodes": [],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_can_handle_indirect_conflict",
+    "label": "Indirect conflict handling (name/country + phone/employee_id)",
+    "identityKeys": [
+      "name",
+      "country"
+    ],
+    "conflictAttrs": [
+      "phone",
+      "employee_id"
+    ],
+    "description": "Three records share name+country; two CRM records disagree on phone over the same interval. Expect a same-as link across all three and a red phone conflict between the CRM records.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "name",
+            "value": "John Doe",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "country",
+            "value": "US",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "phone",
+            "value": "555-1111",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "name",
+            "value": "John Doe",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "country",
+            "value": "US",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "phone",
+            "value": "555-2222",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R3",
+        "uid": "3",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "name",
+            "value": "John Doe",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "country",
+            "value": "US",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "employee_id",
+            "value": "EMP001",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "1",
+        "num_records": "3",
+        "timestamp": "2026-01-01T19:32:04.682559889+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": null,
+          "id": "record_3",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "3"
+          },
+          "record_id": 3
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "JD-V4",
+            "cluster_key_identity": "preset",
+            "golden": "[{\"attr\":\"country\",\"value\":\"US\",\"interval\":{\"start\":86400,\"end\":432000}},{\"attr\":\"employee_id\",\"value\":\"EMP001\",\"interval\":{\"start\":86400,\"end\":432000}},{\"attr\":\"name\",\"value\":\"John Doe\",\"interval\":{\"start\":86400,\"end\":432000}}]",
+            "root_record": "R1",
+            "size": "3"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": [
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 3,
+          "target": 2
+        },
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 3,
+          "target": 1
+        },
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 2,
+          "target": 1
+        }
+      ]
+    }
+  },
+  {
+    "id": "test_can_resolve_person_identity_conflicts",
+    "label": "Person identity conflicts (EMP001 vs EMP002)",
+    "identityKeys": [
+      "name",
+      "country"
+    ],
+    "conflictAttrs": [
+      "employee_id",
+      "email"
+    ],
+    "description": "Two HR records share name+country but overlap with different employee_id and email values. Expect a same-as link and red conflict edges during the overlapping years.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "employee_id",
+            "value": "EMP001",
+            "start": 1388966400,
+            "end": 1613520000
+          },
+          {
+            "attr": "country",
+            "value": "RU",
+            "start": 1388966400,
+            "end": 1613520000
+          },
+          {
+            "attr": "currency",
+            "value": "RUB",
+            "start": 1388966400,
+            "end": 1613520000
+          },
+          {
+            "attr": "name",
+            "value": "John Smith",
+            "start": 1388966400,
+            "end": 1613520000
+          },
+          {
+            "attr": "department",
+            "value": "Engineering",
+            "start": 1388966400,
+            "end": 1613520000
+          },
+          {
+            "attr": "email",
+            "value": "john.smith@company.com",
+            "start": 1388966400,
+            "end": 1613520000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "employee_id",
+            "value": "EMP002",
+            "start": 1047340800,
+            "end": 1438560000
+          },
+          {
+            "attr": "country",
+            "value": "RU",
+            "start": 1047340800,
+            "end": 1438560000
+          },
+          {
+            "attr": "currency",
+            "value": "RUB",
+            "start": 1047340800,
+            "end": 1320105600
+          },
+          {
+            "attr": "currency",
+            "value": "USD",
+            "start": 1320105600,
+            "end": 1438560000
+          },
+          {
+            "attr": "name",
+            "value": "John Smith",
+            "start": 1047340800,
+            "end": 1438560000
+          },
+          {
+            "attr": "department",
+            "value": "Engineering",
+            "start": 1047628800,
+            "end": 1438560000
+          },
+          {
+            "attr": "email",
+            "value": "j.smith@corp.com",
+            "start": 1047340800,
+            "end": 1438560000
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "1",
+        "num_records": "2",
+        "timestamp": "2026-01-01T19:32:04.682694606+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "JS-YS",
+            "cluster_key_identity": "preset",
+            "golden": "[{\"attr\":\"country\",\"value\":\"RU\",\"interval\":{\"start\":1047340800,\"end\":1613520000}},{\"attr\":\"currency\",\"value\":\"RUB\",\"interval\":{\"start\":1047340800,\"end\":1320105600}},{\"attr\":\"currency\",\"value\":\"RUB\",\"interval\":{\"start\":1438560000,\"end\":1613520000}},{\"attr\":\"currency\",\"value\":\"USD\",\"interval\":{\"start\":1320105600,\"end\":1388966400}},{\"attr\":\"department\",\"value\":\"Engineering\",\"interval\":{\"start\":1047628800,\"end\":1613520000}},{\"attr\":\"email\",\"value\":\"j.smith@corp.com\",\"interval\":{\"start\":1047340800,\"end\":1388966400}},{\"attr\":\"email\",\"value\":\"john.smith@company.com\",\"interval\":{\"start\":1438560000,\"end\":1613520000}},{\"attr\":\"employee_id\",\"value\":\"EMP001\",\"interval\":{\"start\":1438560000,\"end\":1613520000}},{\"attr\":\"employee_id\",\"value\":\"EMP002\",\"interval\":{\"start\":1047340800,\"end\":1388966400}},{\"attr\":\"name\",\"value\":\"John Smith\",\"interval\":{\"start\":1047340800,\"end\":1613520000}}]",
+            "root_record": "R1",
+            "size": "2"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": [
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 2,
+          "target": 1
+        }
+      ]
+    }
+  },
+  {
+    "id": "test_can_resolve_temporal_identity_conflicts",
+    "label": "Temporal identity conflicts (name/email changes)",
+    "identityKeys": [
+      "name",
+      "country"
+    ],
+    "conflictAttrs": [
+      "employee_id",
+      "phone",
+      "email"
+    ],
+    "description": "Three records span different eras with matching name+country. Expect them to cluster via time-sliced same-as links but show no red conflicts because values do not overlap.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "employee_id",
+            "value": "H6TJG4721",
+            "start": 851990400,
+            "end": 1613520000
+          },
+          {
+            "attr": "country",
+            "value": "CH",
+            "start": 851990400,
+            "end": 1613520000
+          },
+          {
+            "attr": "currency",
+            "value": "CHF",
+            "start": 851990400,
+            "end": 1613520000
+          },
+          {
+            "attr": "name",
+            "value": "CH0002092614",
+            "start": 851990400,
+            "end": 1211760000
+          },
+          {
+            "attr": "name",
+            "value": "CH0039821084",
+            "start": 1211760000,
+            "end": 1613520000
+          },
+          {
+            "attr": "department",
+            "value": "XSWX",
+            "start": 1363564800,
+            "end": 1613520000
+          },
+          {
+            "attr": "email",
+            "value": "4582526",
+            "start": 851990400,
+            "end": 1211760000
+          },
+          {
+            "attr": "email",
+            "value": "B39HW28",
+            "start": 1211760000,
+            "end": 1613520000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "phone",
+            "value": "17518",
+            "start": 978307200,
+            "end": 1007078400
+          },
+          {
+            "attr": "country",
+            "value": "CH",
+            "start": 978307200,
+            "end": 1007078400
+          },
+          {
+            "attr": "currency",
+            "value": "CHF",
+            "start": 978307200,
+            "end": 1007078400
+          },
+          {
+            "attr": "name",
+            "value": "CH0002092614",
+            "start": 978307200,
+            "end": 1007078400
+          }
+        ]
+      },
+      {
+        "id": "R3",
+        "uid": "3",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "phone",
+            "value": "4688",
+            "start": 795484800,
+            "end": 944006400
+          },
+          {
+            "attr": "country",
+            "value": "CH",
+            "start": 795484800,
+            "end": 944006400
+          },
+          {
+            "attr": "currency",
+            "value": "CHF",
+            "start": 795484800,
+            "end": 944006400
+          },
+          {
+            "attr": "name",
+            "value": "CH0002092614",
+            "start": 795484800,
+            "end": 944006400
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "1",
+        "num_records": "3",
+        "timestamp": "2026-01-01T19:32:04.682823692+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": null,
+          "id": "record_3",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "3"
+          },
+          "record_id": 3
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "CH00-HA",
+            "cluster_key_identity": "preset",
+            "golden": "[{\"attr\":\"country\",\"value\":\"CH\",\"interval\":{\"start\":795484800,\"end\":1613520000}},{\"attr\":\"currency\",\"value\":\"CHF\",\"interval\":{\"start\":795484800,\"end\":1613520000}},{\"attr\":\"department\",\"value\":\"XSWX\",\"interval\":{\"start\":1363564800,\"end\":1613520000}},{\"attr\":\"email\",\"value\":\"4582526\",\"interval\":{\"start\":851990400,\"end\":1211760000}},{\"attr\":\"email\",\"value\":\"B39HW28\",\"interval\":{\"start\":1211760000,\"end\":1613520000}},{\"attr\":\"employee_id\",\"value\":\"H6TJG4721\",\"interval\":{\"start\":851990400,\"end\":1613520000}},{\"attr\":\"name\",\"value\":\"CH0002092614\",\"interval\":{\"start\":795484800,\"end\":1211760000}},{\"attr\":\"name\",\"value\":\"CH0039821084\",\"interval\":{\"start\":1211760000,\"end\":1613520000}},{\"attr\":\"phone\",\"value\":\"17518\",\"interval\":{\"start\":978307200,\"end\":1007078400}},{\"attr\":\"phone\",\"value\":\"4688\",\"interval\":{\"start\":795484800,\"end\":944006400}}]",
+            "root_record": "R1",
+            "size": "3"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": [
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 1,
+          "target": 3
+        },
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 1,
+          "target": 2
+        },
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 3,
+          "target": 2
+        }
+      ]
+    }
+  },
+  {
+    "id": "test_can_resolve_name_change_conflicts",
+    "label": "Name change conflicts (AVESCO timeline)",
+    "identityKeys": [
+      "name",
+      "country"
+    ],
+    "conflictAttrs": [
+      "employee_id",
+      "phone",
+      "email"
+    ],
+    "description": "One long-lived record with multiple name changes aligns with a shorter CRM record. Expect a same-as link without red conflicts, highlighting the name timeline.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "employee_id",
+            "value": "X7W5YMBX4",
+            "start": 851990400,
+            "end": 1482451200
+          },
+          {
+            "attr": "country",
+            "value": "GB",
+            "start": 851990400,
+            "end": 1482451200
+          },
+          {
+            "attr": "currency",
+            "value": "GBP",
+            "start": 851990400,
+            "end": 1482451200
+          },
+          {
+            "attr": "name",
+            "value": "GB0000653229",
+            "start": 851990400,
+            "end": 1482451200
+          },
+          {
+            "attr": "department",
+            "value": "XLON",
+            "start": 1363564800,
+            "end": 1482451200
+          },
+          {
+            "attr": "email",
+            "value": "john.doe@company.com",
+            "start": 851990400,
+            "end": 1482451200
+          },
+          {
+            "attr": "type",
+            "value": "COMMON STOCK-S",
+            "start": 851990400,
+            "end": 1482451200
+          },
+          {
+            "attr": "name",
+            "value": "INVESTINMEDIA",
+            "start": 851990400,
+            "end": 1179705600
+          },
+          {
+            "attr": "name",
+            "value": "AVESCO GROUP",
+            "start": 1179705600,
+            "end": 1241136000
+          },
+          {
+            "attr": "name",
+            "value": "AVESCO GROUP PLC",
+            "start": 1241136000,
+            "end": 1482451200
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "phone",
+            "value": "64541",
+            "start": 946684800,
+            "end": 1022889600
+          },
+          {
+            "attr": "country",
+            "value": "GB",
+            "start": 946684800,
+            "end": 1022889600
+          },
+          {
+            "attr": "currency",
+            "value": "GBP",
+            "start": 946684800,
+            "end": 1022889600
+          },
+          {
+            "attr": "name",
+            "value": "GB0000653229",
+            "start": 946684800,
+            "end": 1022889600
+          },
+          {
+            "attr": "department",
+            "value": "XLON",
+            "start": 1019520000,
+            "end": 1022889600
+          },
+          {
+            "attr": "type",
+            "value": "COMMON",
+            "start": 980985600,
+            "end": 1022889600
+          },
+          {
+            "attr": "name",
+            "value": "AVESCO",
+            "start": 946684800,
+            "end": 1022889600
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "1",
+        "num_records": "2",
+        "timestamp": "2026-01-01T19:32:04.682956619+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "GB00-VX",
+            "cluster_key_identity": "preset",
+            "golden": "[{\"attr\":\"country\",\"value\":\"GB\",\"interval\":{\"start\":851990400,\"end\":1482451200}},{\"attr\":\"currency\",\"value\":\"GBP\",\"interval\":{\"start\":851990400,\"end\":1482451200}},{\"attr\":\"department\",\"value\":\"XLON\",\"interval\":{\"start\":1019520000,\"end\":1022889600}},{\"attr\":\"department\",\"value\":\"XLON\",\"interval\":{\"start\":1363564800,\"end\":1482451200}},{\"attr\":\"email\",\"value\":\"john.doe@company.com\",\"interval\":{\"start\":851990400,\"end\":1482451200}},{\"attr\":\"employee_id\",\"value\":\"X7W5YMBX4\",\"interval\":{\"start\":851990400,\"end\":1482451200}},{\"attr\":\"phone\",\"value\":\"64541\",\"interval\":{\"start\":946684800,\"end\":1022889600}},{\"attr\":\"type\",\"value\":\"COMMON STOCK-S\",\"interval\":{\"start\":851990400,\"end\":980985600}},{\"attr\":\"type\",\"value\":\"COMMON STOCK-S\",\"interval\":{\"start\":1022889600,\"end\":1482451200}}]",
+            "root_record": "R1",
+            "size": "2"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": [
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 2,
+          "target": 1
+        }
+      ]
+    }
+  },
+  {
+    "id": "test_can_detect_intra_entity_conflicts",
+    "label": "Intra-entity SSN conflicts (10 records)",
+    "identityKeys": [],
+    "conflictAttrs": [
+      "ssn"
+    ],
+    "description": "Each record contains two overlapping SSNs. Expect red self-loop conflicts on every record card in the graph.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R3",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R4",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R5",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R6",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R7",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R8",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R9",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R10",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "ssn",
+            "value": "123-45-6789",
+            "start": 86400,
+            "end": 432000
+          },
+          {
+            "attr": "ssn",
+            "value": "987-65-4321",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "10",
+        "num_records": "10",
+        "timestamp": "2026-01-01T19:32:04.683093984+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": null,
+          "id": "record_5",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 5
+        },
+        {
+          "cluster_id": null,
+          "id": "record_7",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 7
+        },
+        {
+          "cluster_id": null,
+          "id": "record_8",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 8
+        },
+        {
+          "cluster_id": null,
+          "id": "record_4",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 4
+        },
+        {
+          "cluster_id": null,
+          "id": "record_6",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 6
+        },
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": null,
+          "id": "record_10",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 10
+        },
+        {
+          "cluster_id": null,
+          "id": "record_9",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 9
+        },
+        {
+          "cluster_id": null,
+          "id": "record_3",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 3
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R8",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 1,
+          "id": "cluster_1",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R10",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 2,
+          "id": "cluster_2",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R2",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 3,
+          "id": "cluster_3",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R1",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 4,
+          "id": "cluster_4",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R3",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 5,
+          "id": "cluster_5",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R4",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 6,
+          "id": "cluster_6",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R9",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 7,
+          "id": "cluster_7",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R5",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 8,
+          "id": "cluster_8",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R7",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 9,
+          "id": "cluster_9",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "789-V9",
+            "cluster_key_identity": "fallback_ssn",
+            "golden": "[]",
+            "root_record": "R6",
+            "size": "1"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_can_detect_cross_entity_conflicts",
+    "label": "Cross-entity email conflicts (same perspective)",
+    "identityKeys": [],
+    "conflictAttrs": [
+      "email"
+    ],
+    "description": "Two records in the same perspective share the same email. Expect a red conflict edge even without a same-as link.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "email",
+            "value": "john.doe@company.com",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "email",
+            "value": "john.doe@company.com",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "2",
+        "num_records": "2",
+        "timestamp": "2026-01-01T19:32:04.683296052+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "JD-HJ",
+            "cluster_key_identity": "fallback_email",
+            "golden": "[{\"attr\":\"email\",\"value\":\"john.doe@company.com\",\"interval\":{\"start\":86400,\"end\":432000}}]",
+            "root_record": "R1",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 1,
+          "id": "cluster_1",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "JD-SB",
+            "cluster_key_identity": "fallback_email",
+            "golden": "[{\"attr\":\"email\",\"value\":\"john.doe@company.com\",\"interval\":{\"start\":86400,\"end\":432000}}]",
+            "root_record": "R2",
+            "size": "1"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_cross_entity_perspective_grouping",
+    "label": "Cross-entity email (different perspectives)",
+    "identityKeys": [],
+    "conflictAttrs": [
+      "email"
+    ],
+    "description": "Two records share the same email but sit in different perspectives. Expect no red conflict edge because uniqueness is scoped per perspective.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "email",
+            "value": "john.doe@company.com",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "email",
+            "value": "john.doe@company.com",
+            "start": 86400,
+            "end": 432000
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "2",
+        "num_records": "2",
+        "timestamp": "2026-01-01T19:32:04.683351716+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "JD-HJ",
+            "cluster_key_identity": "fallback_email",
+            "golden": "[{\"attr\":\"email\",\"value\":\"john.doe@company.com\",\"interval\":{\"start\":86400,\"end\":432000}}]",
+            "root_record": "R1",
+            "size": "1"
+          },
+          "record_id": null
+        },
+        {
+          "cluster_id": 1,
+          "id": "cluster_1",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "JD-3K",
+            "cluster_key_identity": "fallback_email",
+            "golden": "[{\"attr\":\"email\",\"value\":\"john.doe@company.com\",\"interval\":{\"start\":86400,\"end\":432000}}]",
+            "root_record": "R2",
+            "size": "1"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": []
+    }
+  },
+  {
+    "id": "test_can_resolve_extend_descriptor_start_dating_for_national_rv_holding_edge_case",
+    "label": "National RV holding edge case (descriptor start dating)",
+    "identityKeys": [
+      "ssn",
+      "country"
+    ],
+    "conflictAttrs": [
+      "employee_id",
+      "phone",
+      "email"
+    ],
+    "description": "Two records overlap only on a short SSN window. Expect a narrow same-as link with no red conflicts, highlighting the shorter attribute intervals.",
+    "records": [
+      {
+        "id": "R1",
+        "uid": "1",
+        "entityType": "person",
+        "perspective": "hr_system",
+        "descriptors": [
+          {
+            "attr": "employee_id",
+            "value": "D61Y3AJC7",
+            "start": 851990400,
+            "end": 1283040000
+          },
+          {
+            "attr": "country",
+            "value": "US",
+            "start": 851990400,
+            "end": 1283040000
+          },
+          {
+            "attr": "currency",
+            "value": "USD",
+            "start": 851990400,
+            "end": 1283040000
+          },
+          {
+            "attr": "ssn",
+            "value": "637277104",
+            "start": 851990400,
+            "end": 1283040000
+          },
+          {
+            "attr": "name",
+            "value": "US6372771047",
+            "start": 851990400,
+            "end": 1283040000
+          },
+          {
+            "attr": "email",
+            "value": "jane.smith@company.com",
+            "start": 851990400,
+            "end": 1283040000
+          }
+        ]
+      },
+      {
+        "id": "R2",
+        "uid": "2",
+        "entityType": "person",
+        "perspective": "crm_system",
+        "descriptors": [
+          {
+            "attr": "phone",
+            "value": "63819",
+            "start": 899078400,
+            "end": 1022889600
+          },
+          {
+            "attr": "country",
+            "value": "US",
+            "start": 899078400,
+            "end": 1022889600
+          },
+          {
+            "attr": "currency",
+            "value": "USD",
+            "start": 899078400,
+            "end": 1022889600
+          },
+          {
+            "attr": "ssn",
+            "value": "637277104",
+            "start": 1022803200,
+            "end": 1022889600
+          },
+          {
+            "attr": "name",
+            "value": "US6372771047",
+            "start": 1022803200,
+            "end": 1022889600
+          },
+          {
+            "attr": "email",
+            "value": "jane.smith@company.com",
+            "start": 1022803200,
+            "end": 1022889600
+          }
+        ]
+      }
+    ],
+    "graph": {
+      "conflicts_with_edges": [],
+      "metadata": {
+        "num_clusters": "1",
+        "num_records": "2",
+        "timestamp": "2026-01-01T19:32:04.683428359+00:00",
+        "version": "1.0"
+      },
+      "nodes": [
+        {
+          "cluster_id": null,
+          "id": "record_2",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "crm_system",
+            "uid": "2"
+          },
+          "record_id": 2
+        },
+        {
+          "cluster_id": null,
+          "id": "record_1",
+          "node_type": "record",
+          "properties": {
+            "entity_type": "person",
+            "perspective": "hr_system",
+            "uid": "1"
+          },
+          "record_id": 1
+        },
+        {
+          "cluster_id": 0,
+          "id": "cluster_0",
+          "node_type": "cluster",
+          "properties": {
+            "cluster_key": "104-QZ",
+            "cluster_key_identity": "preset",
+            "golden": "[{\"attr\":\"country\",\"value\":\"US\",\"interval\":{\"start\":851990400,\"end\":1283040000}},{\"attr\":\"currency\",\"value\":\"USD\",\"interval\":{\"start\":851990400,\"end\":1283040000}},{\"attr\":\"email\",\"value\":\"jane.smith@company.com\",\"interval\":{\"start\":851990400,\"end\":1283040000}},{\"attr\":\"employee_id\",\"value\":\"D61Y3AJC7\",\"interval\":{\"start\":851990400,\"end\":1283040000}},{\"attr\":\"name\",\"value\":\"US6372771047\",\"interval\":{\"start\":851990400,\"end\":1283040000}},{\"attr\":\"phone\",\"value\":\"63819\",\"interval\":{\"start\":899078400,\"end\":1022889600}},{\"attr\":\"ssn\",\"value\":\"637277104\",\"interval\":{\"start\":851990400,\"end\":1283040000}}]",
+            "root_record": "R1",
+            "size": "2"
+          },
+          "record_id": null
+        }
+      ],
+      "same_as_edges": [
+        {
+          "interval": {
+            "end": 9223372036854775807,
+            "start": -9223372036854775808
+          },
+          "metadata": {},
+          "reason": "cluster_member",
+          "source": 2,
+          "target": 1
+        }
+      ]
+    }
+  }
+]
