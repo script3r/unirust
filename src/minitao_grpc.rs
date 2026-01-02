@@ -47,11 +47,7 @@ impl MinitaoGrpcWriter {
             })
             .collect();
 
-        let to_delete_objects: Vec<_> = self
-            .objects
-            .difference(&new_object_ids)
-            .copied()
-            .collect();
+        let to_delete_objects: Vec<_> = self.objects.difference(&new_object_ids).copied().collect();
         let to_delete_assocs: Vec<_> = self.assocs.difference(&new_assoc_keys).cloned().collect();
 
         for key in to_delete_assocs {

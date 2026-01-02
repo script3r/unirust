@@ -156,9 +156,7 @@ fn node_to_object(node: &GraphNode) -> anyhow::Result<MinitaoObject> {
 
     match node.node_type.as_str() {
         "record" => {
-            let record_id = node
-                .record_id
-                .context("record node missing record_id")?;
+            let record_id = node.record_id.context("record node missing record_id")?;
             data.insert("record_id".to_string(), record_id.0.to_string());
             Ok(MinitaoObject {
                 id: record_object_id(record_id),
@@ -167,9 +165,7 @@ fn node_to_object(node: &GraphNode) -> anyhow::Result<MinitaoObject> {
             })
         }
         "cluster" => {
-            let cluster_id = node
-                .cluster_id
-                .context("cluster node missing cluster_id")?;
+            let cluster_id = node.cluster_id.context("cluster node missing cluster_id")?;
             data.insert("cluster_id".to_string(), cluster_id.0.to_string());
             Ok(MinitaoObject {
                 id: cluster_object_id(cluster_id),
@@ -223,7 +219,12 @@ fn group_same_as_edges(
     for ((left, right), payloads) in grouped {
         let id1 = record_object_id(left);
         let id2 = record_object_id(right);
-        let time = earliest_interval_start(&payloads.iter().map(|p| p.interval_start).collect::<Vec<_>>());
+        let time = earliest_interval_start(
+            &payloads
+                .iter()
+                .map(|p| p.interval_start)
+                .collect::<Vec<_>>(),
+        );
         let edges_json = serde_json::to_string(&payloads)?;
         let mut data = HashMap::new();
         data.insert("edge_type".to_string(), "same_as".to_string());
@@ -261,7 +262,10 @@ fn build_conflict_objects(edges: &[ConflictsWithEdge]) -> anyhow::Result<Vec<Min
         data.insert("source_record_id".to_string(), edge.source.0.to_string());
         data.insert("target_record_id".to_string(), edge.target.0.to_string());
         data.insert("attribute_id".to_string(), edge.attribute.0.to_string());
-        data.insert("interval_start".to_string(), edge.interval.start.to_string());
+        data.insert(
+            "interval_start".to_string(),
+            edge.interval.start.to_string(),
+        );
         data.insert("interval_end".to_string(), edge.interval.end.to_string());
         data.insert("kind".to_string(), edge.kind.clone());
         data.insert("cause".to_string(), edge.cause.clone());
@@ -443,7 +447,10 @@ fn conflict_assoc_data(
     data.insert("source_record_id".to_string(), edge.source.0.to_string());
     data.insert("target_record_id".to_string(), edge.target.0.to_string());
     data.insert("attribute_id".to_string(), edge.attribute.0.to_string());
-    data.insert("interval_start".to_string(), edge.interval.start.to_string());
+    data.insert(
+        "interval_start".to_string(),
+        edge.interval.start.to_string(),
+    );
     data.insert("interval_end".to_string(), edge.interval.end.to_string());
     data.insert("kind".to_string(), edge.kind.clone());
     data.insert("cause".to_string(), edge.cause.clone());

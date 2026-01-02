@@ -5,21 +5,25 @@
 //! This library provides precise temporal modeling, entity resolution, and conflict detection
 //! with strong guarantees about temporal correctness and auditability.
 
+pub mod config;
 pub mod conflicts;
 pub mod dsu;
 pub mod graph;
 pub mod index;
 pub mod linker;
-pub mod model;
-pub mod minitao_store;
 pub mod minitao_grpc;
+pub mod minitao_store;
+pub mod model;
 pub mod ontology;
+pub mod profile;
 pub mod query;
+pub mod sharding;
 pub mod store;
 pub mod temporal;
 pub mod utils;
 
 // Re-export main types for convenience
+pub use config::{StreamingTuning, TuningProfile};
 pub use model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 pub use ontology::Ontology;
 pub use query::{QueryConflict, QueryDescriptor, QueryDescriptorOverlap, QueryMatch, QueryOutcome};
@@ -54,6 +58,7 @@ pub struct Unirust {
     ontology: Ontology,
     streaming: Option<linker::StreamingLinker>,
     graph_state: Option<graph::IncrementalKnowledgeGraph>,
+    tuning: StreamingTuning,
 }
 
 impl Unirust {
@@ -72,6 +77,20 @@ impl Unirust {
             ontology,
             streaming: None,
             graph_state: None,
+            tuning: StreamingTuning::default(),
+        }
+    }
+
+    pub fn with_store_and_tuning<S>(ontology: Ontology, store: S, tuning: StreamingTuning) -> Self
+    where
+        S: RecordStore + 'static,
+    {
+        Self {
+            store: Box::new(store),
+            ontology,
+            streaming: None,
+            graph_state: None,
+            tuning,
         }
     }
 
@@ -150,12 +169,16 @@ impl Unirust {
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedClusterAssignment>> {
         if self.streaming.is_none() {
-            self.streaming =
-                Some(linker::StreamingLinker::new(self.store.as_ref(), &self.ontology)?);
+            self.streaming = Some(linker::StreamingLinker::new(
+                self.store.as_ref(),
+                &self.ontology,
+                &self.tuning,
+            )?);
         }
 
         let streaming = self.streaming.as_mut().unwrap();
         let mut assignments = Vec::with_capacity(records.len());
+        let mut record_ids = Vec::with_capacity(records.len());
 
         for record in records {
             let record_id = self.store.add_record(record)?;
@@ -165,6 +188,14 @@ impl Unirust {
                 record_id,
                 cluster_id,
             });
+            record_ids.push(record_id);
+        }
+
+        if self.tuning.deferred_reconciliation {
+            streaming.reconcile_pending(self.store.as_ref(), &self.ontology)?;
+            for assignment in &mut assignments {
+                assignment.cluster_id = streaming.cluster_id_for(assignment.record_id);
+            }
         }
 
         Ok(assignments)
@@ -176,8 +207,11 @@ impl Unirust {
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedConflictUpdate>> {
         if self.streaming.is_none() {
-            self.streaming =
-                Some(linker::StreamingLinker::new(self.store.as_ref(), &self.ontology)?);
+            self.streaming = Some(linker::StreamingLinker::new(
+                self.store.as_ref(),
+                &self.ontology,
+                &self.tuning,
+            )?);
         }
 
         let streaming = self.streaming.as_mut().unwrap();
@@ -219,8 +253,11 @@ impl Unirust {
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedGraphUpdate>> {
         if self.streaming.is_none() {
-            self.streaming =
-                Some(linker::StreamingLinker::new(self.store.as_ref(), &self.ontology)?);
+            self.streaming = Some(linker::StreamingLinker::new(
+                self.store.as_ref(),
+                &self.ontology,
+                &self.tuning,
+            )?);
         }
 
         let streaming = self.streaming.as_mut().unwrap();
@@ -243,7 +280,12 @@ impl Unirust {
             let observations =
                 conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
 
-            graph_state.update(self.store.as_ref(), &clusters, &observations, &self.ontology)?;
+            graph_state.update(
+                self.store.as_ref(),
+                &clusters,
+                &observations,
+                &self.ontology,
+            )?;
             let graph = graph_state.to_knowledge_graph();
 
             updates.push(StreamedGraphUpdate {
@@ -279,15 +321,5 @@ impl Unirust {
             descriptors,
             interval,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn test_basic_functionality() {
-        // This will be expanded with comprehensive tests
-        assert!(true);
     }
 }

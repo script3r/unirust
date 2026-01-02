@@ -3,7 +3,8 @@
 //! Provides efficient indexing for identity keys, crosswalks, and temporal data
 //! to enable fast lookup during entity resolution and conflict detection.
 
-use crate::model::{CanonicalId, KeyValue, RecordId};
+use crate::dsu::TemporalDSU;
+use crate::model::{CanonicalId, KeyValue, RecordId, ValueId};
 use crate::ontology::{Crosswalk, IdentityKey};
 use crate::temporal::Interval;
 use anyhow::Result;
@@ -11,7 +12,8 @@ use hashbrown::{Equivalent, HashMap};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
-type IdentityIndexMap = HashMap<IdentityIndexKey, CandidateList>;
+type IdentityIndexMap = HashMap<IdentityIndexKey, KeyBucket>;
+const MAX_KEY_VALUES_PER_ATTR: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IdentityIndexKey {
@@ -26,16 +28,327 @@ struct IdentityIndexKeyRef<'a> {
 
 #[derive(Debug, Clone, Default)]
 struct CandidateList {
-    entries: Vec<(RecordId, Interval)>,
+    sorted: Vec<(RecordId, Interval)>,
+    unsorted: Vec<(RecordId, Interval)>,
+    end_order: Vec<usize>,
+    sorted_by_end: bool,
+    cluster_intervals: HashMap<RecordId, ClusterIntervalList>,
+    cluster_tree: IntervalTree,
+    active_intervals: usize,
+    total_intervals: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClusterIntervalList {
+    intervals: Vec<Interval>,
+}
+
+impl ClusterIntervalList {
+    fn add_interval(&mut self, interval: Interval) {
+        let mut start = interval.start;
+        let mut end = interval.end;
+        let mut idx = 0;
+        while idx < self.intervals.len() {
+            let current = self.intervals[idx];
+            if end <= current.start {
+                break;
+            }
+            if start >= current.end {
+                idx += 1;
+                continue;
+            }
+            start = start.min(current.start);
+            end = end.max(current.end);
+            self.intervals.remove(idx);
+        }
+        self.intervals.insert(idx, Interval { start, end });
+    }
+
+    fn extend_from(&mut self, other: &ClusterIntervalList) {
+        for interval in &other.intervals {
+            self.add_interval(*interval);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct KeyBucket {
+    record_candidates: CandidateList,
+}
+
+impl KeyBucket {
+    fn insert_record(&mut self, record_id: RecordId, interval: Interval) {
+        self.record_candidates.insert((record_id, interval));
+    }
+
+    fn insert_cluster_interval(&mut self, root_id: RecordId, interval: Interval) {
+        self.record_candidates
+            .insert_cluster_interval(root_id, interval);
+    }
+
+    fn merge_clusters(&mut self, root_a: RecordId, root_b: RecordId, new_root: RecordId) {
+        self.record_candidates
+            .merge_cluster_intervals(root_a, root_b, new_root);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct IntervalTree {
+    nodes: Vec<IntervalNode>,
+    root: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct IntervalNode {
+    interval: Interval,
+    record_id: RecordId,
+    max_end: i64,
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+impl IntervalTree {
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.root = None;
+    }
+
+    fn insert(&mut self, record_id: RecordId, interval: Interval) {
+        let node_index = self.nodes.len();
+        self.nodes.push(IntervalNode {
+            interval,
+            record_id,
+            max_end: interval.end,
+            left: None,
+            right: None,
+        });
+
+        let Some(mut current) = self.root else {
+            self.root = Some(node_index);
+            return;
+        };
+
+        let new_start = interval.start;
+        let new_end = interval.end;
+
+        loop {
+            let current_start = self.nodes[current].interval.start;
+            self.nodes[current].max_end = self.nodes[current].max_end.max(new_end);
+
+            let next = if new_start < current_start {
+                &mut self.nodes[current].left
+            } else {
+                &mut self.nodes[current].right
+            };
+
+            if let Some(next_idx) = *next {
+                current = next_idx;
+                continue;
+            }
+
+            *next = Some(node_index);
+            break;
+        }
+    }
+
+    fn collect_overlapping(&self, interval: Interval, out: &mut Vec<(RecordId, Interval)>) {
+        let Some(root) = self.root else {
+            return;
+        };
+        let mut stack = vec![root];
+
+        while let Some(node_idx) = stack.pop() {
+            let node = &self.nodes[node_idx];
+            if node.interval.start < interval.end && node.interval.end > interval.start {
+                out.push((node.record_id, node.interval));
+            }
+
+            if let Some(left) = node.left {
+                if self.nodes[left].max_end > interval.start {
+                    stack.push(left);
+                }
+            }
+
+            if let Some(right) = node.right {
+                if node.interval.start < interval.end {
+                    stack.push(right);
+                }
+            }
+        }
+    }
 }
 
 impl CandidateList {
     fn insert(&mut self, entry: (RecordId, Interval)) {
-        self.entries.push(entry);
+        self.unsorted.push(entry);
     }
 
-    fn as_slice(&self) -> &[(RecordId, Interval)] {
-        self.entries.as_slice()
+    fn insert_cluster_interval(&mut self, root_id: RecordId, interval: Interval) {
+        let list = self.cluster_intervals.entry(root_id).or_default();
+        let prev_len = list.intervals.len();
+        list.add_interval(interval);
+        let new_len = list.intervals.len();
+        self.active_intervals = self.active_intervals.saturating_sub(prev_len) + new_len;
+        self.total_intervals = self.total_intervals.saturating_add(1);
+        self.cluster_tree.insert(root_id, interval);
+    }
+
+    fn as_slice(&mut self) -> &[(RecordId, Interval)] {
+        self.force_merge();
+        self.sorted.as_slice()
+    }
+
+    fn collect_overlapping(&mut self, interval: Interval, out: &mut Vec<(RecordId, Interval)>) {
+        self.maybe_merge();
+        self.ensure_sorted_by_end();
+
+        if !self.sorted.is_empty() {
+            let start_idx = self
+                .sorted
+                .partition_point(|(_, entry_interval)| entry_interval.start < interval.end);
+            let end_idx = self
+                .end_order
+                .partition_point(|&idx| self.sorted[idx].1.end <= interval.start);
+
+            let start_len = start_idx;
+            let end_suffix_len = self.sorted.len().saturating_sub(end_idx);
+
+            if start_len <= end_suffix_len {
+                for (record_id, entry_interval) in &self.sorted[..start_idx] {
+                    if entry_interval.end > interval.start {
+                        out.push((*record_id, *entry_interval));
+                    }
+                }
+            } else {
+                for &idx in &self.end_order[end_idx..] {
+                    let (record_id, entry_interval) = self.sorted[idx];
+                    if entry_interval.start < interval.end {
+                        out.push((record_id, entry_interval));
+                    }
+                }
+            }
+        }
+
+        if !self.unsorted.is_empty() {
+            for (record_id, entry_interval) in &self.unsorted {
+                if entry_interval.start < interval.end && entry_interval.end > interval.start {
+                    out.push((*record_id, *entry_interval));
+                }
+            }
+        }
+    }
+
+    fn collect_overlapping_clusters(
+        &mut self,
+        dsu: &mut TemporalDSU,
+        interval: Interval,
+        out: &mut Vec<(RecordId, Interval)>,
+        seen: &mut HashSet<RecordId>,
+    ) {
+        self.rebuild_tree_if_needed();
+        let mut scratch = Vec::new();
+        self.cluster_tree
+            .collect_overlapping(interval, &mut scratch);
+        for (record_id, candidate_interval) in scratch {
+            let root = dsu.find(record_id);
+            if seen.insert(root) {
+                out.push((root, candidate_interval));
+            }
+        }
+    }
+
+    fn merge_cluster_intervals(&mut self, root_a: RecordId, root_b: RecordId, new_root: RecordId) {
+        let mut merged = ClusterIntervalList::default();
+        let mut removed = 0usize;
+
+        if let Some(list) = self.cluster_intervals.remove(&root_a) {
+            removed += list.intervals.len();
+            merged.extend_from(&list);
+        }
+        if let Some(list) = self.cluster_intervals.remove(&root_b) {
+            removed += list.intervals.len();
+            merged.extend_from(&list);
+        }
+
+        if removed > 0 {
+            self.active_intervals = self.active_intervals.saturating_sub(removed);
+        }
+
+        let added = merged.intervals.len();
+        if added > 0 {
+            for interval in &merged.intervals {
+                self.cluster_tree.insert(new_root, *interval);
+            }
+            self.total_intervals = self.total_intervals.saturating_add(added);
+            self.active_intervals = self.active_intervals.saturating_add(added);
+            self.cluster_intervals.insert(new_root, merged);
+        }
+    }
+
+    fn rebuild_tree_if_needed(&mut self) {
+        if self.total_intervals <= self.active_intervals.saturating_mul(2).max(1024) {
+            return;
+        }
+
+        self.cluster_tree.clear();
+        self.total_intervals = 0;
+        for (root_id, intervals) in &self.cluster_intervals {
+            for interval in &intervals.intervals {
+                self.cluster_tree.insert(*root_id, *interval);
+                self.total_intervals = self.total_intervals.saturating_add(1);
+            }
+        }
+    }
+
+    fn ensure_sorted_by_end(&mut self) {
+        if self.sorted_by_end {
+            return;
+        }
+        self.end_order = (0..self.sorted.len()).collect();
+        self.end_order.sort_by_key(|&idx| self.sorted[idx].1.end);
+        self.sorted_by_end = true;
+    }
+
+    fn maybe_merge(&mut self) {
+        const MERGE_THRESHOLD: usize = 256;
+        if self.unsorted.len() >= MERGE_THRESHOLD {
+            self.force_merge();
+        }
+    }
+
+    fn force_merge(&mut self) {
+        if self.unsorted.is_empty() {
+            return;
+        }
+        if self.sorted.is_empty() {
+            self.sorted = std::mem::take(&mut self.unsorted);
+            self.sorted.sort_by_key(|(_, interval)| interval.start);
+            self.sorted_by_end = false;
+            return;
+        }
+
+        self.unsorted.sort_by_key(|(_, interval)| interval.start);
+        let mut merged = Vec::with_capacity(self.sorted.len() + self.unsorted.len());
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.sorted.len() && j < self.unsorted.len() {
+            if self.sorted[i].1.start <= self.unsorted[j].1.start {
+                merged.push(self.sorted[i]);
+                i += 1;
+            } else {
+                merged.push(self.unsorted[j]);
+                j += 1;
+            }
+        }
+        if i < self.sorted.len() {
+            merged.extend_from_slice(&self.sorted[i..]);
+        }
+        if j < self.unsorted.len() {
+            merged.extend_from_slice(&self.unsorted[j..]);
+        }
+        self.sorted = merged;
+        self.unsorted.clear();
+        self.sorted_by_end = false;
     }
 }
 
@@ -59,6 +372,12 @@ pub struct IdentityKeyIndex {
     index: IdentityIndexMap,
     /// Maps record_id -> list of identity keys
     record_keys: HashMap<RecordId, Vec<IdentityKey>>,
+    /// Scratch buffer for overlap lookups.
+    overlap_buffer: Vec<(RecordId, Interval)>,
+    /// Scratch buffer for cluster overlap lookups.
+    cluster_overlap_buffer: Vec<(RecordId, Interval)>,
+    /// Scratch buffer for cluster dedupe.
+    cluster_seen: HashSet<RecordId>,
 }
 
 impl IdentityKeyIndex {
@@ -67,6 +386,9 @@ impl IdentityKeyIndex {
         Self {
             index: HashMap::new(),
             record_keys: HashMap::new(),
+            overlap_buffer: Vec::new(),
+            cluster_overlap_buffer: Vec::new(),
+            cluster_seen: HashSet::new(),
         }
     }
 
@@ -78,6 +400,9 @@ impl IdentityKeyIndex {
     ) -> Result<()> {
         self.index.clear();
         self.record_keys.clear();
+        self.overlap_buffer.clear();
+        self.cluster_overlap_buffer.clear();
+        self.cluster_seen.clear();
 
         for record in records {
             let entity_type = &record.identity.entity_type;
@@ -96,10 +421,9 @@ impl IdentityKeyIndex {
                             entity_type: entity_type.clone(),
                             key_values,
                         };
-                        self.index
-                            .entry(key)
-                            .or_default()
-                            .insert((record.id, interval));
+                        let candidates = self.index.entry(key).or_default();
+                        candidates.insert_record(record.id, interval);
+                        candidates.insert_cluster_interval(record.id, interval);
                     }
 
                     self.record_keys
@@ -119,6 +443,7 @@ impl IdentityKeyIndex {
         record: &crate::model::Record,
         identity_key: &IdentityKey,
     ) -> Result<Vec<(Vec<KeyValue>, Interval)>> {
+        let _guard = crate::profile::profile_scope("identity_key_extract");
         let mut partials: Vec<(Vec<KeyValue>, Interval)> = Vec::new();
 
         for attr in &identity_key.attributes {
@@ -132,24 +457,25 @@ impl IdentityKeyIndex {
                 return Ok(Vec::new());
             }
 
+            let mut value_intervals = Self::coalesce_value_intervals(descriptors);
+
+            if value_intervals.len() > MAX_KEY_VALUES_PER_ATTR {
+                value_intervals = Self::prune_value_intervals(value_intervals);
+            }
+
             if partials.is_empty() {
-                for descriptor in descriptors {
-                    partials.push((
-                        vec![KeyValue::new(*attr, descriptor.value)],
-                        descriptor.interval,
-                    ));
+                for (value, interval) in value_intervals {
+                    partials.push((vec![KeyValue::new(*attr, value)], interval));
                 }
                 continue;
             }
 
             let mut next = Vec::new();
             for (key_values, interval) in &partials {
-                for descriptor in &descriptors {
-                    if let Some(overlap) =
-                        crate::temporal::intersect(interval, &descriptor.interval)
-                    {
+                for (value, value_interval) in &value_intervals {
+                    if let Some(overlap) = crate::temporal::intersect(interval, value_interval) {
                         let mut next_key_values = key_values.clone();
-                        next_key_values.push(KeyValue::new(*attr, descriptor.value));
+                        next_key_values.push(KeyValue::new(*attr, *value));
                         next.push((next_key_values, overlap));
                     }
                 }
@@ -164,10 +490,66 @@ impl IdentityKeyIndex {
         Ok(partials)
     }
 
+    fn coalesce_value_intervals(
+        descriptors: Vec<&crate::model::Descriptor>,
+    ) -> Vec<(ValueId, Interval)> {
+        use std::collections::HashMap;
+
+        let mut by_value: HashMap<ValueId, Vec<Interval>> = HashMap::new();
+        for descriptor in descriptors {
+            by_value
+                .entry(descriptor.value)
+                .or_default()
+                .push(descriptor.interval);
+        }
+
+        let mut result = Vec::new();
+        for (value, intervals) in by_value {
+            let coalesced = crate::temporal::coalesce_same_value(
+                &intervals
+                    .iter()
+                    .map(|interval| (*interval, ()))
+                    .collect::<Vec<_>>(),
+            );
+            for (interval, _) in coalesced {
+                result.push((value, interval));
+            }
+        }
+
+        result
+    }
+
+    fn prune_value_intervals(
+        mut value_intervals: Vec<(ValueId, Interval)>,
+    ) -> Vec<(ValueId, Interval)> {
+        value_intervals.sort_by(|(value_a, interval_a), (value_b, interval_b)| {
+            let len_a = interval_a.end - interval_a.start;
+            let len_b = interval_b.end - interval_b.start;
+            len_b
+                .cmp(&len_a)
+                .then_with(|| interval_a.start.cmp(&interval_b.start))
+                .then_with(|| value_a.0.cmp(&value_b.0))
+        });
+
+        value_intervals
+            .into_iter()
+            .take(MAX_KEY_VALUES_PER_ATTR)
+            .collect()
+    }
+
     /// Add a single record to the index.
     pub fn add_record(
         &mut self,
         record: &crate::model::Record,
+        ontology: &crate::ontology::Ontology,
+    ) -> Result<()> {
+        self.add_record_with_root(record, record.id, ontology)
+    }
+
+    pub fn add_record_with_root(
+        &mut self,
+        record: &crate::model::Record,
+        root_id: RecordId,
         ontology: &crate::ontology::Ontology,
     ) -> Result<()> {
         let entity_type = &record.identity.entity_type;
@@ -183,10 +565,9 @@ impl IdentityKeyIndex {
                         entity_type: entity_type.clone(),
                         key_values,
                     };
-                    self.index
-                        .entry(key)
-                        .or_default()
-                        .insert((record.id, interval));
+                    let candidates = self.index.entry(key).or_default();
+                    candidates.insert_record(record.id, interval);
+                    candidates.insert_cluster_interval(root_id, interval);
                 }
 
                 self.record_keys
@@ -199,10 +580,9 @@ impl IdentityKeyIndex {
         Ok(())
     }
 
-
     /// Find records that match a given identity key
     pub fn find_matching_records(
-        &self,
+        &mut self,
         entity_type: &str,
         key_values: &[KeyValue],
     ) -> &[(RecordId, Interval)] {
@@ -211,12 +591,89 @@ impl IdentityKeyIndex {
             key_values,
         };
         self.index
-            .get(&key)
-            .map(|values| values.as_slice())
+            .get_mut(&key)
+            .map(|values| values.record_candidates.as_slice())
             .unwrap_or(&[])
     }
 
     /// Find records that could overlap before the interval end.
+    pub fn find_matching_records_overlapping(
+        &mut self,
+        entity_type: &str,
+        key_values: &[KeyValue],
+        interval: Interval,
+    ) -> &[(RecordId, Interval)] {
+        let key = IdentityIndexKeyRef {
+            entity_type,
+            key_values,
+        };
+
+        let Self {
+            index,
+            overlap_buffer,
+            ..
+        } = self;
+
+        let Some(values) = index.get_mut(&key) else {
+            return &[];
+        };
+
+        overlap_buffer.clear();
+        values
+            .record_candidates
+            .collect_overlapping(interval, overlap_buffer);
+        overlap_buffer.as_slice()
+    }
+
+    pub fn find_matching_clusters_overlapping(
+        &mut self,
+        dsu: &mut TemporalDSU,
+        entity_type: &str,
+        key_values: &[KeyValue],
+        interval: Interval,
+    ) -> &[(RecordId, Interval)] {
+        let key = IdentityIndexKeyRef {
+            entity_type,
+            key_values,
+        };
+
+        let Self {
+            index,
+            cluster_overlap_buffer,
+            ..
+        } = self;
+
+        let Some(values) = index.get_mut(&key) else {
+            return &[];
+        };
+
+        cluster_overlap_buffer.clear();
+        self.cluster_seen.clear();
+        values.record_candidates.collect_overlapping_clusters(
+            dsu,
+            interval,
+            cluster_overlap_buffer,
+            &mut self.cluster_seen,
+        );
+        cluster_overlap_buffer.as_slice()
+    }
+
+    pub fn merge_key_clusters(
+        &mut self,
+        entity_type: &str,
+        key_values: &[KeyValue],
+        root_a: RecordId,
+        root_b: RecordId,
+        new_root: RecordId,
+    ) {
+        let key = IdentityIndexKeyRef {
+            entity_type,
+            key_values,
+        };
+        if let Some(values) = self.index.get_mut(&key) {
+            values.merge_clusters(root_a, root_b, new_root);
+        }
+    }
 
     /// Get all identity keys for a record
     pub fn get_record_keys(&self, record_id: RecordId) -> Vec<IdentityKey> {
@@ -462,14 +919,16 @@ impl IndexManager {
 
     /// Find records that match an identity key in a time interval
     pub fn find_matching_records_in_interval(
-        &self,
+        &mut self,
         entity_type: &str,
         key_values: &[KeyValue],
         interval: Interval,
     ) -> Vec<RecordId> {
-        let matching_records = self
-            .identity_key_index
-            .find_matching_records(entity_type, key_values);
+        let matching_records = self.identity_key_index.find_matching_records_overlapping(
+            entity_type,
+            key_values,
+            interval,
+        );
 
         matching_records
             .iter()

@@ -5,7 +5,10 @@ use unirust_rs::minitao_store::{
     record_object_id, MinitaoGraphWriter, ASSOC_TYPE_CONFLICT_EDGE, ASSOC_TYPE_SAME_AS,
 };
 use unirust_rs::ontology::{IdentityKey, Ontology};
-use unirust_rs::{Descriptor, Interval, Record, RecordId, RecordIdentity, Store, Unirust};
+use unirust_rs::{
+    Descriptor, Interval, Record, RecordId, RecordIdentity, Store, StreamingTuning, TuningProfile,
+    Unirust,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -47,19 +50,19 @@ async fn main() -> anyhow::Result<()> {
         ],
     );
 
-    let mut unirust = Unirust::with_store(ontology, store);
+    let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
+    let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning);
 
     let storage = Arc::new(SqliteStorage::new("unirust_graph.db")?);
     let writer = MinitaoGraphWriter::new(storage.clone());
 
-    for record in vec![record1, record2] {
+    for record in [record1, record2] {
         let update = unirust.stream_record_update_graph(record)?;
         writer.apply_graph(&update.graph).await?;
 
         println!(
             "Stored graph after record {} -> cluster {}",
-            update.assignment.record_id.0,
-            update.assignment.cluster_id.0
+            update.assignment.record_id.0, update.assignment.cluster_id.0
         );
 
         let record_object = record_object_id(update.assignment.record_id);

@@ -1,19 +1,16 @@
 use std::time::Duration;
 
 use minitao::proto::minitao_service_client::MinitaoServiceClient;
-use minitao::proto::{
-    AssocCountRequest, AssocRangeRequest, ObjectGetRequest,
-};
+use minitao::proto::{AssocCountRequest, AssocRangeRequest, ObjectGetRequest};
 use unirust_rs::minitao_grpc::MinitaoGrpcWriter;
-use unirust_rs::minitao_store::{
-    record_object_id, ASSOC_TYPE_CONFLICT_EDGE, ASSOC_TYPE_SAME_AS,
-};
+use unirust_rs::minitao_store::{record_object_id, ASSOC_TYPE_CONFLICT_EDGE, ASSOC_TYPE_SAME_AS};
 use unirust_rs::ontology::{Constraint, IdentityKey, Ontology};
 use unirust_rs::{Descriptor, Interval, Record, RecordId, RecordIdentity, Store, Unirust};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let addr = std::env::var("MINITAO_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let addr =
+        std::env::var("MINITAO_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
     let mut writer = connect_writer_with_retry(addr.clone()).await?;
     let mut client = connect_client_with_retry(addr).await?;
 
@@ -93,7 +90,10 @@ async fn main() -> anyhow::Result<()> {
         .into_inner()
         .count;
 
-    println!("record1 same_as={} conflicts={}", same_as_count, conflict_count);
+    println!(
+        "record1 same_as={} conflicts={}",
+        same_as_count, conflict_count
+    );
 
     let conflict_assocs = client
         .assoc_range(AssocRangeRequest {

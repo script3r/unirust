@@ -135,7 +135,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut unirust = Unirust::with_store(ontology.clone(), store);
     let mut last_graph = None;
-    for record in vec![record1, record2, record3, record4, record5] {
+    for record in [record1, record2, record3, record4, record5] {
         let update = unirust.stream_record_update_graph(record)?;
         last_graph = Some(update.graph);
     }

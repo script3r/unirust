@@ -540,17 +540,20 @@ fn build_graph_snapshot(
     let mut metadata = HashMap::new();
 
     metadata.insert("version".to_string(), "1.0".to_string());
-    metadata.insert(
-        "timestamp".to_string(),
-        chrono::Utc::now().to_rfc3339(),
-    );
+    metadata.insert("timestamp".to_string(), chrono::Utc::now().to_rfc3339());
     metadata.insert("num_records".to_string(), store.len().to_string());
     metadata.insert("num_clusters".to_string(), clusters.len().to_string());
 
     for record in store.get_all_records() {
         let mut node = GraphNode::record(record.id);
-        node = node.with_property("entity_type".to_string(), record.identity.entity_type.clone());
-        node = node.with_property("perspective".to_string(), record.identity.perspective.clone());
+        node = node.with_property(
+            "entity_type".to_string(),
+            record.identity.entity_type.clone(),
+        );
+        node = node.with_property(
+            "perspective".to_string(),
+            record.identity.perspective.clone(),
+        );
         node = node.with_property("uid".to_string(), record.identity.uid.clone());
         nodes.insert(node.id.clone(), node);
     }
@@ -854,22 +857,19 @@ pub fn cluster_keys_for_clusters(
     resolved
 }
 
-fn dominant_entity_type(
-    store: &dyn RecordStore,
-    cluster: &crate::dsu::Cluster,
-) -> Option<String> {
+fn dominant_entity_type(store: &dyn RecordStore, cluster: &crate::dsu::Cluster) -> Option<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for record_id in &cluster.records {
         if let Some(record) = store.get_record(*record_id) {
-            *counts.entry(record.identity.entity_type.clone()).or_insert(0) += 1;
+            *counts
+                .entry(record.identity.entity_type.clone())
+                .or_insert(0) += 1;
         }
     }
     counts
         .into_iter()
         .max_by(|(name_a, count_a), (name_b, count_b)| {
-            count_a
-                .cmp(count_b)
-                .then_with(|| name_b.cmp(name_a))
+            count_a.cmp(count_b).then_with(|| name_b.cmp(name_a))
         })
         .map(|(name, _)| name)
 }
@@ -1002,8 +1002,8 @@ fn build_cluster_seed(
             .get_attr(*attr)
             .cloned()
             .unwrap_or_else(|| format!("attr_{}", attr.0));
-        let value = pick_cluster_value(store, cluster, *attr)
-            .unwrap_or_else(|| "unknown".to_string());
+        let value =
+            pick_cluster_value(store, cluster, *attr).unwrap_or_else(|| "unknown".to_string());
         let token = token_from_parts(&attr_name, &value, entity_type);
         tokens.push(token);
         parts.push(format!("{}={}", attr_name, value));
@@ -1013,7 +1013,11 @@ fn build_cluster_seed(
         return None;
     }
 
-    let material = format!("{entity_type}|{identity_key_name}|{}|{}", parts.join("|"), signature);
+    let material = format!(
+        "{entity_type}|{identity_key_name}|{}|{}",
+        parts.join("|"),
+        signature
+    );
     Some(ClusterKeySeed {
         cluster_id: cluster.id,
         identity_key: identity_key_name.to_string(),
@@ -1101,7 +1105,14 @@ fn encode_base32(value: u64) -> String {
 
 fn hash_suffix(input: &str) -> String {
     let encoded = short_hash(input);
-    encoded.chars().rev().take(2).collect::<String>().chars().rev().collect()
+    encoded
+        .chars()
+        .rev()
+        .take(2)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
 }
 
 fn resolve_group_keys(seeds: &[ClusterKeySeed]) -> HashMap<ClusterId, ClusterKey> {
@@ -1145,10 +1156,7 @@ fn resolve_group_keys(seeds: &[ClusterKeySeed]) -> HashMap<ClusterId, ClusterKey
 
     let mut resolved = HashMap::new();
     for seed in normalized {
-        let len = assigned
-            .get(&seed.cluster_id)
-            .copied()
-            .unwrap_or(max_len);
+        let len = assigned.get(&seed.cluster_id).copied().unwrap_or(max_len);
         let mut base = seed.tokens[..len].join("-");
         if base.is_empty() {
             base = "UNK".to_string();
@@ -1207,11 +1215,11 @@ fn key_attributes_for_type(ontology: &Ontology, entity_type: &str) -> (Vec<AttrI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::temporal::Interval;
+    use crate::linker::build_clusters;
     use crate::model::{Descriptor, Record, RecordIdentity};
     use crate::ontology::{IdentityKey, Ontology};
     use crate::store::Store;
-    use crate::linker::build_clusters;
+    use crate::temporal::Interval;
 
     #[test]
     fn test_same_as_edge_creation() {
@@ -1314,19 +1322,20 @@ mod tests {
         let cluster = clusters.clusters.first().expect("cluster missing");
 
         let golden = golden_for_cluster(&store, cluster);
-        let email_entries: Vec<_> = golden
-            .iter()
-            .filter(|desc| desc.attr == "email")
-            .collect();
+        let email_entries: Vec<_> = golden.iter().filter(|desc| desc.attr == "email").collect();
 
         assert!(
-            email_entries.iter().any(|desc| desc.value == "alice@corp.example"
-                && desc.interval == Interval::new(0, 10).unwrap()),
+            email_entries
+                .iter()
+                .any(|desc| desc.value == "alice@corp.example"
+                    && desc.interval == Interval::new(0, 10).unwrap()),
             "golden should keep non-overlapping slice of first email"
         );
         assert!(
-            email_entries.iter().any(|desc| desc.value == "alice@next.example"
-                && desc.interval == Interval::new(20, 40).unwrap()),
+            email_entries
+                .iter()
+                .any(|desc| desc.value == "alice@next.example"
+                    && desc.interval == Interval::new(20, 40).unwrap()),
             "golden should keep non-overlapping slice of second email"
         );
     }
@@ -1337,14 +1346,9 @@ mod tests {
         let mut ontology = Ontology::new();
 
         let email_attr = store.interner_mut().intern_attr("email");
-        let email_value = store
-            .interner_mut()
-            .intern_value("alice@example.com");
+        let email_value = store.interner_mut().intern_value("alice@example.com");
 
-        ontology.add_identity_key(IdentityKey::new(
-            vec![email_attr],
-            "email".to_string(),
-        ));
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email".to_string()));
 
         let record = Record::new(
             RecordId(1),

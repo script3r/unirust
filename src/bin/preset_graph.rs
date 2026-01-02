@@ -82,7 +82,11 @@ fn build_graph_for_preset(preset: &Preset) -> Result<graph::KnowledgeGraph> {
 
     for (idx, record) in preset.records.iter().enumerate() {
         let record_id = parse_record_id(&record.id).unwrap_or(0);
-        let id = if record_id == 0 { RecordId(0) } else { RecordId(record_id) };
+        let id = if record_id == 0 {
+            RecordId(0)
+        } else {
+            RecordId(record_id)
+        };
 
         let descriptors = record
             .descriptors
@@ -90,12 +94,13 @@ fn build_graph_for_preset(preset: &Preset) -> Result<graph::KnowledgeGraph> {
             .map(|descriptor| {
                 let attr_id = store.interner_mut().intern_attr(&descriptor.attr);
                 let value_id = store.interner_mut().intern_value(&descriptor.value);
-                let interval = Interval::new(descriptor.start, descriptor.end).with_context(|| {
-                    format!(
-                        "invalid interval {}-{} for record {}",
-                        descriptor.start, descriptor.end, record.id
-                    )
-                })?;
+                let interval =
+                    Interval::new(descriptor.start, descriptor.end).with_context(|| {
+                        format!(
+                            "invalid interval {}-{} for record {}",
+                            descriptor.start, descriptor.end, record.id
+                        )
+                    })?;
                 Ok(Descriptor::new(attr_id, value_id, interval))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -109,7 +114,7 @@ fn build_graph_for_preset(preset: &Preset) -> Result<graph::KnowledgeGraph> {
             ),
             descriptors,
         );
-        let record_label = record.id.clone();
+        let record_label = record.id;
         store
             .add_record(record)
             .with_context(|| format!("failed to add record {} (index {})", record_label, idx))?;

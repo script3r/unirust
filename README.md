@@ -14,6 +14,7 @@ A temporal-first entity mastering and conflict-resolution engine in Rust.
 - Incrementally maintain a knowledge graph for auditing and visualization.
 - Persist a conflict-free golden copy per cluster for downstream consumption.
 - Query master entities for descriptors over time with conflict-aware results.
+- Stream records in parallel via sharding with deterministic reconciliation.
 
 ## How the basic example flows
 
@@ -90,6 +91,25 @@ flowchart LR
 cargo run --example basic_example
 ```
 
+## Tuning (RocksDB-style options)
+
+Streaming performance is controlled via `StreamingTuning`, similar to RocksDB-style option structs.
+
+```rust
+use unirust_rs::{StreamingTuning, TuningProfile, Unirust};
+
+let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
+// Or customize individual fields:
+// let tuning = StreamingTuning { candidate_cap: 2000, ..StreamingTuning::default() };
+
+let mut unirust = Unirust::with_store_and_tuning(ontology, Store::new(), tuning);
+```
+
+The adaptive cap + deferred reconciliation is optimized for high-overlap workloads by bounding
+candidate scans while preserving correctness in a reconciliation pass.
+
+Available profiles: `Balanced` (default), `LowLatency`, `HighThroughput`, `BulkIngest`, `MemorySaver`.
+
 Stream into Minitao:
 
 ```bash
@@ -155,7 +175,24 @@ unirust-rs = "0.1.0"
 cargo test
 ```
 
-Architecture notes: see `DESIGN.md`.
+### Benchmarks and profiling
+
+Benchmarks live in `benches/entity_benchmark.rs`.
+
+```bash
+cargo bench --bench entity_benchmark -- entity_resolution
+cargo bench --bench entity_benchmark -- entity_resolution_large
+cargo bench --bench entity_benchmark -- entity_resolution_sharded
+```
+
+Enable the lightweight profiler (feature-gated) to print hot-path timings:
+
+```bash
+UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_5000
+UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_100k
+```
+
+Benchmark notes: see `BENCHMARKS.md`. Architecture notes: see `DESIGN.md`.
 
 ## License
 

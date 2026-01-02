@@ -57,39 +57,62 @@ pub fn query_master_entities(
         return Ok(QueryOutcome::Matches(Vec::new()));
     }
 
-    let mut matches: Vec<RawMatch> = Vec::new();
-
+    let mut record_to_cluster = std::collections::HashMap::new();
     for cluster in &clusters.clusters {
-        let mut candidate_intervals = vec![interval];
+        for record_id in &cluster.records {
+            record_to_cluster.insert(*record_id, cluster.id);
+        }
+    }
 
-        for descriptor in descriptors {
-            let descriptor_intervals = collect_descriptor_intervals(
-                store,
-                cluster.records.as_slice(),
-                descriptor.attr,
-                descriptor.value,
-            );
+    let mut candidate_intervals_by_cluster: std::collections::HashMap<ClusterId, Vec<Interval>> =
+        std::collections::HashMap::new();
 
-            if descriptor_intervals.is_empty() {
-                candidate_intervals.clear();
-                break;
-            }
+    for (idx, descriptor) in descriptors.iter().enumerate() {
+        let mut next: std::collections::HashMap<ClusterId, Vec<Interval>> =
+            std::collections::HashMap::new();
 
-            candidate_intervals = intersect_interval_sets(&candidate_intervals, &descriptor_intervals);
-            if candidate_intervals.is_empty() {
-                break;
+        let matches =
+            store.get_records_with_value_in_interval(descriptor.attr, descriptor.value, interval);
+
+        for (record_id, record_interval) in matches {
+            if let Some(&cluster_id) = record_to_cluster.get(&record_id) {
+                if let Some(overlap) = crate::temporal::intersect(&record_interval, &interval) {
+                    next.entry(cluster_id).or_default().push(overlap);
+                }
             }
         }
 
-        if candidate_intervals.is_empty() {
-            continue;
+        if idx == 0 {
+            for (cluster_id, intervals) in next {
+                candidate_intervals_by_cluster
+                    .entry(cluster_id)
+                    .or_default()
+                    .extend(intervals);
+            }
+        } else {
+            let mut intersected = std::collections::HashMap::new();
+            for (cluster_id, intervals) in candidate_intervals_by_cluster {
+                if let Some(other_intervals) = next.get(&cluster_id) {
+                    let merged = intersect_interval_sets(&intervals, other_intervals);
+                    if !merged.is_empty() {
+                        intersected.insert(cluster_id, merged);
+                    }
+                }
+            }
+            candidate_intervals_by_cluster = intersected;
         }
 
-        candidate_intervals = coalesce_intervals(&candidate_intervals);
-        for interval in candidate_intervals {
+        if candidate_intervals_by_cluster.is_empty() {
+            break;
+        }
+    }
+
+    let mut matches: Vec<RawMatch> = Vec::new();
+    for (cluster_id, intervals) in candidate_intervals_by_cluster {
+        for merged in coalesce_intervals(&intervals) {
             matches.push(RawMatch {
-                cluster_id: cluster.id,
-                interval,
+                cluster_id,
+                interval: merged,
             });
         }
     }
@@ -123,27 +146,6 @@ pub fn query_master_entities(
     Ok(QueryOutcome::Matches(matches))
 }
 
-fn collect_descriptor_intervals(
-    store: &dyn RecordStore,
-    records: &[RecordId],
-    attr: AttrId,
-    value: ValueId,
-) -> Vec<Interval> {
-    let mut intervals = Vec::new();
-
-    for record_id in records {
-        if let Some(record) = store.get_record(*record_id) {
-            for descriptor in &record.descriptors {
-                if descriptor.attr == attr && descriptor.value == value {
-                    intervals.push(descriptor.interval);
-                }
-            }
-        }
-    }
-
-    coalesce_intervals(&intervals)
-}
-
 fn intersect_interval_sets(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
     let mut overlaps = Vec::new();
 
@@ -162,10 +164,15 @@ fn coalesce_intervals(intervals: &[Interval]) -> Vec<Interval> {
     if intervals.is_empty() {
         return Vec::new();
     }
-    crate::temporal::coalesce_same_value(&intervals.iter().map(|interval| (*interval, ())).collect::<Vec<_>>())
-        .into_iter()
-        .map(|(interval, _)| interval)
-        .collect()
+    crate::temporal::coalesce_same_value(
+        &intervals
+            .iter()
+            .map(|interval| (*interval, ()))
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .map(|(interval, _)| interval)
+    .collect()
 }
 
 fn coalesce_matches_per_cluster(matches: Vec<RawMatch>) -> Vec<RawMatch> {
@@ -173,13 +180,19 @@ fn coalesce_matches_per_cluster(matches: Vec<RawMatch>) -> Vec<RawMatch> {
         std::collections::HashMap::new();
 
     for entry in matches {
-        by_cluster.entry(entry.cluster_id).or_default().push(entry.interval);
+        by_cluster
+            .entry(entry.cluster_id)
+            .or_default()
+            .push(entry.interval);
     }
 
     let mut result = Vec::new();
     for (cluster_id, intervals) in by_cluster {
         for interval in coalesce_intervals(&intervals) {
-            result.push(RawMatch { cluster_id, interval });
+            result.push(RawMatch {
+                cluster_id,
+                interval,
+            });
         }
     }
 
@@ -389,7 +402,10 @@ mod tests {
             &store,
             &clusters,
             &ontology,
-            &[QueryDescriptor { attr: name_attr, value: name_value }],
+            &[QueryDescriptor {
+                attr: name_attr,
+                value: name_value,
+            }],
             Interval::new(0, 20).unwrap(),
         );
 
@@ -418,10 +434,7 @@ mod tests {
         let role_admin = store.interner_mut().intern_value("admin");
         let role_viewer = store.interner_mut().intern_value("viewer");
 
-        ontology.add_identity_key(IdentityKey::new(
-            vec![email_attr],
-            "email".to_string(),
-        ));
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email".to_string()));
 
         let record1 = Record::new(
             RecordId(1),

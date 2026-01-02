@@ -27,19 +27,43 @@ pub trait RecordStore: Send + Sync {
     fn get_record(&self, id: RecordId) -> Option<&Record>;
 
     /// Get all records.
-    fn get_all_records<'a>(&'a self) -> Vec<&'a Record>;
+    fn get_all_records(&self) -> Vec<&Record>;
 
     /// Get records for a specific entity type.
-    fn get_records_by_entity_type<'a>(&'a self, entity_type: &str) -> Vec<&'a Record>;
+    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<&Record>;
 
     /// Get records for a specific perspective.
-    fn get_records_by_perspective<'a>(&'a self, perspective: &str) -> Vec<&'a Record>;
+    fn get_records_by_perspective(&self, perspective: &str) -> Vec<&Record>;
 
     /// Get records that have descriptors for a specific attribute.
-    fn get_records_with_attribute<'a>(&'a self, attr: AttrId) -> Vec<&'a Record>;
+    fn get_records_with_attribute(&self, attr: AttrId) -> Vec<&Record>;
 
     /// Get records that have descriptors overlapping with a time interval.
-    fn get_records_in_interval<'a>(&'a self, interval: Interval) -> Vec<&'a Record>;
+    fn get_records_in_interval(&self, interval: Interval) -> Vec<&Record>;
+
+    /// Get records that have a specific attribute-value pair within a time interval.
+    fn get_records_with_value_in_interval(
+        &self,
+        attr: AttrId,
+        value: ValueId,
+        interval: Interval,
+    ) -> Vec<(RecordId, Interval)> {
+        let mut matches = Vec::new();
+
+        for record in self.get_all_records() {
+            for descriptor in &record.descriptors {
+                if descriptor.attr == attr && descriptor.value == value {
+                    if let Some(overlap) =
+                        crate::temporal::intersect(&descriptor.interval, &interval)
+                    {
+                        matches.push((record.id, overlap));
+                    }
+                }
+            }
+        }
+
+        matches
+    }
 
     /// Get the string interner.
     fn interner(&self) -> &StringInterner;
@@ -61,6 +85,10 @@ pub struct Store {
     records: HashMap<RecordId, Record>,
     /// String interner for attributes and values
     interner: StringInterner,
+    /// Attribute-value index for fast lookups
+    attribute_value_index: AttributeValueIndex,
+    /// Temporal index for interval queries
+    temporal_index: TemporalIndex,
     /// Next available record ID
     next_record_id: u32,
 }
@@ -71,6 +99,8 @@ impl Store {
         Self {
             records: HashMap::new(),
             interner: StringInterner::new(),
+            attribute_value_index: AttributeValueIndex::new(),
+            temporal_index: TemporalIndex::new(),
             next_record_id: 0,
         }
     }
@@ -97,6 +127,10 @@ impl Store {
 
         let record_id = record.id;
         self.records.insert(record.id, record);
+        if let Some(stored) = self.records.get(&record_id) {
+            self.attribute_value_index.add_record(stored);
+            self.temporal_index.add_record(stored);
+        }
         Ok(record_id)
     }
 
@@ -174,6 +208,17 @@ impl Store {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Get records that have a specific attribute-value pair in a time interval.
+    pub fn get_records_with_value_in_interval(
+        &self,
+        attr: AttrId,
+        value: ValueId,
+        interval: Interval,
+    ) -> Vec<(RecordId, Interval)> {
+        self.attribute_value_index
+            .get_records_with_value_in_interval(attr, value, interval)
+    }
 }
 
 impl Default for Store {
@@ -195,24 +240,33 @@ impl RecordStore for Store {
         Store::get_record(self, id)
     }
 
-    fn get_all_records<'a>(&'a self) -> Vec<&'a Record> {
+    fn get_all_records(&self) -> Vec<&Record> {
         Store::get_all_records(self)
     }
 
-    fn get_records_by_entity_type<'a>(&'a self, entity_type: &str) -> Vec<&'a Record> {
+    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<&Record> {
         Store::get_records_by_entity_type(self, entity_type)
     }
 
-    fn get_records_by_perspective<'a>(&'a self, perspective: &str) -> Vec<&'a Record> {
+    fn get_records_by_perspective(&self, perspective: &str) -> Vec<&Record> {
         Store::get_records_by_perspective(self, perspective)
     }
 
-    fn get_records_with_attribute<'a>(&'a self, attr: AttrId) -> Vec<&'a Record> {
+    fn get_records_with_attribute(&self, attr: AttrId) -> Vec<&Record> {
         Store::get_records_with_attribute(self, attr)
     }
 
-    fn get_records_in_interval<'a>(&'a self, interval: Interval) -> Vec<&'a Record> {
+    fn get_records_in_interval(&self, interval: Interval) -> Vec<&Record> {
         Store::get_records_in_interval(self, interval)
+    }
+
+    fn get_records_with_value_in_interval(
+        &self,
+        attr: AttrId,
+        value: ValueId,
+        interval: Interval,
+    ) -> Vec<(RecordId, Interval)> {
+        Store::get_records_with_value_in_interval(self, attr, value, interval)
     }
 
     fn interner(&self) -> &StringInterner {
@@ -259,13 +313,17 @@ impl AttributeValueIndex {
         self.index.clear();
 
         for record in store.get_all_records() {
-            for descriptor in &record.descriptors {
-                let key = (descriptor.attr, descriptor.value);
-                self.index
-                    .entry(key)
-                    .or_default()
-                    .push((record.id, descriptor.interval));
-            }
+            self.add_record(record);
+        }
+    }
+
+    pub fn add_record(&mut self, record: &Record) {
+        for descriptor in &record.descriptors {
+            let key = (descriptor.attr, descriptor.value);
+            self.index
+                .entry(key)
+                .or_default()
+                .push((record.id, descriptor.interval));
         }
     }
 
@@ -339,12 +397,16 @@ impl TemporalIndex {
         self.index.clear();
 
         for record in store.get_all_records() {
-            for descriptor in &record.descriptors {
-                self.index
-                    .entry(descriptor.interval)
-                    .or_default()
-                    .push(record.id);
-            }
+            self.add_record(record);
+        }
+    }
+
+    pub fn add_record(&mut self, record: &Record) {
+        for descriptor in &record.descriptors {
+            self.index
+                .entry(descriptor.interval)
+                .or_default()
+                .push(record.id);
         }
     }
 
@@ -452,6 +514,31 @@ mod tests {
         let index = AttributeValueIndex::from_store(&store);
         let records = index.get_records_with_value(name_attr, name_value);
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn test_store_value_interval_lookup() {
+        let mut store = Store::new();
+        let email_attr = store.interner_mut().intern_attr("email");
+        let email_value = store.interner_mut().intern_value("alice@example.com");
+
+        let descriptor = Descriptor::new(email_attr, email_value, Interval::new(10, 20).unwrap());
+
+        let record = Record::new(
+            RecordId(1),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
+            vec![descriptor],
+        );
+
+        store.add_records(vec![record]).unwrap();
+
+        let matches = store.get_records_with_value_in_interval(
+            email_attr,
+            email_value,
+            Interval::new(0, 15).unwrap(),
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, RecordId(1));
     }
 
     #[test]
