@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let ontology_path = parse_arg("--ontology");
     let data_dir = parse_arg("--data-dir");
     let repair = has_flag("--repair");
+    let config_version = parse_arg("--config-version");
     let tuning = parse_tuning(parse_arg("--tuning"));
 
     let ontology = load_ontology(ontology_path)?;
@@ -58,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         tuning,
         data_dir.map(std::path::PathBuf::from),
         repair,
+        config_version,
     )?;
 
     println!("Unirust shard listening on {}", addr);

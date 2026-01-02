@@ -150,6 +150,26 @@ impl Unirust {
         self.store.get_record(id)
     }
 
+    /// Get records in an ID range [start, end), limited to max_results.
+    pub fn records_in_id_range(
+        &self,
+        start: RecordId,
+        end: RecordId,
+        max_results: usize,
+    ) -> Vec<Record> {
+        self.store.records_in_id_range(start, end, max_results)
+    }
+
+    /// Get min/max record IDs if any records exist.
+    pub fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
+        self.store.record_id_bounds()
+    }
+
+    /// Get the number of records in the store.
+    pub fn record_count(&self) -> usize {
+        self.store.len()
+    }
+
     /// Intern an attribute name into the store interner.
     pub fn intern_attr(&mut self, attr: &str) -> crate::model::AttrId {
         self.store.interner_mut().intern_attr(attr)

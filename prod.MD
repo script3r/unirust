@@ -34,10 +34,21 @@ Focus: correctness, durability, and performance with 32GB RAM per shard and 100M
 
 ## Phase 4: Distributed Reliability
 
-- [ ] Shard discovery (static file or registry)
-- [ ] Routing config versioning (fail fast if router/shards disagree)
-- [ ] Rebalancing plan + tooling
-- [ ] Replica/backup strategy (snapshot shipping)
+- [x] Shard discovery (static file or registry)
+- [x] Routing config versioning (fail fast if router/shards disagree)
+- [x] Rebalancing plan + tooling
+- [x] Replica/backup strategy (snapshot shipping)
+
+Rebalancing plan (v1):
+- Use consistent hashing ring with virtual nodes.
+- Provide a tooling command to list record ID ranges per shard and to export/import those ranges.
+- Move records via batch export/import RPCs (future: incremental streaming).
+- Freeze writes during move or apply dual-write with cutover (future).
+
+Replica/backup strategy (v1):
+- Use `Checkpoint` RPC per shard to create on-disk snapshots.
+- Ship snapshot directories to object storage on a schedule (external job).
+- Restore by replaying snapshots + rehydrating interner state.
 
 ## Phase 5: Production Operations
 

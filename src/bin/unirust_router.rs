@@ -28,10 +28,13 @@ fn load_ontology(path: Option<String>) -> anyhow::Result<DistributedOntologyConf
 async fn main() -> anyhow::Result<()> {
     let listen = parse_arg("--listen").unwrap_or_else(|| "127.0.0.1:50060".to_string());
     let shards_arg = parse_arg("--shards").unwrap_or_else(|| "127.0.0.1:50061".to_string());
+    let shards_file = parse_arg("--shards-file");
     let ontology_path = parse_arg("--ontology");
+    let config_version = parse_arg("--config-version");
 
     let shard_addrs = shards_arg
         .split(',')
+        .filter(|value| !value.is_empty())
         .map(|addr| {
             if addr.starts_with("http://") || addr.starts_with("https://") {
                 addr.to_string()
@@ -42,7 +45,11 @@ async fn main() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
 
     let ontology = load_ontology(ontology_path)?;
-    let router = RouterNode::connect(shard_addrs, ontology).await?;
+    let router = if let Some(path) = shards_file {
+        RouterNode::connect_from_file(path, ontology, config_version).await?
+    } else {
+        RouterNode::connect_with_version(shard_addrs, ontology, config_version).await?
+    };
     let addr: SocketAddr = listen.parse()?;
 
     println!("Unirust router listening on {}", addr);

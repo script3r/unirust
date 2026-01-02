@@ -164,12 +164,69 @@ message HealthCheckResponse {
   string status = 1;
 }
 
+message ConfigVersionRequest {}
+
+message ConfigVersionResponse {
+  string version = 1;
+}
+
 message CheckpointRequest {
   string path = 1;
 }
 
 message CheckpointResponse {
   repeated string paths = 1;
+}
+
+message RecordSnapshot {
+  uint32 record_id = 1;
+  RecordIdentity identity = 2;
+  repeated RecordDescriptor descriptors = 3;
+}
+
+message RecordIdRangeRequest {}
+
+message RecordIdRangeResponse {
+  bool empty = 1;
+  uint32 min_id = 2;
+  uint32 max_id = 3;
+  uint64 record_count = 4;
+}
+
+message ExportRecordsRequest {
+  uint32 start_id = 1;
+  uint32 end_id = 2;
+  uint32 limit = 3;
+}
+
+message ExportRecordsResponse {
+  repeated RecordSnapshot records = 1;
+  bool has_more = 2;
+  uint32 next_start_id = 3;
+}
+
+message ImportRecordsRequest {
+  repeated RecordSnapshot records = 1;
+}
+
+message ImportRecordsResponse {
+  uint64 imported = 1;
+}
+
+message RouterRecordIdRangeRequest {
+  uint32 shard_id = 1;
+}
+
+message RouterExportRecordsRequest {
+  uint32 shard_id = 1;
+  uint32 start_id = 2;
+  uint32 end_id = 3;
+  uint32 limit = 4;
+}
+
+message RouterImportRecordsRequest {
+  uint32 shard_id = 1;
+  repeated RecordSnapshot records = 2;
 }
 
 service ShardService {
@@ -179,7 +236,11 @@ service ShardService {
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
   rpc GetStats(StatsRequest) returns (StatsResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc GetRecordIdRange(RecordIdRangeRequest) returns (RecordIdRangeResponse);
+  rpc ExportRecords(ExportRecordsRequest) returns (ExportRecordsResponse);
+  rpc ImportRecords(ImportRecordsRequest) returns (ImportRecordsResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
   rpc Reset(Empty) returns (Empty);
 }
@@ -191,7 +252,11 @@ service RouterService {
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
   rpc GetStats(StatsRequest) returns (StatsResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc GetRecordIdRange(RouterRecordIdRangeRequest) returns (RecordIdRangeResponse);
+  rpc ExportRecords(RouterExportRecordsRequest) returns (ExportRecordsResponse);
+  rpc ImportRecords(RouterImportRecordsRequest) returns (ImportRecordsResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
   rpc Reset(Empty) returns (Empty);
 }

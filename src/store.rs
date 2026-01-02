@@ -85,6 +85,13 @@ pub trait RecordStore: Send + Sync {
     /// Check if the store is empty.
     fn is_empty(&self) -> bool;
 
+    /// Get records in an ID range [start, end), limited to max_results.
+    fn records_in_id_range(&self, start: RecordId, end: RecordId, max_results: usize)
+        -> Vec<Record>;
+
+    /// Get min/max record IDs if any records exist.
+    fn record_id_bounds(&self) -> Option<(RecordId, RecordId)>;
+
     /// Create a checkpoint at the provided path, if supported.
     fn checkpoint(&self, _path: &Path) -> Result<()> {
         Err(anyhow::anyhow!("checkpoint not supported for this store"))
@@ -269,6 +276,39 @@ impl Store {
         self.records.is_empty()
     }
 
+    /// Get records in an ID range [start, end), limited to max_results.
+    pub fn records_in_id_range(
+        &self,
+        start: RecordId,
+        end: RecordId,
+        max_results: usize,
+    ) -> Vec<Record> {
+        let mut records: Vec<Record> = self
+            .records
+            .values()
+            .filter(|record| record.id >= start && record.id < end)
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.id);
+        if max_results > 0 && records.len() > max_results {
+            records.truncate(max_results);
+        }
+        records
+    }
+
+    /// Get min/max record IDs if any records exist.
+    pub fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
+        let mut iter = self.records.keys();
+        let first = iter.next().copied()?;
+        let (min_id, max_id) = self
+            .records
+            .keys()
+            .fold((first, first), |(min_id, max_id), id| {
+                (std::cmp::min(min_id, *id), std::cmp::max(max_id, *id))
+            });
+        Some((min_id, max_id))
+    }
+
     /// Get records that have a specific attribute-value pair in a time interval.
     pub fn get_records_with_value_in_interval(
         &self,
@@ -349,6 +389,19 @@ impl RecordStore for Store {
 
     fn is_empty(&self) -> bool {
         Store::is_empty(self)
+    }
+
+    fn records_in_id_range(
+        &self,
+        start: RecordId,
+        end: RecordId,
+        max_results: usize,
+    ) -> Vec<Record> {
+        Store::records_in_id_range(self, start, end, max_results)
+    }
+
+    fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
+        Store::record_id_bounds(self)
     }
 }
 

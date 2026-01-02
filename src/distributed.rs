@@ -261,9 +261,11 @@ pub struct ShardNode {
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
     ingest_tx: tokio::sync::mpsc::Sender<IngestJob>,
+    config_version: String,
 }
 
 const INGEST_QUEUE_CAPACITY: usize = 128;
+const EXPORT_DEFAULT_LIMIT: usize = 1000;
 
 struct IngestJob {
     records: Vec<proto::RecordInput>,
@@ -276,7 +278,7 @@ impl ShardNode {
         ontology_config: DistributedOntologyConfig,
         tuning: StreamingTuning,
     ) -> AnyResult<Self> {
-        Self::new_with_data_dir(shard_id, ontology_config, tuning, None, false)
+        Self::new_with_data_dir(shard_id, ontology_config, tuning, None, false, None)
     }
 
     pub fn new_with_data_dir(
@@ -285,7 +287,9 @@ impl ShardNode {
         tuning: StreamingTuning,
         data_dir: Option<PathBuf>,
         repair_on_start: bool,
+        config_version: Option<String>,
     ) -> AnyResult<Self> {
+        let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
@@ -302,6 +306,7 @@ impl ShardNode {
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
                 ingest_tx,
+                config_version,
             });
         }
 
@@ -320,6 +325,7 @@ impl ShardNode {
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
             ingest_tx,
+            config_version,
         })
     }
 
@@ -351,6 +357,60 @@ impl ShardNode {
             ),
             descriptors,
         ))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn build_record_with_id(
+        unirust: &mut Unirust,
+        record_id: u32,
+        identity: &proto::RecordIdentity,
+        descriptors: &[proto::RecordDescriptor],
+    ) -> Result<Record, Status> {
+        let descriptors = descriptors
+            .iter()
+            .map(|desc| {
+                let attr = unirust.intern_attr(&desc.attr);
+                let value = unirust.intern_value(&desc.value);
+                let interval = Interval::new(desc.start, desc.end)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+                Ok(crate::Descriptor::new(attr, value, interval))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        Ok(Record::new(
+            RecordId(record_id),
+            RecordIdentity::new(
+                identity.entity_type.clone(),
+                identity.perspective.clone(),
+                identity.uid.clone(),
+            ),
+            descriptors,
+        ))
+    }
+
+    fn record_to_snapshot(unirust: &Unirust, record: &Record) -> proto::RecordSnapshot {
+        proto::RecordSnapshot {
+            record_id: record.id.0,
+            identity: Some(proto::RecordIdentity {
+                entity_type: record.identity.entity_type.clone(),
+                perspective: record.identity.perspective.clone(),
+                uid: record.identity.uid.clone(),
+            }),
+            descriptors: record
+                .descriptors
+                .iter()
+                .map(|descriptor| proto::RecordDescriptor {
+                    attr: unirust
+                        .resolve_attr(descriptor.attr)
+                        .unwrap_or_default(),
+                    value: unirust
+                        .resolve_value(descriptor.value)
+                        .unwrap_or_default(),
+                    start: descriptor.interval.start,
+                    end: descriptor.interval.end,
+                })
+                .collect(),
+        }
     }
 
     fn cluster_key_from_graph(
@@ -676,6 +736,16 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }))
     }
 
+    async fn get_config_version(
+        &self,
+        _request: Request<proto::ConfigVersionRequest>,
+    ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        Ok(Response::new(proto::ConfigVersionResponse {
+            version: self.config_version.clone(),
+        }))
+    }
+
+
     async fn checkpoint(
         &self,
         request: Request<proto::CheckpointRequest>,
@@ -697,6 +767,104 @@ impl proto::shard_service_server::ShardService for ShardNode {
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(proto::CheckpointResponse {
             paths: vec![target.to_string_lossy().to_string()],
+        }))
+    }
+
+    async fn get_record_id_range(
+        &self,
+        _request: Request<proto::RecordIdRangeRequest>,
+    ) -> Result<Response<proto::RecordIdRangeResponse>, Status> {
+        let unirust = self.unirust.lock().await;
+        let record_count = unirust.record_count() as u64;
+        let response = match unirust.record_id_bounds() {
+            Some((min_id, max_id)) => proto::RecordIdRangeResponse {
+                empty: false,
+                min_id: min_id.0,
+                max_id: max_id.0,
+                record_count,
+            },
+            None => proto::RecordIdRangeResponse {
+                empty: true,
+                min_id: 0,
+                max_id: 0,
+                record_count: 0,
+            },
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn export_records(
+        &self,
+        request: Request<proto::ExportRecordsRequest>,
+    ) -> Result<Response<proto::ExportRecordsResponse>, Status> {
+        let request = request.into_inner();
+        let limit = if request.limit == 0 {
+            EXPORT_DEFAULT_LIMIT
+        } else {
+            request.limit as usize
+        };
+        let start_id = RecordId(request.start_id);
+        let end_id = if request.end_id == 0 {
+            RecordId(u32::MAX)
+        } else {
+            RecordId(request.end_id)
+        };
+        if start_id >= end_id {
+            return Err(Status::invalid_argument("start_id must be < end_id"));
+        }
+
+        let unirust = self.unirust.lock().await;
+        let mut records = unirust.records_in_id_range(start_id, end_id, limit + 1);
+        let has_more = records.len() > limit;
+        if has_more {
+            records.truncate(limit);
+        }
+        let next_start_id = if has_more {
+            records
+                .last()
+                .map(|record| record.id.0.saturating_add(1))
+                .unwrap_or(request.start_id)
+        } else {
+            0
+        };
+        let response = proto::ExportRecordsResponse {
+            records: records
+                .iter()
+                .map(|record| Self::record_to_snapshot(&unirust, record))
+                .collect(),
+            has_more,
+            next_start_id,
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn import_records(
+        &self,
+        request: Request<proto::ImportRecordsRequest>,
+    ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        let request = request.into_inner();
+        if request.records.is_empty() {
+            return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
+        }
+        let mut unirust = self.unirust.lock().await;
+        let mut records = Vec::with_capacity(request.records.len());
+        for snapshot in &request.records {
+            let identity = snapshot
+                .identity
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+            records.push(Self::build_record_with_id(
+                &mut unirust,
+                snapshot.record_id,
+                identity,
+                &snapshot.descriptors,
+            )?);
+        }
+        unirust
+            .ingest(records)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(proto::ImportRecordsResponse {
+            imported: request.records.len() as u64,
         }))
     }
 
@@ -768,12 +936,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
 pub struct RouterNode {
     shard_clients: Vec<proto::shard_service_client::ShardServiceClient<tonic::transport::Channel>>,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
+    config_version: String,
 }
 
 impl RouterNode {
     pub async fn connect(
         shard_addrs: Vec<String>,
         ontology_config: DistributedOntologyConfig,
+    ) -> Result<Self, Status> {
+        Self::connect_with_version(shard_addrs, ontology_config, None).await
+    }
+
+    pub async fn connect_with_version(
+        shard_addrs: Vec<String>,
+        ontology_config: DistributedOntologyConfig,
+        config_version: Option<String>,
     ) -> Result<Self, Status> {
         let mut shard_clients = Vec::with_capacity(shard_addrs.len());
         for addr in shard_addrs {
@@ -782,10 +959,68 @@ impl RouterNode {
                 .map_err(|err| Status::unavailable(err.to_string()))?;
             shard_clients.push(client);
         }
+        let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
+        for client in &shard_clients {
+            let mut client = client.clone();
+            let version = client
+                .get_config_version(Request::new(proto::ConfigVersionRequest {}))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?
+                .into_inner()
+                .version;
+            if version != config_version {
+                return Err(Status::failed_precondition(format!(
+                    "config version mismatch: router {}, shard {}",
+                    config_version, version
+                )));
+            }
+        }
         Ok(Self {
             shard_clients,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
+            config_version,
         })
+    }
+
+    pub async fn connect_from_file(
+        path: impl AsRef<Path>,
+        ontology_config: DistributedOntologyConfig,
+        config_version: Option<String>,
+    ) -> Result<Self, Status> {
+        let content = fs::read_to_string(path.as_ref())
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let shard_addrs = content
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    None
+                } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    Some(trimmed.to_string())
+                } else {
+                    Some(format!("http://{}", trimmed))
+                }
+            })
+            .collect::<Vec<_>>();
+        if shard_addrs.is_empty() {
+            return Err(Status::invalid_argument("no shard addresses found"));
+        }
+        Self::connect_with_version(shard_addrs, ontology_config, config_version).await
+    }
+
+    fn shard_client(
+        &self,
+        shard_id: u32,
+    ) -> Result<proto::shard_service_client::ShardServiceClient<tonic::transport::Channel>, Status>
+    {
+        let idx = shard_id as usize;
+        if idx >= self.shard_clients.len() {
+            return Err(Status::invalid_argument(format!(
+                "shard_id {} out of range",
+                shard_id
+            )));
+        }
+        Ok(self.shard_clients[idx].clone())
     }
 
     fn merge_query_responses(
@@ -986,6 +1221,63 @@ impl proto::router_service_server::RouterService for RouterNode {
         Ok(Response::new(proto::HealthCheckResponse {
             status: "ok".to_string(),
         }))
+    }
+
+    async fn get_config_version(
+        &self,
+        _request: Request<proto::ConfigVersionRequest>,
+    ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        Ok(Response::new(proto::ConfigVersionResponse {
+            version: self.config_version.clone(),
+        }))
+    }
+
+    async fn get_record_id_range(
+        &self,
+        request: Request<proto::RouterRecordIdRangeRequest>,
+    ) -> Result<Response<proto::RecordIdRangeResponse>, Status> {
+        let request = request.into_inner();
+        let mut client = self.shard_client(request.shard_id)?;
+        let response = client
+            .get_record_id_range(Request::new(proto::RecordIdRangeRequest {}))
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?
+            .into_inner();
+        Ok(Response::new(response))
+    }
+
+    async fn export_records(
+        &self,
+        request: Request<proto::RouterExportRecordsRequest>,
+    ) -> Result<Response<proto::ExportRecordsResponse>, Status> {
+        let request = request.into_inner();
+        let mut client = self.shard_client(request.shard_id)?;
+        let response = client
+            .export_records(Request::new(proto::ExportRecordsRequest {
+                start_id: request.start_id,
+                end_id: request.end_id,
+                limit: request.limit,
+            }))
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?
+            .into_inner();
+        Ok(Response::new(response))
+    }
+
+    async fn import_records(
+        &self,
+        request: Request<proto::RouterImportRecordsRequest>,
+    ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        let request = request.into_inner();
+        let mut client = self.shard_client(request.shard_id)?;
+        let response = client
+            .import_records(Request::new(proto::ImportRecordsRequest {
+                records: request.records,
+            }))
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?
+            .into_inner();
+        Ok(Response::new(response))
     }
 
     async fn checkpoint(

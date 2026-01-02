@@ -478,6 +478,63 @@ impl RecordStore for PersistentStore {
         self.inner.is_empty()
     }
 
+    fn records_in_id_range(
+        &self,
+        start: RecordId,
+        end: RecordId,
+        max_results: usize,
+    ) -> Vec<Record> {
+        let records_cf = match self.db.cf_handle(CF_RECORDS) {
+            Some(cf) => cf,
+            None => return Vec::new(),
+        };
+        let mut records = Vec::new();
+        let start_key = start.0.to_be_bytes();
+        let mut iter = self.db.iterator_cf(
+            records_cf,
+            IteratorMode::From(&start_key, Direction::Forward),
+        );
+        while let Some(entry) = iter.next() {
+            let (key, value) = match entry {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            let record_id = match decode_record_id_key(&key) {
+                Some(id) => id,
+                None => continue,
+            };
+            if record_id >= end.0 {
+                break;
+            }
+            if let Ok(record) = bincode::deserialize::<Record>(&value) {
+                records.push(record);
+                if max_results > 0 && records.len() >= max_results {
+                    break;
+                }
+            }
+        }
+        records
+    }
+
+    fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
+        let records_cf = self.db.cf_handle(CF_RECORDS)?;
+        let mut start_iter = self.db.iterator_cf(records_cf, IteratorMode::Start);
+        let min_id = start_iter
+            .next()
+            .and_then(|entry| entry.ok())
+            .and_then(|(key, _)| decode_record_id_key(&key))
+            .map(RecordId)?;
+
+        let mut end_iter = self.db.iterator_cf(records_cf, IteratorMode::End);
+        let max_id = end_iter
+            .next()
+            .and_then(|entry| entry.ok())
+            .and_then(|(key, _)| decode_record_id_key(&key))
+            .map(RecordId)?;
+
+        Some((min_id, max_id))
+    }
+
     fn checkpoint(&self, path: &Path) -> Result<()> {
         PersistentStore::checkpoint(self, path)
     }
@@ -556,6 +613,13 @@ fn decode_attr_value_record_id(key: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_be_bytes(key[24..28].try_into().ok()?))
+}
+
+fn decode_record_id_key(key: &[u8]) -> Option<u32> {
+    if key.len() != 4 {
+        return None;
+    }
+    Some(u32::from_be_bytes(key.try_into().ok()?))
 }
 
 fn encode_string_prefix(value: &str) -> Vec<u8> {
