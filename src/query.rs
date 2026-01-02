@@ -5,11 +5,66 @@ use crate::ontology::Ontology;
 use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueryDescriptor {
     pub attr: AttrId,
     pub value: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuerySelectivity {
+    count: u64,
+    total_matches: u64,
+    max_matches: u64,
+}
+
+impl QuerySelectivity {
+    fn record(&mut self, matches: usize) {
+        self.count += 1;
+        self.total_matches += matches as u64;
+        self.max_matches = self.max_matches.max(matches as u64);
+    }
+
+    fn estimate(&self) -> usize {
+        if self.count == 0 {
+            return 0;
+        }
+        (self.total_matches / self.count) as usize
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct QuerySelectivityStats {
+    entries: HashMap<QueryDescriptor, QuerySelectivity>,
+}
+
+impl QuerySelectivityStats {
+    pub fn order_descriptors(&self, descriptors: &[QueryDescriptor]) -> Vec<QueryDescriptor> {
+        let mut ordered = descriptors
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, descriptor)| {
+                let estimate = self.entries.get(&descriptor).map(|entry| entry.estimate());
+                (estimate.unwrap_or(usize::MAX), idx, descriptor)
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(estimate, idx, _)| (*estimate, *idx));
+        ordered.into_iter().map(|(_, _, descriptor)| descriptor).collect()
+    }
+
+    pub fn record(&mut self, descriptor: QueryDescriptor, matches: usize) {
+        self.entries
+            .entry(descriptor)
+            .or_insert(QuerySelectivity {
+                count: 0,
+                total_matches: 0,
+                max_matches: 0,
+            })
+            .record(matches);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +154,111 @@ pub fn query_master_entities_with_cache(
         let mut next: std::collections::HashMap<ClusterId, Vec<Interval>> =
             std::collections::HashMap::new();
 
+        for (record_id, record_interval) in matches {
+            if let Some(&cluster_id) = record_to_cluster.get(&record_id) {
+                if let Some(overlap) = crate::temporal::intersect(&record_interval, &interval) {
+                    next.entry(cluster_id).or_default().push(overlap);
+                }
+            }
+        }
+
+        if idx == 0 {
+            for (cluster_id, intervals) in next {
+                candidate_intervals_by_cluster
+                    .entry(cluster_id)
+                    .or_default()
+                    .extend(intervals);
+            }
+        } else {
+            let mut intersected = std::collections::HashMap::new();
+            for (cluster_id, intervals) in candidate_intervals_by_cluster {
+                if let Some(other_intervals) = next.get(&cluster_id) {
+                    let merged = intersect_interval_sets(&intervals, other_intervals);
+                    if !merged.is_empty() {
+                        intersected.insert(cluster_id, merged);
+                    }
+                }
+            }
+            candidate_intervals_by_cluster = intersected;
+        }
+
+        if candidate_intervals_by_cluster.is_empty() {
+            break;
+        }
+    }
+
+    let mut matches: Vec<RawMatch> = Vec::new();
+    for (cluster_id, intervals) in candidate_intervals_by_cluster {
+        for merged in coalesce_intervals(&intervals) {
+            matches.push(RawMatch {
+                cluster_id,
+                interval: merged,
+            });
+        }
+    }
+
+    let matches = coalesce_matches_per_cluster(matches);
+    if let Some(conflict) = find_overlap_conflict(store, clusters, &matches, descriptors) {
+        return Ok(QueryOutcome::Conflict(conflict));
+    }
+    let matches = matches
+        .into_iter()
+        .map(|entry| QueryMatch {
+            cluster_id: entry.cluster_id,
+            interval: entry.interval,
+            golden: filter_golden_for_interval(
+                golden_cache
+                    .get(&entry.cluster_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                entry.interval,
+            ),
+            cluster_key: cluster_key_cache
+                .get(&entry.cluster_id)
+                .map(|key| key.value.clone()),
+            cluster_key_identity: cluster_key_cache
+                .get(&entry.cluster_id)
+                .map(|key| key.identity_key.clone()),
+        })
+        .collect();
+    Ok(QueryOutcome::Matches(matches))
+}
+
+pub fn query_master_entities_with_cache_selective(
+    store: &dyn RecordStore,
+    clusters: &Clusters,
+    descriptors: &[QueryDescriptor],
+    interval: Interval,
+    golden_cache: &std::collections::HashMap<ClusterId, Vec<GoldenDescriptor>>,
+    cluster_key_cache: &std::collections::HashMap<ClusterId, ClusterKey>,
+    stats: &mut QuerySelectivityStats,
+) -> Result<QueryOutcome> {
+    if descriptors.is_empty() {
+        return Ok(QueryOutcome::Matches(Vec::new()));
+    }
+
+    let ordered = stats.order_descriptors(descriptors);
+    let mut record_to_cluster = std::collections::HashMap::new();
+    for cluster in &clusters.clusters {
+        for record_id in &cluster.records {
+            record_to_cluster.insert(*record_id, cluster.id);
+        }
+    }
+
+    let mut candidate_intervals_by_cluster: std::collections::HashMap<ClusterId, Vec<Interval>> =
+        std::collections::HashMap::new();
+
+    for (idx, descriptor) in ordered.iter().enumerate() {
+        let matches =
+            store.get_records_with_value_in_interval(descriptor.attr, descriptor.value, interval);
+        stats.record(*descriptor, matches.len());
+        if matches.is_empty() {
+            candidate_intervals_by_cluster.clear();
+            break;
+        }
+
+        let mut next: std::collections::HashMap<ClusterId, Vec<Interval>> =
+            std::collections::HashMap::new();
         for (record_id, record_interval) in matches {
             if let Some(&cluster_id) = record_to_cluster.get(&record_id) {
                 if let Some(overlap) = crate::temporal::intersect(&record_interval, &interval) {

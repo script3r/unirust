@@ -61,6 +61,7 @@ pub struct Unirust {
     graph_state: Option<graph::IncrementalKnowledgeGraph>,
     query_cache: std::sync::Mutex<Option<QueryCache>>,
     conflict_cache: std::sync::Mutex<Option<Vec<conflicts::ConflictSummary>>>,
+    query_stats: std::sync::Mutex<query::QuerySelectivityStats>,
     tuning: StreamingTuning,
 }
 
@@ -89,6 +90,7 @@ impl Unirust {
             graph_state: None,
             query_cache: std::sync::Mutex::new(None),
             conflict_cache: std::sync::Mutex::new(None),
+            query_stats: std::sync::Mutex::new(query::QuerySelectivityStats::default()),
             tuning: StreamingTuning::default(),
         }
     }
@@ -104,6 +106,7 @@ impl Unirust {
             graph_state: None,
             query_cache: std::sync::Mutex::new(None),
             conflict_cache: std::sync::Mutex::new(None),
+            query_stats: std::sync::Mutex::new(query::QuerySelectivityStats::default()),
             tuning,
         }
     }
@@ -115,6 +118,7 @@ impl Unirust {
         self.graph_state = None;
         self.invalidate_query_cache();
         self.clear_conflict_cache();
+        self.clear_query_stats();
         Ok(())
     }
 
@@ -234,6 +238,7 @@ impl Unirust {
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedClusterAssignment>> {
         self.clear_conflict_cache();
+        self.clear_query_stats();
         if self.streaming.is_none() {
             self.streaming = Some(linker::StreamingLinker::new(
                 self.store.as_ref(),
@@ -274,6 +279,7 @@ impl Unirust {
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedConflictUpdate>> {
         self.clear_conflict_cache();
+        self.clear_query_stats();
         if self.streaming.is_none() {
             self.streaming = Some(linker::StreamingLinker::new(
                 self.store.as_ref(),
@@ -326,6 +332,7 @@ impl Unirust {
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedGraphUpdate>> {
         self.clear_conflict_cache();
+        self.clear_query_stats();
         if self.streaming.is_none() {
             self.streaming = Some(linker::StreamingLinker::new(
                 self.store.as_ref(),
@@ -406,13 +413,15 @@ impl Unirust {
             });
         }
         let cache = cache_guard.as_ref().expect("cache");
-        query::query_master_entities_with_cache(
+        let mut stats_guard = self.query_stats.lock().expect("query stats lock");
+        query::query_master_entities_with_cache_selective(
             self.store.as_ref(),
             &cache.clusters,
             descriptors,
             interval,
             &cache.golden,
             &cache.cluster_keys,
+            &mut stats_guard,
         )
     }
 
@@ -440,5 +449,9 @@ impl Unirust {
 
     fn clear_conflict_cache(&self) {
         *self.conflict_cache.lock().unwrap() = None;
+    }
+
+    fn clear_query_stats(&self) {
+        *self.query_stats.lock().unwrap() = query::QuerySelectivityStats::default();
     }
 }

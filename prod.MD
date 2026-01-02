@@ -66,8 +66,8 @@ Replica/backup strategy (v1):
 
 ### Phase 6.2: Incremental Indexing + Conflict Materialization
 - [x] Shard-local conflict summary cache (avoid repeat full scans on list conflicts)
-- [ ] Query planner selectivity stats (index hit rates, skew detection)
-- [ ] Cache invalidation strategy tuned for streaming ingest
+- [x] Query planner selectivity stats (adaptive ordering from observed matches)
+- [x] Cache invalidation strategy tuned for streaming ingest
 
 ### Phase 6.3: Storage Tuning at Scale
 - [ ] RocksDB per-CF tuning (block cache, filters, compression)
