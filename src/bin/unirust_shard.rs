@@ -42,11 +42,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "0".to_string())
         .parse()?;
     let ontology_path = parse_arg("--ontology");
+    let data_dir = parse_arg("--data-dir");
     let tuning = parse_tuning(parse_arg("--tuning"));
 
     let ontology = load_ontology(ontology_path)?;
     let addr: SocketAddr = listen.parse()?;
-    let shard = ShardNode::new(shard_id, ontology, tuning);
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        ontology,
+        tuning,
+        data_dir.map(std::path::PathBuf::from),
+    )?;
 
     println!("Unirust shard listening on {}", addr);
     Server::builder()

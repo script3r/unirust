@@ -14,6 +14,7 @@ pub mod index;
 pub mod linker;
 pub mod model;
 pub mod ontology;
+pub mod persistence;
 pub mod profile;
 pub mod query;
 pub mod sharding;
@@ -26,6 +27,7 @@ pub use config::{StreamingTuning, TuningProfile};
 pub use model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 pub use ontology::Ontology;
 pub use query::{QueryConflict, QueryDescriptor, QueryDescriptorOverlap, QueryMatch, QueryOutcome};
+pub use persistence::PersistentStore;
 pub use store::{RecordStore, Store};
 pub use temporal::Interval;
 

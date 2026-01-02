@@ -23,7 +23,7 @@ async fn spawn_shard(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
-    );
+    )?;
     let handle = tokio::spawn(async move {
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))

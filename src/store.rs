@@ -105,6 +105,17 @@ impl Store {
         }
     }
 
+    /// Create a new store with a preloaded interner and record ID counter.
+    pub fn with_interner(interner: StringInterner, next_record_id: u32) -> Self {
+        Self {
+            records: HashMap::new(),
+            interner,
+            attribute_value_index: AttributeValueIndex::new(),
+            temporal_index: TemporalIndex::new(),
+            next_record_id,
+        }
+    }
+
     /// Add a single record to the store and return its assigned ID.
     pub fn add_record(&mut self, mut record: Record) -> Result<RecordId> {
         // Intern all attribute and value strings
@@ -124,6 +135,28 @@ impl Store {
         } else {
             self.next_record_id = self.next_record_id.max(record.id.0 + 1);
         }
+
+        let record_id = record.id;
+        self.records.insert(record.id, record);
+        if let Some(stored) = self.records.get(&record_id) {
+            self.attribute_value_index.add_record(stored);
+            self.temporal_index.add_record(stored);
+        }
+        Ok(record_id)
+    }
+
+    /// Insert a record with an explicit ID without assigning a new one.
+    pub fn insert_record(&mut self, mut record: Record) -> Result<RecordId> {
+        for descriptor in &mut record.descriptors {
+            if self.interner.get_attr(descriptor.attr).is_none() {
+                descriptor.attr = self.interner.intern_attr("unknown");
+            }
+            if self.interner.get_value(descriptor.value).is_none() {
+                descriptor.value = self.interner.intern_value("unknown");
+            }
+        }
+
+        self.next_record_id = self.next_record_id.max(record.id.0 + 1);
 
         let record_id = record.id;
         self.records.insert(record.id, record);
@@ -197,6 +230,16 @@ impl Store {
     /// Get a mutable reference to the string interner
     pub fn interner_mut(&mut self) -> &mut StringInterner {
         &mut self.interner
+    }
+
+    /// Get the next record ID.
+    pub fn next_record_id(&self) -> u32 {
+        self.next_record_id
+    }
+
+    /// Set the next record ID.
+    pub fn set_next_record_id(&mut self, next_record_id: u32) {
+        self.next_record_id = next_record_id;
     }
 
     /// Get the number of records

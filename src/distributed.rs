@@ -4,10 +4,14 @@ use crate::model::{AttrId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::temporal::Interval;
-use crate::{StreamingTuning, Unirust};
+use crate::{PersistentStore, StreamingTuning, Unirust};
+use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -251,6 +255,7 @@ pub struct ShardNode {
     unirust: Arc<Mutex<Unirust>>,
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
+    data_dir: Option<PathBuf>,
 }
 
 impl ShardNode {
@@ -258,16 +263,38 @@ impl ShardNode {
         shard_id: u32,
         ontology_config: DistributedOntologyConfig,
         tuning: StreamingTuning,
-    ) -> Self {
+    ) -> AnyResult<Self> {
+        Self::new_with_data_dir(shard_id, ontology_config, tuning, None)
+    }
+
+    pub fn new_with_data_dir(
+        shard_id: u32,
+        ontology_config: DistributedOntologyConfig,
+        tuning: StreamingTuning,
+        data_dir: Option<PathBuf>,
+    ) -> AnyResult<Self> {
+        if let Some(path) = data_dir.clone() {
+            let (store, config, ontology) = load_persistent_state(&path, ontology_config)?;
+            let unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
+            return Ok(Self {
+                shard_id,
+                unirust: Arc::new(Mutex::new(unirust)),
+                tuning,
+                ontology_config: Arc::new(Mutex::new(config)),
+                data_dir: Some(path),
+            });
+        }
+
         let mut store = crate::Store::new();
         let ontology = ontology_config.clone().build_ontology(&mut store);
         let unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
-        Self {
+        Ok(Self {
             shard_id,
             unirust: Arc::new(Mutex::new(unirust)),
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
-        }
+            data_dir: None,
+        })
     }
 
     #[allow(clippy::result_large_err)]
@@ -341,6 +368,26 @@ impl ShardNode {
     }
 }
 
+fn load_persistent_state(
+    path: &Path,
+    fallback_config: DistributedOntologyConfig,
+) -> AnyResult<(PersistentStore, DistributedOntologyConfig, Ontology)> {
+    let mut store = PersistentStore::open(path)?;
+    let stored_config = store
+        .load_ontology_config()?
+        .map(|payload| serde_json::from_slice(&payload))
+        .transpose()?;
+    let config = if let Some(config) = stored_config {
+        config
+    } else {
+        store.save_ontology_config(&serde_json::to_vec(&fallback_config)?)?;
+        fallback_config
+    };
+    let ontology = config.build_ontology(store.inner_mut());
+    store.persist_interner()?;
+    Ok((store, config, ontology))
+}
+
 #[tonic::async_trait]
 impl proto::shard_service_server::ShardService for ShardNode {
     async fn set_ontology(
@@ -353,14 +400,32 @@ impl proto::shard_service_server::ShardService for ShardNode {
             .ok_or_else(|| Status::invalid_argument("ontology config is required"))?;
 
         let config = map_proto_config(&config);
-        let mut store = crate::Store::new();
-        let ontology = config.build_ontology(&mut store);
-
         let mut config_guard = self.ontology_config.lock().await;
-        *config_guard = config;
+        *config_guard = config.clone();
 
-        let mut guard = self.unirust.lock().await;
-        *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        if let Some(path) = &self.data_dir {
+            let mut store =
+                PersistentStore::open(path).map_err(|err| Status::internal(err.to_string()))?;
+            store
+                .reset_data()
+                .map_err(|err| Status::internal(err.to_string()))?;
+            store
+                .save_ontology_config(&serde_json::to_vec(&config).map_err(|err| {
+                    Status::internal(format!("failed to encode ontology config: {err}"))
+                })?)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let ontology = config.build_ontology(store.inner_mut());
+            store
+                .persist_interner()
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let mut guard = self.unirust.lock().await;
+            *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        } else {
+            let mut store = crate::Store::new();
+            let ontology = config.build_ontology(&mut store);
+            let mut guard = self.unirust.lock().await;
+            *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        }
 
         Ok(Response::new(proto::ApplyOntologyResponse {}))
     }
@@ -565,11 +630,30 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::Empty>,
     ) -> Result<Response<proto::Empty>, Status> {
-        let mut store = crate::Store::new();
         let config = self.ontology_config.lock().await.clone();
-        let ontology = config.build_ontology(&mut store);
-        let mut guard = self.unirust.lock().await;
-        *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        if let Some(path) = &self.data_dir {
+            let mut store =
+                PersistentStore::open(path).map_err(|err| Status::internal(err.to_string()))?;
+            store
+                .reset_data()
+                .map_err(|err| Status::internal(err.to_string()))?;
+            store
+                .save_ontology_config(&serde_json::to_vec(&config).map_err(|err| {
+                    Status::internal(format!("failed to encode ontology config: {err}"))
+                })?)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let ontology = config.build_ontology(store.inner_mut());
+            store
+                .persist_interner()
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let mut guard = self.unirust.lock().await;
+            *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        } else {
+            let mut store = crate::Store::new();
+            let ontology = config.build_ontology(&mut store);
+            let mut guard = self.unirust.lock().await;
+            *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        }
         Ok(Response::new(proto::Empty {}))
     }
 }

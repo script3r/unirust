@@ -135,7 +135,7 @@ impl Record {
 }
 
 /// String interner for efficient storage of attributes and values
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StringInterner {
     attr_to_id: HashMap<String, AttrId>,
     value_to_id: HashMap<String, ValueId>,
