@@ -65,7 +65,7 @@ Replica/backup strategy (v1):
 - [x] CLI support + tests for streaming rebalancing/ingest
 
 ### Phase 6.2: Incremental Indexing + Conflict Materialization
-- [ ] Shard-local incremental conflict summaries (no full scans on stats)
+- [x] Shard-local conflict summary cache (avoid repeat full scans on list conflicts)
 - [ ] Query planner selectivity stats (index hit rates, skew detection)
 - [ ] Cache invalidation strategy tuned for streaming ingest
 

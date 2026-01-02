@@ -1137,13 +1137,19 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
         let unirust = self.unirust.lock().await;
         let request = request.into_inner();
-        let clusters = unirust
-            .build_clusters()
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let observations = unirust
-            .detect_conflicts(&clusters)
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let mut summaries = unirust.summarize_conflicts(&observations);
+        let mut summaries = if let Some(cache) = unirust.cached_conflict_summaries() {
+            cache
+        } else {
+            let clusters = unirust
+                .build_clusters()
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let observations = unirust
+                .detect_conflicts(&clusters)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let summaries = unirust.summarize_conflicts(&observations);
+            unirust.set_conflict_cache(summaries.clone());
+            summaries
+        };
 
         if !request.attribute.is_empty() {
             summaries.retain(|summary| summary.attribute.as_deref() == Some(&request.attribute));

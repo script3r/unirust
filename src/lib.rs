@@ -60,6 +60,7 @@ pub struct Unirust {
     streaming: Option<linker::StreamingLinker>,
     graph_state: Option<graph::IncrementalKnowledgeGraph>,
     query_cache: std::sync::Mutex<Option<QueryCache>>,
+    conflict_cache: std::sync::Mutex<Option<Vec<conflicts::ConflictSummary>>>,
     tuning: StreamingTuning,
 }
 
@@ -87,6 +88,7 @@ impl Unirust {
             streaming: None,
             graph_state: None,
             query_cache: std::sync::Mutex::new(None),
+            conflict_cache: std::sync::Mutex::new(None),
             tuning: StreamingTuning::default(),
         }
     }
@@ -101,6 +103,7 @@ impl Unirust {
             streaming: None,
             graph_state: None,
             query_cache: std::sync::Mutex::new(None),
+            conflict_cache: std::sync::Mutex::new(None),
             tuning,
         }
     }
@@ -111,6 +114,7 @@ impl Unirust {
         self.streaming = None;
         self.graph_state = None;
         self.invalidate_query_cache();
+        self.clear_conflict_cache();
         Ok(())
     }
 
@@ -229,6 +233,7 @@ impl Unirust {
         &mut self,
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedClusterAssignment>> {
+        self.clear_conflict_cache();
         if self.streaming.is_none() {
             self.streaming = Some(linker::StreamingLinker::new(
                 self.store.as_ref(),
@@ -268,6 +273,7 @@ impl Unirust {
         &mut self,
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedConflictUpdate>> {
+        self.clear_conflict_cache();
         if self.streaming.is_none() {
             self.streaming = Some(linker::StreamingLinker::new(
                 self.store.as_ref(),
@@ -319,6 +325,7 @@ impl Unirust {
         &mut self,
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedGraphUpdate>> {
+        self.clear_conflict_cache();
         if self.streaming.is_none() {
             self.streaming = Some(linker::StreamingLinker::new(
                 self.store.as_ref(),
@@ -346,6 +353,8 @@ impl Unirust {
                 streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
             let observations =
                 conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
+            let summaries = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
+            *self.conflict_cache.lock().unwrap() = Some(summaries);
 
             graph_state.update(
                 self.store.as_ref(),
@@ -419,5 +428,17 @@ impl Unirust {
         observations: &[conflicts::Observation],
     ) -> Vec<conflicts::ConflictSummary> {
         conflicts::summarize_conflicts(self.store.as_ref(), observations)
+    }
+
+    pub fn cached_conflict_summaries(&self) -> Option<Vec<conflicts::ConflictSummary>> {
+        self.conflict_cache.lock().unwrap().clone()
+    }
+
+    pub fn set_conflict_cache(&self, summaries: Vec<conflicts::ConflictSummary>) {
+        *self.conflict_cache.lock().unwrap() = Some(summaries);
+    }
+
+    fn clear_conflict_cache(&self) {
+        *self.conflict_cache.lock().unwrap() = None;
     }
 }
