@@ -230,7 +230,17 @@ message ExportRecordsResponse {
   uint32 next_start_id = 3;
 }
 
+message ExportRecordsChunk {
+  repeated RecordSnapshot records = 1;
+  bool has_more = 2;
+  uint32 next_start_id = 3;
+}
+
 message ImportRecordsRequest {
+  repeated RecordSnapshot records = 1;
+}
+
+message ImportRecordsChunk {
   repeated RecordSnapshot records = 1;
 }
 
@@ -266,7 +276,9 @@ service ShardService {
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
   rpc GetRecordIdRange(RecordIdRangeRequest) returns (RecordIdRangeResponse);
   rpc ExportRecords(ExportRecordsRequest) returns (ExportRecordsResponse);
+  rpc ExportRecordsStream(ExportRecordsRequest) returns (stream ExportRecordsChunk);
   rpc ImportRecords(ImportRecordsRequest) returns (ImportRecordsResponse);
+  rpc ImportRecordsStream(stream ImportRecordsChunk) returns (ImportRecordsResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
   rpc Reset(Empty) returns (Empty);
 }
@@ -283,7 +295,9 @@ service RouterService {
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
   rpc GetRecordIdRange(RouterRecordIdRangeRequest) returns (RecordIdRangeResponse);
   rpc ExportRecords(RouterExportRecordsRequest) returns (ExportRecordsResponse);
+  rpc ExportRecordsStream(RouterExportRecordsRequest) returns (stream ExportRecordsChunk);
   rpc ImportRecords(RouterImportRecordsRequest) returns (ImportRecordsResponse);
+  rpc ImportRecordsStream(stream RouterImportRecordsRequest) returns (ImportRecordsResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
   rpc Reset(Empty) returns (Empty);
 }

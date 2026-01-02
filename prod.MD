@@ -55,3 +55,30 @@ Replica/backup strategy (v1):
 - [x] Metrics/tracing (ingest latency, query latency, compactions, qps)
 - [x] Alerting + runbooks
 - [x] SLOs and capacity planning
+
+## Phase 6: Billion-Scale Performance
+
+### Phase 6.1: Streaming RPCs + Backpressure
+- [x] Streaming export/import for rebalancing (server-stream export, client-stream import)
+- [ ] Streaming ingest (client-stream) with bounded queue on shard
+- [x] Router proxy for streaming RPCs
+- [x] CLI support + tests for streaming rebalancing/ingest
+
+### Phase 6.2: Incremental Indexing + Conflict Materialization
+- [ ] Shard-local incremental conflict summaries (no full scans on stats)
+- [ ] Query planner selectivity stats (index hit rates, skew detection)
+- [ ] Cache invalidation strategy tuned for streaming ingest
+
+### Phase 6.3: Storage Tuning at Scale
+- [ ] RocksDB per-CF tuning (block cache, filters, compression)
+- [ ] Dynamic cache sizing + memory limits
+- [ ] Compaction/flush metrics and throttling policies
+
+### Phase 6.4: Concurrency + Resilience
+- [ ] Reduce global mutex scope (shard-local actors or partitioned locks)
+- [ ] Idempotent ingest + WAL/replay for partial failures
+- [ ] Hot-key mitigation + shard auto-rebalance (dual-write cutover)
+
+### Phase 6.5: Benchmarking + Regression
+- [ ] 100M+ record ingest benchmark harness
+- [ ] Query latency regression suite (p50/p95/p99)

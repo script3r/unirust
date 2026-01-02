@@ -19,7 +19,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
+use std::pin::Pin;
 
 #[derive(Debug, Deserialize)]
 struct JsonRecordIdentity {
@@ -616,6 +619,9 @@ fn load_persistent_state(
 
 #[tonic::async_trait]
 impl proto::shard_service_server::ShardService for ShardNode {
+    type ExportRecordsStreamStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ExportRecordsChunk, Status>> + Send + 'static>>;
+
     async fn set_ontology(
         &self,
         request: Request<proto::ApplyOntologyRequest>,
@@ -944,6 +950,82 @@ impl proto::shard_service_server::ShardService for ShardNode {
         Ok(Response::new(response))
     }
 
+    async fn export_records_stream(
+        &self,
+        request: Request<proto::ExportRecordsRequest>,
+    ) -> Result<Response<Self::ExportRecordsStreamStream>, Status> {
+        let request = request.into_inner();
+        let limit = if request.limit == 0 {
+            EXPORT_DEFAULT_LIMIT
+        } else {
+            request.limit as usize
+        };
+        let mut start_id = request.start_id;
+        let end_id = if request.end_id == 0 {
+            u32::MAX
+        } else {
+            request.end_id
+        };
+        if start_id >= end_id {
+            return Err(Status::invalid_argument("start_id must be < end_id"));
+        }
+
+        let unirust = self.unirust.clone();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            loop {
+                let (records, has_more, next_start_id) = {
+                    let unirust_guard = unirust.lock().await;
+                    let mut records =
+                        unirust_guard.records_in_id_range(RecordId(start_id), RecordId(end_id), limit + 1);
+                    let has_more = records.len() > limit;
+                    if has_more {
+                        records.truncate(limit);
+                    }
+                    let next_start_id = if has_more {
+                        records
+                            .last()
+                            .map(|record| record.id.0.saturating_add(1))
+                            .unwrap_or(start_id)
+                    } else {
+                        0
+                    };
+                    let snapshots = records
+                        .iter()
+                        .map(|record| ShardNode::record_to_snapshot(&unirust_guard, record))
+                        .collect::<Vec<_>>();
+                    (snapshots, has_more, next_start_id)
+                };
+
+                if records.is_empty() {
+                    break;
+                }
+
+                if tx
+                    .send(Ok(proto::ExportRecordsChunk {
+                        records,
+                        has_more,
+                        next_start_id,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+
+                if !has_more {
+                    break;
+                }
+                if next_start_id == 0 {
+                    break;
+                }
+                start_id = next_start_id;
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
     async fn import_records(
         &self,
         request: Request<proto::ImportRecordsRequest>,
@@ -972,6 +1054,42 @@ impl proto::shard_service_server::ShardService for ShardNode {
         Ok(Response::new(proto::ImportRecordsResponse {
             imported: request.records.len() as u64,
         }))
+    }
+
+    async fn import_records_stream(
+        &self,
+        request: Request<tonic::Streaming<proto::ImportRecordsChunk>>,
+    ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut imported = 0u64;
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|err| Status::invalid_argument(err.to_string()))?
+        {
+            if chunk.records.is_empty() {
+                continue;
+            }
+            let mut unirust = self.unirust.lock().await;
+            let mut records = Vec::with_capacity(chunk.records.len());
+            for snapshot in &chunk.records {
+                let identity = snapshot
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+                records.push(Self::build_record_with_id(
+                    &mut unirust,
+                    snapshot.record_id,
+                    identity,
+                    &snapshot.descriptors,
+                )?);
+            }
+            unirust
+                .ingest(records)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            imported += chunk.records.len() as u64;
+        }
+        Ok(Response::new(proto::ImportRecordsResponse { imported }))
     }
 
     async fn list_conflicts(
@@ -1202,6 +1320,9 @@ impl RouterNode {
 
 #[tonic::async_trait]
 impl proto::router_service_server::RouterService for RouterNode {
+    type ExportRecordsStreamStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ExportRecordsChunk, Status>> + Send + 'static>>;
+
     async fn set_ontology(
         &self,
         request: Request<proto::ApplyOntologyRequest>,
@@ -1438,6 +1559,26 @@ impl proto::router_service_server::RouterService for RouterNode {
         Ok(Response::new(response))
     }
 
+    async fn export_records_stream(
+        &self,
+        request: Request<proto::RouterExportRecordsRequest>,
+    ) -> Result<Response<Self::ExportRecordsStreamStream>, Status> {
+        let request = request.into_inner();
+        let mut client = self.shard_client(request.shard_id)?;
+        let response = client
+            .export_records_stream(Request::new(proto::ExportRecordsRequest {
+                start_id: request.start_id,
+                end_id: request.end_id,
+                limit: request.limit,
+            }))
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?;
+        let stream = response
+            .into_inner()
+            .map(|item| item.map_err(|err| Status::unavailable(err.to_string())));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn import_records(
         &self,
         request: Request<proto::RouterImportRecordsRequest>,
@@ -1453,6 +1594,81 @@ impl proto::router_service_server::RouterService for RouterNode {
             .into_inner();
         Ok(Response::new(response))
     }
+
+    async fn import_records_stream(
+        &self,
+        request: Request<tonic::Streaming<proto::RouterImportRecordsRequest>>,
+    ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let Some(first) = first else {
+            return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
+        };
+
+        let shard_id = first.shard_id;
+        let mut client = self.shard_client(shard_id)?;
+        let (tx, rx) = mpsc::channel(4);
+        let (err_tx, err_rx) = oneshot::channel::<Result<(), Status>>();
+
+        tokio::spawn(async move {
+            if tx
+                .send(proto::ImportRecordsChunk {
+                    records: first.records,
+                })
+                .await
+                .is_err()
+            {
+                let _ = err_tx.send(Err(Status::unavailable("import channel closed")));
+                return;
+            }
+            loop {
+                match inbound.message().await {
+                    Ok(Some(chunk)) => {
+                        if chunk.shard_id != shard_id {
+                            let _ = err_tx.send(Err(Status::invalid_argument(
+                                "shard_id must be consistent for stream",
+                            )));
+                            return;
+                        }
+                        if tx
+                            .send(proto::ImportRecordsChunk {
+                                records: chunk.records,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            let _ = err_tx.send(Err(Status::unavailable(
+                                "import channel closed",
+                            )));
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = err_tx.send(Ok(()));
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send(Err(Status::invalid_argument(err.to_string())));
+                        return;
+                    }
+                }
+            }
+        });
+
+        let response = client
+            .import_records_stream(Request::new(ReceiverStream::new(rx)))
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?;
+        match err_rx.await {
+            Ok(Ok(())) => Ok(response),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(Status::unavailable("import stream dropped")),
+        }
+    }
+
 
     async fn checkpoint(
         &self,

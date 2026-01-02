@@ -2,8 +2,11 @@ use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::shard_service_client::ShardServiceClient;
 use unirust_rs::distributed::proto::{
     ExportRecordsRequest, ImportRecordsRequest, RecordIdRangeRequest,
+    ImportRecordsChunk,
     RouterExportRecordsRequest, RouterImportRecordsRequest, RouterRecordIdRangeRequest,
 };
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -95,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let batch_size: u32 = parse_arg("--batch-size")
         .unwrap_or_else(|| "1000".to_string())
         .parse()?;
+    let use_stream = has_flag("--stream");
 
     let use_router = router.is_some();
     let mut router_client = if let Some(router) = router {
@@ -117,69 +121,146 @@ async fn main() -> anyhow::Result<()> {
 
     let mut next_start_id = start_id;
     let mut total_imported = 0u64;
-    loop {
-        let response = if let Some(client) = router_client.as_mut() {
+    if use_stream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ImportRecordsChunk>(4);
+        let import_task = if let Some(client) = router_client.as_ref() {
+            let mut client = client.clone();
+            let shard_id = target_shard_id.expect("target shard id");
+            let stream = ReceiverStream::new(rx).map(move |chunk| RouterImportRecordsRequest {
+                shard_id,
+                records: chunk.records,
+            });
+            tokio::spawn(async move {
+                client
+                    .import_records_stream(stream)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))
+            })
+        } else {
+            let mut client = target_client.take().expect("target client");
+            tokio::spawn(async move {
+                client
+                    .import_records_stream(ReceiverStream::new(rx))
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))
+            })
+        };
+
+        let mut export_stream: std::pin::Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<unirust_rs::distributed::proto::ExportRecordsChunk, anyhow::Error>> + Send>,
+        > = if let Some(client) = router_client.as_mut() {
             let shard_id = source_shard_id.expect("source shard id");
-            client
-                .export_records(RouterExportRecordsRequest {
+            let stream = client
+                .export_records_stream(RouterExportRecordsRequest {
                     shard_id,
-                    start_id: next_start_id,
+                    start_id,
                     end_id,
                     limit: batch_size,
                 })
                 .await?
                 .into_inner()
+                .map(|item| item.map_err(|err| anyhow::anyhow!(err.to_string())));
+            Box::pin(stream)
         } else {
-            source_client
+            let stream = source_client
                 .as_mut()
                 .expect("source client")
-                .export_records(ExportRecordsRequest {
-                    start_id: next_start_id,
+                .export_records_stream(ExportRecordsRequest {
+                    start_id,
                     end_id,
                     limit: batch_size,
                 })
                 .await?
                 .into_inner()
+                .map(|item| item.map_err(|err| anyhow::anyhow!(err.to_string())));
+            Box::pin(stream)
         };
 
-        if response.records.is_empty() {
-            break;
+        while let Some(chunk) = export_stream.next().await {
+            let chunk = chunk?;
+            if chunk.records.is_empty() {
+                continue;
+            }
+            let count = chunk.records.len() as u64;
+            tx.send(ImportRecordsChunk { records: chunk.records })
+                .await
+                .map_err(|_| anyhow::anyhow!("import stream closed"))?;
+            total_imported += count;
+            println!("Imported {} records (total {})", count, total_imported);
         }
+        drop(tx);
 
-        let imported = if let Some(client) = router_client.as_mut() {
-            let shard_id = target_shard_id.expect("target shard id");
-            client
-                .import_records(RouterImportRecordsRequest {
-                    shard_id,
-                    records: response.records,
-                })
-                .await?
-                .into_inner()
-                .imported
-        } else {
-            target_client
-                .as_mut()
-                .expect("target client")
-                .import_records(ImportRecordsRequest {
-                    records: response.records,
-                })
-                .await?
-                .into_inner()
-                .imported
-        };
-        total_imported += imported;
-        println!(
-            "Imported {} records (total {})",
-            imported, total_imported
-        );
+        let response = import_task.await??;
+        total_imported = response.imported;
+    } else {
+        loop {
+            let response = if let Some(client) = router_client.as_mut() {
+                let shard_id = source_shard_id.expect("source shard id");
+                client
+                    .export_records(RouterExportRecordsRequest {
+                        shard_id,
+                        start_id: next_start_id,
+                        end_id,
+                        limit: batch_size,
+                    })
+                    .await?
+                    .into_inner()
+            } else {
+                source_client
+                    .as_mut()
+                    .expect("source client")
+                    .export_records(ExportRecordsRequest {
+                        start_id: next_start_id,
+                        end_id,
+                        limit: batch_size,
+                    })
+                    .await?
+                    .into_inner()
+            };
 
-        if !response.has_more {
-            break;
+            if response.records.is_empty() {
+                break;
+            }
+
+            let imported = if let Some(client) = router_client.as_mut() {
+                let shard_id = target_shard_id.expect("target shard id");
+                client
+                    .import_records(RouterImportRecordsRequest {
+                        shard_id,
+                        records: response.records,
+                    })
+                    .await?
+                    .into_inner()
+                    .imported
+            } else {
+                target_client
+                    .as_mut()
+                    .expect("target client")
+                    .import_records(ImportRecordsRequest {
+                        records: response.records,
+                    })
+                    .await?
+                    .into_inner()
+                    .imported
+            };
+            total_imported += imported;
+            println!(
+                "Imported {} records (total {})",
+                imported, total_imported
+            );
+
+            if !response.has_more {
+                break;
+            }
+            if response.next_start_id == 0 {
+                return Err(anyhow::anyhow!(
+                    "export indicated more records but next_start_id is 0"
+                ));
+            }
+            next_start_id = response.next_start_id;
         }
-        if response.next_start_id == 0 {
-            return Err(anyhow::anyhow!("export indicated more records but next_start_id is 0"));
-        }
-        next_start_id = response.next_start_id;
     }
 
     println!("Done. Total imported: {}", total_imported);
