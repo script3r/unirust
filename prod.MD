@@ -21,10 +21,10 @@ Focus: correctness, durability, and performance with 32GB RAM per shard and 100M
 
 ## Phase 2: Ingest Throughput
 
-- [ ] Batch write record + index updates via RocksDB `WriteBatch`
-- [ ] Async ingest pipeline with bounded queue + backpressure
-- [ ] Compaction tuning (memtable size, level sizes, compression)
-- [ ] Incremental interner persistence (keyed entries, not full snapshot)
+- [x] Batch write record + index updates via RocksDB `WriteBatch`
+- [x] Async ingest pipeline with bounded queue + backpressure
+- [x] Compaction tuning (memtable size, level sizes, compression)
+- [x] Incremental interner persistence (keyed entries, not full snapshot)
 
 ## Phase 3: Query and Conflict Performance
 

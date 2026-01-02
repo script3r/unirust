@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs};
 use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +260,14 @@ pub struct ShardNode {
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
+    ingest_tx: tokio::sync::mpsc::Sender<IngestJob>,
+}
+
+const INGEST_QUEUE_CAPACITY: usize = 128;
+
+struct IngestJob {
+    records: Vec<proto::RecordInput>,
+    respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
 }
 
 impl ShardNode {
@@ -280,25 +289,37 @@ impl ShardNode {
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
-            let unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
+            let unirust = Arc::new(Mutex::new(Unirust::with_store_and_tuning(
+                ontology,
+                store,
+                tuning.clone(),
+            )));
+            let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id);
             return Ok(Self {
                 shard_id,
-                unirust: Arc::new(Mutex::new(unirust)),
+                unirust,
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
+                ingest_tx,
             });
         }
 
         let mut store = crate::Store::new();
         let ontology = ontology_config.clone().build_ontology(&mut store);
-        let unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
+        let unirust = Arc::new(Mutex::new(Unirust::with_store_and_tuning(
+            ontology,
+            store,
+            tuning.clone(),
+        )));
+        let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id);
         Ok(Self {
             shard_id,
-            unirust: Arc::new(Mutex::new(unirust)),
+            unirust,
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
+            ingest_tx,
         })
     }
 
@@ -389,6 +410,47 @@ fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, 
     }
 }
 
+fn spawn_ingest_worker(
+    unirust: Arc<Mutex<Unirust>>,
+    shard_id: u32,
+) -> mpsc::Sender<IngestJob> {
+    let (tx, mut rx) = mpsc::channel::<IngestJob>(INGEST_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let result = {
+                let mut guard = unirust.lock().await;
+                process_ingest_batch(&mut guard, shard_id, &job.records)
+            };
+            let _ = job.respond_to.send(result);
+        }
+    });
+    tx
+}
+
+fn process_ingest_batch(
+    unirust: &mut Unirust,
+    shard_id: u32,
+    records: &[proto::RecordInput],
+) -> Result<Vec<proto::IngestAssignment>, Status> {
+    let mut assignments = Vec::new();
+    for record in records {
+        let record_input = ShardNode::build_record(unirust, record)?;
+        let update = unirust
+            .stream_record_update_graph(record_input)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let cluster_key = ShardNode::cluster_key_from_graph(update.assignment.cluster_id, &update.graph);
+
+        assignments.push(proto::IngestAssignment {
+            index: record.index,
+            shard_id,
+            record_id: update.assignment.record_id.0,
+            cluster_id: update.assignment.cluster_id.0,
+            cluster_key,
+        });
+    }
+    Ok(assignments)
+}
+
 fn load_persistent_state(
     path: &Path,
     fallback_config: DistributedOntologyConfig,
@@ -411,7 +473,7 @@ fn load_persistent_state(
         fallback_config
     };
     let ontology = config.build_ontology(store.inner_mut());
-    store.persist_interner()?;
+    store.persist_state()?;
     Ok((store, config, ontology))
 }
 
@@ -443,7 +505,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map_err(|err| Status::internal(err.to_string()))?;
             let ontology = config.build_ontology(store.inner_mut());
             store
-                .persist_interner()
+                .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
             let mut guard = self.unirust.lock().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
@@ -461,25 +523,18 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
-        let mut unirust = self.unirust.lock().await;
-        let mut assignments = Vec::new();
-
-        for record in &request.into_inner().records {
-            let record_input = Self::build_record(&mut unirust, record)?;
-            let update = unirust
-                .stream_record_update_graph(record_input)
-                .map_err(|err| Status::internal(err.to_string()))?;
-            let cluster_key =
-                Self::cluster_key_from_graph(update.assignment.cluster_id, &update.graph);
-
-            assignments.push(proto::IngestAssignment {
-                index: record.index,
-                shard_id: self.shard_id,
-                record_id: update.assignment.record_id.0,
-                cluster_id: update.assignment.cluster_id.0,
-                cluster_key,
-            });
-        }
+        let (tx, rx) = oneshot::channel();
+        let job = IngestJob {
+            records: request.into_inner().records,
+            respond_to: tx,
+        };
+        self.ingest_tx
+            .send(job)
+            .await
+            .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
+        let assignments = rx
+            .await
+            .map_err(|_| Status::internal("ingest worker dropped"))??;
 
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
@@ -695,7 +750,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map_err(|err| Status::internal(err.to_string()))?;
             let ontology = config.build_ontology(store.inner_mut());
             store
-                .persist_interner()
+                .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
             let mut guard = self.unirust.lock().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());

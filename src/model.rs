@@ -198,6 +198,30 @@ impl StringInterner {
         self.id_to_value.get(&id)
     }
 
+    /// Get the next attribute ID.
+    pub fn next_attr_id(&self) -> u32 {
+        self.next_attr_id
+    }
+
+    /// Get the next value ID.
+    pub fn next_value_id(&self) -> u32 {
+        self.next_value_id
+    }
+
+    /// Insert an attribute with a specific ID (used for persistence restores).
+    pub fn insert_attr_with_id(&mut self, id: AttrId, attr: String) {
+        self.attr_to_id.insert(attr.clone(), id);
+        self.id_to_attr.insert(id, attr);
+        self.next_attr_id = self.next_attr_id.max(id.0 + 1);
+    }
+
+    /// Insert a value with a specific ID (used for persistence restores).
+    pub fn insert_value_with_id(&mut self, id: ValueId, value: String) {
+        self.value_to_id.insert(value.clone(), id);
+        self.id_to_value.insert(id, value);
+        self.next_value_id = self.next_value_id.max(id.0 + 1);
+    }
+
     /// Get all attribute IDs
     pub fn attr_ids(&self) -> impl Iterator<Item = AttrId> + '_ {
         self.id_to_attr.keys().copied()

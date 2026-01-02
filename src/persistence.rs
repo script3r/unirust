@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
     checkpoint::Checkpoint, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch,
-    DB,
+    DB, DBCompressionType,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,6 +22,8 @@ const KEY_INTERNER: &[u8] = b"interner";
 const KEY_ONTOLOGY_CONFIG: &[u8] = b"ontology_config";
 const KEY_MANIFEST: &[u8] = b"manifest";
 const KEY_INDEX_VERSION: &[u8] = b"index_version";
+const KEY_NEXT_ATTR_ID: &[u8] = b"next_attr_id";
+const KEY_NEXT_VALUE_ID: &[u8] = b"next_value_id";
 
 const STORAGE_FORMAT_VERSION: u32 = 1;
 const INDEX_FORMAT_VERSION: u32 = 1;
@@ -38,6 +40,8 @@ pub struct PersistentStore {
     inner: Store,
     db: DB,
     cache: Mutex<LruCache<RecordId, Record>>,
+    persisted_attr_id: u32,
+    persisted_value_id: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +70,7 @@ impl PersistentStore {
         let db = open_db(path)?;
         validate_or_init_manifest(&db)?;
 
-        let interner = load_interner(&db)?;
+        let (interner, persisted_attr_id, persisted_value_id) = load_interner_state(&db)?;
         let mut store = Store::with_interner(interner, 0);
         if let Some(next_id) = load_metadata::<u32>(&db, KEY_NEXT_RECORD_ID)? {
             store.set_next_record_id(next_id);
@@ -79,6 +83,8 @@ impl PersistentStore {
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
                     .expect("cache capacity"),
             )),
+            persisted_attr_id,
+            persisted_value_id,
         };
         instance.rebuild_indexes_if_needed()?;
         instance.load_records_into_store()?;
@@ -93,23 +99,53 @@ impl PersistentStore {
         &mut self.inner
     }
 
-    pub fn persist_interner(&self) -> Result<()> {
+    pub fn persist_interner(&mut self, batch: &mut WriteBatch) -> Result<()> {
         let interner_cf = self
             .db
             .cf_handle(CF_INTERNER)
             .ok_or_else(|| anyhow!("missing interner column family"))?;
-        let bytes = bincode::serialize(self.inner.interner())?;
-        self.db.put_cf(interner_cf, KEY_INTERNER, bytes)?;
+        let interner = self.inner.interner();
+        let next_attr = interner.next_attr_id();
+        let next_value = interner.next_value_id();
+
+        for id in self.persisted_attr_id..next_attr {
+            let attr_id = crate::model::AttrId(id);
+            if let Some(attr) = interner.get_attr(attr_id) {
+                let key = encode_interner_key(b'a', id);
+                batch.put_cf(interner_cf, key, attr.as_bytes());
+            }
+        }
+
+        for id in self.persisted_value_id..next_value {
+            let value_id = crate::model::ValueId(id);
+            if let Some(value) = interner.get_value(value_id) {
+                let key = encode_interner_key(b'v', id);
+                batch.put_cf(interner_cf, key, value.as_bytes());
+            }
+        }
+
+        self.persisted_attr_id = next_attr;
+        self.persisted_value_id = next_value;
+        batch.put_cf(
+            self.db.cf_handle(CF_METADATA).ok_or_else(|| anyhow!("missing metadata column family"))?,
+            KEY_NEXT_ATTR_ID,
+            bincode::serialize(&next_attr)?,
+        );
+        batch.put_cf(
+            self.db.cf_handle(CF_METADATA).ok_or_else(|| anyhow!("missing metadata column family"))?,
+            KEY_NEXT_VALUE_ID,
+            bincode::serialize(&next_value)?,
+        );
         Ok(())
     }
 
-    pub fn persist_metadata(&self) -> Result<()> {
+    pub fn persist_metadata(&self, batch: &mut WriteBatch) -> Result<()> {
         let metadata_cf = self
             .db
             .cf_handle(CF_METADATA)
             .ok_or_else(|| anyhow!("missing metadata column family"))?;
         let bytes = bincode::serialize(&self.inner.next_record_id())?;
-        self.db.put_cf(metadata_cf, KEY_NEXT_RECORD_ID, bytes)?;
+        batch.put_cf(metadata_cf, KEY_NEXT_RECORD_ID, bytes);
         Ok(())
     }
 
@@ -125,46 +161,8 @@ impl PersistentStore {
     }
 
     pub fn index_record(&self, record: &Record) -> Result<()> {
-        let attr_value_cf = self
-            .db
-            .cf_handle(CF_INDEX_ATTR_VALUE)
-            .ok_or_else(|| anyhow!("missing attr/value index column family"))?;
-        let entity_type_cf = self
-            .db
-            .cf_handle(CF_INDEX_ENTITY_TYPE)
-            .ok_or_else(|| anyhow!("missing entity_type index column family"))?;
-        let perspective_cf = self
-            .db
-            .cf_handle(CF_INDEX_PERSPECTIVE)
-            .ok_or_else(|| anyhow!("missing perspective index column family"))?;
-        let temporal_cf = self
-            .db
-            .cf_handle(CF_INDEX_TEMPORAL_BUCKET)
-            .ok_or_else(|| anyhow!("missing temporal bucket index column family"))?;
-
         let mut batch = WriteBatch::default();
-        let record_id = record.id.0;
-        let entity_key = encode_string_index(&record.identity.entity_type, record_id);
-        batch.put_cf(entity_type_cf, entity_key, []);
-        let perspective_key = encode_string_index(&record.identity.perspective, record_id);
-        batch.put_cf(perspective_cf, perspective_key, []);
-
-        for descriptor in &record.descriptors {
-            let key = encode_attr_value_index(
-                descriptor.attr.0,
-                descriptor.value.0,
-                descriptor.interval.start,
-                descriptor.interval.end,
-                record_id,
-            );
-            batch.put_cf(attr_value_cf, key, []);
-
-            for bucket in buckets_for_interval(descriptor.interval.start, descriptor.interval.end) {
-                let key = encode_temporal_bucket(bucket, record_id);
-                batch.put_cf(temporal_cf, key, []);
-            }
-        }
-
+        self.index_record_with_batch(record, &mut batch)?;
         self.db.write(batch)?;
         Ok(())
     }
@@ -196,8 +194,12 @@ impl PersistentStore {
         remove_metadata_key(&self.db, KEY_NEXT_RECORD_ID)?;
         remove_metadata_key(&self.db, KEY_INDEX_VERSION)?;
         self.inner = Store::new();
-        self.persist_interner()?;
-        self.persist_metadata()?;
+        self.persisted_attr_id = 0;
+        self.persisted_value_id = 0;
+        let mut batch = WriteBatch::default();
+        self.persist_interner(&mut batch)?;
+        self.persist_metadata(&mut batch)?;
+        self.db.write(batch)?;
         Ok(())
     }
 
@@ -211,20 +213,36 @@ impl PersistentStore {
         checkpoint.create_checkpoint(path)?;
         Ok(())
     }
+
+    pub fn persist_state(&mut self) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        self.persist_interner(&mut batch)?;
+        self.persist_metadata(&mut batch)?;
+        self.db.write(batch)?;
+        Ok(())
+    }
 }
 
 impl RecordStore for PersistentStore {
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
         let record_id = self.inner.add_record(record)?;
         if let Some(stored) = self.inner.get_record(record_id) {
-            self.persist_record(&stored)?;
-            self.index_record(&stored)?;
+            let mut batch = WriteBatch::default();
+            let records_cf = self
+                .db
+                .cf_handle(CF_RECORDS)
+                .ok_or_else(|| anyhow!("missing records column family"))?;
+            let key = record_id.0.to_be_bytes();
+            let bytes = bincode::serialize(&stored)?;
+            batch.put_cf(records_cf, key, bytes);
+            self.index_record_with_batch(&stored, &mut batch)?;
+            self.persist_interner(&mut batch)?;
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
             if let Ok(mut cache) = self.cache.lock() {
                 cache.put(record_id, stored);
             }
         }
-        self.persist_interner()?;
-        self.persist_metadata()?;
         Ok(record_id)
     }
 
@@ -476,6 +494,12 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     options.set_paranoid_checks(true);
+    options.set_write_buffer_size(128 * 1024 * 1024);
+    options.set_max_write_buffer_number(4);
+    options.set_target_file_size_base(128 * 1024 * 1024);
+    options.set_max_bytes_for_level_base(512 * 1024 * 1024);
+    options.set_max_background_jobs(4);
+    options.set_compression_type(DBCompressionType::Zstd);
     let cfs = vec![
         ColumnFamilyDescriptor::new(CF_RECORDS, Options::default()),
         ColumnFamilyDescriptor::new(CF_METADATA, Options::default()),
@@ -647,16 +671,57 @@ fn repair_db(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_interner(db: &DB) -> Result<StringInterner> {
+fn load_interner_state(db: &DB) -> Result<(StringInterner, u32, u32)> {
+    let mut interner = StringInterner::new();
+    if let (Some(next_attr), Some(next_value)) = (
+        load_metadata::<u32>(db, KEY_NEXT_ATTR_ID)?,
+        load_metadata::<u32>(db, KEY_NEXT_VALUE_ID)?,
+    ) {
+        let interner_cf = db
+            .cf_handle(CF_INTERNER)
+            .ok_or_else(|| anyhow!("missing interner column family"))?;
+        for id in 0..next_attr {
+            let key = encode_interner_key(b'a', id);
+            if let Some(value) = db.get_cf(interner_cf, key)? {
+                let attr = String::from_utf8(value.to_vec())?;
+                interner.insert_attr_with_id(crate::model::AttrId(id), attr);
+            }
+        }
+        for id in 0..next_value {
+            let key = encode_interner_key(b'v', id);
+            if let Some(value) = db.get_cf(interner_cf, key)? {
+                let val = String::from_utf8(value.to_vec())?;
+                interner.insert_value_with_id(crate::model::ValueId(id), val);
+            }
+        }
+        return Ok((interner, next_attr, next_value));
+    }
+
     let interner_cf = db
         .cf_handle(CF_INTERNER)
         .ok_or_else(|| anyhow!("missing interner column family"))?;
     if let Some(bytes) = db.get_cf(interner_cf, KEY_INTERNER)? {
         let interner: StringInterner = bincode::deserialize(&bytes)?;
-        Ok(interner)
-    } else {
-        Ok(StringInterner::new())
+        let next_attr = interner.next_attr_id();
+        let next_value = interner.next_value_id();
+        save_metadata(db, KEY_NEXT_ATTR_ID, next_attr)?;
+        save_metadata(db, KEY_NEXT_VALUE_ID, next_value)?;
+        for id in 0..next_attr {
+            if let Some(attr) = interner.get_attr(crate::model::AttrId(id)) {
+                let key = encode_interner_key(b'a', id);
+                db.put_cf(interner_cf, key, attr.as_bytes())?;
+            }
+        }
+        for id in 0..next_value {
+            if let Some(value) = interner.get_value(crate::model::ValueId(id)) {
+                let key = encode_interner_key(b'v', id);
+                db.put_cf(interner_cf, key, value.as_bytes())?;
+            }
+        }
+        return Ok((interner, next_attr, next_value));
     }
+
+    Ok((interner, 0, 0))
 }
 
 fn validate_or_init_manifest(db: &DB) -> Result<()> {
@@ -682,6 +747,58 @@ fn validate_or_init_manifest(db: &DB) -> Result<()> {
     let bytes = bincode::serialize(&manifest)?;
     db.put_cf(metadata_cf, KEY_MANIFEST, bytes)?;
     Ok(())
+}
+
+fn encode_interner_key(prefix: u8, id: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 4);
+    key.push(prefix);
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+impl PersistentStore {
+    fn index_record_with_batch(&self, record: &Record, batch: &mut WriteBatch) -> Result<()> {
+        let attr_value_cf = self
+            .db
+            .cf_handle(CF_INDEX_ATTR_VALUE)
+            .ok_or_else(|| anyhow!("missing attr/value index column family"))?;
+        let entity_type_cf = self
+            .db
+            .cf_handle(CF_INDEX_ENTITY_TYPE)
+            .ok_or_else(|| anyhow!("missing entity_type index column family"))?;
+        let perspective_cf = self
+            .db
+            .cf_handle(CF_INDEX_PERSPECTIVE)
+            .ok_or_else(|| anyhow!("missing perspective index column family"))?;
+        let temporal_cf = self
+            .db
+            .cf_handle(CF_INDEX_TEMPORAL_BUCKET)
+            .ok_or_else(|| anyhow!("missing temporal bucket index column family"))?;
+
+        let record_id = record.id.0;
+        let entity_key = encode_string_index(&record.identity.entity_type, record_id);
+        batch.put_cf(entity_type_cf, entity_key, []);
+        let perspective_key = encode_string_index(&record.identity.perspective, record_id);
+        batch.put_cf(perspective_cf, perspective_key, []);
+
+        for descriptor in &record.descriptors {
+            let key = encode_attr_value_index(
+                descriptor.attr.0,
+                descriptor.value.0,
+                descriptor.interval.start,
+                descriptor.interval.end,
+                record_id,
+            );
+            batch.put_cf(attr_value_cf, key, []);
+
+            for bucket in buckets_for_interval(descriptor.interval.start, descriptor.interval.end) {
+                let key = encode_temporal_bucket(bucket, record_id);
+                batch.put_cf(temporal_cf, key, []);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn load_metadata<T: serde::de::DeserializeOwned>(db: &DB, key: &[u8]) -> Result<Option<T>> {
