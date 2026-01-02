@@ -11,6 +11,13 @@ use std::path::Path;
 
 type AttributeValuePairs = Vec<((AttrId, ValueId), Vec<(RecordId, Interval)>)>;
 
+#[derive(Debug, Clone, Copy)]
+pub struct StoreMetrics {
+    pub persistent: bool,
+    pub running_compactions: u64,
+    pub running_flushes: u64,
+}
+
 /// Persistence abstraction for records and metadata.
 pub trait RecordStore: Send + Sync {
     /// Add a single record and return its assigned ID.
@@ -95,6 +102,11 @@ pub trait RecordStore: Send + Sync {
     /// Create a checkpoint at the provided path, if supported.
     fn checkpoint(&self, _path: &Path) -> Result<()> {
         Err(anyhow::anyhow!("checkpoint not supported for this store"))
+    }
+
+    /// Optional store-level metrics.
+    fn metrics(&self) -> Option<StoreMetrics> {
+        None
     }
 }
 
@@ -309,6 +321,14 @@ impl Store {
         Some((min_id, max_id))
     }
 
+    pub fn store_metrics(&self) -> StoreMetrics {
+        StoreMetrics {
+            persistent: false,
+            running_compactions: 0,
+            running_flushes: 0,
+        }
+    }
+
     /// Get records that have a specific attribute-value pair in a time interval.
     pub fn get_records_with_value_in_interval(
         &self,
@@ -402,6 +422,10 @@ impl RecordStore for Store {
 
     fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
         Store::record_id_bounds(self)
+    }
+
+    fn metrics(&self) -> Option<StoreMetrics> {
+        Some(self.store_metrics())
     }
 }
 

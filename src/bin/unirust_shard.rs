@@ -41,6 +41,7 @@ fn load_ontology(path: Option<String>) -> anyhow::Result<DistributedOntologyConf
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let listen = parse_arg("--listen").unwrap_or_else(|| "127.0.0.1:50061".to_string());
     let shard_id: u32 = parse_arg("--shard-id")
         .unwrap_or_else(|| "0".to_string())

@@ -52,6 +52,6 @@ Replica/backup strategy (v1):
 
 ## Phase 5: Production Operations
 
-- [ ] Metrics/tracing (ingest latency, query latency, compactions, qps)
-- [ ] Alerting + runbooks
-- [ ] SLOs and capacity planning
+- [x] Metrics/tracing (ingest latency, query latency, compactions, qps)
+- [x] Alerting + runbooks
+- [x] SLOs and capacity planning

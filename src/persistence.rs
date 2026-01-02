@@ -1,5 +1,5 @@
 use crate::model::{Record, RecordId, StringInterner};
-use crate::store::{RecordStore, Store};
+use crate::store::{RecordStore, Store, StoreMetrics};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
@@ -533,6 +533,28 @@ impl RecordStore for PersistentStore {
             .map(RecordId)?;
 
         Some((min_id, max_id))
+    }
+
+    fn metrics(&self) -> Option<StoreMetrics> {
+        let running_compactions = self
+            .db
+            .property_value("rocksdb.num-running-compactions")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let running_flushes = self
+            .db
+            .property_value("rocksdb.num-running-flushes")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        Some(StoreMetrics {
+            persistent: true,
+            running_compactions,
+            running_flushes,
+        })
     }
 
     fn checkpoint(&self, path: &Path) -> Result<()> {

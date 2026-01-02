@@ -178,6 +178,31 @@ message CheckpointResponse {
   repeated string paths = 1;
 }
 
+message LatencyMetrics {
+  uint64 count = 1;
+  uint64 total_micros = 2;
+  uint64 max_micros = 3;
+}
+
+message StoreMetrics {
+  bool persistent = 1;
+  uint64 running_compactions = 2;
+  uint64 running_flushes = 3;
+}
+
+message MetricsRequest {}
+
+message MetricsResponse {
+  uint64 uptime_seconds = 1;
+  uint64 ingest_requests = 2;
+  uint64 ingest_records = 3;
+  uint64 query_requests = 4;
+  LatencyMetrics ingest_latency = 5;
+  LatencyMetrics query_latency = 6;
+  StoreMetrics store = 7;
+  uint32 shards_reporting = 8;
+}
+
 message RecordSnapshot {
   uint32 record_id = 1;
   RecordIdentity identity = 2;
@@ -238,6 +263,7 @@ service ShardService {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
   rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
   rpc GetRecordIdRange(RecordIdRangeRequest) returns (RecordIdRangeResponse);
   rpc ExportRecords(ExportRecordsRequest) returns (ExportRecordsResponse);
   rpc ImportRecords(ImportRecordsRequest) returns (ImportRecordsResponse);
@@ -254,6 +280,7 @@ service RouterService {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
   rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
   rpc GetRecordIdRange(RouterRecordIdRangeRequest) returns (RecordIdRangeResponse);
   rpc ExportRecords(RouterExportRecordsRequest) returns (ExportRecordsResponse);
   rpc ImportRecords(RouterImportRecordsRequest) returns (ImportRecordsResponse);

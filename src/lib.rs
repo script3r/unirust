@@ -28,7 +28,7 @@ pub use model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 pub use ontology::Ontology;
 pub use query::{QueryConflict, QueryDescriptor, QueryDescriptorOverlap, QueryMatch, QueryOutcome};
 pub use persistence::PersistentStore;
-pub use store::{RecordStore, Store};
+pub use store::{RecordStore, Store, StoreMetrics};
 pub use temporal::Interval;
 
 /// Assignment result for streaming clustering.
@@ -168,6 +168,10 @@ impl Unirust {
     /// Get the number of records in the store.
     pub fn record_count(&self) -> usize {
         self.store.len()
+    }
+
+    pub fn store_metrics(&self) -> Option<StoreMetrics> {
+        self.store.metrics()
     }
 
     /// Intern an attribute name into the store interner.

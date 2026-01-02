@@ -5,7 +5,7 @@ use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::temporal::Interval;
 use crate::persistence::PersistentOpenOptions;
-use crate::{PersistentStore, StreamingTuning, Unirust};
+use crate::{PersistentStore, StoreMetrics, StreamingTuning, Unirust};
 use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -13,8 +13,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
@@ -44,6 +45,79 @@ struct JsonRecordInput {
 
 pub mod proto {
     tonic::include_proto!("unirust");
+}
+
+#[derive(Debug, Default)]
+struct LatencyCounters {
+    count: AtomicU64,
+    total_micros: AtomicU64,
+    max_micros: AtomicU64,
+}
+
+impl LatencyCounters {
+    fn record(&self, micros: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_micros.fetch_add(micros, Ordering::Relaxed);
+        let mut current = self.max_micros.load(Ordering::Relaxed);
+        while micros > current {
+            match self.max_micros.compare_exchange(
+                current,
+                micros,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn snapshot(&self) -> proto::LatencyMetrics {
+        proto::LatencyMetrics {
+            count: self.count.load(Ordering::Relaxed),
+            total_micros: self.total_micros.load(Ordering::Relaxed),
+            max_micros: self.max_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Metrics {
+    start: Instant,
+    ingest_requests: AtomicU64,
+    ingest_records: AtomicU64,
+    query_requests: AtomicU64,
+    ingest_latency: LatencyCounters,
+    query_latency: LatencyCounters,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            ingest_requests: AtomicU64::new(0),
+            ingest_records: AtomicU64::new(0),
+            query_requests: AtomicU64::new(0),
+            ingest_latency: LatencyCounters::default(),
+            query_latency: LatencyCounters::default(),
+        }
+    }
+
+    fn record_ingest(&self, record_count: usize, micros: u64) {
+        self.ingest_requests.fetch_add(1, Ordering::Relaxed);
+        self.ingest_records
+            .fetch_add(record_count as u64, Ordering::Relaxed);
+        self.ingest_latency.record(micros);
+    }
+
+    fn record_query(&self, micros: u64) {
+        self.query_requests.fetch_add(1, Ordering::Relaxed);
+        self.query_latency.record(micros);
+    }
+
+    fn uptime_seconds(&self) -> u64 {
+        self.start.elapsed().as_secs()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +336,7 @@ pub struct ShardNode {
     data_dir: Option<PathBuf>,
     ingest_tx: tokio::sync::mpsc::Sender<IngestJob>,
     config_version: String,
+    metrics: Arc<Metrics>,
 }
 
 const INGEST_QUEUE_CAPACITY: usize = 128;
@@ -307,6 +382,7 @@ impl ShardNode {
                 data_dir: Some(path),
                 ingest_tx,
                 config_version,
+                metrics: Arc::new(Metrics::new()),
             });
         }
 
@@ -326,6 +402,7 @@ impl ShardNode {
             data_dir: None,
             ingest_tx,
             config_version,
+            metrics: Arc::new(Metrics::new()),
         })
     }
 
@@ -583,9 +660,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        let start = Instant::now();
+        let records = request.into_inner().records;
+        let record_count = records.len();
         let (tx, rx) = oneshot::channel();
         let job = IngestJob {
-            records: request.into_inner().records,
+            records,
             respond_to: tx,
         };
         self.ingest_tx
@@ -596,6 +676,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             .await
             .map_err(|_| Status::internal("ingest worker dropped"))??;
 
+        self.metrics
+            .record_ingest(record_count, start.elapsed().as_micros() as u64);
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
 
@@ -611,6 +693,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::QueryEntitiesRequest>,
     ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
+        let start = Instant::now();
         let mut unirust = self.unirust.lock().await;
         let request = request.into_inner();
         let interval = Interval::new(request.start, request.end)
@@ -694,6 +777,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             }
         };
 
+        self.metrics
+            .record_query(start.elapsed().as_micros() as u64);
         Ok(Response::new(response))
     }
 
@@ -743,6 +828,27 @@ impl proto::shard_service_server::ShardService for ShardNode {
         Ok(Response::new(proto::ConfigVersionResponse {
             version: self.config_version.clone(),
         }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<proto::MetricsRequest>,
+    ) -> Result<Response<proto::MetricsResponse>, Status> {
+        let store_metrics = {
+            let unirust = self.unirust.lock().await;
+            unirust.store_metrics()
+        };
+        let response = proto::MetricsResponse {
+            uptime_seconds: self.metrics.uptime_seconds(),
+            ingest_requests: self.metrics.ingest_requests.load(Ordering::Relaxed),
+            ingest_records: self.metrics.ingest_records.load(Ordering::Relaxed),
+            query_requests: self.metrics.query_requests.load(Ordering::Relaxed),
+            ingest_latency: Some(self.metrics.ingest_latency.snapshot()),
+            query_latency: Some(self.metrics.query_latency.snapshot()),
+            store: Some(store_metrics_to_proto(store_metrics)),
+            shards_reporting: 1,
+        };
+        Ok(Response::new(response))
     }
 
 
@@ -937,6 +1043,7 @@ pub struct RouterNode {
     shard_clients: Vec<proto::shard_service_client::ShardServiceClient<tonic::transport::Channel>>,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     config_version: String,
+    metrics: Arc<Metrics>,
 }
 
 impl RouterNode {
@@ -979,6 +1086,7 @@ impl RouterNode {
             shard_clients,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             config_version,
+            metrics: Arc::new(Metrics::new()),
         })
     }
 
@@ -1121,7 +1229,9 @@ impl proto::router_service_server::RouterService for RouterNode {
         &self,
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        let start = Instant::now();
         let batch = request.into_inner();
+        let record_count = batch.records.len();
         let shard_count = self.shard_clients.len();
         let config = self.ontology_config.lock().await.clone();
         let mut shard_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
@@ -1145,6 +1255,8 @@ impl proto::router_service_server::RouterService for RouterNode {
         }
 
         results.sort_by_key(|assignment| assignment.index);
+        self.metrics
+            .record_ingest(record_count, start.elapsed().as_micros() as u64);
         Ok(Response::new(proto::IngestRecordsResponse {
             assignments: results,
         }))
@@ -1162,6 +1274,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         &self,
         request: Request<proto::QueryEntitiesRequest>,
     ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
+        let start = Instant::now();
         let request = request.into_inner();
         let mut responses = Vec::with_capacity(self.shard_clients.len());
         for client in &self.shard_clients {
@@ -1174,6 +1287,8 @@ impl proto::router_service_server::RouterService for RouterNode {
         }
 
         let merged = self.merge_query_responses(&request.descriptors, responses);
+        self.metrics
+            .record_query(start.elapsed().as_micros() as u64);
         Ok(Response::new(merged))
     }
 
@@ -1230,6 +1345,65 @@ impl proto::router_service_server::RouterService for RouterNode {
         Ok(Response::new(proto::ConfigVersionResponse {
             version: self.config_version.clone(),
         }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<proto::MetricsRequest>,
+    ) -> Result<Response<proto::MetricsResponse>, Status> {
+        let mut ingest_latency = empty_latency();
+        let mut query_latency = empty_latency();
+        let mut ingest_requests = 0u64;
+        let mut ingest_records = 0u64;
+        let mut query_requests = 0u64;
+        let mut running_compactions = 0u64;
+        let mut running_flushes = 0u64;
+        let mut persistent = false;
+        let mut shards_reporting = 0u32;
+
+        for client in &self.shard_clients {
+            let mut client = client.clone();
+            let metrics = client
+                .get_metrics(Request::new(proto::MetricsRequest {}))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?
+                .into_inner();
+            ingest_requests += metrics.ingest_requests;
+            ingest_records += metrics.ingest_records;
+            query_requests += metrics.query_requests;
+            merge_latency(&mut ingest_latency, metrics.ingest_latency);
+            merge_latency(&mut query_latency, metrics.query_latency);
+            if let Some(store) = metrics.store {
+                persistent |= store.persistent;
+                running_compactions += store.running_compactions;
+                running_flushes += store.running_flushes;
+            }
+            shards_reporting += 1;
+        }
+
+        if shards_reporting == 0 {
+            ingest_requests = self.metrics.ingest_requests.load(Ordering::Relaxed);
+            ingest_records = self.metrics.ingest_records.load(Ordering::Relaxed);
+            query_requests = self.metrics.query_requests.load(Ordering::Relaxed);
+            ingest_latency = self.metrics.ingest_latency.snapshot();
+            query_latency = self.metrics.query_latency.snapshot();
+        }
+
+        let response = proto::MetricsResponse {
+            uptime_seconds: self.metrics.uptime_seconds(),
+            ingest_requests,
+            ingest_records,
+            query_requests,
+            ingest_latency: Some(ingest_latency),
+            query_latency: Some(query_latency),
+            store: Some(proto::StoreMetrics {
+                persistent,
+                running_compactions,
+                running_flushes,
+            }),
+            shards_reporting,
+        };
+        Ok(Response::new(response))
     }
 
     async fn get_record_id_range(
@@ -1374,5 +1548,37 @@ fn to_proto_conflict_summary(summary: ConflictSummary) -> proto::ConflictSummary
             })
             .collect(),
         cause: summary.cause.unwrap_or_default(),
+    }
+}
+
+fn store_metrics_to_proto(metrics: Option<StoreMetrics>) -> proto::StoreMetrics {
+    if let Some(metrics) = metrics {
+        proto::StoreMetrics {
+            persistent: metrics.persistent,
+            running_compactions: metrics.running_compactions,
+            running_flushes: metrics.running_flushes,
+        }
+    } else {
+        proto::StoreMetrics {
+            persistent: false,
+            running_compactions: 0,
+            running_flushes: 0,
+        }
+    }
+}
+
+fn empty_latency() -> proto::LatencyMetrics {
+    proto::LatencyMetrics {
+        count: 0,
+        total_micros: 0,
+        max_micros: 0,
+    }
+}
+
+fn merge_latency(acc: &mut proto::LatencyMetrics, other: Option<proto::LatencyMetrics>) {
+    if let Some(other) = other {
+        acc.count += other.count;
+        acc.total_micros += other.total_micros;
+        acc.max_micros = acc.max_micros.max(other.max_micros);
     }
 }
