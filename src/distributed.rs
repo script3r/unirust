@@ -1524,6 +1524,8 @@ impl proto::router_service_server::RouterService for RouterNode {
         let mut query_requests = 0u64;
         let mut running_compactions = 0u64;
         let mut running_flushes = 0u64;
+        let mut block_cache_capacity_bytes = 0u64;
+        let mut block_cache_usage_bytes = 0u64;
         let mut persistent = false;
         let mut shards_reporting = 0u32;
 
@@ -1543,6 +1545,8 @@ impl proto::router_service_server::RouterService for RouterNode {
                 persistent |= store.persistent;
                 running_compactions += store.running_compactions;
                 running_flushes += store.running_flushes;
+                block_cache_capacity_bytes += store.block_cache_capacity_bytes;
+                block_cache_usage_bytes += store.block_cache_usage_bytes;
             }
             shards_reporting += 1;
         }
@@ -1566,6 +1570,8 @@ impl proto::router_service_server::RouterService for RouterNode {
                 persistent,
                 running_compactions,
                 running_flushes,
+                block_cache_capacity_bytes,
+                block_cache_usage_bytes,
             }),
             shards_reporting,
         };
@@ -1818,12 +1824,16 @@ fn store_metrics_to_proto(metrics: Option<StoreMetrics>) -> proto::StoreMetrics 
             persistent: metrics.persistent,
             running_compactions: metrics.running_compactions,
             running_flushes: metrics.running_flushes,
+            block_cache_capacity_bytes: metrics.block_cache_capacity_bytes,
+            block_cache_usage_bytes: metrics.block_cache_usage_bytes,
         }
     } else {
         proto::StoreMetrics {
             persistent: false,
             running_compactions: 0,
             running_flushes: 0,
+            block_cache_capacity_bytes: 0,
+            block_cache_usage_bytes: 0,
         }
     }
 }

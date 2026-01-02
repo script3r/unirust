@@ -70,8 +70,8 @@ Replica/backup strategy (v1):
 - [x] Cache invalidation strategy tuned for streaming ingest
 
 ### Phase 6.3: Storage Tuning at Scale
-- [ ] RocksDB per-CF tuning (block cache, filters, compression)
-- [ ] Dynamic cache sizing + memory limits
+- [x] RocksDB per-CF tuning (block cache, filters, compression)
+- [x] Dynamic cache sizing + memory limits (env overrides)
 - [ ] Compaction/flush metrics and throttling policies
 
 ### Phase 6.4: Concurrency + Resilience

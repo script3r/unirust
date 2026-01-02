@@ -3,8 +3,8 @@ use crate::store::{RecordStore, Store, StoreMetrics};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
-    checkpoint::Checkpoint, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch,
-    DB, DBCompressionType,
+    checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, Direction,
+    IteratorMode, Options, SliceTransform, WriteBatch, DB, DBCompressionType,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -29,6 +29,21 @@ const STORAGE_FORMAT_VERSION: u32 = 1;
 const INDEX_FORMAT_VERSION: u32 = 1;
 const TEMPORAL_BUCKET_SECONDS: i64 = 86400;
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
+const DEFAULT_BLOCK_CACHE_MB: u64 = 512;
+const DEFAULT_WRITE_BUFFER_MB: u64 = 128;
+const DEFAULT_MAX_WRITE_BUFFERS: i32 = 4;
+const DEFAULT_TARGET_FILE_MB: u64 = 128;
+const DEFAULT_LEVEL_BASE_MB: u64 = 512;
+const DEFAULT_BLOOM_BITS_PER_KEY: f64 = 10.0;
+const DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO: f64 = 0.1;
+
+const ENV_BLOCK_CACHE_MB: &str = "UNIRUST_BLOCK_CACHE_MB";
+const ENV_WRITE_BUFFER_MB: &str = "UNIRUST_WRITE_BUFFER_MB";
+const ENV_MAX_WRITE_BUFFERS: &str = "UNIRUST_MAX_WRITE_BUFFERS";
+const ENV_TARGET_FILE_MB: &str = "UNIRUST_TARGET_FILE_MB";
+const ENV_LEVEL_BASE_MB: &str = "UNIRUST_LEVEL_BASE_MB";
+const ENV_BLOOM_BITS_PER_KEY: &str = "UNIRUST_BLOOM_BITS_PER_KEY";
+const ENV_MEMTABLE_PREFIX_BLOOM_RATIO: &str = "UNIRUST_MEMTABLE_PREFIX_BLOOM_RATIO";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StorageManifest {
@@ -550,10 +565,26 @@ impl RecordStore for PersistentStore {
             .flatten()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        let block_cache_capacity_bytes = self
+            .db
+            .property_value("rocksdb.block-cache-capacity")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let block_cache_usage_bytes = self
+            .db
+            .property_value("rocksdb.block-cache-usage")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
         Some(StoreMetrics {
             persistent: true,
             running_compactions,
             running_flushes,
+            block_cache_capacity_bytes,
+            block_cache_usage_bytes,
         })
     }
 
@@ -568,27 +599,149 @@ impl Drop for PersistentStore {
     }
 }
 
-fn open_db(path: impl AsRef<Path>) -> Result<DB> {
+struct RocksDbTuning {
+    block_cache_bytes: u64,
+    write_buffer_bytes: u64,
+    max_write_buffers: i32,
+    target_file_size_base: u64,
+    max_bytes_for_level_base: u64,
+    bloom_bits_per_key: f64,
+    memtable_prefix_bloom_ratio: f64,
+}
+
+fn load_tuning() -> RocksDbTuning {
+    let block_cache_mb = env_u64(ENV_BLOCK_CACHE_MB, DEFAULT_BLOCK_CACHE_MB).max(8);
+    let write_buffer_mb = env_u64(ENV_WRITE_BUFFER_MB, DEFAULT_WRITE_BUFFER_MB).max(8);
+    let target_file_mb = env_u64(ENV_TARGET_FILE_MB, DEFAULT_TARGET_FILE_MB).max(8);
+    let level_base_mb = env_u64(ENV_LEVEL_BASE_MB, DEFAULT_LEVEL_BASE_MB).max(64);
+    let max_write_buffers =
+        env_i32(ENV_MAX_WRITE_BUFFERS, DEFAULT_MAX_WRITE_BUFFERS).max(1);
+    let bloom_bits_per_key = env_f64(ENV_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_BITS_PER_KEY);
+    let memtable_prefix_bloom_ratio =
+        env_f64(ENV_MEMTABLE_PREFIX_BLOOM_RATIO, DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO);
+
+    RocksDbTuning {
+        block_cache_bytes: block_cache_mb * 1024 * 1024,
+        write_buffer_bytes: write_buffer_mb * 1024 * 1024,
+        max_write_buffers,
+        target_file_size_base: target_file_mb * 1024 * 1024,
+        max_bytes_for_level_base: level_base_mb * 1024 * 1024,
+        bloom_bits_per_key,
+        memtable_prefix_bloom_ratio,
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i32(key: &str, default: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn build_base_options(tuning: &RocksDbTuning) -> Options {
     let mut options = Options::default();
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     options.set_paranoid_checks(true);
-    options.set_write_buffer_size(128 * 1024 * 1024);
-    options.set_max_write_buffer_number(4);
-    options.set_target_file_size_base(128 * 1024 * 1024);
-    options.set_max_bytes_for_level_base(512 * 1024 * 1024);
+    options.set_write_buffer_size(bytes_to_usize(tuning.write_buffer_bytes));
+    options.set_max_write_buffer_number(tuning.max_write_buffers);
+    options.set_target_file_size_base(tuning.target_file_size_base);
+    options.set_max_bytes_for_level_base(tuning.max_bytes_for_level_base);
     options.set_max_background_jobs(4);
+    options.set_level_compaction_dynamic_level_bytes(true);
     options.set_compression_type(DBCompressionType::Zstd);
+    options
+}
+
+fn build_block_options(cache: &Cache, bloom_bits_per_key: f64, with_filter: bool) -> BlockBasedOptions {
+    let mut block_opts = BlockBasedOptions::default();
+    block_opts.set_block_cache(cache);
+    if with_filter {
+        block_opts.set_bloom_filter(bloom_bits_per_key, true);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    }
+    block_opts
+}
+
+fn build_cf_options(
+    base: &Options,
+    block_opts: &BlockBasedOptions,
+    prefix: Option<SliceTransform>,
+    memtable_prefix_bloom_ratio: Option<f64>,
+) -> Options {
+    let mut options = base.clone();
+    options.set_block_based_table_factory(block_opts);
+    if let Some(prefix) = prefix {
+        options.set_prefix_extractor(prefix);
+    }
+    if let Some(ratio) = memtable_prefix_bloom_ratio {
+        options.set_memtable_prefix_bloom_ratio(ratio);
+    }
+    options
+}
+
+fn bytes_to_usize(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+fn open_db(path: impl AsRef<Path>) -> Result<DB> {
+    let tuning = load_tuning();
+    let base = build_base_options(&tuning);
+    let cache = Cache::new_lru_cache(bytes_to_usize(tuning.block_cache_bytes));
+
+    let data_block_opts = build_block_options(&cache, tuning.bloom_bits_per_key, false);
+    let index_block_opts = build_block_options(&cache, tuning.bloom_bits_per_key, true);
+
+    let attr_value_prefix = SliceTransform::create_fixed_prefix(8);
+    let temporal_prefix = SliceTransform::create_fixed_prefix(8);
+
     let cfs = vec![
-        ColumnFamilyDescriptor::new(CF_RECORDS, Options::default()),
-        ColumnFamilyDescriptor::new(CF_METADATA, Options::default()),
-        ColumnFamilyDescriptor::new(CF_INTERNER, Options::default()),
-        ColumnFamilyDescriptor::new(CF_INDEX_ATTR_VALUE, Options::default()),
-        ColumnFamilyDescriptor::new(CF_INDEX_ENTITY_TYPE, Options::default()),
-        ColumnFamilyDescriptor::new(CF_INDEX_PERSPECTIVE, Options::default()),
-        ColumnFamilyDescriptor::new(CF_INDEX_TEMPORAL_BUCKET, Options::default()),
+        ColumnFamilyDescriptor::new(CF_RECORDS, build_cf_options(&base, &data_block_opts, None, None)),
+        ColumnFamilyDescriptor::new(CF_METADATA, build_cf_options(&base, &data_block_opts, None, None)),
+        ColumnFamilyDescriptor::new(CF_INTERNER, build_cf_options(&base, &data_block_opts, None, None)),
+        ColumnFamilyDescriptor::new(
+            CF_INDEX_ATTR_VALUE,
+            build_cf_options(
+                &base,
+                &index_block_opts,
+                Some(attr_value_prefix),
+                Some(tuning.memtable_prefix_bloom_ratio),
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_INDEX_ENTITY_TYPE,
+            build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_INDEX_PERSPECTIVE,
+            build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_INDEX_TEMPORAL_BUCKET,
+            build_cf_options(
+                &base,
+                &index_block_opts,
+                Some(temporal_prefix),
+                Some(tuning.memtable_prefix_bloom_ratio),
+            ),
+        ),
     ];
-    Ok(DB::open_cf_descriptors(&options, path, cfs)?)
+    Ok(DB::open_cf_descriptors(&base, path, cfs)?)
 }
 
 fn encode_attr_value_index(

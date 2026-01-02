@@ -16,6 +16,8 @@ pub struct StoreMetrics {
     pub persistent: bool,
     pub running_compactions: u64,
     pub running_flushes: u64,
+    pub block_cache_capacity_bytes: u64,
+    pub block_cache_usage_bytes: u64,
 }
 
 /// Persistence abstraction for records and metadata.
@@ -326,6 +328,8 @@ impl Store {
             persistent: false,
             running_compactions: 0,
             running_flushes: 0,
+            block_cache_capacity_bytes: 0,
+            block_cache_usage_bytes: 0,
         }
     }
 

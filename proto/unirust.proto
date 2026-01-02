@@ -192,6 +192,8 @@ message StoreMetrics {
   bool persistent = 1;
   uint64 running_compactions = 2;
   uint64 running_flushes = 3;
+  uint64 block_cache_capacity_bytes = 4;
+  uint64 block_cache_usage_bytes = 5;
 }
 
 message MetricsRequest {}

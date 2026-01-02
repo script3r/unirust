@@ -57,3 +57,14 @@ Capacity hints:
 - Reserve ~30% RAM for RocksDB cache and memtables.
 - Avoid compaction stalls by maintaining 20% free disk space.
 - Use periodic checkpoints + snapshots for restore drills.
+
+## Storage Tuning (RocksDB)
+
+Environment overrides (values are in MB unless noted):
+- `UNIRUST_BLOCK_CACHE_MB` (default 512)
+- `UNIRUST_WRITE_BUFFER_MB` (default 128)
+- `UNIRUST_MAX_WRITE_BUFFERS` (default 4)
+- `UNIRUST_TARGET_FILE_MB` (default 128)
+- `UNIRUST_LEVEL_BASE_MB` (default 512)
+- `UNIRUST_BLOOM_BITS_PER_KEY` (default 10.0)
+- `UNIRUST_MEMTABLE_PREFIX_BLOOM_RATIO` (default 0.1)
