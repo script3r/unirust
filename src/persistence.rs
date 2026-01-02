@@ -1,4 +1,4 @@
-use crate::model::{Record, RecordId, StringInterner};
+use crate::model::{Record, RecordId, RecordIdentity, StringInterner};
 use crate::store::{RecordStore, Store, StoreMetrics};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
@@ -269,6 +269,14 @@ impl RecordStore for PersistentStore {
         Ok(())
     }
 
+    fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        if let Some(existing) = self.inner.get_record_id_by_identity(&record.identity) {
+            return Ok((existing, false));
+        }
+        let record_id = self.add_record(record)?;
+        Ok((record_id, true))
+    }
+
     fn get_record(&self, id: RecordId) -> Option<Record> {
         if let Ok(mut cache) = self.cache.lock() {
             if let Some(record) = cache.get(&id) {
@@ -295,6 +303,10 @@ impl RecordStore for PersistentStore {
             .iterator_cf(records_cf, IteratorMode::Start)
             .filter_map(|entry| entry.ok().and_then(|(_, value)| bincode::deserialize(&value).ok()))
             .collect()
+    }
+
+    fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
+        self.inner.get_record_id_by_identity(identity)
     }
 
     fn for_each_record(&self, f: &mut dyn FnMut(Record)) {

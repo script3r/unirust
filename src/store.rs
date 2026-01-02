@@ -2,7 +2,7 @@
 //!
 //! Provides storage and management for records, with efficient indexing and retrieval.
 
-use crate::model::{AttrId, Record, RecordId, StringInterner, ValueId};
+use crate::model::{AttrId, Record, RecordId, RecordIdentity, StringInterner, ValueId};
 use crate::temporal::Interval;
 use anyhow::Result;
 use hashbrown::HashMap;
@@ -35,6 +35,11 @@ pub trait RecordStore: Send + Sync {
 
     /// Get a record by ID.
     fn get_record(&self, id: RecordId) -> Option<Record>;
+
+    /// Get a record ID by identity if present.
+    fn get_record_id_by_identity(&self, _identity: &RecordIdentity) -> Option<RecordId> {
+        None
+    }
 
     /// Get all records.
     fn get_all_records(&self) -> Vec<Record>;
@@ -106,6 +111,12 @@ pub trait RecordStore: Send + Sync {
         Err(anyhow::anyhow!("checkpoint not supported for this store"))
     }
 
+    /// Add a record if its identity has not been seen; returns (id, inserted).
+    fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        let id = self.add_record(record)?;
+        Ok((id, true))
+    }
+
     /// Optional store-level metrics.
     fn metrics(&self) -> Option<StoreMetrics> {
         None
@@ -117,6 +128,8 @@ pub trait RecordStore: Send + Sync {
 pub struct Store {
     /// All records indexed by ID
     records: HashMap<RecordId, Record>,
+    /// Identity to record ID mapping (idempotent ingest)
+    identity_index: HashMap<RecordIdentity, RecordId>,
     /// String interner for attributes and values
     interner: StringInterner,
     /// Attribute-value index for fast lookups
@@ -132,6 +145,7 @@ impl Store {
     pub fn new() -> Self {
         Self {
             records: HashMap::new(),
+            identity_index: HashMap::new(),
             interner: StringInterner::new(),
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
@@ -143,6 +157,7 @@ impl Store {
     pub fn with_interner(interner: StringInterner, next_record_id: u32) -> Self {
         Self {
             records: HashMap::new(),
+            identity_index: HashMap::new(),
             interner,
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
@@ -171,7 +186,9 @@ impl Store {
         }
 
         let record_id = record.id;
+        let identity = record.identity.clone();
         self.records.insert(record.id, record);
+        self.identity_index.insert(identity, record_id);
         if let Some(stored) = self.records.get(&record_id) {
             self.attribute_value_index.add_record(stored);
             self.temporal_index.add_record(stored);
@@ -193,7 +210,9 @@ impl Store {
         self.next_record_id = self.next_record_id.max(record.id.0 + 1);
 
         let record_id = record.id;
+        let identity = record.identity.clone();
         self.records.insert(record.id, record);
+        self.identity_index.insert(identity, record_id);
         if let Some(stored) = self.records.get(&record_id) {
             self.attribute_value_index.add_record(stored);
             self.temporal_index.add_record(stored);
@@ -209,9 +228,22 @@ impl Store {
         Ok(())
     }
 
+    /// Add a record if its identity is new; returns (id, inserted).
+    pub fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            return Ok((existing, false));
+        }
+        let id = self.add_record(record)?;
+        Ok((id, true))
+    }
+
     /// Get a record by ID
     pub fn get_record(&self, id: RecordId) -> Option<Record> {
         self.records.get(&id).cloned()
+    }
+
+    pub fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
+        self.identity_index.get(identity).copied()
     }
 
     /// Get all records
@@ -364,6 +396,10 @@ impl RecordStore for Store {
         Store::get_record(self, id)
     }
 
+    fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
+        Store::get_record_id_by_identity(self, identity)
+    }
+
     fn get_all_records(&self) -> Vec<Record> {
         Store::get_all_records(self)
     }
@@ -430,6 +466,10 @@ impl RecordStore for Store {
 
     fn metrics(&self) -> Option<StoreMetrics> {
         Some(self.store_metrics())
+    }
+
+    fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        Store::add_record_if_absent(self, record)
     }
 }
 
@@ -608,6 +648,29 @@ mod tests {
         );
 
         store.add_records(vec![record]).unwrap();
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_add_record_if_absent_dedupes_identity() {
+        let mut store = Store::new();
+
+        let record_a = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
+            vec![],
+        );
+        let record_b = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "123".to_string()),
+            vec![],
+        );
+
+        let (first_id, inserted) = store.add_record_if_absent(record_a).unwrap();
+        assert!(inserted);
+        let (second_id, inserted) = store.add_record_if_absent(record_b).unwrap();
+        assert!(!inserted);
+        assert_eq!(first_id, second_id);
         assert_eq!(store.len(), 1);
     }
 

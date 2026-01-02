@@ -252,9 +252,12 @@ impl Unirust {
         let mut record_ids = Vec::with_capacity(records.len());
 
         for record in records {
-            let record_id = self.store.add_record(record)?;
-            let cluster_id =
-                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?;
+            let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+            let cluster_id = if inserted {
+                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
+            } else {
+                streaming.cluster_id_for(record_id)
+            };
             assignments.push(StreamedClusterAssignment {
                 record_id,
                 cluster_id,
@@ -292,21 +295,28 @@ impl Unirust {
         let mut updates = Vec::with_capacity(records.len());
 
         for record in records {
-            let record_id = self.store.add_record(record)?;
-            let cluster_id =
-                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?;
+            let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+            let cluster_id = if inserted {
+                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
+            } else {
+                streaming.cluster_id_for(record_id)
+            };
             let assignment = StreamedClusterAssignment {
                 record_id,
                 cluster_id,
             };
-            let clusters =
-                streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
-            let observations = conflicts::detect_conflicts_for_clusters(
-                self.store.as_ref(),
-                &clusters,
-                &self.ontology,
-                &[cluster_id],
-            )?;
+            let observations = if inserted {
+                let clusters = streaming
+                    .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
+                conflicts::detect_conflicts_for_clusters(
+                    self.store.as_ref(),
+                    &clusters,
+                    &self.ontology,
+                    &[cluster_id],
+                )?
+            } else {
+                Vec::new()
+            };
             updates.push(StreamedConflictUpdate {
                 assignment,
                 observations,
@@ -348,27 +358,35 @@ impl Unirust {
         let mut updates = Vec::with_capacity(records.len());
 
         for record in records {
-            let record_id = self.store.add_record(record)?;
-            let cluster_id =
-                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?;
+            let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+            let cluster_id = if inserted {
+                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
+            } else {
+                streaming.cluster_id_for(record_id)
+            };
             let assignment = StreamedClusterAssignment {
                 record_id,
                 cluster_id,
             };
 
-            let clusters =
-                streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
-            let observations =
-                conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
-            let summaries = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
-            *self.conflict_cache.lock().unwrap() = Some(summaries);
+            let observations = if inserted {
+                let clusters = streaming
+                    .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
+                let observations =
+                    conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
+                let summaries = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
+                *self.conflict_cache.lock().unwrap() = Some(summaries);
 
-            graph_state.update(
-                self.store.as_ref(),
-                &clusters,
-                &observations,
-                &self.ontology,
-            )?;
+                graph_state.update(
+                    self.store.as_ref(),
+                    &clusters,
+                    &observations,
+                    &self.ontology,
+                )?;
+                observations
+            } else {
+                Vec::new()
+            };
             let graph = graph_state.to_knowledge_graph();
 
             updates.push(StreamedGraphUpdate {
