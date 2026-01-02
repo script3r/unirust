@@ -5,7 +5,7 @@
 - Stream records and resolve entity clusters with interval-aware constraints.
 - Detect conflicts and preserve temporal provenance in the knowledge graph.
 - Provide conflict-aware query results for master entities over time.
-- Keep storage pluggable (in-memory now, Minitao persistence supported).
+- Keep storage pluggable (in-memory now, persistence later).
 - Support sharded ingestion with deterministic reconciliation.
 
 ## Core data flow
@@ -14,9 +14,8 @@
 2. Stream records through the linker to assign clusters.
 3. Detect conflicts (direct, indirect, constraint violations).
 4. Incrementally update the knowledge graph.
-5. Persist graph state to Minitao (optional).
-6. Serve queries for descriptors over time.
-7. Optionally reconcile sharded ingests into a single store snapshot.
+5. Serve queries for descriptors over time.
+6. Optionally reconcile sharded ingests into a single store snapshot.
 
 ## Key modules
 
@@ -25,7 +24,6 @@
 - `conflicts`: conflict detection and constraint violations.
 - `graph`: knowledge graph snapshots and incremental updates.
 - `query`: conflict-aware master-entity queries.
-- `minitao_store` / `minitao_grpc`: persistence to Minitao (local or gRPC).
 - `sharding`: parallel streaming ingest and reconciliation.
 - `profile`: lightweight hot-path profiler (feature gated).
 
@@ -77,6 +75,15 @@ sequenceDiagram
   Reconcile-->>Client: clusters + conflicts
 ```
 
+## Distributed services (gRPC)
+
+- `ShardService`: shard-local streaming and query service.
+- `RouterService`: routes records by identity-key hash and merges query results.
+- Router detects cross-shard overlap conflicts when shard matches overlap.
+- Ontology is configured via `DistributedOntologyConfig` (string attributes → shard-local interner).
+
+See `DISTRIBUTION.md` for the rollout plan and hardening steps.
+
 ## Conflict model
 
 - Direct conflicts: overlapping descriptors with different values.
@@ -107,13 +114,6 @@ sequenceDiagram
 
 The query outcome enforces the invariant: at any time instant, at most one master entity is returned.
 
-## Minitao persistence
-
-- Storage writer maps graph nodes to Minitao objects.
-- SAME_AS associations are aggregated by record pair.
-- Conflict edges are stored as objects with associations from each record to the conflict object.
-- gRPC writer supports the same payloads for server-backed persistence.
-
 ## Invariants
 
 - Intervals are half-open [start, end) and must satisfy start < end.
@@ -136,7 +136,7 @@ The query outcome enforces the invariant: at any time instant, at most one maste
 ## Testing
 
 - Unit tests cover conflicts, DSU behavior, indexing, graph export, and queries.
-- E2E script validates gRPC persistence against a live Minitao server.
+- Distributed E2E tests validate shard/router ingestion, query behavior, and conflict summaries.
 - Sharded reconciliation tests assert equivalence with single-stream conflicts and clusters.
 
 ## Scaling constraints and next steps
@@ -144,8 +144,8 @@ The query outcome enforces the invariant: at any time instant, at most one maste
 To reach billions of entities, we need to push more work into indexed, incremental paths
 and avoid global scans:
 
-- Replace in-memory `Store` with a sharded persistence layer (Minitao/other DB) that can
-  serve attribute-value and identity-key lookups in O(log n) per descriptor.
+- Replace in-memory `Store` with a sharded persistence layer that can serve
+  attribute-value and identity-key lookups in O(log n) per descriptor.
 - Maintain cluster-level summaries (golden copy + active attribute intervals) in the
   persistence layer to avoid re-walking all records for query and conflict checks.
 - Partition workloads by entity type and identity key to enable parallel ingestion and

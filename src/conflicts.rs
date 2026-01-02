@@ -1019,6 +1019,124 @@ pub fn detect_conflicts(
     ConflictDetector::detect_conflicts(store, clusters, ontology)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConflictRecordRef {
+    pub perspective: String,
+    pub uid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConflictSummary {
+    pub kind: String,
+    pub attribute: Option<String>,
+    pub interval: Interval,
+    pub records: Vec<ConflictRecordRef>,
+    pub cause: Option<String>,
+}
+
+pub fn summarize_conflicts(
+    store: &dyn RecordStore,
+    observations: &[Observation],
+) -> Vec<ConflictSummary> {
+    let mut summaries = Vec::new();
+
+    for observation in observations {
+        match observation {
+            Observation::DirectConflict(conflict) => {
+                let attribute = store
+                    .interner()
+                    .get_attr(conflict.attribute)
+                    .cloned()
+                    .or_else(|| Some(format!("attr_{}", conflict.attribute.0)));
+
+                let mut record_refs = Vec::new();
+                for value in &conflict.values {
+                    for record_id in &value.participants {
+                        if let Some(record) = store.get_record(*record_id) {
+                            record_refs.push(ConflictRecordRef {
+                                perspective: record.identity.perspective.clone(),
+                                uid: record.identity.uid.clone(),
+                            });
+                        }
+                    }
+                }
+                record_refs.sort_by(|a, b| {
+                    (a.perspective.clone(), a.uid.clone())
+                        .cmp(&(b.perspective.clone(), b.uid.clone()))
+                });
+                record_refs.dedup();
+
+                summaries.push(ConflictSummary {
+                    kind: conflict.kind.clone(),
+                    attribute,
+                    interval: conflict.interval,
+                    records: record_refs,
+                    cause: None,
+                });
+            }
+            Observation::IndirectConflict(conflict) => {
+                let attribute = conflict
+                    .attribute
+                    .and_then(|attr| store.interner().get_attr(attr).cloned())
+                    .or_else(|| conflict.attribute.map(|attr| format!("attr_{}", attr.0)));
+
+                let mut record_refs = Vec::new();
+                if let Some(records) = &conflict.participants.records {
+                    for record_id in records {
+                        if let Some(record) = store.get_record(*record_id) {
+                            record_refs.push(ConflictRecordRef {
+                                perspective: record.identity.perspective.clone(),
+                                uid: record.identity.uid.clone(),
+                            });
+                        }
+                    }
+                }
+                record_refs.sort_by(|a, b| {
+                    (a.perspective.clone(), a.uid.clone())
+                        .cmp(&(b.perspective.clone(), b.uid.clone()))
+                });
+                record_refs.dedup();
+
+                summaries.push(ConflictSummary {
+                    kind: conflict.kind.clone(),
+                    attribute,
+                    interval: conflict.interval,
+                    records: record_refs,
+                    cause: Some(conflict.cause.clone()),
+                });
+            }
+            Observation::Merge { .. } => {}
+        }
+    }
+
+    summaries.sort_by(|a, b| {
+        (
+            a.kind.clone(),
+            a.attribute.clone().unwrap_or_default(),
+            a.interval.start,
+            a.interval.end,
+            a.cause.clone().unwrap_or_default(),
+            a.records
+                .iter()
+                .map(|record| format!("{}:{}", record.perspective, record.uid))
+                .collect::<Vec<_>>(),
+        )
+            .cmp(&(
+                b.kind.clone(),
+                b.attribute.clone().unwrap_or_default(),
+                b.interval.start,
+                b.interval.end,
+                b.cause.clone().unwrap_or_default(),
+                b.records
+                    .iter()
+                    .map(|record| format!("{}:{}", record.perspective, record.uid))
+                    .collect::<Vec<_>>(),
+            ))
+    });
+
+    summaries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

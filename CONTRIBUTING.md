@@ -10,7 +10,7 @@ By participating in this project, you agree to abide by our Code of Conduct. We 
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.82 or later
 - Git
 - Basic familiarity with entity resolution, temporal modeling, or graph algorithms (helpful but not required)
 

@@ -7,12 +7,11 @@
 
 pub mod config;
 pub mod conflicts;
+pub mod distributed;
 pub mod dsu;
 pub mod graph;
 pub mod index;
 pub mod linker;
-pub mod minitao_grpc;
-pub mod minitao_store;
 pub mod model;
 pub mod ontology;
 pub mod profile;
@@ -136,6 +135,26 @@ impl Unirust {
     /// Get a record by ID from the underlying store.
     pub fn get_record(&self, id: RecordId) -> Option<&Record> {
         self.store.get_record(id)
+    }
+
+    /// Intern an attribute name into the store interner.
+    pub fn intern_attr(&mut self, attr: &str) -> crate::model::AttrId {
+        self.store.interner_mut().intern_attr(attr)
+    }
+
+    /// Intern a value string into the store interner.
+    pub fn intern_value(&mut self, value: &str) -> crate::model::ValueId {
+        self.store.interner_mut().intern_value(value)
+    }
+
+    /// Resolve an attribute ID back to its string label.
+    pub fn resolve_attr(&self, attr: crate::model::AttrId) -> Option<String> {
+        self.store.interner().get_attr(attr).cloned()
+    }
+
+    /// Resolve a value ID back to its string label.
+    pub fn resolve_value(&self, value: crate::model::ValueId) -> Option<String> {
+        self.store.interner().get_value(value).cloned()
     }
 
     /// Export the knowledge graph as a text summary.
@@ -321,5 +340,13 @@ impl Unirust {
             descriptors,
             interval,
         )
+    }
+
+    /// Summarize conflicts into stable, record-identity based descriptors.
+    pub fn summarize_conflicts(
+        &self,
+        observations: &[conflicts::Observation],
+    ) -> Vec<conflicts::ConflictSummary> {
+        conflicts::summarize_conflicts(self.store.as_ref(), observations)
     }
 }

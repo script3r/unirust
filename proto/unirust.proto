@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package unirust;
+
+message RecordIdentity {
+  string entity_type = 1;
+  string perspective = 2;
+  string uid = 3;
+}
+
+message RecordDescriptor {
+  string attr = 1;
+  string value = 2;
+  int64 start = 3;
+  int64 end = 4;
+}
+
+message RecordInput {
+  uint32 index = 1;
+  RecordIdentity identity = 2;
+  repeated RecordDescriptor descriptors = 3;
+}
+
+message IngestRecordsRequest {
+  repeated RecordInput records = 1;
+}
+
+message IngestAssignment {
+  uint32 index = 1;
+  uint32 shard_id = 2;
+  uint32 record_id = 3;
+  uint32 cluster_id = 4;
+  string cluster_key = 5;
+}
+
+message IngestRecordsResponse {
+  repeated IngestAssignment assignments = 1;
+}
+
+message QueryDescriptor {
+  string attr = 1;
+  string value = 2;
+}
+
+message QueryEntitiesRequest {
+  repeated QueryDescriptor descriptors = 1;
+  int64 start = 2;
+  int64 end = 3;
+}
+
+message GoldenDescriptor {
+  string attr = 1;
+  string value = 2;
+  int64 start = 3;
+  int64 end = 4;
+}
+
+message QueryMatch {
+  uint32 shard_id = 1;
+  uint32 cluster_id = 2;
+  int64 start = 3;
+  int64 end = 4;
+  string cluster_key = 5;
+  string cluster_key_identity = 6;
+  repeated GoldenDescriptor golden = 7;
+}
+
+message QueryDescriptorOverlap {
+  QueryDescriptor descriptor = 1;
+  int64 start = 2;
+  int64 end = 3;
+}
+
+message QueryConflict {
+  int64 start = 1;
+  int64 end = 2;
+  repeated QueryMatch clusters = 3;
+  repeated QueryDescriptorOverlap descriptors = 4;
+}
+
+message QueryMatches {
+  repeated QueryMatch matches = 1;
+}
+
+message QueryEntitiesResponse {
+  oneof outcome {
+    QueryMatches matches = 1;
+    QueryConflict conflict = 2;
+  }
+}
+
+message RecordRef {
+  string perspective = 1;
+  string uid = 2;
+}
+
+message ConflictSummary {
+  string kind = 1;
+  string attribute = 2;
+  int64 start = 3;
+  int64 end = 4;
+  repeated RecordRef records = 5;
+  string cause = 6;
+}
+
+message ListConflictsRequest {
+  int64 start = 1;
+  int64 end = 2;
+  string attribute = 3;
+}
+
+message ListConflictsResponse {
+  repeated ConflictSummary conflicts = 1;
+}
+
+message Empty {}
+
+message IdentityKeyConfig {
+  string name = 1;
+  repeated string attributes = 2;
+}
+
+enum ConstraintKind {
+  CONSTRAINT_KIND_UNSPECIFIED = 0;
+  UNIQUE = 1;
+  UNIQUE_WITHIN_PERSPECTIVE = 2;
+}
+
+message ConstraintConfig {
+  string name = 1;
+  string attribute = 2;
+  ConstraintKind kind = 3;
+}
+
+message OntologyConfig {
+  repeated IdentityKeyConfig identity_keys = 1;
+  repeated string strong_identifiers = 2;
+  repeated ConstraintConfig constraints = 3;
+}
+
+message ApplyOntologyRequest {
+  OntologyConfig config = 1;
+}
+
+message ApplyOntologyResponse {}
+
+message IngestRecordsFromUrlRequest {
+  string url = 1;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 record_count = 1;
+  uint64 cluster_count = 2;
+  uint64 conflict_count = 3;
+  uint64 graph_node_count = 4;
+  uint64 graph_edge_count = 5;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;
+}
+
+service ShardService {
+  rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
+  rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
+  rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
+  rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
+  rpc Reset(Empty) returns (Empty);
+}
+
+service RouterService {
+  rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
+  rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
+  rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
+  rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
+  rpc Reset(Empty) returns (Empty);
+}

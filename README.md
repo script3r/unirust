@@ -12,7 +12,7 @@ A temporal-first entity mastering and conflict-resolution engine in Rust.
 - Resolve entities across multiple sources and perspectives.
 - Detect direct and indirect conflicts.
 - Incrementally maintain a knowledge graph for auditing and visualization.
-- Persist a conflict-free golden copy per cluster for downstream consumption.
+- Maintain a conflict-free golden copy per cluster for downstream consumption.
 - Query master entities for descriptors over time with conflict-aware results.
 - Stream records in parallel via sharding with deterministic reconciliation.
 
@@ -96,7 +96,7 @@ cargo run --example basic_example
 Streaming performance is controlled via `StreamingTuning`, similar to RocksDB-style option structs.
 
 ```rust
-use unirust_rs::{StreamingTuning, TuningProfile, Unirust};
+use unirust_rs::{StreamingTuning, TuningProfile, Unirust, Store};
 
 let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
 // Or customize individual fields:
@@ -110,34 +110,57 @@ candidate scans while preserving correctness in a reconciliation pass.
 
 Available profiles: `Balanced` (default), `LowLatency`, `HighThroughput`, `BulkIngest`, `MemorySaver`.
 
-Stream into Minitao:
+## Distributed gRPC processing
+
+Run shards and a router:
 
 ```bash
-cargo run --example stream_to_minitao
+cargo run --bin unirust_shard -- --listen 127.0.0.1:50061 --shard-id 0
+cargo run --bin unirust_shard -- --listen 127.0.0.1:50062 --shard-id 1
+
+cargo run --bin unirust_router -- --listen 127.0.0.1:50060 --shards 127.0.0.1:50061,127.0.0.1:50062
 ```
 
-Stream to a running Minitao server:
+Pass an ontology config JSON with `--ontology path.json` to both shard and router. See `DISTRIBUTION.md`.
+
+Apply an ontology config via gRPC before streaming records, or pass `--ontology path.json` to shard/router.
+
+Set the ontology before ingest/query:
 
 ```bash
-cargo run --example stream_to_minitao_server
+grpcurl -d @ 127.0.0.1:50060 unirust.RouterService/SetOntology <<'JSON'
+{
+  "config": {
+    "identity_keys": [{ "name": "email", "attributes": ["email"] }],
+    "strong_identifiers": ["ssn"],
+    "constraints": [{ "name": "unique_email", "attribute": "email", "kind": "UNIQUE" }]
+  }
+}
+JSON
 ```
 
-## Persist the knowledge graph (Minitao)
+Ingest and query via the router:
 
-Use the Minitao SQLite storage backend to persist the incrementally updated graph.
-
-```rust
-use std::sync::Arc;
-
-use minitao::storage::sqlite::SqliteStorage;
-use unirust_rs::minitao_store::MinitaoGraphWriter;
-
-let storage = Arc::new(SqliteStorage::new("unirust_graph.db")?);
-let writer = MinitaoGraphWriter::new(storage);
-
-// After streaming records and building a graph update:
-writer.apply_graph(&update.graph).await?;
+```bash
+cargo run --example distributed_client
 ```
+
+### Podman cluster demo
+
+Spin up a multi-node cluster locally with Podman:
+
+```bash
+scripts/podman_cluster.sh start
+scripts/podman_demo.sh
+```
+
+Stop the cluster:
+
+```bash
+scripts/podman_cluster.sh stop
+```
+
+For the rollout plan and production hardening steps, see `DISTRIBUTION.md`.
 
 ## Query master entities
 
