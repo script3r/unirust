@@ -125,7 +125,7 @@ impl RecordStore for PersistentStore {
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
         let record_id = self.inner.add_record(record)?;
         if let Some(stored) = self.inner.get_record(record_id) {
-            self.persist_record(stored)?;
+            self.persist_record(&stored)?;
         }
         self.persist_interner()?;
         self.persist_metadata()?;
@@ -139,27 +139,27 @@ impl RecordStore for PersistentStore {
         Ok(())
     }
 
-    fn get_record(&self, id: RecordId) -> Option<&Record> {
+    fn get_record(&self, id: RecordId) -> Option<Record> {
         self.inner.get_record(id)
     }
 
-    fn get_all_records(&self) -> Vec<&Record> {
+    fn get_all_records(&self) -> Vec<Record> {
         self.inner.get_all_records()
     }
 
-    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<&Record> {
+    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         self.inner.get_records_by_entity_type(entity_type)
     }
 
-    fn get_records_by_perspective(&self, perspective: &str) -> Vec<&Record> {
+    fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record> {
         self.inner.get_records_by_perspective(perspective)
     }
 
-    fn get_records_with_attribute(&self, attr: crate::model::AttrId) -> Vec<&Record> {
+    fn get_records_with_attribute(&self, attr: crate::model::AttrId) -> Vec<Record> {
         self.inner.get_records_with_attribute(attr)
     }
 
-    fn get_records_in_interval(&self, interval: crate::temporal::Interval) -> Vec<&Record> {
+    fn get_records_in_interval(&self, interval: crate::temporal::Interval) -> Vec<Record> {
         self.inner.get_records_in_interval(interval)
     }
 
@@ -287,7 +287,12 @@ fn remove_metadata_key(db: &DB, key: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::model::{Descriptor, RecordIdentity};
+    use crate::ontology::{IdentityKey, Ontology, StrongIdentifier};
     use crate::temporal::Interval;
+    use crate::distributed::{DistributedOntologyConfig, IdentityKeyConfig};
+    use crate::linker::build_clusters;
+    use crate::query::{query_master_entities, QueryDescriptor, QueryOutcome};
+    use crate::{StreamingTuning, Unirust};
     use tempfile::tempdir;
 
     #[test]
@@ -310,5 +315,180 @@ mod tests {
         let loaded = store.get_record(record_id).unwrap();
         assert_eq!(loaded.identity.uid, "1");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn persistent_store_retains_ontology_and_sequence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let config = DistributedOntologyConfig {
+            identity_keys: vec![IdentityKeyConfig {
+                name: "email_key".to_string(),
+                attributes: vec!["email".to_string()],
+            }],
+            strong_identifiers: vec!["email".to_string()],
+            constraints: Vec::new(),
+        };
+        let payload = serde_json::to_vec(&config).unwrap();
+        store.save_ontology_config(&payload).unwrap();
+
+        let attr = store.interner_mut().intern_attr("email");
+        let value = store.interner_mut().intern_value("first@example.com");
+        let record = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "1".to_string()),
+            vec![Descriptor::new(attr, value, Interval::new(0, 10).unwrap())],
+        );
+        let first_id = store.add_record(record).unwrap();
+        assert_eq!(first_id.0, 0);
+        drop(store);
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let stored = store.load_ontology_config().unwrap().unwrap();
+        let decoded: DistributedOntologyConfig = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(decoded.identity_keys.len(), 1);
+        assert_eq!(decoded.strong_identifiers, vec!["email".to_string()]);
+
+        let attr = store.interner_mut().intern_attr("email");
+        let value = store.interner_mut().intern_value("second@example.com");
+        let record = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "2".to_string()),
+            vec![Descriptor::new(attr, value, Interval::new(10, 20).unwrap())],
+        );
+        let second_id = store.add_record(record).unwrap();
+        assert_eq!(second_id.0, 1);
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn persistent_store_preserves_conflict_results() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let email_attr = store.interner_mut().intern_attr("email");
+        let email_value_a = store.interner_mut().intern_value("alice@example.com");
+        let email_value_b = store.interner_mut().intern_value("bob@example.com");
+
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
+        ontology.add_strong_identifier(StrongIdentifier::new(email_attr, "email".to_string()));
+
+        let mut unirust = Unirust::with_store_and_tuning(
+            ontology,
+            store,
+            StreamingTuning::default(),
+        );
+
+        let record_a = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "1".to_string()),
+            vec![Descriptor::new(
+                email_attr,
+                email_value_a,
+                Interval::new(0, 10).unwrap(),
+            )],
+        );
+        let record_b = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "2".to_string()),
+            vec![Descriptor::new(
+                email_attr,
+                email_value_b,
+                Interval::new(0, 10).unwrap(),
+            )],
+        );
+        unirust.stream_records(vec![record_a, record_b]).unwrap();
+        let clusters = unirust.build_clusters().unwrap();
+        let observations = unirust.detect_conflicts(&clusters).unwrap();
+        let conflict_count = observations.len();
+        drop(unirust);
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let email_attr = store.interner_mut().intern_attr("email");
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
+        ontology.add_strong_identifier(StrongIdentifier::new(email_attr, "email".to_string()));
+
+        let unirust = Unirust::with_store_and_tuning(
+            ontology,
+            store,
+            StreamingTuning::default(),
+        );
+        let clusters = unirust.build_clusters().unwrap();
+        let observations = unirust.detect_conflicts(&clusters).unwrap();
+        assert_eq!(observations.len(), conflict_count);
+    }
+
+    #[test]
+    fn persistent_store_query_after_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let email_attr = store.interner_mut().intern_attr("email");
+        let email_value = store
+            .interner_mut()
+            .intern_value("alice@example.com");
+
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
+
+        let record = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "1".to_string()),
+            vec![Descriptor::new(
+                email_attr,
+                email_value,
+                Interval::new(0, 10).unwrap(),
+            )],
+        );
+        store.add_record(record).unwrap();
+        let clusters = build_clusters(&store, &ontology).unwrap();
+        let outcome = query_master_entities(
+            &store,
+            &clusters,
+            &ontology,
+            &[QueryDescriptor {
+                attr: email_attr,
+                value: email_value,
+            }],
+            Interval::new(0, 10).unwrap(),
+        )
+        .unwrap();
+
+        let QueryOutcome::Matches(matches) = outcome else {
+            panic!("expected matches before restart");
+        };
+        assert_eq!(matches.len(), 1);
+        drop(store);
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let email_attr = store.interner_mut().intern_attr("email");
+        let email_value = store
+            .interner_mut()
+            .intern_value("alice@example.com");
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
+
+        let clusters = build_clusters(&store, &ontology).unwrap();
+        let outcome = query_master_entities(
+            &store,
+            &clusters,
+            &ontology,
+            &[QueryDescriptor {
+                attr: email_attr,
+                value: email_value,
+            }],
+            Interval::new(0, 10).unwrap(),
+        )
+        .unwrap();
+        let QueryOutcome::Matches(matches) = outcome else {
+            panic!("expected matches after restart");
+        };
+        assert_eq!(matches.len(), 1);
     }
 }

@@ -24,22 +24,22 @@ pub trait RecordStore: Send + Sync {
     }
 
     /// Get a record by ID.
-    fn get_record(&self, id: RecordId) -> Option<&Record>;
+    fn get_record(&self, id: RecordId) -> Option<Record>;
 
     /// Get all records.
-    fn get_all_records(&self) -> Vec<&Record>;
+    fn get_all_records(&self) -> Vec<Record>;
 
     /// Get records for a specific entity type.
-    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<&Record>;
+    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record>;
 
     /// Get records for a specific perspective.
-    fn get_records_by_perspective(&self, perspective: &str) -> Vec<&Record>;
+    fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record>;
 
     /// Get records that have descriptors for a specific attribute.
-    fn get_records_with_attribute(&self, attr: AttrId) -> Vec<&Record>;
+    fn get_records_with_attribute(&self, attr: AttrId) -> Vec<Record>;
 
     /// Get records that have descriptors overlapping with a time interval.
-    fn get_records_in_interval(&self, interval: Interval) -> Vec<&Record>;
+    fn get_records_in_interval(&self, interval: Interval) -> Vec<Record>;
 
     /// Get records that have a specific attribute-value pair within a time interval.
     fn get_records_with_value_in_interval(
@@ -176,41 +176,44 @@ impl Store {
     }
 
     /// Get a record by ID
-    pub fn get_record(&self, id: RecordId) -> Option<&Record> {
-        self.records.get(&id)
+    pub fn get_record(&self, id: RecordId) -> Option<Record> {
+        self.records.get(&id).cloned()
     }
 
     /// Get all records
-    pub fn get_all_records(&self) -> Vec<&Record> {
-        self.records.values().collect()
+    pub fn get_all_records(&self) -> Vec<Record> {
+        self.records.values().cloned().collect()
     }
 
     /// Get records for a specific entity type
-    pub fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<&Record> {
+    pub fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         self.records
             .values()
             .filter(|record| record.identity.entity_type == entity_type)
+            .cloned()
             .collect()
     }
 
     /// Get records for a specific perspective
-    pub fn get_records_by_perspective(&self, perspective: &str) -> Vec<&Record> {
+    pub fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record> {
         self.records
             .values()
             .filter(|record| record.identity.perspective == perspective)
+            .cloned()
             .collect()
     }
 
     /// Get records that have descriptors for a specific attribute
-    pub fn get_records_with_attribute(&self, attr: AttrId) -> Vec<&Record> {
+    pub fn get_records_with_attribute(&self, attr: AttrId) -> Vec<Record> {
         self.records
             .values()
             .filter(|record| record.descriptors.iter().any(|d| d.attr == attr))
+            .cloned()
             .collect()
     }
 
     /// Get records that have descriptors overlapping with a time interval
-    pub fn get_records_in_interval(&self, interval: Interval) -> Vec<&Record> {
+    pub fn get_records_in_interval(&self, interval: Interval) -> Vec<Record> {
         self.records
             .values()
             .filter(|record| {
@@ -219,6 +222,7 @@ impl Store {
                     .iter()
                     .any(|d| crate::temporal::is_overlapping(&d.interval, &interval))
             })
+            .cloned()
             .collect()
     }
 
@@ -279,27 +283,27 @@ impl RecordStore for Store {
         Store::add_records(self, records)
     }
 
-    fn get_record(&self, id: RecordId) -> Option<&Record> {
+    fn get_record(&self, id: RecordId) -> Option<Record> {
         Store::get_record(self, id)
     }
 
-    fn get_all_records(&self) -> Vec<&Record> {
+    fn get_all_records(&self) -> Vec<Record> {
         Store::get_all_records(self)
     }
 
-    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<&Record> {
+    fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         Store::get_records_by_entity_type(self, entity_type)
     }
 
-    fn get_records_by_perspective(&self, perspective: &str) -> Vec<&Record> {
+    fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record> {
         Store::get_records_by_perspective(self, perspective)
     }
 
-    fn get_records_with_attribute(&self, attr: AttrId) -> Vec<&Record> {
+    fn get_records_with_attribute(&self, attr: AttrId) -> Vec<Record> {
         Store::get_records_with_attribute(self, attr)
     }
 
-    fn get_records_in_interval(&self, interval: Interval) -> Vec<&Record> {
+    fn get_records_in_interval(&self, interval: Interval) -> Vec<Record> {
         Store::get_records_in_interval(self, interval)
     }
 
@@ -356,7 +360,7 @@ impl AttributeValueIndex {
         self.index.clear();
 
         for record in store.get_all_records() {
-            self.add_record(record);
+            self.add_record(&record);
         }
     }
 
@@ -440,7 +444,7 @@ impl TemporalIndex {
         self.index.clear();
 
         for record in store.get_all_records() {
-            self.add_record(record);
+            self.add_record(&record);
         }
     }
 

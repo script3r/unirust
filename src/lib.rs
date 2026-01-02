@@ -135,7 +135,7 @@ impl Unirust {
     }
 
     /// Get a record by ID from the underlying store.
-    pub fn get_record(&self, id: RecordId) -> Option<&Record> {
+    pub fn get_record(&self, id: RecordId) -> Option<Record> {
         self.store.get_record(id)
     }
 

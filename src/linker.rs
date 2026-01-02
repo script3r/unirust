@@ -103,7 +103,7 @@ impl StreamingLinker {
         self.strong_id_summaries
             .entry(record_id)
             .or_default()
-            .merge(build_record_summary(record, ontology));
+            .merge(build_record_summary(&record, ontology));
 
         let entity_type = &record.identity.entity_type;
         let identity_keys = ontology.identity_keys_for_type(entity_type);
@@ -113,7 +113,7 @@ impl StreamingLinker {
             let _key_guard = crate::profile::profile_scope("identity_key_loop");
             let key_values_with_intervals = self
                 .identity_index
-                .extract_key_values_with_intervals(record, identity_key)?;
+                .extract_key_values_with_intervals(&record, identity_key)?;
 
             for (key_values, interval) in key_values_with_intervals {
                 let key_signature = IdentityKeySignature::new(entity_type, &key_values);
@@ -260,7 +260,7 @@ impl StreamingLinker {
         // Add the record to the index after matching to avoid self-matches.
         let root = self.dsu.find(record_id);
         self.identity_index
-            .add_record_with_root(record, root, ontology)?;
+            .add_record_with_root(&record, root, ontology)?;
 
         Ok(self.get_or_assign_cluster_id(root))
     }
@@ -562,8 +562,8 @@ fn check_strong_identifier_conflict(
 
     // Check strong identifiers for conflicts
     for strong_id in ontology.strong_identifiers_for_type(&record_a.identity.entity_type) {
-        let descriptor_a = get_strong_identifier_descriptor(record_a, strong_id);
-        let descriptor_b = get_strong_identifier_descriptor(record_b, strong_id);
+        let descriptor_a = get_strong_identifier_descriptor(&record_a, strong_id);
+        let descriptor_b = get_strong_identifier_descriptor(&record_b, strong_id);
 
         // Only check for conflicts if both records have values for this strong identifier
         if let (Some(desc_a), Some(desc_b)) = (descriptor_a, descriptor_b) {
