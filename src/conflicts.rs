@@ -303,6 +303,62 @@ impl ConflictDetector {
 
         Ok(observations)
     }
+
+    pub fn detect_conflicts_for_clusters(
+        store: &dyn RecordStore,
+        clusters: &Clusters,
+        ontology: &Ontology,
+        cluster_ids: &[ClusterId],
+    ) -> Result<Vec<Observation>> {
+        if cluster_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut observations = Vec::new();
+        let target: std::collections::HashSet<ClusterId> =
+            cluster_ids.iter().copied().collect();
+
+        for cluster in &clusters.clusters {
+            if !target.contains(&cluster.id) {
+                continue;
+            }
+            let direct_conflicts = Self::detect_direct_conflicts(store, cluster, ontology)?;
+            for conflict in direct_conflicts {
+                observations.push(Observation::direct_conflict(conflict));
+            }
+            let violations = Self::detect_constraint_violations_for_cluster(
+                store,
+                cluster,
+                ontology,
+            )?;
+            for violation in violations {
+                let conflict = IndirectConflict::new(
+                    "constraint_violation".to_string(),
+                    violation.constraint.name().to_string(),
+                    Some(violation.constraint.attribute()),
+                    violation.interval,
+                    ConflictParticipants::new(vec![], Some(violation.participants)),
+                    "violation".to_string(),
+                    ConflictDetails::new().with_evidence(vec![violation.details]),
+                );
+                observations.push(Observation::indirect_conflict(conflict));
+            }
+        }
+
+        let intra_entity_conflicts =
+            Self::detect_intra_entity_conflicts_for_clusters(store, clusters, ontology, &target)?;
+        for conflict in intra_entity_conflicts {
+            observations.push(Observation::direct_conflict(conflict));
+        }
+
+        let indirect_conflicts =
+            Self::detect_indirect_conflicts_for_clusters(store, clusters, ontology, &target)?;
+        for conflict in indirect_conflicts {
+            observations.push(Observation::indirect_conflict(conflict));
+        }
+
+        Ok(observations)
+    }
     /// Detect direct conflicts within a cluster
     fn detect_direct_conflicts(
         store: &dyn RecordStore,
@@ -377,6 +433,44 @@ impl ConflictDetector {
             return Err(err);
         }
 
+        Ok(conflicts)
+    }
+
+    fn detect_intra_entity_conflicts_for_clusters(
+        store: &dyn RecordStore,
+        clusters: &Clusters,
+        ontology: &Ontology,
+        target: &std::collections::HashSet<ClusterId>,
+    ) -> Result<Vec<DirectConflict>> {
+        let mut conflicts = Vec::new();
+        for cluster in &clusters.clusters {
+            if !target.contains(&cluster.id) {
+                continue;
+            }
+            for record_id in &cluster.records {
+                if let Some(record) = store.get_record(*record_id) {
+                    let mut descriptors_by_attr: HashMap<AttrId, Vec<Descriptor>> =
+                        HashMap::new();
+                    for descriptor in &record.descriptors {
+                        descriptors_by_attr
+                            .entry(descriptor.attr)
+                            .or_default()
+                            .push(descriptor.clone());
+                    }
+                    for (attr, descriptors) in descriptors_by_attr {
+                        if ontology.is_strong_identifier(&record.identity.entity_type, attr) {
+                            let entity_conflicts =
+                                Self::detect_intra_entity_conflicts_for_attribute(
+                                    descriptors,
+                                    attr,
+                                    record.id,
+                                )?;
+                            conflicts.extend(entity_conflicts);
+                        }
+                    }
+                }
+            }
+        }
         Ok(conflicts)
     }
 
@@ -633,6 +727,88 @@ impl ConflictDetector {
         Ok(conflicts)
     }
 
+    fn detect_indirect_conflicts_for_clusters(
+        store: &dyn RecordStore,
+        clusters: &Clusters,
+        ontology: &Ontology,
+        target: &std::collections::HashSet<ClusterId>,
+    ) -> Result<Vec<IndirectConflict>> {
+        let mut conflicts = Vec::new();
+
+        let mut clusters_by_identity: std::collections::HashMap<
+            Vec<KeyValue>,
+            Vec<&crate::dsu::Cluster>,
+        > = std::collections::HashMap::new();
+
+        for cluster in &clusters.clusters {
+            if let Some(record_id) = cluster.records.first() {
+                if let Some(record) = store.get_record(*record_id) {
+                    let identity_keys =
+                        ontology.identity_keys_for_type(&record.identity.entity_type);
+                    for identity_key in identity_keys {
+                        if let Ok(key_values) = Self::extract_key_values(&record, identity_key) {
+                            if !key_values.is_empty() {
+                                clusters_by_identity
+                                    .entry(key_values)
+                                    .or_default()
+                                    .push(cluster);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key_values, clusters_with_same_identity) in clusters_by_identity {
+            if !clusters_with_same_identity
+                .iter()
+                .any(|cluster| target.contains(&cluster.id))
+            {
+                continue;
+            }
+            if clusters_with_same_identity.len() > 1 {
+                let mut has_strong_id_conflict = false;
+                for i in 0..clusters_with_same_identity.len() {
+                    for j in i + 1..clusters_with_same_identity.len() {
+                        let cluster_a = clusters_with_same_identity[i];
+                        let cluster_b = clusters_with_same_identity[j];
+                        if Self::clusters_have_conflicting_strong_ids(
+                            store, cluster_a, cluster_b, ontology,
+                        ) {
+                            has_strong_id_conflict = true;
+                        }
+                    }
+                }
+
+                if has_strong_id_conflict {
+                    for cluster in clusters_with_same_identity {
+                        if !target.contains(&cluster.id) {
+                            continue;
+                        }
+                        let interval =
+                            Self::interval_for_key_values(store, cluster, &key_values)
+                                .unwrap_or_else(|| Interval::new(0, 1).unwrap());
+                        let conflict = IndirectConflict::new(
+                            "indirect".to_string(),
+                            "strong_id_conflict".to_string(),
+                            None,
+                            interval,
+                            ConflictParticipants::new(vec![], Some(cluster.records.clone())),
+                            "suppressed_merge".to_string(),
+                            ConflictDetails::new().with_evidence(vec![format!(
+                                "Cluster {} shares identity key but conflicts on strong identifiers",
+                                cluster.id.0
+                            )]),
+                        );
+                        conflicts.push(conflict);
+                    }
+                }
+            }
+        }
+
+        Ok(conflicts)
+    }
+
     /// Extract key values for a record based on an identity key
     fn extract_key_values(
         record: &crate::model::Record,
@@ -811,6 +987,22 @@ impl ConflictDetector {
             }
         }
 
+        Ok(violations)
+    }
+
+    fn detect_constraint_violations_for_cluster(
+        store: &dyn RecordStore,
+        cluster: &crate::dsu::Cluster,
+        ontology: &Ontology,
+    ) -> Result<Vec<ConstraintViolation>> {
+        let mut violations = Vec::new();
+        if cluster.records.is_empty() {
+            return Ok(violations);
+        }
+        for constraint in &ontology.constraints {
+            let cluster_violations = Self::check_constraint_in_cluster(store, cluster, constraint)?;
+            violations.extend(cluster_violations);
+        }
         Ok(violations)
     }
 
@@ -1027,6 +1219,15 @@ pub fn detect_conflicts(
     ontology: &Ontology,
 ) -> Result<Vec<Observation>> {
     ConflictDetector::detect_conflicts(store, clusters, ontology)
+}
+
+pub fn detect_conflicts_for_clusters(
+    store: &dyn RecordStore,
+    clusters: &Clusters,
+    ontology: &Ontology,
+    cluster_ids: &[ClusterId],
+) -> Result<Vec<Observation>> {
+    ConflictDetector::detect_conflicts_for_clusters(store, clusters, ontology, cluster_ids)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

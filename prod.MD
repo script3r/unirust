@@ -28,9 +28,9 @@ Focus: correctness, durability, and performance with 32GB RAM per shard and 100M
 
 ## Phase 3: Query and Conflict Performance
 
-- [ ] Query planner to choose the smallest index scan
-- [ ] Incremental conflict detection for affected clusters only
-- [ ] Precompute cluster keys and golden summaries (cacheable)
+- [x] Query planner to choose the smallest index scan
+- [x] Incremental conflict detection for affected clusters only
+- [x] Precompute cluster keys and golden summaries (cacheable)
 
 ## Phase 4: Distributed Reliability
 

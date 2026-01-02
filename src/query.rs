@@ -53,6 +53,26 @@ pub fn query_master_entities(
     descriptors: &[QueryDescriptor],
     interval: Interval,
 ) -> Result<QueryOutcome> {
+    let golden_cache = build_golden_cache(store, clusters);
+    let cluster_key_cache = build_cluster_key_cache(store, clusters, ontology);
+    query_master_entities_with_cache(
+        store,
+        clusters,
+        descriptors,
+        interval,
+        &golden_cache,
+        &cluster_key_cache,
+    )
+}
+
+pub fn query_master_entities_with_cache(
+    store: &dyn RecordStore,
+    clusters: &Clusters,
+    descriptors: &[QueryDescriptor],
+    interval: Interval,
+    golden_cache: &std::collections::HashMap<ClusterId, Vec<GoldenDescriptor>>,
+    cluster_key_cache: &std::collections::HashMap<ClusterId, ClusterKey>,
+) -> Result<QueryOutcome> {
     if descriptors.is_empty() {
         return Ok(QueryOutcome::Matches(Vec::new()));
     }
@@ -67,12 +87,17 @@ pub fn query_master_entities(
     let mut candidate_intervals_by_cluster: std::collections::HashMap<ClusterId, Vec<Interval>> =
         std::collections::HashMap::new();
 
-    for (idx, descriptor) in descriptors.iter().enumerate() {
-        let mut next: std::collections::HashMap<ClusterId, Vec<Interval>> =
-            std::collections::HashMap::new();
-
+    let mut descriptor_matches = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
         let matches =
             store.get_records_with_value_in_interval(descriptor.attr, descriptor.value, interval);
+        descriptor_matches.push((descriptor, matches));
+    }
+    descriptor_matches.sort_by_key(|(_, matches)| matches.len());
+
+    for (idx, (_descriptor, matches)) in descriptor_matches.iter().enumerate() {
+        let mut next: std::collections::HashMap<ClusterId, Vec<Interval>> =
+            std::collections::HashMap::new();
 
         for (record_id, record_interval) in matches {
             if let Some(&cluster_id) = record_to_cluster.get(&record_id) {
@@ -121,8 +146,6 @@ pub fn query_master_entities(
     if let Some(conflict) = find_overlap_conflict(store, clusters, &matches, descriptors) {
         return Ok(QueryOutcome::Conflict(conflict));
     }
-    let golden_cache = build_golden_cache(store, clusters);
-    let cluster_key_cache = build_cluster_key_cache(store, clusters, ontology);
     let matches = matches
         .into_iter()
         .map(|entry| QueryMatch {
@@ -252,7 +275,7 @@ fn find_overlap_conflict(
     None
 }
 
-fn build_golden_cache(
+pub fn build_golden_cache(
     store: &dyn RecordStore,
     clusters: &Clusters,
 ) -> std::collections::HashMap<ClusterId, Vec<GoldenDescriptor>> {
@@ -263,7 +286,7 @@ fn build_golden_cache(
     cache
 }
 
-fn build_cluster_key_cache(
+pub fn build_cluster_key_cache(
     store: &dyn RecordStore,
     clusters: &Clusters,
     ontology: &Ontology,

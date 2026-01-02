@@ -59,7 +59,15 @@ pub struct Unirust {
     ontology: Ontology,
     streaming: Option<linker::StreamingLinker>,
     graph_state: Option<graph::IncrementalKnowledgeGraph>,
+    query_cache: std::sync::Mutex<Option<QueryCache>>,
     tuning: StreamingTuning,
+}
+
+#[derive(Clone)]
+struct QueryCache {
+    clusters: dsu::Clusters,
+    golden: std::collections::HashMap<ClusterId, Vec<graph::GoldenDescriptor>>,
+    cluster_keys: std::collections::HashMap<ClusterId, graph::ClusterKey>,
 }
 
 impl Unirust {
@@ -78,6 +86,7 @@ impl Unirust {
             ontology,
             streaming: None,
             graph_state: None,
+            query_cache: std::sync::Mutex::new(None),
             tuning: StreamingTuning::default(),
         }
     }
@@ -91,6 +100,7 @@ impl Unirust {
             ontology,
             streaming: None,
             graph_state: None,
+            query_cache: std::sync::Mutex::new(None),
             tuning,
         }
     }
@@ -100,6 +110,7 @@ impl Unirust {
         self.store.add_records(records)?;
         self.streaming = None;
         self.graph_state = None;
+        self.invalidate_query_cache();
         Ok(())
     }
 
@@ -224,6 +235,7 @@ impl Unirust {
             }
         }
 
+        self.invalidate_query_cache();
         Ok(assignments)
     }
 
@@ -253,14 +265,19 @@ impl Unirust {
             };
             let clusters =
                 streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
-            let observations =
-                conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
+            let observations = conflicts::detect_conflicts_for_clusters(
+                self.store.as_ref(),
+                &clusters,
+                &self.ontology,
+                &[cluster_id],
+            )?;
             updates.push(StreamedConflictUpdate {
                 assignment,
                 observations,
             });
         }
 
+        self.invalidate_query_cache();
         Ok(updates)
     }
 
@@ -321,6 +338,7 @@ impl Unirust {
             });
         }
 
+        self.invalidate_query_cache();
         Ok(updates)
     }
 
@@ -339,14 +357,36 @@ impl Unirust {
         descriptors: &[query::QueryDescriptor],
         interval: Interval,
     ) -> anyhow::Result<query::QueryOutcome> {
-        let clusters = self.build_clusters()?;
-        query::query_master_entities(
+        let mut cache_guard = self.query_cache.lock().expect("query cache lock");
+        if cache_guard.is_none() {
+            let clusters = self.build_clusters()?;
+            let golden = query::build_golden_cache(self.store.as_ref(), &clusters);
+            let cluster_keys = query::build_cluster_key_cache(
+                self.store.as_ref(),
+                &clusters,
+                &self.ontology,
+            );
+            *cache_guard = Some(QueryCache {
+                clusters,
+                golden,
+                cluster_keys,
+            });
+        }
+        let cache = cache_guard.as_ref().expect("cache");
+        query::query_master_entities_with_cache(
             self.store.as_ref(),
-            &clusters,
-            &self.ontology,
+            &cache.clusters,
             descriptors,
             interval,
+            &cache.golden,
+            &cache.cluster_keys,
         )
+    }
+
+    fn invalidate_query_cache(&self) {
+        if let Ok(mut guard) = self.query_cache.lock() {
+            *guard = None;
+        }
     }
 
     /// Summarize conflicts into stable, record-identity based descriptors.
