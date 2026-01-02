@@ -75,7 +75,7 @@ Replica/backup strategy (v1):
 - [x] Compaction/flush metrics and throttling policies (rate limiter + metrics)
 
 ### Phase 6.4: Concurrency + Resilience
-- [ ] Reduce global mutex scope (shard-local actors or partitioned locks)
+- [x] Reduce global mutex scope (RW locks for read-heavy shard operations)
 - [ ] Idempotent ingest + WAL/replay for partial failures
 - [ ] Hot-key mitigation + shard auto-rebalance (dual-write cutover)
 

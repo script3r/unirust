@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -333,7 +333,7 @@ pub fn hash_record_to_shard(
 #[derive(Clone)]
 pub struct ShardNode {
     shard_id: u32,
-    unirust: Arc<Mutex<Unirust>>,
+    unirust: Arc<RwLock<Unirust>>,
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
@@ -371,7 +371,7 @@ impl ShardNode {
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
-            let unirust = Arc::new(Mutex::new(Unirust::with_store_and_tuning(
+            let unirust = Arc::new(RwLock::new(Unirust::with_store_and_tuning(
                 ontology,
                 store,
                 tuning.clone(),
@@ -391,7 +391,7 @@ impl ShardNode {
 
         let mut store = crate::Store::new();
         let ontology = ontology_config.clone().build_ontology(&mut store);
-        let unirust = Arc::new(Mutex::new(Unirust::with_store_and_tuning(
+        let unirust = Arc::new(RwLock::new(Unirust::with_store_and_tuning(
             ontology,
             store,
             tuning.clone(),
@@ -551,14 +551,14 @@ fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, 
 }
 
 fn spawn_ingest_worker(
-    unirust: Arc<Mutex<Unirust>>,
+    unirust: Arc<RwLock<Unirust>>,
     shard_id: u32,
 ) -> mpsc::Sender<IngestJob> {
     let (tx, mut rx) = mpsc::channel::<IngestJob>(INGEST_QUEUE_CAPACITY);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             let result = {
-                let mut guard = unirust.lock().await;
+                let mut guard = unirust.write().await;
                 process_ingest_batch(&mut guard, shard_id, &job.records)
             };
             let _ = job.respond_to.send(result);
@@ -650,12 +650,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
             store
                 .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
-            let mut guard = self.unirust.lock().await;
+            let mut guard = self.unirust.write().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         } else {
             let mut store = crate::Store::new();
             let ontology = config.build_ontology(&mut store);
-            let mut guard = self.unirust.lock().await;
+            let mut guard = self.unirust.write().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         }
 
@@ -739,7 +739,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::QueryEntitiesRequest>,
     ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
         let start = Instant::now();
-        let mut unirust = self.unirust.lock().await;
+        let mut unirust = self.unirust.write().await;
         let request = request.into_inner();
         let interval = Interval::new(request.start, request.end)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -831,7 +831,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
-        let unirust = self.unirust.lock().await;
+        let unirust = self.unirust.read().await;
         let clusters = unirust
             .build_clusters()
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -880,7 +880,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::MetricsRequest>,
     ) -> Result<Response<proto::MetricsResponse>, Status> {
         let store_metrics = {
-            let unirust = self.unirust.lock().await;
+            let unirust = self.unirust.read().await;
             unirust.store_metrics()
         };
         let response = proto::MetricsResponse {
@@ -912,7 +912,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .ok_or_else(|| Status::internal("invalid checkpoint path"))?,
         )
         .map_err(|err| Status::internal(err.to_string()))?;
-        let unirust = self.unirust.lock().await;
+        let unirust = self.unirust.read().await;
         unirust
             .checkpoint(&target)
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -925,7 +925,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::RecordIdRangeRequest>,
     ) -> Result<Response<proto::RecordIdRangeResponse>, Status> {
-        let unirust = self.unirust.lock().await;
+        let unirust = self.unirust.read().await;
         let record_count = unirust.record_count() as u64;
         let response = match unirust.record_id_bounds() {
             Some((min_id, max_id)) => proto::RecordIdRangeResponse {
@@ -964,7 +964,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             return Err(Status::invalid_argument("start_id must be < end_id"));
         }
 
-        let unirust = self.unirust.lock().await;
+        let unirust = self.unirust.read().await;
         let mut records = unirust.records_in_id_range(start_id, end_id, limit + 1);
         let has_more = records.len() > limit;
         if has_more {
@@ -1014,7 +1014,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         tokio::spawn(async move {
             loop {
                 let (records, has_more, next_start_id) = {
-                    let unirust_guard = unirust.lock().await;
+                    let unirust_guard = unirust.read().await;
                     let mut records =
                         unirust_guard.records_in_id_range(RecordId(start_id), RecordId(end_id), limit + 1);
                     let has_more = records.len() > limit;
@@ -1073,7 +1073,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         if request.records.is_empty() {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
         }
-        let mut unirust = self.unirust.lock().await;
+        let mut unirust = self.unirust.write().await;
         let mut records = Vec::with_capacity(request.records.len());
         for snapshot in &request.records {
             let identity = snapshot
@@ -1109,7 +1109,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             if chunk.records.is_empty() {
                 continue;
             }
-            let mut unirust = self.unirust.lock().await;
+            let mut unirust = self.unirust.write().await;
             let mut records = Vec::with_capacity(chunk.records.len());
             for snapshot in &chunk.records {
                 let identity = snapshot
@@ -1135,7 +1135,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ListConflictsRequest>,
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
-        let unirust = self.unirust.lock().await;
+        let unirust = self.unirust.read().await;
         let request = request.into_inner();
         let mut summaries = if let Some(cache) = unirust.cached_conflict_summaries() {
             cache
@@ -1189,12 +1189,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
             store
                 .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
-            let mut guard = self.unirust.lock().await;
+            let mut guard = self.unirust.write().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         } else {
             let mut store = crate::Store::new();
             let ontology = config.build_ontology(&mut store);
-            let mut guard = self.unirust.lock().await;
+            let mut guard = self.unirust.write().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         }
         Ok(Response::new(proto::Empty {}))
