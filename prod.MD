@@ -76,7 +76,7 @@ Replica/backup strategy (v1):
 
 ### Phase 6.4: Concurrency + Resilience
 - [x] Reduce global mutex scope (RW locks for read-heavy shard operations)
-- [ ] Idempotent ingest + WAL/replay for partial failures (idempotent ingest done, WAL pending)
+- [x] Idempotent ingest + WAL/replay for partial failures
 - [ ] Hot-key mitigation + shard auto-rebalance (dual-write cutover)
 
 ### Phase 6.5: Benchmarking + Regression

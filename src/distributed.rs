@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,14 +25,14 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 use std::pin::Pin;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct JsonRecordIdentity {
     entity_type: String,
     perspective: String,
     uid: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct JsonRecordDescriptor {
     attr: String,
     value: String,
@@ -39,11 +40,84 @@ struct JsonRecordDescriptor {
     end: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct JsonRecordInput {
     index: u32,
     identity: JsonRecordIdentity,
     descriptors: Vec<JsonRecordDescriptor>,
+}
+
+struct IngestWal {
+    path: PathBuf,
+    temp_path: PathBuf,
+}
+
+impl IngestWal {
+    fn new(data_dir: &Path) -> Self {
+        let path = data_dir.join("ingest_wal.json");
+        let temp_path = data_dir.join("ingest_wal.json.tmp");
+        Self { path, temp_path }
+    }
+
+    fn write_batch(&self, records: &[proto::RecordInput]) -> Result<(), Status> {
+        if records.is_empty() {
+            return self.clear();
+        }
+        let inputs: Vec<JsonRecordInput> = records
+            .iter()
+            .map(json_from_proto_input)
+            .collect::<Result<_, Status>>()?;
+        let payload =
+            serde_json::to_vec(&inputs).map_err(|err| Status::internal(err.to_string()))?;
+        let mut file = fs::File::create(&self.temp_path)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        file.write_all(&payload)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        file.sync_all()
+            .map_err(|err| Status::internal(err.to_string()))?;
+        fs::rename(&self.temp_path, &self.path)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(())
+    }
+
+    fn load_batch(&self) -> Result<Option<Vec<proto::RecordInput>>, Status> {
+        let source = if self.path.exists() {
+            Some(self.path.as_path())
+        } else if self.temp_path.exists() {
+            Some(self.temp_path.as_path())
+        } else {
+            None
+        };
+        let Some(path) = source else {
+            return Ok(None);
+        };
+        let bytes = fs::read(path).map_err(|err| Status::internal(err.to_string()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let inputs: Vec<JsonRecordInput> =
+            serde_json::from_slice(&bytes).map_err(|err| Status::internal(err.to_string()))?;
+        let records = inputs.into_iter().map(proto_from_json_input).collect();
+        Ok(Some(records))
+    }
+
+    fn replay(&self, unirust: &mut Unirust, shard_id: u32) -> Result<(), Status> {
+        if let Some(records) = self.load_batch()? {
+            process_ingest_batch(unirust, shard_id, &records)?;
+            self.clear()?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), Status> {
+        if self.path.exists() {
+            fs::remove_file(&self.path).map_err(|err| Status::internal(err.to_string()))?;
+        }
+        if self.temp_path.exists() {
+            fs::remove_file(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 pub mod proto {
@@ -223,6 +297,57 @@ fn map_proto_config(config: &proto::OntologyConfig) -> DistributedOntologyConfig
     }
 }
 
+fn json_from_proto_input(input: &proto::RecordInput) -> Result<JsonRecordInput, Status> {
+    let identity = input
+        .identity
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+    let descriptors = input
+        .descriptors
+        .iter()
+        .map(|descriptor| {
+            Interval::new(descriptor.start, descriptor.end)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            Ok(JsonRecordDescriptor {
+                attr: descriptor.attr.clone(),
+                value: descriptor.value.clone(),
+                start: descriptor.start,
+                end: descriptor.end,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok(JsonRecordInput {
+        index: input.index,
+        identity: JsonRecordIdentity {
+            entity_type: identity.entity_type.clone(),
+            perspective: identity.perspective.clone(),
+            uid: identity.uid.clone(),
+        },
+        descriptors,
+    })
+}
+
+fn proto_from_json_input(input: JsonRecordInput) -> proto::RecordInput {
+    proto::RecordInput {
+        index: input.index,
+        identity: Some(proto::RecordIdentity {
+            entity_type: input.identity.entity_type,
+            perspective: input.identity.perspective,
+            uid: input.identity.uid,
+        }),
+        descriptors: input
+            .descriptors
+            .into_iter()
+            .map(|descriptor| proto::RecordDescriptor {
+                attr: descriptor.attr,
+                value: descriptor.value,
+                start: descriptor.start,
+                end: descriptor.end,
+            })
+            .collect(),
+    }
+}
+
 async fn fetch_record_batch_from_url(url: &str) -> Result<proto::IngestRecordsRequest, Status> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(Status::invalid_argument("url must be http or https"));
@@ -245,27 +370,7 @@ async fn fetch_record_batch_from_url(url: &str) -> Result<proto::IngestRecordsRe
     let inputs: Vec<JsonRecordInput> = serde_json::from_slice(&bytes)
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-    let records = inputs
-        .into_iter()
-        .map(|input| proto::RecordInput {
-            index: input.index,
-            identity: Some(proto::RecordIdentity {
-                entity_type: input.identity.entity_type,
-                perspective: input.identity.perspective,
-                uid: input.identity.uid,
-            }),
-            descriptors: input
-                .descriptors
-                .into_iter()
-                .map(|descriptor| proto::RecordDescriptor {
-                    attr: descriptor.attr,
-                    value: descriptor.value,
-                    start: descriptor.start,
-                    end: descriptor.end,
-                })
-                .collect(),
-        })
-        .collect();
+    let records = inputs.into_iter().map(proto_from_json_input).collect();
 
     Ok(proto::IngestRecordsRequest { records })
 }
@@ -371,12 +476,14 @@ impl ShardNode {
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
-            let unirust = Arc::new(RwLock::new(Unirust::with_store_and_tuning(
-                ontology,
-                store,
-                tuning.clone(),
-            )));
-            let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id);
+            let ingest_wal = Some(Arc::new(IngestWal::new(&path)));
+            let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
+            if let Some(wal) = ingest_wal.as_ref() {
+                wal.replay(&mut unirust, shard_id)
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            }
+            let unirust = Arc::new(RwLock::new(unirust));
+            let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id, ingest_wal.clone());
             return Ok(Self {
                 shard_id,
                 unirust,
@@ -391,12 +498,13 @@ impl ShardNode {
 
         let mut store = crate::Store::new();
         let ontology = ontology_config.clone().build_ontology(&mut store);
+        let ingest_wal = None;
         let unirust = Arc::new(RwLock::new(Unirust::with_store_and_tuning(
             ontology,
             store,
             tuning.clone(),
         )));
-        let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id);
+        let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id, ingest_wal.clone());
         Ok(Self {
             shard_id,
             unirust,
@@ -553,13 +661,30 @@ fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, 
 fn spawn_ingest_worker(
     unirust: Arc<RwLock<Unirust>>,
     shard_id: u32,
+    ingest_wal: Option<Arc<IngestWal>>,
 ) -> mpsc::Sender<IngestJob> {
     let (tx, mut rx) = mpsc::channel::<IngestJob>(INGEST_QUEUE_CAPACITY);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let result = {
-                let mut guard = unirust.write().await;
-                process_ingest_batch(&mut guard, shard_id, &job.records)
+            let result = match ingest_wal.as_ref() {
+                Some(wal) => {
+                    let wal_result = wal.write_batch(&job.records);
+                    let result = match wal_result {
+                        Ok(()) => {
+                            let mut guard = unirust.write().await;
+                            process_ingest_batch(&mut guard, shard_id, &job.records)
+                        }
+                        Err(err) => Err(err),
+                    };
+                    if result.is_ok() {
+                        let _ = wal.clear();
+                    }
+                    result
+                }
+                None => {
+                    let mut guard = unirust.write().await;
+                    process_ingest_batch(&mut guard, shard_id, &job.records)
+                }
             };
             let _ = job.respond_to.send(result);
         }
