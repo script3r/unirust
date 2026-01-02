@@ -14,10 +14,10 @@ Focus: correctness, durability, and performance with 32GB RAM per shard and 100M
 ## Phase 1: Memory + Indexing (scale)
 
 - [x] Refactor `RecordStore` to return owned records or iterators
-- [ ] Eliminate full in-memory record scan dependency in query/linker/conflicts
-- [ ] Implement RocksDB-native indexes for attr/value, entity_type, perspective
-- [ ] Implement temporal bucketed index (time-windowed keys)
-- [ ] Add bounded LRU cache for hot records
+- [x] Eliminate full in-memory record scan dependency in query/linker/conflicts
+- [x] Implement RocksDB-native indexes for attr/value, entity_type, perspective
+- [x] Implement temporal bucketed index (time-windowed keys)
+- [x] Add bounded LRU cache for hot records
 
 ## Phase 2: Ingest Throughput
 

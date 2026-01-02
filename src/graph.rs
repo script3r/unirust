@@ -394,7 +394,7 @@ impl GraphExporter {
         graph.add_metadata("num_clusters".to_string(), clusters.len().to_string());
 
         // Add record nodes
-        for record in store.get_all_records() {
+        store.for_each_record(&mut |record| {
             let mut node = GraphNode::record(record.id);
             node = node.with_property(
                 "entity_type".to_string(),
@@ -406,7 +406,7 @@ impl GraphExporter {
             );
             node = node.with_property("uid".to_string(), record.identity.uid.clone());
             graph.add_node(node);
-        }
+        });
 
         let cluster_keys = cluster_keys_for_clusters(store, clusters, ontology);
 
@@ -544,7 +544,7 @@ fn build_graph_snapshot(
     metadata.insert("num_records".to_string(), store.len().to_string());
     metadata.insert("num_clusters".to_string(), clusters.len().to_string());
 
-    for record in store.get_all_records() {
+    store.for_each_record(&mut |record| {
         let mut node = GraphNode::record(record.id);
         node = node.with_property(
             "entity_type".to_string(),
@@ -556,7 +556,7 @@ fn build_graph_snapshot(
         );
         node = node.with_property("uid".to_string(), record.identity.uid.clone());
         nodes.insert(node.id.clone(), node);
-    }
+    });
 
     let cluster_keys = cluster_keys_for_clusters(store, clusters, ontology);
 

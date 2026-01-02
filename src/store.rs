@@ -30,6 +30,13 @@ pub trait RecordStore: Send + Sync {
     /// Get all records.
     fn get_all_records(&self) -> Vec<Record>;
 
+    /// Apply a function to each record.
+    fn for_each_record(&self, f: &mut dyn FnMut(Record)) {
+        for record in self.get_all_records() {
+            f(record);
+        }
+    }
+
     /// Get records for a specific entity type.
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record>;
 
@@ -51,7 +58,7 @@ pub trait RecordStore: Send + Sync {
     ) -> Vec<(RecordId, Interval)> {
         let mut matches = Vec::new();
 
-        for record in self.get_all_records() {
+        self.for_each_record(&mut |record| {
             for descriptor in &record.descriptors {
                 if descriptor.attr == attr && descriptor.value == value {
                     if let Some(overlap) =
@@ -61,7 +68,7 @@ pub trait RecordStore: Send + Sync {
                     }
                 }
             }
-        }
+        });
 
         matches
     }
@@ -297,6 +304,12 @@ impl RecordStore for Store {
         Store::get_all_records(self)
     }
 
+    fn for_each_record(&self, f: &mut dyn FnMut(Record)) {
+        for record in self.records.values() {
+            f(record.clone());
+        }
+    }
+
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         Store::get_records_by_entity_type(self, entity_type)
     }
@@ -365,9 +378,9 @@ impl AttributeValueIndex {
     pub fn build(&mut self, store: &dyn RecordStore) {
         self.index.clear();
 
-        for record in store.get_all_records() {
+        store.for_each_record(&mut |record| {
             self.add_record(&record);
-        }
+        });
     }
 
     pub fn add_record(&mut self, record: &Record) {
@@ -449,9 +462,9 @@ impl TemporalIndex {
     pub fn build(&mut self, store: &dyn RecordStore) {
         self.index.clear();
 
-        for record in store.get_all_records() {
+        store.for_each_record(&mut |record| {
             self.add_record(&record);
-        }
+        });
     }
 
     pub fn add_record(&mut self, record: &Record) {

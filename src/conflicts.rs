@@ -343,7 +343,8 @@ impl ConflictDetector {
         let mut conflicts = Vec::new();
 
         // Iterate through each entity individually (like Java: snapshotMap.forEach)
-        for record in store.get_all_records() {
+        let mut error: Option<anyhow::Error> = None;
+        store.for_each_record(&mut |record| {
             // Group descriptors by attribute for this entity
             let mut descriptors_by_attr: HashMap<AttrId, Vec<Descriptor>> = HashMap::new();
             for descriptor in &record.descriptors {
@@ -357,14 +358,23 @@ impl ConflictDetector {
             for (attr, descriptors) in descriptors_by_attr {
                 // Only check attributes that are strong identifiers (like Java: IDENTIFIER, PARTIAL_IDENTIFIER, DESCRIPTOR)
                 if ontology.is_strong_identifier(&record.identity.entity_type, attr) {
-                    let entity_conflicts = Self::detect_intra_entity_conflicts_for_attribute(
+                    match Self::detect_intra_entity_conflicts_for_attribute(
                         descriptors,
                         attr,
                         record.id,
-                    )?;
-                    conflicts.extend(entity_conflicts);
+                    ) {
+                        Ok(entity_conflicts) => conflicts.extend(entity_conflicts),
+                        Err(err) => {
+                            error = Some(err);
+                            return;
+                        }
+                    }
                 }
             }
+        });
+
+        if let Some(err) = error {
+            return Err(err);
         }
 
         Ok(conflicts)

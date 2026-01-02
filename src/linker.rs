@@ -67,11 +67,10 @@ impl StreamingLinker {
         };
 
         if !store.is_empty() {
-            let mut record_ids: Vec<RecordId> = store
-                .get_all_records()
-                .iter()
-                .map(|record| record.id)
-                .collect();
+            let mut record_ids: Vec<RecordId> = Vec::new();
+            store.for_each_record(&mut |record| {
+                record_ids.push(record.id);
+            });
             record_ids.sort_by_key(|record_id| record_id.0);
 
             for record_id in record_ids {
@@ -803,7 +802,8 @@ fn split_clusters_with_unresolvable_conflicts(
 /// Determine if conflict splitting should be applied based on the scenario.
 /// This uses a narrow heuristic for known test fixtures.
 fn should_apply_conflict_splitting(store: &dyn RecordStore, ontology: &Ontology) -> bool {
-    let records = store.get_all_records();
+    let mut records = Vec::new();
+    store.for_each_record(&mut |record| records.push(record));
 
     // Check if this looks like the indirect conflict test case
     // (3 records with same identity key but conflicting strong identifiers from same perspective)
