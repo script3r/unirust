@@ -95,6 +95,10 @@ impl Unirust {
         }
     }
 
+    pub fn store_mut(&mut self) -> &mut dyn RecordStore {
+        self.store.as_mut()
+    }
+
     pub fn with_store_and_tuning<S>(ontology: Ontology, store: S, tuning: StreamingTuning) -> Self
     where
         S: RecordStore + 'static,
@@ -178,28 +182,43 @@ impl Unirust {
         self.store.len()
     }
 
+    pub fn streaming_cluster_count(&self) -> Option<usize> {
+        self.streaming
+            .as_ref()
+            .map(|streaming| streaming.cluster_count())
+            .or_else(|| self.store.cluster_count())
+    }
+
+    pub fn graph_counts(&self) -> Option<(u64, u64)> {
+        self.graph_state.as_ref().map(|graph| {
+            let nodes = graph.num_nodes() as u64;
+            let edges = (graph.num_same_as_edges() + graph.num_conflicts_with_edges()) as u64;
+            (nodes, edges)
+        })
+    }
+
     pub fn store_metrics(&self) -> Option<StoreMetrics> {
         self.store.metrics()
     }
 
     /// Intern an attribute name into the store interner.
     pub fn intern_attr(&mut self, attr: &str) -> crate::model::AttrId {
-        self.store.interner_mut().intern_attr(attr)
+        self.store.intern_attr(attr)
     }
 
     /// Intern a value string into the store interner.
     pub fn intern_value(&mut self, value: &str) -> crate::model::ValueId {
-        self.store.interner_mut().intern_value(value)
+        self.store.intern_value(value)
     }
 
     /// Resolve an attribute ID back to its string label.
     pub fn resolve_attr(&self, attr: crate::model::AttrId) -> Option<String> {
-        self.store.interner().get_attr(attr).cloned()
+        self.store.resolve_attr(attr)
     }
 
     /// Resolve a value ID back to its string label.
     pub fn resolve_value(&self, value: crate::model::ValueId) -> Option<String> {
-        self.store.interner().get_value(value).cloned()
+        self.store.resolve_value(value)
     }
 
     /// Export the knowledge graph as a text summary.
@@ -247,31 +266,37 @@ impl Unirust {
             )?);
         }
 
-        let streaming = self.streaming.as_mut().unwrap();
         let mut assignments = Vec::with_capacity(records.len());
         let mut record_ids = Vec::with_capacity(records.len());
+        let cluster_count = {
+            let streaming = self.streaming.as_mut().unwrap();
 
-        for record in records {
-            let (record_id, inserted) = self.store.add_record_if_absent(record)?;
-            let cluster_id = if inserted {
-                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
-            } else {
-                streaming.cluster_id_for(record_id)
-            };
-            assignments.push(StreamedClusterAssignment {
-                record_id,
-                cluster_id,
-            });
-            record_ids.push(record_id);
-        }
-
-        if self.tuning.deferred_reconciliation {
-            streaming.reconcile_pending(self.store.as_ref(), &self.ontology)?;
-            for assignment in &mut assignments {
-                assignment.cluster_id = streaming.cluster_id_for(assignment.record_id);
+            for record in records {
+                let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+                let cluster_id = if inserted {
+                    streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
+                } else {
+                    streaming.cluster_id_for(record_id)
+                };
+                let _ = self.store.set_cluster_assignment(record_id, cluster_id);
+                assignments.push(StreamedClusterAssignment {
+                    record_id,
+                    cluster_id,
+                });
+                record_ids.push(record_id);
             }
-        }
 
+            if self.tuning.deferred_reconciliation {
+                streaming.reconcile_pending(self.store.as_ref(), &self.ontology)?;
+                for assignment in &mut assignments {
+                    assignment.cluster_id = streaming.cluster_id_for(assignment.record_id);
+                }
+            }
+
+            streaming.cluster_count()
+        };
+
+        let _ = self.store.set_cluster_count(cluster_count);
         self.invalidate_query_cache();
         Ok(assignments)
     }
@@ -291,39 +316,52 @@ impl Unirust {
             )?);
         }
 
-        let streaming = self.streaming.as_mut().unwrap();
         let mut updates = Vec::with_capacity(records.len());
+        let cluster_count = {
+            let streaming = self.streaming.as_mut().unwrap();
 
-        for record in records {
-            let (record_id, inserted) = self.store.add_record_if_absent(record)?;
-            let cluster_id = if inserted {
-                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
-            } else {
-                streaming.cluster_id_for(record_id)
-            };
-            let assignment = StreamedClusterAssignment {
-                record_id,
-                cluster_id,
-            };
-            let observations = if inserted {
-                let clusters = streaming
-                    .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
-                conflicts::detect_conflicts_for_clusters(
-                    self.store.as_ref(),
-                    &clusters,
-                    &self.ontology,
-                    &[cluster_id],
-                )?
-            } else {
-                Vec::new()
-            };
-            updates.push(StreamedConflictUpdate {
-                assignment,
-                observations,
-            });
-        }
+            for record in records {
+                let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+                let cluster_id = if inserted {
+                    streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
+                } else {
+                    streaming.cluster_id_for(record_id)
+                };
+                let _ = self.store.set_cluster_assignment(record_id, cluster_id);
+                let assignment = StreamedClusterAssignment {
+                    record_id,
+                    cluster_id,
+                };
+                let observations = if inserted {
+                    let clusters = streaming
+                        .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
+                    conflicts::detect_conflicts_for_clusters(
+                        self.store.as_ref(),
+                        &clusters,
+                        &self.ontology,
+                        &[cluster_id],
+                    )?
+                } else {
+                    Vec::new()
+                };
+                if inserted && !observations.is_empty() {
+                    let summaries =
+                        conflicts::summarize_conflicts(self.store.as_ref(), &observations);
+                    let _ = self
+                        .store
+                        .set_cluster_conflict_summaries(cluster_id, &summaries);
+                }
+                updates.push(StreamedConflictUpdate {
+                    assignment,
+                    observations,
+                });
+            }
+
+            streaming.cluster_count()
+        };
 
         self.invalidate_query_cache();
+        let _ = self.store.set_cluster_count(cluster_count);
         Ok(updates)
     }
 
@@ -351,52 +389,65 @@ impl Unirust {
             )?);
         }
 
-        let streaming = self.streaming.as_mut().unwrap();
         let graph_state = self
             .graph_state
             .get_or_insert_with(graph::IncrementalKnowledgeGraph::new);
         let mut updates = Vec::with_capacity(records.len());
+        let cluster_count = {
+            let streaming = self.streaming.as_mut().unwrap();
 
-        for record in records {
-            let (record_id, inserted) = self.store.add_record_if_absent(record)?;
-            let cluster_id = if inserted {
-                streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
-            } else {
-                streaming.cluster_id_for(record_id)
-            };
-            let assignment = StreamedClusterAssignment {
-                record_id,
-                cluster_id,
-            };
+            for record in records {
+                let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+                let cluster_id = if inserted {
+                    streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
+                } else {
+                    streaming.cluster_id_for(record_id)
+                };
+                let _ = self.store.set_cluster_assignment(record_id, cluster_id);
+                let assignment = StreamedClusterAssignment {
+                    record_id,
+                    cluster_id,
+                };
 
-            let observations = if inserted {
-                let clusters = streaming
-                    .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
-                let observations =
-                    conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
-                let summaries = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
-                *self.conflict_cache.lock().unwrap() = Some(summaries);
+                let observations = if inserted {
+                    let clusters = streaming
+                        .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
+                    let observations = conflicts::detect_conflicts(
+                        self.store.as_ref(),
+                        &clusters,
+                        &self.ontology,
+                    )?;
+                    let summaries =
+                        conflicts::summarize_conflicts(self.store.as_ref(), &observations);
+                    if let Err(err) = self.store.set_conflict_summaries(&summaries) {
+                        eprintln!("Failed to persist conflict summaries: {err}");
+                    }
+                    *self.conflict_cache.lock().unwrap() = Some(summaries);
 
-                graph_state.update(
-                    self.store.as_ref(),
-                    &clusters,
-                    &observations,
-                    &self.ontology,
-                )?;
-                observations
-            } else {
-                Vec::new()
-            };
-            let graph = graph_state.to_knowledge_graph();
+                    graph_state.update(
+                        self.store.as_ref(),
+                        &clusters,
+                        &observations,
+                        &self.ontology,
+                    )?;
+                    observations
+                } else {
+                    Vec::new()
+                };
+                let graph = graph_state.to_knowledge_graph();
 
-            updates.push(StreamedGraphUpdate {
-                assignment,
-                observations,
-                graph,
-            });
-        }
+                updates.push(StreamedGraphUpdate {
+                    assignment,
+                    observations,
+                    graph,
+                });
+            }
+
+            streaming.cluster_count()
+        };
 
         self.invalidate_query_cache();
+        let _ = self.store.set_cluster_count(cluster_count);
         Ok(updates)
     }
 
@@ -461,7 +512,22 @@ impl Unirust {
         self.conflict_cache.lock().unwrap().clone()
     }
 
-    pub fn set_conflict_cache(&self, summaries: Vec<conflicts::ConflictSummary>) {
+    pub fn load_conflict_summaries(&self) -> Option<Vec<conflicts::ConflictSummary>> {
+        self.store.load_conflict_summaries()
+    }
+
+    pub fn conflict_summary_count(&self) -> Option<usize> {
+        self.conflict_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|summaries| summaries.len()))
+            .or_else(|| self.store.conflict_summary_count())
+    }
+
+    pub fn set_conflict_cache(&mut self, summaries: Vec<conflicts::ConflictSummary>) {
+        if let Err(err) = self.store.set_conflict_summaries(&summaries) {
+            eprintln!("Failed to persist conflict summaries: {err}");
+        }
         *self.conflict_cache.lock().unwrap() = Some(summaries);
     }
 

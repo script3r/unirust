@@ -132,6 +132,13 @@ impl StreamingLinker {
                     .to_vec();
                 let candidate_len = candidates.len();
                 deferred_keys.push((key_signature.clone(), candidate_len));
+                if candidate_len > self.tuning.hot_key_threshold {
+                    tainted_identity_keys.insert(key_signature.clone());
+                    if self.tuning.deferred_reconciliation {
+                        self.pending_keys.insert(key_signature.clone());
+                    }
+                    continue;
+                }
                 let stats = self.key_stats.get(&key_signature);
                 let avg = stats.map(|stats| stats.average_candidates()).unwrap_or(0.0);
                 let actual_cap = if self.tuning.adaptive_candidate_cap {
@@ -262,6 +269,10 @@ impl StreamingLinker {
             .add_record_with_root(&record, root, ontology)?;
 
         Ok(self.get_or_assign_cluster_id(root))
+    }
+
+    pub fn cluster_count(&self) -> usize {
+        self.dsu.cluster_count()
     }
 
     /// Get clusters from the streaming DSU state.

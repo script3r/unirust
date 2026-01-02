@@ -93,8 +93,74 @@ pub trait RecordStore: Send + Sync {
     /// Get a mutable reference to the string interner.
     fn interner_mut(&mut self) -> &mut StringInterner;
 
+    /// Intern an attribute string.
+    fn intern_attr(&mut self, attr: &str) -> AttrId {
+        self.interner_mut().intern_attr(attr)
+    }
+
+    /// Intern a value string.
+    fn intern_value(&mut self, value: &str) -> ValueId {
+        self.interner_mut().intern_value(value)
+    }
+
+    /// Resolve an attribute ID to its string.
+    fn resolve_attr(&self, id: AttrId) -> Option<String> {
+        self.interner().get_attr(id).cloned()
+    }
+
+    /// Resolve a value ID to its string.
+    fn resolve_value(&self, id: ValueId) -> Option<String> {
+        self.interner().get_value(id).cloned()
+    }
+
     /// Get the number of records.
     fn len(&self) -> usize;
+
+    /// Persist the current cluster count if supported.
+    fn set_cluster_count(&mut self, _count: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load the persisted cluster count if supported.
+    fn cluster_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Persist conflict summaries if supported.
+    fn set_conflict_summaries(
+        &mut self,
+        _summaries: &[crate::conflicts::ConflictSummary],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist conflict summaries for a specific cluster if supported.
+    fn set_cluster_conflict_summaries(
+        &mut self,
+        _cluster_id: crate::model::ClusterId,
+        _summaries: &[crate::conflicts::ConflictSummary],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load all persisted conflict summaries if supported.
+    fn load_conflict_summaries(&self) -> Option<Vec<crate::conflicts::ConflictSummary>> {
+        None
+    }
+
+    /// Load conflict summary count if supported.
+    fn conflict_summary_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Persist a record -> cluster assignment if supported.
+    fn set_cluster_assignment(
+        &mut self,
+        _record_id: RecordId,
+        _cluster_id: crate::model::ClusterId,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Check if the store is empty.
     fn is_empty(&self) -> bool;
@@ -165,9 +231,7 @@ impl Store {
         }
     }
 
-    /// Add a single record to the store and return its assigned ID.
-    pub fn add_record(&mut self, mut record: Record) -> Result<RecordId> {
-        // Intern all attribute and value strings
+    fn intern_record(&mut self, record: &mut Record) {
         for descriptor in &mut record.descriptors {
             if self.interner.get_attr(descriptor.attr).is_none() {
                 descriptor.attr = self.interner.intern_attr("unknown");
@@ -176,8 +240,12 @@ impl Store {
                 descriptor.value = self.interner.intern_value("unknown");
             }
         }
+    }
 
-        // Assign a new record ID if not already set
+    /// Prepare a record for persistence without storing it in memory.
+    pub fn prepare_record(&mut self, record: &mut Record) -> Result<RecordId> {
+        self.intern_record(record);
+
         if record.id.0 == 0 {
             record.id = RecordId(self.next_record_id);
             self.next_record_id += 1;
@@ -185,7 +253,13 @@ impl Store {
             self.next_record_id = self.next_record_id.max(record.id.0 + 1);
         }
 
-        let record_id = record.id;
+        Ok(record.id)
+    }
+
+    /// Add a single record to the store and return its assigned ID.
+    pub fn add_record(&mut self, mut record: Record) -> Result<RecordId> {
+        let record_id = self.prepare_record(&mut record)?;
+
         let identity = record.identity.clone();
         self.records.insert(record.id, record);
         self.identity_index.insert(identity, record_id);
@@ -198,14 +272,7 @@ impl Store {
 
     /// Insert a record with an explicit ID without assigning a new one.
     pub fn insert_record(&mut self, mut record: Record) -> Result<RecordId> {
-        for descriptor in &mut record.descriptors {
-            if self.interner.get_attr(descriptor.attr).is_none() {
-                descriptor.attr = self.interner.intern_attr("unknown");
-            }
-            if self.interner.get_value(descriptor.value).is_none() {
-                descriptor.value = self.interner.intern_value("unknown");
-            }
-        }
+        self.intern_record(&mut record);
 
         self.next_record_id = self.next_record_id.max(record.id.0 + 1);
 

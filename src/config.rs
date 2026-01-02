@@ -7,6 +7,7 @@ pub struct StreamingTuning {
     pub adaptive_high_cap: usize,
     pub adaptive_mid_cap: usize,
     pub deferred_reconciliation: bool,
+    pub hot_key_threshold: usize,
 }
 
 /// Preset profiles that bundle common tuning choices.
@@ -29,6 +30,7 @@ impl Default for StreamingTuning {
             adaptive_high_cap: 500,
             adaptive_mid_cap: 1000,
             deferred_reconciliation: true,
+            hot_key_threshold: 50_000,
         }
     }
 }
@@ -57,6 +59,7 @@ impl StreamingTuning {
             adaptive_high_cap: 250,
             adaptive_mid_cap: 500,
             deferred_reconciliation: true,
+            hot_key_threshold: 20_000,
         }
     }
 
@@ -69,6 +72,7 @@ impl StreamingTuning {
             adaptive_high_cap: 1500,
             adaptive_mid_cap: 2500,
             deferred_reconciliation: true,
+            hot_key_threshold: 100_000,
         }
     }
 
@@ -81,6 +85,7 @@ impl StreamingTuning {
             adaptive_high_cap: 200,
             adaptive_mid_cap: 300,
             deferred_reconciliation: true,
+            hot_key_threshold: 10_000,
         }
     }
 
@@ -93,6 +98,7 @@ impl StreamingTuning {
             adaptive_high_cap: 0,
             adaptive_mid_cap: 0,
             deferred_reconciliation: true,
+            hot_key_threshold: 5_000,
         }
     }
 }

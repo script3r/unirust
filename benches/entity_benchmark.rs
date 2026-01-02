@@ -2,109 +2,17 @@ use criterion::{
     criterion_group, criterion_main, AxisScale, BatchSize, BenchmarkId, Criterion,
     PlotConfiguration, SamplingMode, Throughput,
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Once;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
-use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
 use unirust_rs::sharding::ShardedStreamEngine;
-use unirust_rs::temporal::Interval;
 use unirust_rs::*;
 
-/// Generate test records with controlled overlap patterns
-fn generate_test_records(store: &mut Store, count: u32, overlap_probability: f64) -> Vec<Record> {
-    let mut rng = StdRng::seed_from_u64(42);
-    let mut records = Vec::with_capacity(count as usize);
-
-    // Create attributes
-    let name_attr = store.interner_mut().intern_attr("name");
-    let email_attr = store.interner_mut().intern_attr("email");
-    let phone_attr = store.interner_mut().intern_attr("phone");
-    let ssn_attr = store.interner_mut().intern_attr("ssn");
-
-    // Create shared values for clustering
-    let name_value1 = store.interner_mut().intern_value("John Doe");
-    let email_value1 = store.interner_mut().intern_value("john@example.com");
-    let phone_value1 = store.interner_mut().intern_value("555-1234");
-    let ssn_value1 = store.interner_mut().intern_value("123-45-6789");
-
-    for i in 1..=count {
-        let perspectives = ["crm", "erp", "web", "mobile", "api"];
-        let perspective = perspectives[rng.random_range(0..perspectives.len())];
-        let uid = format!("{}_{:06}", perspective, i);
-        let identity = RecordIdentity::new("person".to_string(), perspective.to_string(), uid);
-
-        let start = rng.random_range(0..1000);
-        let end = start + rng.random_range(1..100);
-        let interval = Interval::new(start, end).unwrap();
-
-        let mut descriptors = Vec::new();
-
-        // Use shared values based on overlap probability
-        if rng.random_bool(overlap_probability) {
-            descriptors.push(Descriptor::new(name_attr, name_value1, interval));
-            descriptors.push(Descriptor::new(email_attr, email_value1, interval));
-        } else {
-            let unique_name = format!("Person_{:06}", i);
-            let unique_email = format!("person_{:06}@example.com", i);
-            let name_value = store.interner_mut().intern_value(&unique_name);
-            let email_value = store.interner_mut().intern_value(&unique_email);
-            descriptors.push(Descriptor::new(name_attr, name_value, interval));
-            descriptors.push(Descriptor::new(email_attr, email_value, interval));
-        }
-
-        // Phone - some shared, some unique
-        if rng.random_bool(0.5) {
-            descriptors.push(Descriptor::new(phone_attr, phone_value1, interval));
-        } else {
-            let phone = format!("555-{:04}", rng.random_range(1000..9999));
-            let phone_value = store.interner_mut().intern_value(&phone);
-            descriptors.push(Descriptor::new(phone_attr, phone_value, interval));
-        }
-
-        // SSN - mostly shared for strong clustering
-        if rng.random_bool(0.8) {
-            descriptors.push(Descriptor::new(ssn_attr, ssn_value1, interval));
-        } else {
-            let ssn = format!(
-                "{:03}-{:02}-{:04}",
-                rng.random_range(100..999),
-                rng.random_range(10..99),
-                rng.random_range(1000..9999)
-            );
-            let ssn_value = store.interner_mut().intern_value(&ssn);
-            descriptors.push(Descriptor::new(ssn_attr, ssn_value, interval));
-        }
-
-        records.push(Record::new(RecordId(i), identity, descriptors));
-    }
-
-    records
-}
-
-/// Create a simple ontology for testing
-fn create_test_ontology(store: &mut Store) -> Ontology {
-    let mut ontology = Ontology::new();
-
-    // Create attributes
-    let name_attr = store.interner_mut().intern_attr("name");
-    let email_attr = store.interner_mut().intern_attr("email");
-    let ssn_attr = store.interner_mut().intern_attr("ssn");
-
-    // Identity key: name + email
-    let identity_key = IdentityKey::new(vec![name_attr, email_attr], "name_email".to_string());
-    ontology.add_identity_key(identity_key);
-
-    // Strong identifier: SSN
-    let ssn_strong_id = StrongIdentifier::new(ssn_attr, "ssn".to_string());
-    ontology.add_strong_identifier(ssn_strong_id);
-
-    ontology
-}
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::{default_ontology, generate_dataset};
 
 /// Benchmark entity resolution with different entity counts and overlap probabilities
 fn benchmark_entity_resolution(c: &mut Criterion) {
@@ -137,8 +45,9 @@ fn benchmark_entity_resolution(c: &mut Criterion) {
 
         // Streaming algorithm benchmark
         let mut base_store = Store::new();
-        let ontology = create_test_ontology(&mut base_store);
-        let records = generate_test_records(&mut base_store, entity_count, overlap_prob);
+        let dataset = generate_dataset(&mut base_store, entity_count, overlap_prob, 42);
+        let ontology = default_ontology(&dataset.schema);
+        let records = dataset.records;
         group.bench_with_input(
             BenchmarkId::new(
                 "streaming",
@@ -201,8 +110,9 @@ fn benchmark_entity_resolution_large(c: &mut Criterion) {
                     }
 
                     let mut store = Store::new();
-                    let ontology = create_test_ontology(&mut store);
-                    let records = generate_test_records(&mut store, *entity_count, *overlap_prob);
+                    let dataset = generate_dataset(&mut store, *entity_count, *overlap_prob, 42);
+                    let ontology = default_ontology(&dataset.schema);
+                    let records = dataset.records;
                     let mut unirust = Unirust::with_store(ontology, store);
                     let start = std::time::Instant::now();
                     black_box(unirust.stream_records(records).unwrap());
@@ -256,9 +166,9 @@ fn benchmark_entity_resolution_sharded(c: &mut Criterion) {
                     }
 
                     let mut base_store = Store::new();
-                    let ontology = create_test_ontology(&mut base_store);
-                    let records =
-                        generate_test_records(&mut base_store, *entity_count, *overlap_prob);
+                    let dataset = generate_dataset(&mut base_store, *entity_count, *overlap_prob, 42);
+                    let ontology = default_ontology(&dataset.schema);
+                    let records = dataset.records;
                     let mut engine = ShardedStreamEngine::new(ontology, *shard_count).unwrap();
                     engine.seed_interners(base_store.interner());
 
@@ -285,8 +195,9 @@ fn benchmark_entity_resolution_profile_5000(c: &mut Criterion) {
     let overlap_prob = 0.10;
 
     let mut base_store = Store::new();
-    let ontology = create_test_ontology(&mut base_store);
-    let records = generate_test_records(&mut base_store, entity_count, overlap_prob);
+    let dataset = generate_dataset(&mut base_store, entity_count, overlap_prob, 42);
+    let ontology = default_ontology(&dataset.schema);
+    let records = dataset.records;
 
     group.bench_with_input(
         BenchmarkId::new("streaming", "5000_entities_10%_overlap"),
@@ -324,8 +235,9 @@ fn benchmark_entity_resolution_profile_100k(c: &mut Criterion) {
     let overlap_prob = 0.10;
 
     let mut base_store = Store::new();
-    let ontology = create_test_ontology(&mut base_store);
-    let records = generate_test_records(&mut base_store, entity_count, overlap_prob);
+    let dataset = generate_dataset(&mut base_store, entity_count, overlap_prob, 42);
+    let ontology = default_ontology(&dataset.schema);
+    let records = dataset.records;
 
     group.bench_with_input(
         BenchmarkId::new("streaming", "100000_entities_10%_overlap"),

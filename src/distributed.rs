@@ -15,8 +15,8 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs};
 use tokio::sync::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
@@ -95,8 +95,13 @@ impl IngestWal {
         if bytes.is_empty() {
             return Ok(None);
         }
-        let inputs: Vec<JsonRecordInput> =
-            serde_json::from_slice(&bytes).map_err(|err| Status::internal(err.to_string()))?;
+        let inputs: Vec<JsonRecordInput> = match serde_json::from_slice(&bytes) {
+            Ok(inputs) => inputs,
+            Err(_) => {
+                self.quarantine_corrupt()?;
+                return Ok(None);
+            }
+        };
         let records = inputs.into_iter().map(proto_from_json_input).collect();
         Ok(Some(records))
     }
@@ -112,6 +117,29 @@ impl IngestWal {
     fn clear(&self) -> Result<(), Status> {
         if self.path.exists() {
             fs::remove_file(&self.path).map_err(|err| Status::internal(err.to_string()))?;
+        }
+        if self.temp_path.exists() {
+            fs::remove_file(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn quarantine_corrupt(&self) -> Result<(), Status> {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| Status::internal(err.to_string()))?
+            .as_secs();
+        let corrupt_path = self
+            .path
+            .with_extension(format!("json.corrupt.{}", suffix));
+        if self.path.exists() {
+            if let Err(err) = fs::rename(&self.path, &corrupt_path) {
+                if self.path.exists() {
+                    fs::remove_file(&self.path)
+                        .map_err(|err| Status::internal(err.to_string()))?;
+                }
+                return Err(Status::internal(err.to_string()));
+            }
         }
         if self.temp_path.exists() {
             fs::remove_file(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
@@ -375,11 +403,10 @@ async fn fetch_record_batch_from_url(url: &str) -> Result<proto::IngestRecordsRe
     Ok(proto::IngestRecordsRequest { records })
 }
 
-pub fn hash_record_to_shard(
+fn hash_record_to_u64(
     config: &DistributedOntologyConfig,
     record: &proto::RecordInput,
-    shard_count: usize,
-) -> usize {
+) -> u64 {
     let identity = record.identity.as_ref();
     let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
     for descriptor in &record.descriptors {
@@ -406,7 +433,7 @@ pub fn hash_record_to_shard(
             for value in values {
                 value.hash(&mut state);
             }
-            return (state.finish() as usize) % shard_count;
+            return state.finish();
         }
     }
 
@@ -422,7 +449,7 @@ pub fn hash_record_to_shard(
             constraint.name.hash(&mut state);
             constraint.attribute.hash(&mut state);
             value.hash(&mut state);
-            return (state.finish() as usize) % shard_count;
+            return state.finish();
         }
     }
 
@@ -432,7 +459,223 @@ pub fn hash_record_to_shard(
         identity.perspective.hash(&mut state);
         identity.uid.hash(&mut state);
     }
-    (state.finish() as usize) % shard_count
+    state.finish()
+}
+
+pub fn hash_record_to_shard(
+    config: &DistributedOntologyConfig,
+    record: &proto::RecordInput,
+    shard_count: usize,
+) -> usize {
+    (hash_record_to_u64(config, record) as usize) % shard_count
+}
+
+fn hash_record_to_bucket(
+    config: &DistributedOntologyConfig,
+    record: &proto::RecordInput,
+    bucket_count: usize,
+) -> usize {
+    (hash_record_to_u64(config, record) as usize) % bucket_count
+}
+
+struct BucketAssignment {
+    primary: usize,
+    secondary: Option<usize>,
+    dual_write_until: Option<Instant>,
+    cutover_at: Option<Instant>,
+}
+
+struct ShardBalancer {
+    bucket_count: usize,
+    shard_count: usize,
+    assignments: StdRwLock<Vec<BucketAssignment>>,
+    bucket_counts: StdMutex<Vec<u64>>,
+    rebalance_every: u64,
+    rebalance_skew: f64,
+    dual_write_for: Duration,
+    cutover_after: Option<Duration>,
+    ingest_counter: AtomicU64,
+}
+
+impl ShardBalancer {
+    fn new(shard_count: usize) -> Option<Self> {
+        let bucket_count = env_usize("UNIRUST_REBALANCE_BUCKETS", 0);
+        if bucket_count == 0 || shard_count == 0 {
+            return None;
+        }
+        let rebalance_every = env_u64("UNIRUST_REBALANCE_EVERY", 0);
+        if rebalance_every == 0 {
+            return None;
+        }
+        let rebalance_skew = env_f64("UNIRUST_REBALANCE_SKEW", 1.25);
+        let dual_write_secs = env_u64("UNIRUST_REBALANCE_DUAL_WRITE_SECS", 300);
+        let cutover_secs = env_u64("UNIRUST_REBALANCE_CUTOVER_SECS", dual_write_secs);
+        let cutover_after = if cutover_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(cutover_secs))
+        };
+
+        let mut assignments = Vec::with_capacity(bucket_count);
+        for bucket in 0..bucket_count {
+            assignments.push(BucketAssignment {
+                primary: bucket % shard_count,
+                secondary: None,
+                dual_write_until: None,
+                cutover_at: None,
+            });
+        }
+
+        Some(Self {
+            bucket_count,
+            shard_count,
+            assignments: StdRwLock::new(assignments),
+            bucket_counts: StdMutex::new(vec![0; bucket_count]),
+            rebalance_every,
+            rebalance_skew,
+            dual_write_for: Duration::from_secs(dual_write_secs),
+            cutover_after,
+            ingest_counter: AtomicU64::new(0),
+        })
+    }
+
+    fn route_record(
+        &self,
+        config: &DistributedOntologyConfig,
+        record: &proto::RecordInput,
+    ) -> (usize, Option<usize>) {
+        let bucket = hash_record_to_bucket(config, record, self.bucket_count);
+        if let Ok(mut counts) = self.bucket_counts.lock() {
+            if let Some(count) = counts.get_mut(bucket) {
+                *count = count.saturating_add(1);
+            }
+        }
+
+        self.maybe_rebalance();
+
+        let now = Instant::now();
+        if let Ok(mut assignments) = self.assignments.write() {
+            let assignment = &mut assignments[bucket];
+            if let Some(cutover_at) = assignment.cutover_at {
+                if now >= cutover_at {
+                    if let Some(secondary) = assignment.secondary.take() {
+                        assignment.primary = secondary;
+                    }
+                    assignment.dual_write_until = None;
+                    assignment.cutover_at = None;
+                }
+            }
+            if assignment.cutover_at.is_none() {
+                if let Some(until) = assignment.dual_write_until {
+                    if now >= until {
+                        assignment.secondary = None;
+                        assignment.dual_write_until = None;
+                    }
+                }
+            }
+            return (assignment.primary, assignment.secondary);
+        }
+        (bucket % self.shard_count, None)
+    }
+
+    fn maybe_rebalance(&self) {
+        if self.rebalance_every == 0 || self.bucket_count == 0 {
+            return;
+        }
+        let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % self.rebalance_every != 0 {
+            return;
+        }
+
+        let assignments = match self.assignments.read() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let counts = match self.bucket_counts.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        let mut shard_loads = vec![0u64; self.shard_count];
+        for (bucket, assignment) in assignments.iter().enumerate() {
+            if let Some(count) = counts.get(bucket) {
+                shard_loads[assignment.primary] =
+                    shard_loads[assignment.primary].saturating_add(*count);
+            }
+        }
+
+        let (max_shard, max_load) = shard_loads
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, load)| *load)
+            .map(|(idx, load)| (idx, *load))
+            .unwrap_or((0, 0));
+        let (min_shard, min_load) = shard_loads
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, load)| *load)
+            .map(|(idx, load)| (idx, *load))
+            .unwrap_or((0, 0));
+
+        if max_shard == min_shard {
+            return;
+        }
+        if min_load > 0 && (max_load as f64) <= (min_load as f64 * self.rebalance_skew) {
+            return;
+        }
+
+        let mut candidate_bucket = None;
+        let mut candidate_load = 0u64;
+        for (bucket, assignment) in assignments.iter().enumerate() {
+            if assignment.primary != max_shard || assignment.secondary.is_some() {
+                continue;
+            }
+            let load = counts.get(bucket).copied().unwrap_or(0);
+            if load > candidate_load {
+                candidate_load = load;
+                candidate_bucket = Some(bucket);
+            }
+        }
+        drop(assignments);
+        drop(counts);
+
+        let Some(bucket) = candidate_bucket else {
+            return;
+        };
+        let mut assignments = match self.assignments.write() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let assignment = &mut assignments[bucket];
+        if assignment.primary != max_shard || assignment.secondary.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        assignment.secondary = Some(min_shard);
+        assignment.dual_write_until = Some(now + self.dual_write_for);
+        assignment.cutover_at = self.cutover_after.map(|duration| now + duration);
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Clone)]
@@ -442,12 +685,14 @@ pub struct ShardNode {
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
-    ingest_tx: tokio::sync::mpsc::Sender<IngestJob>,
+    ingest_wal: Option<Arc<IngestWal>>,
+    ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     config_version: String,
     metrics: Arc<Metrics>,
 }
 
 const INGEST_QUEUE_CAPACITY: usize = 128;
+const DEFAULT_INGEST_WORKERS: usize = 4;
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
 
 struct IngestJob {
@@ -473,6 +718,7 @@ impl ShardNode {
         config_version: Option<String>,
     ) -> AnyResult<Self> {
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
+        let worker_count = ingest_worker_count();
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
@@ -483,14 +729,15 @@ impl ShardNode {
                     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
             }
             let unirust = Arc::new(RwLock::new(unirust));
-            let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id, ingest_wal.clone());
+            let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
             return Ok(Self {
                 shard_id,
                 unirust,
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
-                ingest_tx,
+                ingest_wal,
+                ingest_txs,
                 config_version,
                 metrics: Arc::new(Metrics::new()),
             });
@@ -504,14 +751,15 @@ impl ShardNode {
             store,
             tuning.clone(),
         )));
-        let ingest_tx = spawn_ingest_worker(unirust.clone(), shard_id, ingest_wal.clone());
+        let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
         Ok(Self {
             shard_id,
             unirust,
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
-            ingest_tx,
+            ingest_wal,
+            ingest_txs,
             config_version,
             metrics: Arc::new(Metrics::new()),
         })
@@ -658,38 +906,101 @@ fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, 
     }
 }
 
-fn spawn_ingest_worker(
+fn ingest_worker_count() -> usize {
+    std::env::var("UNIRUST_INGEST_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INGEST_WORKERS)
+}
+
+fn ingest_worker_index(record: &proto::RecordInput, worker_count: usize) -> usize {
+    let identity = record.identity.as_ref();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Some(identity) = identity {
+        identity.entity_type.hash(&mut hasher);
+        identity.perspective.hash(&mut hasher);
+        identity.uid.hash(&mut hasher);
+    } else {
+        record.index.hash(&mut hasher);
+    }
+    (hasher.finish() as usize) % worker_count
+}
+
+fn spawn_ingest_workers(
     unirust: Arc<RwLock<Unirust>>,
     shard_id: u32,
-    ingest_wal: Option<Arc<IngestWal>>,
-) -> mpsc::Sender<IngestJob> {
-    let (tx, mut rx) = mpsc::channel::<IngestJob>(INGEST_QUEUE_CAPACITY);
-    tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            let result = match ingest_wal.as_ref() {
-                Some(wal) => {
-                    let wal_result = wal.write_batch(&job.records);
-                    let result = match wal_result {
-                        Ok(()) => {
-                            let mut guard = unirust.write().await;
-                            process_ingest_batch(&mut guard, shard_id, &job.records)
-                        }
-                        Err(err) => Err(err),
-                    };
-                    if result.is_ok() {
-                        let _ = wal.clear();
-                    }
-                    result
-                }
-                None => {
-                    let mut guard = unirust.write().await;
+    worker_count: usize,
+) -> Vec<mpsc::Sender<IngestJob>> {
+    let mut senders = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(INGEST_QUEUE_CAPACITY);
+        let worker_unirust = unirust.clone();
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                let result = {
+                    let mut guard = worker_unirust.write().await;
                     process_ingest_batch(&mut guard, shard_id, &job.records)
-                }
-            };
-            let _ = job.respond_to.send(result);
+                };
+                let _ = job.respond_to.send(result);
+            }
+        });
+        senders.push(tx);
+    }
+    senders
+}
+
+async fn dispatch_ingest_records(
+    ingest_txs: &[mpsc::Sender<IngestJob>],
+    ingest_wal: Option<&IngestWal>,
+    records: Vec<proto::RecordInput>,
+) -> Result<Vec<proto::IngestAssignment>, Status> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(wal) = ingest_wal {
+        wal.write_batch(&records)?;
+    }
+
+    let worker_count = ingest_txs.len().max(1);
+    let mut batches = vec![Vec::new(); worker_count];
+    for record in records {
+        let idx = ingest_worker_index(&record, worker_count);
+        batches[idx].push(record);
+    }
+
+    let mut receivers = Vec::new();
+    for (idx, batch) in batches.into_iter().enumerate() {
+        if batch.is_empty() {
+            continue;
         }
-    });
-    tx
+        let (tx, rx) = oneshot::channel();
+        let job = IngestJob {
+            records: batch,
+            respond_to: tx,
+        };
+        ingest_txs[idx]
+            .send(job)
+            .await
+            .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
+        receivers.push(rx);
+    }
+
+    let mut assignments = Vec::new();
+    for rx in receivers {
+        let batch_assignments = rx
+            .await
+            .map_err(|_| Status::internal("ingest worker dropped"))??;
+        assignments.extend(batch_assignments);
+    }
+
+    if let Some(wal) = ingest_wal {
+        wal.clear()?;
+    }
+
+    assignments.sort_by_key(|assignment| assignment.index);
+    Ok(assignments)
 }
 
 fn process_ingest_batch(
@@ -794,18 +1105,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let start = Instant::now();
         let records = request.into_inner().records;
         let record_count = records.len();
-        let (tx, rx) = oneshot::channel();
-        let job = IngestJob {
+        let assignments = dispatch_ingest_records(
+            &self.ingest_txs,
+            self.ingest_wal.as_deref(),
             records,
-            respond_to: tx,
-        };
-        self.ingest_tx
-            .send(job)
-            .await
-            .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
-        let assignments = rx
-            .await
-            .map_err(|_| Status::internal("ingest worker dropped"))??;
+        )
+        .await?;
 
         self.metrics
             .record_ingest(record_count, start.elapsed().as_micros() as u64);
@@ -830,22 +1135,15 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             record_count += chunk.records.len();
-            let (tx, rx) = oneshot::channel();
-            let job = IngestJob {
-                records: chunk.records,
-                respond_to: tx,
-            };
-            self.ingest_tx
-                .send(job)
-                .await
-                .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
-            let batch_assignments = rx
-                .await
-                .map_err(|_| Status::internal("ingest worker dropped"))??;
+            let batch_assignments = dispatch_ingest_records(
+                &self.ingest_txs,
+                self.ingest_wal.as_deref(),
+                chunk.records,
+            )
+            .await?;
             assignments.extend(batch_assignments);
         }
 
-        assignments.sort_by_key(|assignment| assignment.index);
         self.metrics
             .record_ingest(record_count, start.elapsed().as_micros() as u64);
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
@@ -957,28 +1255,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
         let unirust = self.unirust.read().await;
-        let clusters = unirust
-            .build_clusters()
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let observations = unirust
-            .detect_conflicts(&clusters)
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let graph = unirust
-            .export_graph(&clusters, &observations)
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let record_count = graph
-            .metadata
-            .get("num_records")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
+        let record_count = unirust.record_count() as u64;
+        let cluster_count = unirust.streaming_cluster_count().unwrap_or(0) as u64;
+        let conflict_count = unirust.conflict_summary_count().unwrap_or(0) as u64;
+        let (graph_node_count, graph_edge_count) = unirust.graph_counts().unwrap_or((0, 0));
 
         Ok(Response::new(proto::StatsResponse {
             record_count,
-            cluster_count: clusters.len() as u64,
-            conflict_count: observations.len() as u64,
-            graph_node_count: graph.num_nodes() as u64,
-            graph_edge_count: (graph.num_same_as_edges() + graph.num_conflicts_with_edges())
-                as u64,
+            cluster_count,
+            conflict_count,
+            graph_node_count,
+            graph_edge_count,
         }))
     }
 
@@ -1260,11 +1547,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ListConflictsRequest>,
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
-        let unirust = self.unirust.read().await;
         let request = request.into_inner();
-        let mut summaries = if let Some(cache) = unirust.cached_conflict_summaries() {
+        let mut summaries = if let Some(cache) = {
+            let guard = self.unirust.read().await;
+            guard.cached_conflict_summaries()
+        } {
             cache
+        } else if let Some(persisted) = {
+            let guard = self.unirust.read().await;
+            guard.load_conflict_summaries()
+        } {
+            let mut unirust = self.unirust.write().await;
+            unirust.set_conflict_cache(persisted.clone());
+            persisted
         } else {
+            let mut unirust = self.unirust.write().await;
             let clusters = unirust
                 .build_clusters()
                 .map_err(|err| Status::internal(err.to_string()))?;
@@ -1332,6 +1629,7 @@ pub struct RouterNode {
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     config_version: String,
     metrics: Arc<Metrics>,
+    balancer: Option<Arc<ShardBalancer>>,
 }
 
 impl RouterNode {
@@ -1347,7 +1645,8 @@ impl RouterNode {
         ontology_config: DistributedOntologyConfig,
         config_version: Option<String>,
     ) -> Result<Self, Status> {
-        let mut shard_clients = Vec::with_capacity(shard_addrs.len());
+        let shard_count = shard_addrs.len();
+        let mut shard_clients = Vec::with_capacity(shard_count);
         for addr in shard_addrs {
             let client = proto::shard_service_client::ShardServiceClient::connect(addr)
                 .await
@@ -1375,6 +1674,7 @@ impl RouterNode {
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             config_version,
             metrics: Arc::new(Metrics::new()),
+            balancer: ShardBalancer::new(shard_count).map(Arc::new),
         })
     }
 
@@ -1526,10 +1826,21 @@ impl proto::router_service_server::RouterService for RouterNode {
         let shard_count = self.shard_clients.len();
         let config = self.ontology_config.lock().await.clone();
         let mut shard_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
+        let mut shadow_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
 
         for record in batch.records {
-            let shard_idx = hash_record_to_shard(&config, &record, shard_count);
-            shard_batches[shard_idx].push(record);
+            if let Some(balancer) = &self.balancer {
+                let (primary, secondary) = balancer.route_record(&config, &record);
+                if let Some(secondary) = secondary {
+                    shard_batches[primary].push(record.clone());
+                    shadow_batches[secondary].push(record);
+                } else {
+                    shard_batches[primary].push(record);
+                }
+            } else {
+                let shard_idx = hash_record_to_shard(&config, &record, shard_count);
+                shard_batches[shard_idx].push(record);
+            }
         }
 
         let mut results: Vec<proto::IngestAssignment> = Vec::new();
@@ -1543,6 +1854,17 @@ impl proto::router_service_server::RouterService for RouterNode {
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?;
             results.extend(response.into_inner().assignments);
+        }
+
+        for (idx, records) in shadow_batches.into_iter().enumerate() {
+            if records.is_empty() {
+                continue;
+            }
+            let mut client = self.shard_clients[idx].clone();
+            let _ = client
+                .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?;
         }
 
         results.sort_by_key(|assignment| assignment.index);

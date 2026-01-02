@@ -8,7 +8,6 @@ use crate::temporal::Interval;
 // use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 /// A temporal guard that validates whether two records can be merged
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +96,8 @@ pub struct TemporalDSU {
     conflicts: HashMap<RecordId, Vec<TemporalConflict>>,
     /// Next available cluster ID
     next_cluster_id: u32,
+    /// Current number of clusters
+    cluster_count: usize,
 }
 
 impl TemporalDSU {
@@ -108,6 +109,7 @@ impl TemporalDSU {
             guards: HashMap::new(),
             conflicts: HashMap::new(),
             next_cluster_id: 0,
+            cluster_count: 0,
         }
     }
 
@@ -117,6 +119,7 @@ impl TemporalDSU {
         self.rank.insert(record_id, 0);
         self.guards.insert(record_id, Vec::new());
         self.conflicts.insert(record_id, Vec::new());
+        self.cluster_count += 1;
     }
 
     /// Check if a record exists in the DSU.
@@ -215,6 +218,7 @@ impl TemporalDSU {
             self.parent.insert(a, b);
             self.rank.insert(b, rank_b + 1);
         }
+        self.cluster_count = self.cluster_count.saturating_sub(1);
     }
 
     /// Get all clusters.
@@ -279,12 +283,12 @@ impl TemporalDSU {
 
     /// Get the number of clusters
     pub fn num_clusters(&mut self) -> usize {
-        let mut roots: HashSet<RecordId> = HashSet::new();
-        let record_ids: Vec<RecordId> = self.parent.keys().cloned().collect();
-        for record_id in record_ids {
-            roots.insert(self.find(record_id));
-        }
-        roots.len()
+        self.cluster_count
+    }
+
+    /// Get the number of clusters without mutating.
+    pub fn cluster_count(&self) -> usize {
+        self.cluster_count
     }
 }
 

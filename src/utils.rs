@@ -99,8 +99,8 @@ pub fn export_to_dot(
             if let Some(record) = store.get_record(*record_id) {
                 let mut attr_info = String::new();
                 for descriptor in &record.descriptors {
-                    if let Some(_attr_name) = store.interner().get_attr(descriptor.attr) {
-                        if let Some(value_name) = store.interner().get_value(descriptor.value) {
+                    if let Some(_attr_name) = store.resolve_attr(descriptor.attr) {
+                        if let Some(value_name) = store.resolve_value(descriptor.value) {
                             attr_info.push_str(&format!("{}\\n", value_name));
                         }
                     }

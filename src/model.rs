@@ -198,6 +198,14 @@ impl StringInterner {
         self.id_to_value.get(&id)
     }
 
+    pub fn get_attr_id(&self, attr: &str) -> Option<AttrId> {
+        self.attr_to_id.get(attr).copied()
+    }
+
+    pub fn get_value_id(&self, value: &str) -> Option<ValueId> {
+        self.value_to_id.get(value).copied()
+    }
+
     /// Get the next attribute ID.
     pub fn next_attr_id(&self) -> u32 {
         self.next_attr_id
@@ -206,6 +214,14 @@ impl StringInterner {
     /// Get the next value ID.
     pub fn next_value_id(&self) -> u32 {
         self.next_value_id
+    }
+
+    pub fn set_next_attr_id(&mut self, next: u32) {
+        self.next_attr_id = self.next_attr_id.max(next);
+    }
+
+    pub fn set_next_value_id(&mut self, next: u32) {
+        self.next_value_id = self.next_value_id.max(next);
     }
 
     /// Insert an attribute with a specific ID (used for persistence restores).

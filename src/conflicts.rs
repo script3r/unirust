@@ -1230,13 +1230,13 @@ pub fn detect_conflicts_for_clusters(
     ConflictDetector::detect_conflicts_for_clusters(store, clusters, ontology, cluster_ids)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConflictRecordRef {
     pub perspective: String,
     pub uid: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConflictSummary {
     pub kind: String,
     pub attribute: Option<String>,
@@ -1255,9 +1255,7 @@ pub fn summarize_conflicts(
         match observation {
             Observation::DirectConflict(conflict) => {
                 let attribute = store
-                    .interner()
-                    .get_attr(conflict.attribute)
-                    .cloned()
+                    .resolve_attr(conflict.attribute)
                     .or_else(|| Some(format!("attr_{}", conflict.attribute.0)));
 
                 let mut record_refs = Vec::new();
@@ -1288,7 +1286,7 @@ pub fn summarize_conflicts(
             Observation::IndirectConflict(conflict) => {
                 let attribute = conflict
                     .attribute
-                    .and_then(|attr| store.interner().get_attr(attr).cloned())
+                    .and_then(|attr| store.resolve_attr(attr))
                     .or_else(|| conflict.attribute.map(|attr| format!("attr_{}", attr.0)));
 
                 let mut record_refs = Vec::new();

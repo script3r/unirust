@@ -250,6 +250,18 @@ impl IncrementalKnowledgeGraph {
         graph
     }
 
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn num_same_as_edges(&self) -> usize {
+        self.same_as_edges.len()
+    }
+
+    pub fn num_conflicts_with_edges(&self) -> usize {
+        self.conflicts_with_edges.len()
+    }
+
     fn apply_snapshot(&mut self, snapshot: GraphSnapshot) {
         self.nodes.retain(|key, _| snapshot.nodes.contains_key(key));
         for (key, node) in snapshot.nodes {
@@ -768,14 +780,10 @@ pub fn golden_for_cluster(
         if candidates.len() == 1 {
             let (value, intervals) = candidates.remove(0);
             let attr_name = store
-                .interner()
-                .get_attr(attr)
-                .cloned()
+                .resolve_attr(attr)
                 .unwrap_or_else(|| format!("attr_{}", attr.0));
             let value_str = store
-                .interner()
-                .get_value(value)
-                .cloned()
+                .resolve_value(value)
                 .unwrap_or_else(|| format!("value_{}", value.0));
 
             for interval in intervals {
@@ -801,14 +809,10 @@ pub fn golden_for_cluster(
                 continue;
             }
             let attr_name = store
-                .interner()
-                .get_attr(attr)
-                .cloned()
+                .resolve_attr(attr)
                 .unwrap_or_else(|| format!("attr_{}", attr.0));
             let value_str = store
-                .interner()
-                .get_value(*value)
-                .cloned()
+                .resolve_value(*value)
                 .unwrap_or_else(|| format!("value_{}", value.0));
             for interval in safe {
                 golden.push(GoldenDescriptor {
@@ -894,13 +898,11 @@ fn pick_cluster_value(
         return None;
     }
 
-    let interner = store.interner();
     let mut choices: Vec<(String, usize)> = counts
         .into_iter()
         .map(|(value, count)| {
-            let value_str = interner
-                .get_value(value)
-                .cloned()
+            let value_str = store
+                .resolve_value(value)
                 .unwrap_or_else(|| format!("value_{}", value.0));
             (value_str, count)
         })
@@ -978,7 +980,6 @@ fn build_cluster_seed(
     key_attrs: &[AttrId],
     identity_key_name: &str,
 ) -> Option<ClusterKeySeed> {
-    let interner = store.interner();
     let mut tokens = Vec::new();
     let mut parts = Vec::new();
     let signature = cluster_signature(store, cluster);
@@ -998,9 +999,8 @@ fn build_cluster_seed(
     }
 
     for attr in key_attrs {
-        let attr_name = interner
-            .get_attr(*attr)
-            .cloned()
+        let attr_name = store
+            .resolve_attr(*attr)
             .unwrap_or_else(|| format!("attr_{}", attr.0));
         let value =
             pick_cluster_value(store, cluster, *attr).unwrap_or_else(|| "unknown".to_string());
@@ -1043,13 +1043,11 @@ fn pick_cluster_attr_value(
         return None;
     }
 
-    let interner = store.interner();
     let mut attrs: Vec<(AttrId, usize, String)> = attr_counts
         .into_iter()
         .map(|(attr, count)| {
-            let name = interner
-                .get_attr(attr)
-                .cloned()
+            let name = store
+                .resolve_attr(attr)
                 .unwrap_or_else(|| format!("attr_{}", attr.0));
             (attr, count, name)
         })
@@ -1062,7 +1060,6 @@ fn pick_cluster_attr_value(
 }
 
 fn cluster_signature(store: &dyn RecordStore, cluster: &crate::dsu::Cluster) -> String {
-    let interner = store.interner();
     let mut parts = Vec::new();
     for record_id in &cluster.records {
         if let Some(record) = store.get_record(*record_id) {
@@ -1071,13 +1068,11 @@ fn cluster_signature(store: &dyn RecordStore, cluster: &crate::dsu::Cluster) -> 
                 record.identity.entity_type, record.identity.perspective, record.identity.uid
             ));
             for descriptor in &record.descriptors {
-                let attr = interner
-                    .get_attr(descriptor.attr)
-                    .cloned()
+                let attr = store
+                    .resolve_attr(descriptor.attr)
                     .unwrap_or_else(|| format!("attr_{}", descriptor.attr.0));
-                let value = interner
-                    .get_value(descriptor.value)
-                    .cloned()
+                let value = store
+                    .resolve_value(descriptor.value)
                     .unwrap_or_else(|| format!("value_{}", descriptor.value.0));
                 parts.push(format!(
                     "{}={}@{}:{}",

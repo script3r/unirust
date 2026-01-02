@@ -1,84 +1,19 @@
 # Productionalization TODO
 
-This is the working checklist to take Unirust from functional to production-ready at scale.
-Focus: correctness, durability, and performance with 32GB RAM per shard and 100M+ entities.
+This is the final checklist to take Unirust to billions of entities on 32GB RAM per shard.
+Focus: correctness, durability, and sustained throughput at scale.
 
-## Phase 0: Safety and Integrity (now)
+## Billion-scale requirements (final)
 
-- [x] Add storage manifest with format version + app version
-- [x] Validate manifest on startup (fail fast on mismatched format)
-- [x] Ensure RocksDB flush on shutdown (drop-safe)
-- [x] Add periodic checkpoint API (manual trigger is enough for now)
-- [x] Add startup corruption checks / repair option
-
-## Phase 1: Memory + Indexing (scale)
-
-- [x] Refactor `RecordStore` to return owned records or iterators
-- [x] Eliminate full in-memory record scan dependency in query/linker/conflicts
-- [x] Implement RocksDB-native indexes for attr/value, entity_type, perspective
-- [x] Implement temporal bucketed index (time-windowed keys)
-- [x] Add bounded LRU cache for hot records
-
-## Phase 2: Ingest Throughput
-
-- [x] Batch write record + index updates via RocksDB `WriteBatch`
-- [x] Async ingest pipeline with bounded queue + backpressure
-- [x] Compaction tuning (memtable size, level sizes, compression)
-- [x] Incremental interner persistence (keyed entries, not full snapshot)
-
-## Phase 3: Query and Conflict Performance
-
-- [x] Query planner to choose the smallest index scan
-- [x] Incremental conflict detection for affected clusters only
-- [x] Precompute cluster keys and golden summaries (cacheable)
-
-## Phase 4: Distributed Reliability
-
-- [x] Shard discovery (static file or registry)
-- [x] Routing config versioning (fail fast if router/shards disagree)
-- [x] Rebalancing plan + tooling
-- [x] Replica/backup strategy (snapshot shipping)
-
-Rebalancing plan (v1):
-- Use consistent hashing ring with virtual nodes.
-- Provide a tooling command to list record ID ranges per shard and to export/import those ranges.
-- Move records via batch export/import RPCs (future: incremental streaming).
-- Freeze writes during move or apply dual-write with cutover (future).
-
-Replica/backup strategy (v1):
-- Use `Checkpoint` RPC per shard to create on-disk snapshots.
-- Ship snapshot directories to object storage on a schedule (external job).
-- Restore by replaying snapshots + rehydrating interner state.
-
-## Phase 5: Production Operations
-
-- [x] Metrics/tracing (ingest latency, query latency, compactions, qps)
-- [x] Alerting + runbooks
-- [x] SLOs and capacity planning
-
-## Phase 6: Billion-Scale Performance
-
-### Phase 6.1: Streaming RPCs + Backpressure
-- [x] Streaming export/import for rebalancing (server-stream export, client-stream import)
-- [x] Streaming ingest (client-stream) with bounded queue on shard
-- [x] Router proxy for streaming RPCs
-- [x] CLI support + tests for streaming rebalancing/ingest
-
-### Phase 6.2: Incremental Indexing + Conflict Materialization
-- [x] Shard-local conflict summary cache (avoid repeat full scans on list conflicts)
-- [x] Query planner selectivity stats (adaptive ordering from observed matches)
-- [x] Cache invalidation strategy tuned for streaming ingest
-
-### Phase 6.3: Storage Tuning at Scale
-- [x] RocksDB per-CF tuning (block cache, filters, compression)
-- [x] Dynamic cache sizing + memory limits (env overrides)
-- [x] Compaction/flush metrics and throttling policies (rate limiter + metrics)
-
-### Phase 6.4: Concurrency + Resilience
-- [x] Reduce global mutex scope (RW locks for read-heavy shard operations)
-- [x] Idempotent ingest + WAL/replay for partial failures
-- [ ] Hot-key mitigation + shard auto-rebalance (dual-write cutover)
-
-### Phase 6.5: Benchmarking + Regression
-- [ ] 100M+ record ingest benchmark harness
-- [ ] Query latency regression suite (p50/p95/p99)
+- [x] Avoid full record loads on startup; access records lazily from RocksDB only.
+- [x] Persist identity -> record_id index in RocksDB for idempotent ingest without RAM maps.
+- [x] Maintain exact record_count metadata (avoid relying on next_record_id).
+- [x] Persist incremental cluster state (no full rebuild for queries/stats).
+- [x] Persist incremental conflict materialization per affected cluster only.
+- [x] Replace stats paths that build full graph with lightweight counters.
+- [x] Shard-local parallel ingest workers with key-based partitioning.
+- [x] Hot-key mitigation + shard auto-rebalance with dual-write cutover.
+- [x] Disk-backed or compacted interner/value dictionary for high-cardinality values.
+- [x] Scale benchmarks: 100M+ ingest harness and p50/p95/p99 regression gates.
+- [x] Failure/chaos tests for WAL replay and partial ingest.
+- [x] Snapshot restore validation at scale (automated correctness checks).

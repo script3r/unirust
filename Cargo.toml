@@ -59,6 +59,14 @@ tonic-build = "0.11"
 name = "entity_benchmark"
 harness = false
 
+[[bench]]
+name = "perf_suite"
+harness = false
+
+[[bench]]
+name = "scale_benchmark"
+harness = false
+
 [features]
 default = []
 profiling = []

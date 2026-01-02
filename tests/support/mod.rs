@@ -20,6 +20,7 @@ pub fn build_iam_config() -> DistributedOntologyConfig {
     }
 }
 
+#[allow(dead_code)]
 pub fn to_proto_config(config: &DistributedOntologyConfig) -> OntologyConfig {
     OntologyConfig {
         identity_keys: config

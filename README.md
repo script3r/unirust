@@ -4,21 +4,18 @@
   <img src="unirust.png" alt="Unirust Logo" width="350" height="350">
 </div>
 
-A temporal-first entity mastering and conflict-resolution engine in Rust.
+Temporal-first entity mastering and conflict resolution in Rust.
 
-## What it does
+## Why Unirust
 
-- Model records with explicit validity intervals.
-- Resolve entities across multiple sources and perspectives.
-- Detect direct and indirect conflicts.
-- Incrementally maintain a knowledge graph for auditing and visualization.
-- Maintain a conflict-free golden copy per cluster for downstream consumption.
-- Query master entities for descriptors over time with conflict-aware results.
-- Stream records in parallel via sharding with deterministic reconciliation.
+- Time-aware entity resolution across sources and perspectives.
+- Conflict detection with explainable observations.
+- Conflict-free golden records per cluster.
+- Streaming ingest with deterministic clustering.
 
 ## How the basic example flows
 
-The `examples/basic_example.rs` program streams five person records from CRM/ERP/Web/Mobile, defines identity rules (name+email) and a strong identifier (SSN), resolves clusters, detects conflicts, and keeps an incrementally updated graph.
+The `examples/basic_example.rs` program streams five records, defines identity rules (name+email) and a strong identifier (SSN), resolves clusters, and reports conflicts.
 
 ```mermaid
 flowchart LR
@@ -58,8 +55,6 @@ flowchart LR
 
 ## Example output (derived entities)
 
-This diagram reflects the clusters and conflicts produced by running `cargo run --example basic_example` locally.
-
 ```mermaid
 flowchart LR
   subgraph Cluster0["Cluster 0"]
@@ -91,9 +86,9 @@ flowchart LR
 cargo run --example basic_example
 ```
 
-## Tuning (RocksDB-style options)
+## Tuning
 
-Streaming performance is controlled via `StreamingTuning`, similar to RocksDB-style option structs.
+Streaming performance is controlled via `StreamingTuning`.
 
 ```rust
 use unirust_rs::{StreamingTuning, TuningProfile, Unirust, Store};
@@ -105,62 +100,7 @@ let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
 let mut unirust = Unirust::with_store_and_tuning(ontology, Store::new(), tuning);
 ```
 
-The adaptive cap + deferred reconciliation is optimized for high-overlap workloads by bounding
-candidate scans while preserving correctness in a reconciliation pass.
-
 Available profiles: `Balanced` (default), `LowLatency`, `HighThroughput`, `BulkIngest`, `MemorySaver`.
-
-## Distributed gRPC processing
-
-Run shards and a router:
-
-```bash
-cargo run --bin unirust_shard -- --listen 127.0.0.1:50061 --shard-id 0
-cargo run --bin unirust_shard -- --listen 127.0.0.1:50062 --shard-id 1
-
-cargo run --bin unirust_router -- --listen 127.0.0.1:50060 --shards 127.0.0.1:50061,127.0.0.1:50062
-```
-
-Pass an ontology config JSON with `--ontology path.json` to both shard and router. See `DISTRIBUTION.md`.
-
-Apply an ontology config via gRPC before streaming records, or pass `--ontology path.json` to shard/router.
-
-Set the ontology before ingest/query:
-
-```bash
-grpcurl -d @ 127.0.0.1:50060 unirust.RouterService/SetOntology <<'JSON'
-{
-  "config": {
-    "identity_keys": [{ "name": "email", "attributes": ["email"] }],
-    "strong_identifiers": ["ssn"],
-    "constraints": [{ "name": "unique_email", "attribute": "email", "kind": "UNIQUE" }]
-  }
-}
-JSON
-```
-
-Ingest and query via the router:
-
-```bash
-cargo run --example distributed_client
-```
-
-### Podman cluster demo
-
-Spin up a multi-node cluster locally with Podman:
-
-```bash
-scripts/podman_cluster.sh start
-scripts/podman_demo.sh
-```
-
-Stop the cluster:
-
-```bash
-scripts/podman_cluster.sh stop
-```
-
-For the rollout plan and production hardening steps, see `DISTRIBUTION.md`.
 
 ## Query master entities
 
@@ -200,7 +140,7 @@ cargo test
 
 ### Benchmarks and profiling
 
-Benchmarks live in `benches/entity_benchmark.rs`.
+Benchmarks live in `benches/entity_benchmark.rs` and `benches/perf_suite.rs`.
 
 ```bash
 cargo bench --bench entity_benchmark -- entity_resolution
@@ -215,7 +155,7 @@ UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- p
 UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_100k
 ```
 
-Benchmark notes: see `BENCHMARKS.md`. Architecture notes: see `DESIGN.md`.
+Benchmark notes: see `BENCHMARKS.md`. Testing notes: see `TESTING.md`. Architecture notes: see `DESIGN.md`.
 
 ## License
 
