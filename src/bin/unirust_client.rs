@@ -85,7 +85,18 @@ async fn main() -> anyhow::Result<()> {
         .into_inner();
     println!("Assignments: {:?}", response.assignments);
 
-    let query = QueryEntitiesRequest {
+    let match_query = QueryEntitiesRequest {
+        descriptors: vec![QueryDescriptor {
+            attr: "email".to_string(),
+            value: "alice@example.com".to_string(),
+        }],
+        start: 0,
+        end: 10,
+    };
+    let match_response = client.query_entities(match_query).await?.into_inner();
+    println!("Match query response: {:?}", match_response);
+
+    let conflict_query = QueryEntitiesRequest {
         descriptors: vec![QueryDescriptor {
             attr: "role".to_string(),
             value: "admin".to_string(),
@@ -93,8 +104,11 @@ async fn main() -> anyhow::Result<()> {
         start: 0,
         end: 10,
     };
-    let response = client.query_entities(query).await?.into_inner();
-    println!("Query response: {:?}", response);
+    let conflict_response = client
+        .query_entities(conflict_query)
+        .await?
+        .into_inner();
+    println!("Conflict query response: {:?}", conflict_response);
 
     Ok(())
 }
