@@ -11,6 +11,15 @@ const CF_INTERNER: &str = "interner";
 const KEY_NEXT_RECORD_ID: &[u8] = b"next_record_id";
 const KEY_INTERNER: &[u8] = b"interner";
 const KEY_ONTOLOGY_CONFIG: &[u8] = b"ontology_config";
+const KEY_MANIFEST: &[u8] = b"manifest";
+
+const STORAGE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StorageManifest {
+    format_version: u32,
+    app_version: String,
+}
 
 pub struct PersistentStore {
     inner: Store,
@@ -20,6 +29,7 @@ pub struct PersistentStore {
 impl PersistentStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = open_db(path)?;
+        validate_or_init_manifest(&db)?;
 
         let interner = load_interner(&db)?;
         let mut store = Store::with_interner(interner, 0);
@@ -104,6 +114,11 @@ impl PersistentStore {
         self.persist_metadata()?;
         Ok(())
     }
+
+    pub fn flush(&self) -> Result<()> {
+        self.db.flush()?;
+        Ok(())
+    }
 }
 
 impl RecordStore for PersistentStore {
@@ -175,6 +190,12 @@ impl RecordStore for PersistentStore {
     }
 }
 
+impl Drop for PersistentStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 fn open_db(path: impl AsRef<Path>) -> Result<DB> {
     let mut options = Options::default();
     options.create_if_missing(true);
@@ -197,6 +218,31 @@ fn load_interner(db: &DB) -> Result<StringInterner> {
     } else {
         Ok(StringInterner::new())
     }
+}
+
+fn validate_or_init_manifest(db: &DB) -> Result<()> {
+    let metadata_cf = db
+        .cf_handle(CF_METADATA)
+        .ok_or_else(|| anyhow!("missing metadata column family"))?;
+    if let Some(bytes) = db.get_cf(metadata_cf, KEY_MANIFEST)? {
+        let manifest: StorageManifest = bincode::deserialize(&bytes)?;
+        if manifest.format_version != STORAGE_FORMAT_VERSION {
+            return Err(anyhow!(
+                "storage format version mismatch: expected {}, found {}",
+                STORAGE_FORMAT_VERSION,
+                manifest.format_version
+            ));
+        }
+        return Ok(());
+    }
+
+    let manifest = StorageManifest {
+        format_version: STORAGE_FORMAT_VERSION,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let bytes = bincode::serialize(&manifest)?;
+    db.put_cf(metadata_cf, KEY_MANIFEST, bytes)?;
+    Ok(())
 }
 
 fn load_metadata<T: serde::de::DeserializeOwned>(db: &DB, key: &[u8]) -> Result<Option<T>> {

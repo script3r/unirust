@@ -1,0 +1,46 @@
+# Productionalization TODO
+
+This is the working checklist to take Unirust from functional to production-ready at scale.
+Focus: correctness, durability, and performance with 32GB RAM per shard and 100M+ entities.
+
+## Phase 0: Safety and Integrity (now)
+
+- [ ] Add storage manifest with format version + app version
+- [ ] Validate manifest on startup (fail fast on mismatched format)
+- [ ] Ensure RocksDB flush on shutdown (drop-safe)
+- [ ] Add periodic checkpoint API (manual trigger is enough for now)
+- [ ] Add startup corruption checks / repair option
+
+## Phase 1: Memory + Indexing (scale)
+
+- [ ] Refactor `RecordStore` to return owned records or iterators
+- [ ] Eliminate full in-memory record scan dependency in query/linker/conflicts
+- [ ] Implement RocksDB-native indexes for attr/value, entity_type, perspective
+- [ ] Implement temporal bucketed index (time-windowed keys)
+- [ ] Add bounded LRU cache for hot records
+
+## Phase 2: Ingest Throughput
+
+- [ ] Batch write record + index updates via RocksDB `WriteBatch`
+- [ ] Async ingest pipeline with bounded queue + backpressure
+- [ ] Compaction tuning (memtable size, level sizes, compression)
+- [ ] Incremental interner persistence (keyed entries, not full snapshot)
+
+## Phase 3: Query and Conflict Performance
+
+- [ ] Query planner to choose the smallest index scan
+- [ ] Incremental conflict detection for affected clusters only
+- [ ] Precompute cluster keys and golden summaries (cacheable)
+
+## Phase 4: Distributed Reliability
+
+- [ ] Shard discovery (static file or registry)
+- [ ] Routing config versioning (fail fast if router/shards disagree)
+- [ ] Rebalancing plan + tooling
+- [ ] Replica/backup strategy (snapshot shipping)
+
+## Phase 5: Production Operations
+
+- [ ] Metrics/tracing (ingest latency, query latency, compactions, qps)
+- [ ] Alerting + runbooks
+- [ ] SLOs and capacity planning
