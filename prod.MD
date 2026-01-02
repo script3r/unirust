@@ -60,7 +60,7 @@ Replica/backup strategy (v1):
 
 ### Phase 6.1: Streaming RPCs + Backpressure
 - [x] Streaming export/import for rebalancing (server-stream export, client-stream import)
-- [ ] Streaming ingest (client-stream) with bounded queue on shard
+- [x] Streaming ingest (client-stream) with bounded queue on shard
 - [x] Router proxy for streaming RPCs
 - [x] CLI support + tests for streaming rebalancing/ingest
 

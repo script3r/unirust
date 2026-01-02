@@ -687,6 +687,45 @@ impl proto::shard_service_server::ShardService for ShardNode {
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
 
+    async fn ingest_records_stream(
+        &self,
+        request: Request<tonic::Streaming<proto::IngestRecordsChunk>>,
+    ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        let start = Instant::now();
+        let mut stream = request.into_inner();
+        let mut assignments = Vec::new();
+        let mut record_count = 0usize;
+
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|err| Status::invalid_argument(err.to_string()))?
+        {
+            if chunk.records.is_empty() {
+                continue;
+            }
+            record_count += chunk.records.len();
+            let (tx, rx) = oneshot::channel();
+            let job = IngestJob {
+                records: chunk.records,
+                respond_to: tx,
+            };
+            self.ingest_tx
+                .send(job)
+                .await
+                .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
+            let batch_assignments = rx
+                .await
+                .map_err(|_| Status::internal("ingest worker dropped"))??;
+            assignments.extend(batch_assignments);
+        }
+
+        assignments.sort_by_key(|assignment| assignment.index);
+        self.metrics
+            .record_ingest(record_count, start.elapsed().as_micros() as u64);
+        Ok(Response::new(proto::IngestRecordsResponse { assignments }))
+    }
+
     async fn ingest_records_from_url(
         &self,
         request: Request<proto::IngestRecordsFromUrlRequest>,

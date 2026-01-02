@@ -25,6 +25,10 @@ message IngestRecordsRequest {
   repeated RecordInput records = 1;
 }
 
+message IngestRecordsChunk {
+  repeated RecordInput records = 1;
+}
+
 message IngestAssignment {
   uint32 index = 1;
   uint32 shard_id = 2;
@@ -267,6 +271,7 @@ message RouterImportRecordsRequest {
 service ShardService {
   rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
   rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
+  rpc IngestRecordsStream(stream IngestRecordsChunk) returns (IngestRecordsResponse);
   rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
   rpc GetStats(StatsRequest) returns (StatsResponse);
