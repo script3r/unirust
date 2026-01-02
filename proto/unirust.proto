@@ -164,6 +164,14 @@ message HealthCheckResponse {
   string status = 1;
 }
 
+message CheckpointRequest {
+  string path = 1;
+}
+
+message CheckpointResponse {
+  repeated string paths = 1;
+}
+
 service ShardService {
   rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
   rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
@@ -171,6 +179,7 @@ service ShardService {
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
   rpc GetStats(StatsRequest) returns (StatsResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
   rpc Reset(Empty) returns (Empty);
 }
@@ -182,6 +191,7 @@ service RouterService {
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
   rpc GetStats(StatsRequest) returns (StatsResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
   rpc Reset(Empty) returns (Empty);
 }

@@ -4,6 +4,7 @@ use crate::model::{AttrId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::temporal::Interval;
+use crate::persistence::PersistentOpenOptions;
 use crate::{PersistentStore, StreamingTuning, Unirust};
 use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,8 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
@@ -264,7 +267,7 @@ impl ShardNode {
         ontology_config: DistributedOntologyConfig,
         tuning: StreamingTuning,
     ) -> AnyResult<Self> {
-        Self::new_with_data_dir(shard_id, ontology_config, tuning, None)
+        Self::new_with_data_dir(shard_id, ontology_config, tuning, None, false)
     }
 
     pub fn new_with_data_dir(
@@ -272,9 +275,11 @@ impl ShardNode {
         ontology_config: DistributedOntologyConfig,
         tuning: StreamingTuning,
         data_dir: Option<PathBuf>,
+        repair_on_start: bool,
     ) -> AnyResult<Self> {
         if let Some(path) = data_dir.clone() {
-            let (store, config, ontology) = load_persistent_state(&path, ontology_config)?;
+            let (store, config, ontology) =
+                load_persistent_state(&path, ontology_config, repair_on_start)?;
             let unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
             return Ok(Self {
                 shard_id,
@@ -368,11 +373,33 @@ impl ShardNode {
     }
 }
 
+fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, Status> {
+    if requested.is_empty() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| Status::internal(err.to_string()))?
+            .as_secs();
+        return Ok(data_dir.join("checkpoints").join(format!("{timestamp}")));
+    }
+    let candidate = PathBuf::from(requested);
+    if candidate.is_absolute() {
+        Ok(candidate)
+    } else {
+        Ok(data_dir.join(candidate))
+    }
+}
+
 fn load_persistent_state(
     path: &Path,
     fallback_config: DistributedOntologyConfig,
+    repair_on_start: bool,
 ) -> AnyResult<(PersistentStore, DistributedOntologyConfig, Ontology)> {
-    let mut store = PersistentStore::open(path)?;
+    let mut store = PersistentStore::open_with_options(
+        path,
+        PersistentOpenOptions {
+            repair: repair_on_start,
+        },
+    )?;
     let stored_config = store
         .load_ontology_config()?
         .map(|payload| serde_json::from_slice(&payload))
@@ -591,6 +618,30 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
         Ok(Response::new(proto::HealthCheckResponse {
             status: "ok".to_string(),
+        }))
+    }
+
+    async fn checkpoint(
+        &self,
+        request: Request<proto::CheckpointRequest>,
+    ) -> Result<Response<proto::CheckpointResponse>, Status> {
+        let data_dir = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("checkpoint requires --data-dir"))?;
+        let target = resolve_checkpoint_path(data_dir, &request.into_inner().path)?;
+        fs::create_dir_all(
+            target
+                .parent()
+                .ok_or_else(|| Status::internal("invalid checkpoint path"))?,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?;
+        let unirust = self.unirust.lock().await;
+        unirust
+            .checkpoint(&target)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(proto::CheckpointResponse {
+            paths: vec![target.to_string_lossy().to_string()],
         }))
     }
 
@@ -880,6 +931,24 @@ impl proto::router_service_server::RouterService for RouterNode {
         Ok(Response::new(proto::HealthCheckResponse {
             status: "ok".to_string(),
         }))
+    }
+
+    async fn checkpoint(
+        &self,
+        request: Request<proto::CheckpointRequest>,
+    ) -> Result<Response<proto::CheckpointResponse>, Status> {
+        let payload = request.into_inner();
+        let mut paths = Vec::new();
+        for client in &self.shard_clients {
+            let mut client = client.clone();
+            let response = client
+                .checkpoint(Request::new(payload.clone()))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?
+                .into_inner();
+            paths.extend(response.paths);
+        }
+        Ok(Response::new(proto::CheckpointResponse { paths }))
     }
 
     async fn list_conflicts(

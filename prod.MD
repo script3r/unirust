@@ -5,15 +5,15 @@ Focus: correctness, durability, and performance with 32GB RAM per shard and 100M
 
 ## Phase 0: Safety and Integrity (now)
 
-- [ ] Add storage manifest with format version + app version
-- [ ] Validate manifest on startup (fail fast on mismatched format)
-- [ ] Ensure RocksDB flush on shutdown (drop-safe)
-- [ ] Add periodic checkpoint API (manual trigger is enough for now)
-- [ ] Add startup corruption checks / repair option
+- [x] Add storage manifest with format version + app version
+- [x] Validate manifest on startup (fail fast on mismatched format)
+- [x] Ensure RocksDB flush on shutdown (drop-safe)
+- [x] Add periodic checkpoint API (manual trigger is enough for now)
+- [x] Add startup corruption checks / repair option
 
 ## Phase 1: Memory + Indexing (scale)
 
-- [ ] Refactor `RecordStore` to return owned records or iterators
+- [x] Refactor `RecordStore` to return owned records or iterators
 - [ ] Eliminate full in-memory record scan dependency in query/linker/conflicts
 - [ ] Implement RocksDB-native indexes for attr/value, entity_type, perspective
 - [ ] Implement temporal bucketed index (time-windowed keys)

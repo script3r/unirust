@@ -15,6 +15,10 @@ fn parse_arg(flag: &str) -> Option<String> {
     None
 }
 
+fn has_flag(flag: &str) -> bool {
+    std::env::args().any(|arg| arg == flag)
+}
+
 fn parse_tuning(value: Option<String>) -> StreamingTuning {
     match value.as_deref() {
         Some("low-latency") => StreamingTuning::from_profile(TuningProfile::LowLatency),
@@ -43,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let ontology_path = parse_arg("--ontology");
     let data_dir = parse_arg("--data-dir");
+    let repair = has_flag("--repair");
     let tuning = parse_tuning(parse_arg("--tuning"));
 
     let ontology = load_ontology(ontology_path)?;
@@ -52,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         ontology,
         tuning,
         data_dir.map(std::path::PathBuf::from),
+        repair,
     )?;
 
     println!("Unirust shard listening on {}", addr);

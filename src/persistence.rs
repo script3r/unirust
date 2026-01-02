@@ -1,7 +1,7 @@
 use crate::model::{Record, RecordId, StringInterner};
 use crate::store::{RecordStore, Store};
 use anyhow::{anyhow, Result};
-use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{checkpoint::Checkpoint, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 use std::path::Path;
 
 const CF_RECORDS: &str = "records";
@@ -26,8 +26,29 @@ pub struct PersistentStore {
     db: DB,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PersistentOpenOptions {
+    pub repair: bool,
+}
+
+impl Default for PersistentOpenOptions {
+    fn default() -> Self {
+        Self { repair: false }
+    }
+}
+
 impl PersistentStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, PersistentOpenOptions::default())
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: PersistentOpenOptions,
+    ) -> Result<Self> {
+        if options.repair {
+            repair_db(path.as_ref())?;
+        }
         let db = open_db(path)?;
         validate_or_init_manifest(&db)?;
 
@@ -119,6 +140,12 @@ impl PersistentStore {
         self.db.flush()?;
         Ok(())
     }
+
+    pub fn checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let checkpoint = Checkpoint::new(&self.db)?;
+        checkpoint.create_checkpoint(path)?;
+        Ok(())
+    }
 }
 
 impl RecordStore for PersistentStore {
@@ -188,6 +215,10 @@ impl RecordStore for PersistentStore {
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    fn checkpoint(&self, path: &Path) -> Result<()> {
+        PersistentStore::checkpoint(self, path)
+    }
 }
 
 impl Drop for PersistentStore {
@@ -200,12 +231,20 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
     let mut options = Options::default();
     options.create_if_missing(true);
     options.create_missing_column_families(true);
+    options.set_paranoid_checks(true);
     let cfs = vec![
         ColumnFamilyDescriptor::new(CF_RECORDS, Options::default()),
         ColumnFamilyDescriptor::new(CF_METADATA, Options::default()),
         ColumnFamilyDescriptor::new(CF_INTERNER, Options::default()),
     ];
     Ok(DB::open_cf_descriptors(&options, path, cfs)?)
+}
+
+fn repair_db(path: &Path) -> Result<()> {
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    DB::repair(&options, path)?;
+    Ok(())
 }
 
 fn load_interner(db: &DB) -> Result<StringInterner> {

@@ -168,6 +168,11 @@ impl Unirust {
         utils::export_to_text_summary(self.store.as_ref(), clusters, observations)
     }
 
+    /// Create a durable checkpoint of the underlying store, if supported.
+    pub fn checkpoint(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.store.checkpoint(path)
+    }
+
     /// Generate graph visualizations (DOT/PNG/SVG).
     pub fn generate_graph_visualizations(
         &self,

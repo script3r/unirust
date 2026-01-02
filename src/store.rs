@@ -7,6 +7,7 @@ use crate::temporal::Interval;
 use anyhow::Result;
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 type AttributeValuePairs = Vec<((AttrId, ValueId), Vec<(RecordId, Interval)>)>;
 
@@ -76,6 +77,11 @@ pub trait RecordStore: Send + Sync {
 
     /// Check if the store is empty.
     fn is_empty(&self) -> bool;
+
+    /// Create a checkpoint at the provided path, if supported.
+    fn checkpoint(&self, _path: &Path) -> Result<()> {
+        Err(anyhow::anyhow!("checkpoint not supported for this store"))
+    }
 }
 
 /// Main in-memory storage for records and metadata
