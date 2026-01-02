@@ -72,7 +72,7 @@ Replica/backup strategy (v1):
 ### Phase 6.3: Storage Tuning at Scale
 - [x] RocksDB per-CF tuning (block cache, filters, compression)
 - [x] Dynamic cache sizing + memory limits (env overrides)
-- [ ] Compaction/flush metrics and throttling policies
+- [x] Compaction/flush metrics and throttling policies (rate limiter + metrics)
 
 ### Phase 6.4: Concurrency + Resilience
 - [ ] Reduce global mutex scope (shard-local actors or partitioned locks)

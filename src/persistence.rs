@@ -44,6 +44,7 @@ const ENV_TARGET_FILE_MB: &str = "UNIRUST_TARGET_FILE_MB";
 const ENV_LEVEL_BASE_MB: &str = "UNIRUST_LEVEL_BASE_MB";
 const ENV_BLOOM_BITS_PER_KEY: &str = "UNIRUST_BLOOM_BITS_PER_KEY";
 const ENV_MEMTABLE_PREFIX_BLOOM_RATIO: &str = "UNIRUST_MEMTABLE_PREFIX_BLOOM_RATIO";
+const ENV_RATE_LIMIT_MBPS: &str = "UNIRUST_RATE_LIMIT_MBPS";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StorageManifest {
@@ -607,6 +608,7 @@ struct RocksDbTuning {
     max_bytes_for_level_base: u64,
     bloom_bits_per_key: f64,
     memtable_prefix_bloom_ratio: f64,
+    rate_limit_bytes_per_sec: i64,
 }
 
 fn load_tuning() -> RocksDbTuning {
@@ -619,6 +621,7 @@ fn load_tuning() -> RocksDbTuning {
     let bloom_bits_per_key = env_f64(ENV_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_BITS_PER_KEY);
     let memtable_prefix_bloom_ratio =
         env_f64(ENV_MEMTABLE_PREFIX_BLOOM_RATIO, DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO);
+    let rate_limit_mbps = env_u64(ENV_RATE_LIMIT_MBPS, 0) as i64;
 
     RocksDbTuning {
         block_cache_bytes: block_cache_mb * 1024 * 1024,
@@ -628,6 +631,7 @@ fn load_tuning() -> RocksDbTuning {
         max_bytes_for_level_base: level_base_mb * 1024 * 1024,
         bloom_bits_per_key,
         memtable_prefix_bloom_ratio,
+        rate_limit_bytes_per_sec: rate_limit_mbps.saturating_mul(1024 * 1024),
     }
 }
 
@@ -664,6 +668,11 @@ fn build_base_options(tuning: &RocksDbTuning) -> Options {
     options.set_max_background_jobs(4);
     options.set_level_compaction_dynamic_level_bytes(true);
     options.set_compression_type(DBCompressionType::Zstd);
+    if tuning.rate_limit_bytes_per_sec > 0 {
+        options.set_ratelimiter(tuning.rate_limit_bytes_per_sec, 100_000, 10);
+        options.set_bytes_per_sync(1 * 1024 * 1024);
+        options.set_wal_bytes_per_sync(1 * 1024 * 1024);
+    }
     options
 }
 

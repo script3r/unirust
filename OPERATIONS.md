@@ -68,3 +68,4 @@ Environment overrides (values are in MB unless noted):
 - `UNIRUST_LEVEL_BASE_MB` (default 512)
 - `UNIRUST_BLOOM_BITS_PER_KEY` (default 10.0)
 - `UNIRUST_MEMTABLE_PREFIX_BLOOM_RATIO` (default 0.1)
+- `UNIRUST_RATE_LIMIT_MBPS` (default 0, disabled)
