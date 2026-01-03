@@ -116,6 +116,13 @@ impl StreamingLinker {
 
             for (key_values, interval) in key_values_with_intervals {
                 let key_signature = IdentityKeySignature::new(entity_type, &key_values);
+
+                // Fast path: skip if key is already known to be tainted (O(1) set lookup).
+                // We already added to pending_keys when first tainted, no need to re-add.
+                if self.tainted_identity_keys.contains(&key_signature) {
+                    continue;
+                }
+
                 let StreamingLinker {
                     dsu,
                     identity_index,
@@ -127,10 +134,30 @@ impl StreamingLinker {
                     ..
                 } = self;
 
-                let candidates = identity_index
-                    .find_matching_clusters_overlapping(dsu, entity_type, &key_values, interval)
-                    .to_vec();
+                // Use limited query with early exit - if we visit > adaptive_high_cap tree nodes,
+                // the key is hot and we should skip expensive processing.
+                let max_tree_nodes = self.tuning.adaptive_high_cap;
+                let (candidates_slice, is_hot) = identity_index
+                    .find_matching_clusters_overlapping_limited(
+                        dsu,
+                        entity_type,
+                        &key_values,
+                        interval,
+                        max_tree_nodes,
+                    );
+                let candidates = candidates_slice.to_vec();
                 let candidate_len = candidates.len();
+
+                // If the tree query hit the limit, mark as hot and skip.
+                if is_hot {
+                    tainted_identity_keys.insert(key_signature.clone());
+                    if self.tuning.deferred_reconciliation {
+                        self.pending_keys.insert(key_signature.clone());
+                    }
+                    deferred_keys.push((key_signature, candidate_len));
+                    continue;
+                }
+
                 deferred_keys.push((key_signature.clone(), candidate_len));
                 if candidate_len > self.tuning.hot_key_threshold {
                     tainted_identity_keys.insert(key_signature.clone());
@@ -330,54 +357,77 @@ impl StreamingLinker {
                 continue;
             }
 
+            let key_is_tainted = self.tainted_identity_keys.contains(&key_signature);
+            let mut records = Vec::with_capacity(candidates.len());
             for (record_id, interval) in &candidates {
                 if !self.dsu.has_record(*record_id) {
                     continue;
                 }
-                let record = store.get_record(*record_id);
-                let Some(record) = record else {
+                let perspective = self
+                    .record_perspectives
+                    .get(record_id)
+                    .cloned()
+                    .or_else(|| {
+                        store
+                            .get_record(*record_id)
+                            .map(|record| record.identity.perspective)
+                    });
+                let Some(perspective) = perspective else {
                     continue;
                 };
-                let record_perspective = record.identity.perspective.clone();
-                let key_is_tainted = self.tainted_identity_keys.contains(&key_signature);
-                let mut root_a = self.dsu.find(*record_id);
+                records.push((*record_id, *interval, perspective));
+            }
+            if records.len() < 2 {
+                continue;
+            }
 
-                for (candidate_id, candidate_interval) in &candidates {
-                    if candidate_id == record_id {
+            records.sort_by_key(|(_, interval, _)| interval.start);
+            let cap = if records.len() > self.tuning.candidate_cap {
+                self.tuning.candidate_cap
+            } else {
+                usize::MAX
+            };
+
+            let mut active: Vec<usize> = Vec::new();
+            for idx in 0..records.len() {
+                let (record_id, interval, record_perspective) = &records[idx];
+
+                active.retain(|&active_idx| records[active_idx].1.end > interval.start);
+
+                let mut compared = 0usize;
+                for &active_idx in active.iter() {
+                    if compared >= cap {
+                        break;
+                    }
+                    let (candidate_id, candidate_interval, candidate_perspective) =
+                        &records[active_idx];
+                    if record_id == candidate_id {
                         continue;
                     }
                     if !crate::temporal::is_overlapping(interval, candidate_interval) {
                         continue;
                     }
 
+                    let root_a = self.dsu.find(*record_id);
                     let root_b = self.dsu.find(*candidate_id);
                     if root_a == root_b {
                         continue;
                     }
 
-                    let candidate_perspective = self.record_perspectives.get(candidate_id);
-                    let same_perspective_conflict = candidate_perspective
-                        .map(|perspective| {
-                            perspective == &record_perspective
-                                && same_perspective_conflict_for_clusters(
-                                    &self.strong_id_summaries,
-                                    root_a,
-                                    root_b,
-                                    perspective,
-                                )
-                        })
-                        .unwrap_or(false);
+                    let same_perspective_conflict = candidate_perspective == record_perspective
+                        && same_perspective_conflict_for_clusters(
+                            &self.strong_id_summaries,
+                            root_a,
+                            root_b,
+                            record_perspective,
+                        );
 
                     if same_perspective_conflict {
                         self.tainted_identity_keys.insert(key_signature.clone());
                         continue;
                     }
 
-                    if key_is_tainted
-                        && candidate_perspective
-                            .map(|perspective| perspective != &record_perspective)
-                            .unwrap_or(false)
-                    {
+                    if key_is_tainted && candidate_perspective != record_perspective {
                         continue;
                     }
 
@@ -418,9 +468,11 @@ impl StreamingLinker {
                             root_b,
                             new_root,
                         );
-                        root_a = new_root;
                     }
+                    compared = compared.saturating_add(1);
                 }
+
+                active.push(idx);
             }
         }
 

@@ -130,12 +130,25 @@ impl IntervalTree {
 
         let new_start = interval.start;
         let new_end = interval.end;
+        // Use bit-reversed node_index as tiebreaker for better tree balance.
+        // This distributes sequential inserts across the tree when start times are equal.
+        let tiebreaker = (node_index as u32).reverse_bits();
 
         loop {
-            let current_start = self.nodes[current].interval.start;
+            let current_node = &self.nodes[current];
+            let current_start = current_node.interval.start;
+            let current_tiebreaker = (current as u32).reverse_bits();
             self.nodes[current].max_end = self.nodes[current].max_end.max(new_end);
 
-            let next = if new_start < current_start {
+            // Use (start, bit-reversed index) as composite key to prevent tree skew
+            // when many intervals have the same start time.
+            let go_left = if new_start != current_start {
+                new_start < current_start
+            } else {
+                tiebreaker < current_tiebreaker
+            };
+
+            let next = if go_left {
                 &mut self.nodes[current].left
             } else {
                 &mut self.nodes[current].right
@@ -152,8 +165,19 @@ impl IntervalTree {
     }
 
     fn collect_overlapping(&self, interval: Interval, out: &mut Vec<(RecordId, Interval)>) {
+        self.collect_overlapping_limited(interval, out, usize::MAX);
+    }
+
+    /// Collect overlapping intervals with an early exit after max_results.
+    /// Returns true if the limit was reached (potentially more results exist).
+    fn collect_overlapping_limited(
+        &self,
+        interval: Interval,
+        out: &mut Vec<(RecordId, Interval)>,
+        max_results: usize,
+    ) -> bool {
         let Some(root) = self.root else {
-            return;
+            return false;
         };
         let mut stack = vec![root];
 
@@ -161,6 +185,9 @@ impl IntervalTree {
             let node = &self.nodes[node_idx];
             if node.interval.start < interval.end && node.interval.end > interval.start {
                 out.push((node.record_id, node.interval));
+                if out.len() >= max_results {
+                    return true;
+                }
             }
 
             if let Some(left) = node.left {
@@ -175,6 +202,7 @@ impl IntervalTree {
                 }
             }
         }
+        false
     }
 }
 
@@ -245,16 +273,31 @@ impl CandidateList {
         out: &mut Vec<(RecordId, Interval)>,
         seen: &mut HashSet<RecordId>,
     ) {
+        self.collect_overlapping_clusters_limited(dsu, interval, out, seen, usize::MAX);
+    }
+
+    /// Collect overlapping clusters with an early exit after visiting max_tree_nodes.
+    /// Returns true if the limit was reached (tree is too hot for efficient querying).
+    fn collect_overlapping_clusters_limited(
+        &mut self,
+        dsu: &mut TemporalDSU,
+        interval: Interval,
+        out: &mut Vec<(RecordId, Interval)>,
+        seen: &mut HashSet<RecordId>,
+        max_tree_nodes: usize,
+    ) -> bool {
         self.rebuild_tree_if_needed();
         let mut scratch = Vec::new();
-        self.cluster_tree
-            .collect_overlapping(interval, &mut scratch);
+        let limit_reached = self
+            .cluster_tree
+            .collect_overlapping_limited(interval, &mut scratch, max_tree_nodes);
         for (record_id, candidate_interval) in scratch {
             let root = dsu.find(record_id);
             if seen.insert(root) {
                 out.push((root, candidate_interval));
             }
         }
+        limit_reached
     }
 
     fn merge_cluster_intervals(&mut self, root_a: RecordId, root_b: RecordId, new_root: RecordId) {
@@ -632,6 +675,20 @@ impl IdentityKeyIndex {
         key_values: &[KeyValue],
         interval: Interval,
     ) -> &[(RecordId, Interval)] {
+        self.find_matching_clusters_overlapping_limited(dsu, entity_type, key_values, interval, usize::MAX)
+            .0
+    }
+
+    /// Find matching clusters with an early exit after visiting max_tree_nodes.
+    /// Returns (candidates, limit_reached) where limit_reached indicates the key is "hot".
+    pub fn find_matching_clusters_overlapping_limited(
+        &mut self,
+        dsu: &mut TemporalDSU,
+        entity_type: &str,
+        key_values: &[KeyValue],
+        interval: Interval,
+        max_tree_nodes: usize,
+    ) -> (&[(RecordId, Interval)], bool) {
         let key = IdentityIndexKeyRef {
             entity_type,
             key_values,
@@ -644,18 +701,19 @@ impl IdentityKeyIndex {
         } = self;
 
         let Some(values) = index.get_mut(&key) else {
-            return &[];
+            return (&[], false);
         };
 
         cluster_overlap_buffer.clear();
         self.cluster_seen.clear();
-        values.record_candidates.collect_overlapping_clusters(
+        let limit_reached = values.record_candidates.collect_overlapping_clusters_limited(
             dsu,
             interval,
             cluster_overlap_buffer,
             &mut self.cluster_seen,
+            max_tree_nodes,
         );
-        cluster_overlap_buffer.as_slice()
+        (cluster_overlap_buffer.as_slice(), limit_reached)
     }
 
     pub fn merge_key_clusters(
