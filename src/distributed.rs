@@ -916,6 +916,8 @@ pub struct ShardNode {
     data_dir: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
+    /// Batch coalescer for high-throughput ingest (replaces per-worker locks)
+    ingest_coalescer: Option<Arc<BatchCoalescer>>,
     config_version: String,
     metrics: Arc<Metrics>,
 }
@@ -924,9 +926,114 @@ const INGEST_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_INGEST_WORKERS: usize = 4;
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
 
+// Batch coalescing configuration
+const COALESCE_MAX_RECORDS: usize = 2000; // Max records per coalesced batch
+const COALESCE_MAX_WAIT_MICROS: u64 = 100; // Max wait time before processing (100µs)
+
 struct IngestJob {
     records: Vec<proto::RecordInput>,
     respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
+}
+
+/// A pending job waiting to be coalesced with others
+struct CoalescedJob {
+    records: Vec<proto::RecordInput>,
+    respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
+}
+
+/// Batch coalescer collects multiple ingest jobs and processes them together
+struct BatchCoalescer {
+    pending: StdMutex<Vec<CoalescedJob>>,
+    notify: tokio::sync::Notify,
+}
+
+impl BatchCoalescer {
+    fn new() -> Self {
+        Self {
+            pending: StdMutex::new(Vec::new()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Submit a job for coalesced processing
+    fn submit(&self, job: CoalescedJob) -> usize {
+        let mut pending = self.pending.lock().unwrap();
+        pending.push(job);
+        let count = pending.iter().map(|j| j.records.len()).sum();
+        drop(pending);
+        self.notify.notify_one();
+        count
+    }
+
+    /// Take all pending jobs for processing
+    fn take_pending(&self) -> Vec<CoalescedJob> {
+        let mut pending = self.pending.lock().unwrap();
+        std::mem::take(&mut *pending)
+    }
+
+    /// Check if we have enough records to process immediately
+    fn should_flush(&self) -> bool {
+        let pending = self.pending.lock().unwrap();
+        let total_records: usize = pending.iter().map(|j| j.records.len()).sum();
+        total_records >= COALESCE_MAX_RECORDS
+    }
+}
+
+/// Spawn a coalescing ingest writer that batches multiple requests together
+/// Uses zero-wait strategy: process immediately but grab all pending work
+fn spawn_coalescing_ingest(
+    unirust: Arc<RwLock<Unirust>>,
+    shard_id: u32,
+) -> Arc<BatchCoalescer> {
+    let coalescer = Arc::new(BatchCoalescer::new());
+    let writer_coalescer = coalescer.clone();
+
+    tokio::spawn(async move {
+        loop {
+            // Wait for at least one job
+            writer_coalescer.notify.notified().await;
+
+            // Immediately collect ALL pending jobs (zero wait)
+            let jobs = writer_coalescer.take_pending();
+            if jobs.is_empty() {
+                continue;
+            }
+
+            // Combine all records, tracking boundaries
+            let mut all_records = Vec::new();
+            let mut job_boundaries: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
+
+            for job in &jobs {
+                let start = all_records.len();
+                all_records.extend(job.records.iter().cloned());
+                job_boundaries.push((start, job.records.len()));
+            }
+
+            // Process entire batch under single lock acquisition
+            let result = {
+                let mut guard = unirust.write().await;
+                process_ingest_batch(&mut guard, shard_id, &all_records)
+            };
+
+            // Distribute results back to each job by position
+            match result {
+                Ok(all_assignments) => {
+                    for (job, (start, len)) in jobs.into_iter().zip(job_boundaries) {
+                        let end = (start + len).min(all_assignments.len());
+                        let job_assignments = all_assignments[start..end].to_vec();
+                        let _ = job.respond_to.send(Ok(job_assignments));
+                    }
+                }
+                Err(e) => {
+                    for job in jobs {
+                        let _ = job.respond_to.send(Err(Status::internal(e.to_string())));
+                    }
+                }
+            }
+        }
+    });
+
+    coalescer
 }
 
 impl ShardNode {
@@ -961,6 +1068,7 @@ impl ShardNode {
             }
             let unirust = Arc::new(RwLock::new(unirust));
             let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
+            let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
             return Ok(Self {
                 shard_id,
                 unirust,
@@ -969,6 +1077,7 @@ impl ShardNode {
                 data_dir: Some(path),
                 ingest_wal,
                 ingest_txs,
+                ingest_coalescer,
                 config_version,
                 metrics: Arc::new(Metrics::new()),
             });
@@ -983,6 +1092,7 @@ impl ShardNode {
             tuning.clone(),
         )));
         let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
+        let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
         Ok(Self {
             shard_id,
             unirust,
@@ -991,6 +1101,7 @@ impl ShardNode {
             data_dir: None,
             ingest_wal,
             ingest_txs,
+            ingest_coalescer,
             config_version,
             metrics: Arc::new(Metrics::new()),
         })
@@ -1163,6 +1274,39 @@ fn spawn_ingest_workers(
         senders.push(tx);
     }
     senders
+}
+
+/// Dispatch records using the batch coalescer for higher throughput
+async fn dispatch_ingest_coalesced(
+    coalescer: &BatchCoalescer,
+    ingest_wal: Option<&IngestWal>,
+    records: Vec<proto::RecordInput>,
+) -> Result<Vec<proto::IngestAssignment>, Status> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(wal) = ingest_wal {
+        wal.write_batch(&records)?;
+    }
+
+    // Submit to coalescer and wait for result
+    let (tx, rx) = oneshot::channel();
+    let job = CoalescedJob {
+        records,
+        respond_to: tx,
+    };
+    coalescer.submit(job);
+
+    let assignments = rx
+        .await
+        .map_err(|_| Status::internal("coalescing writer dropped"))??;
+
+    if let Some(wal) = ingest_wal {
+        wal.clear()?;
+    }
+
+    Ok(assignments)
 }
 
 async fn dispatch_ingest_records(
@@ -1353,8 +1497,13 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let start = Instant::now();
         let records = request.into_inner().records;
         let record_count = records.len();
-        let assignments =
-            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?;
+
+        // Use coalescer for higher throughput when available
+        let assignments = if let Some(coalescer) = &self.ingest_coalescer {
+            dispatch_ingest_coalesced(coalescer, self.ingest_wal.as_deref(), records).await?
+        } else {
+            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
+        };
 
         self.metrics
             .record_ingest(record_count, start.elapsed().as_micros() as u64);
@@ -1379,12 +1528,15 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             record_count += chunk.records.len();
-            let batch_assignments = dispatch_ingest_records(
-                &self.ingest_txs,
-                self.ingest_wal.as_deref(),
-                chunk.records,
-            )
-            .await?;
+
+            // Use coalescer for higher throughput when available
+            let batch_assignments = if let Some(coalescer) = &self.ingest_coalescer {
+                dispatch_ingest_coalesced(coalescer, self.ingest_wal.as_deref(), chunk.records)
+                    .await?
+            } else {
+                dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), chunk.records)
+                    .await?
+            };
             assignments.extend(batch_assignments);
         }
 
