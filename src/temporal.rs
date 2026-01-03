@@ -339,6 +339,52 @@ pub fn local_to_utc(local: time::PrimitiveDateTime) -> anyhow::Result<OffsetDate
     Ok(local.assume_utc())
 }
 
+/// Compute atomic intervals from a collection of intervals.
+///
+/// Atomic intervals are the finest-grained intervals where no boundary points
+/// change within them. For example, given intervals [0,10), [5,15), [10,20),
+/// the atomic intervals are [0,5), [5,10), [10,15), [15,20).
+///
+/// This is useful for temporal conflict detection because within each atomic
+/// interval, the set of active values is constant, enabling per-slice processing.
+pub fn atomic_intervals(intervals: &[Interval]) -> Vec<Interval> {
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect all boundary points
+    let mut points: Vec<Instant> = Vec::with_capacity(intervals.len() * 2);
+    for interval in intervals {
+        points.push(interval.start);
+        points.push(interval.end);
+    }
+
+    // Sort and deduplicate
+    points.sort_unstable();
+    points.dedup();
+
+    if points.len() < 2 {
+        return Vec::new();
+    }
+
+    // Create atomic intervals between consecutive points
+    let mut result = Vec::with_capacity(points.len() - 1);
+    for i in 0..points.len() - 1 {
+        if let Ok(interval) = Interval::new(points[i], points[i + 1]) {
+            result.push(interval);
+        }
+    }
+
+    result
+}
+
+/// Check if an interval encloses another (i.e., completely contains it).
+/// An interval A encloses B if A.start <= B.start and A.end >= B.end.
+#[inline]
+pub fn encloses(outer: &Interval, inner: &Interval) -> bool {
+    outer.start <= inner.start && outer.end >= inner.end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +520,40 @@ mod tests {
         assert!(is_overlapping(&a, &b));
         assert!(!is_overlapping(&a, &c));
         assert!(!is_overlapping(&a, &d));
+    }
+
+    #[test]
+    fn test_atomic_intervals() {
+        // Given intervals [0,10), [5,15), [10,20)
+        // Atomic intervals should be [0,5), [5,10), [10,15), [15,20)
+        let intervals = vec![
+            Interval::new(0, 10).unwrap(),
+            Interval::new(5, 15).unwrap(),
+            Interval::new(10, 20).unwrap(),
+        ];
+
+        let atoms = atomic_intervals(&intervals);
+        assert_eq!(atoms.len(), 4);
+        assert_eq!(atoms[0], Interval::new(0, 5).unwrap());
+        assert_eq!(atoms[1], Interval::new(5, 10).unwrap());
+        assert_eq!(atoms[2], Interval::new(10, 15).unwrap());
+        assert_eq!(atoms[3], Interval::new(15, 20).unwrap());
+    }
+
+    #[test]
+    fn test_atomic_intervals_empty() {
+        let atoms = atomic_intervals(&[]);
+        assert!(atoms.is_empty());
+    }
+
+    #[test]
+    fn test_encloses() {
+        let outer = Interval::new(0, 100).unwrap();
+        let inner = Interval::new(10, 50).unwrap();
+        let partial = Interval::new(50, 150).unwrap();
+
+        assert!(encloses(&outer, &inner));
+        assert!(!encloses(&outer, &partial));
+        assert!(encloses(&outer, &outer)); // Self-enclosure
     }
 }

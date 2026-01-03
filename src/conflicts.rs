@@ -701,6 +701,92 @@ impl ConflictDetector {
         merged
     }
 
+    /// Detect conflicts using atomic intervals approach.
+    ///
+    /// This is an alternative algorithm that:
+    /// 1. Collects all boundary points from all intervals
+    /// 2. Creates atomic intervals between consecutive points
+    /// 3. For each atomic interval, determines which values are active
+    /// 4. Multiple active values = conflict
+    ///
+    /// This approach is more parallelizable but has different performance characteristics.
+    fn detect_conflicts_atomic(
+        attribute: AttrId,
+        descriptors: Vec<(RecordId, ValueId, Interval)>,
+    ) -> Vec<DirectConflict> {
+        if descriptors.is_empty() {
+            return Vec::new();
+        }
+
+        // Collect all intervals for atomic interval computation
+        let intervals: Vec<Interval> = descriptors.iter().map(|(_, _, i)| *i).collect();
+
+        // Get atomic intervals
+        let atoms = crate::temporal::atomic_intervals(&intervals);
+        if atoms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut conflicts = Vec::new();
+
+        // For each atomic interval, find which values are active
+        for atom in &atoms {
+            let mut active_values: HashMap<ValueId, Vec<RecordId>> = HashMap::new();
+
+            for (record_id, value, interval) in &descriptors {
+                if crate::temporal::encloses(interval, atom) {
+                    active_values
+                        .entry(*value)
+                        .or_insert_with(Vec::new)
+                        .push(*record_id);
+                }
+            }
+
+            // If multiple values are active in this atomic interval, it's a conflict
+            if active_values.len() > 1 {
+                let values: Vec<ConflictValue> = active_values
+                    .into_iter()
+                    .map(|(value, participants)| ConflictValue::new(value, participants))
+                    .collect();
+
+                conflicts.push(DirectConflict::new(
+                    "direct".to_string(),
+                    attribute,
+                    *atom,
+                    values,
+                ));
+            }
+        }
+
+        // Merge adjacent conflicts with the same values
+        Self::merge_adjacent_conflicts(conflicts)
+    }
+
+    /// Merge adjacent conflicts that have the same set of values.
+    fn merge_adjacent_conflicts(mut conflicts: Vec<DirectConflict>) -> Vec<DirectConflict> {
+        if conflicts.len() < 2 {
+            return conflicts;
+        }
+
+        conflicts.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+        let mut merged: Vec<DirectConflict> = Vec::with_capacity(conflicts.len());
+
+        for current in conflicts {
+            if let Some(last) = merged.last_mut() {
+                // Check if intervals are adjacent and values match
+                if last.interval.end == current.interval.start && last.values == current.values {
+                    // Extend the interval
+                    last.interval = Interval::new(last.interval.start, current.interval.end)
+                        .unwrap_or(last.interval);
+                    continue;
+                }
+            }
+            merged.push(current);
+        }
+
+        merged
+    }
+
     /// Detect indirect conflicts (suppressed merges)
     fn detect_indirect_conflicts(
         store: &dyn RecordStore,
@@ -1286,6 +1372,64 @@ pub fn detect_conflicts_for_clusters(
     cluster_ids: &[ClusterId],
 ) -> Result<Vec<Observation>> {
     ConflictDetector::detect_conflicts_for_clusters(store, clusters, ontology, cluster_ids)
+}
+
+/// Algorithm selection for conflict detection benchmarking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAlgorithm {
+    /// Sweep-line algorithm (default, current implementation)
+    SweepLine,
+    /// Atomic intervals algorithm (experimental)
+    AtomicIntervals,
+}
+
+/// Detect direct conflicts for an attribute using the specified algorithm.
+/// This is exposed for benchmarking purposes.
+pub fn detect_attribute_conflicts(
+    attribute: AttrId,
+    descriptors: Vec<(RecordId, ValueId, Interval)>,
+    algorithm: ConflictAlgorithm,
+) -> Vec<DirectConflict> {
+    match algorithm {
+        ConflictAlgorithm::SweepLine => {
+            ConflictDetector::detect_conflicts_for_attribute_fast(descriptors, attribute)
+                .unwrap_or_default()
+        }
+        ConflictAlgorithm::AtomicIntervals => {
+            ConflictDetector::detect_conflicts_atomic(attribute, descriptors)
+        }
+    }
+}
+
+/// Detect direct conflicts for an attribute with automatic algorithm selection.
+///
+/// Uses the ConflictTuning configuration to automatically select the best
+/// algorithm based on the data characteristics (overlap ratio).
+pub fn detect_attribute_conflicts_auto(
+    attribute: AttrId,
+    descriptors: Vec<(RecordId, ValueId, Interval)>,
+    tuning: &crate::config::ConflictTuning,
+) -> Vec<DirectConflict> {
+    if descriptors.is_empty() {
+        return Vec::new();
+    }
+
+    // Count unique boundaries for auto-selection
+    let unique_boundaries = count_unique_boundaries(&descriptors);
+    let algorithm = tuning.select_algorithm(unique_boundaries, descriptors.len());
+
+    detect_attribute_conflicts(attribute, descriptors, algorithm)
+}
+
+/// Count the number of unique boundary points in a set of intervals.
+fn count_unique_boundaries(descriptors: &[(RecordId, ValueId, Interval)]) -> usize {
+    use std::collections::HashSet;
+    let mut boundaries: HashSet<i64> = HashSet::with_capacity(descriptors.len() * 2);
+    for (_, _, interval) in descriptors {
+        boundaries.insert(interval.start);
+        boundaries.insert(interval.end);
+    }
+    boundaries.len()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

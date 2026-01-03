@@ -21,6 +21,7 @@ pub struct TestSchema {
 
 #[derive(Debug, Clone)]
 pub struct GeneratedDataset {
+    #[allow(dead_code)]
     pub records: Vec<Record>,
     #[allow(dead_code)]
     pub schema: TestSchema,

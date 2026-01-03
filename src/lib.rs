@@ -23,7 +23,7 @@ pub mod temporal;
 pub mod utils;
 
 // Re-export main types for convenience
-pub use config::{StreamingTuning, TuningProfile};
+pub use config::{ConflictAlgorithmChoice, ConflictTuning, StreamingTuning, TuningProfile};
 pub use model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 pub use ontology::Ontology;
 pub use persistence::PersistentStore;

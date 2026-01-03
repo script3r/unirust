@@ -223,6 +223,7 @@ pub fn query_master_entities_with_cache(
     Ok(QueryOutcome::Matches(matches))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn query_master_entities_with_cache_selective(
     store: &dyn RecordStore,
     clusters: &Clusters,

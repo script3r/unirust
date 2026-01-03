@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 use unirust_rs::dsu::{Cluster, Clusters};
-use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity, ClusterId};
+use unirust_rs::model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 use unirust_rs::ontology::{Ontology, StrongIdentifier};
 use unirust_rs::store::RecordStore;
 use unirust_rs::temporal::Interval;
@@ -13,8 +13,12 @@ fn main() {
     let cluster_count = 100usize;
 
     println!("=== Conflict Detection Profiler ===\n");
-    println!("Configuration: {} clusters × {} records = {} total\n",
-             cluster_count, cluster_size, cluster_count * cluster_size);
+    println!(
+        "Configuration: {} clusters × {} records = {} total\n",
+        cluster_count,
+        cluster_size,
+        cluster_count * cluster_size
+    );
 
     let (store, clusters, ontology) = setup(cluster_size, cluster_count);
 
@@ -24,7 +28,11 @@ fn main() {
     println!("--- Baseline ---\n");
     let start = Instant::now();
     let result = unirust_rs::conflicts::detect_conflicts(&store, &clusters, &ontology).unwrap();
-    println!("Full detect_conflicts: {:?} ({} observations)\n", start.elapsed(), result.len());
+    println!(
+        "Full detect_conflicts: {:?} ({} observations)\n",
+        start.elapsed(),
+        result.len()
+    );
 
     // Profile store.get_record performance
     println!("--- Store Access Patterns ---\n");
@@ -41,7 +49,10 @@ fn main() {
         }
     }
     let get_record_time = start.elapsed();
-    println!("store.get_record() × {}: {:?}", record_count, get_record_time);
+    println!(
+        "store.get_record() × {}: {:?}",
+        record_count, get_record_time
+    );
     println!("  Per record: {:?}", get_record_time / record_count as u32);
     println!("  Descriptors accessed: {}\n", descriptor_count);
 
@@ -93,8 +104,12 @@ fn setup(cluster_size: usize, cluster_count: usize) -> (Store, Clusters, Ontolog
 
         for i in 0..cluster_size {
             let record_id = RecordId(base_id + i as u32);
-            let value = store.interner_mut().intern_value(&format!("name_{}_{}", cluster_idx, i));
-            let strong_val = store.interner_mut().intern_value(&format!("ssn_{}", base_id + i as u32));
+            let value = store
+                .interner_mut()
+                .intern_value(&format!("name_{}_{}", cluster_idx, i));
+            let strong_val = store
+                .interner_mut()
+                .intern_value(&format!("ssn_{}", base_id + i as u32));
 
             let record = Record::new(
                 record_id,
@@ -119,7 +134,9 @@ fn setup(cluster_size: usize, cluster_count: usize) -> (Store, Clusters, Ontolog
         ));
     }
 
-    let clusters = Clusters { clusters: clusters_vec };
+    let clusters = Clusters {
+        clusters: clusters_vec,
+    };
     let mut ontology = Ontology::new();
     ontology.add_strong_identifier(StrongIdentifier::new(strong_attr, "ssn".to_string()));
 
@@ -134,7 +151,9 @@ fn profile_hashmap_perf(n: usize) {
     let start = Instant::now();
     let mut map: HashMap<ValueId, Vec<usize>> = HashMap::with_capacity(n);
     for i in 0..n {
-        map.entry(ValueId(i as u32)).or_insert_with(|| Vec::with_capacity(2)).push(i);
+        map.entry(ValueId(i as u32))
+            .or_insert_with(|| Vec::with_capacity(2))
+            .push(i);
     }
     let insert_time = start.elapsed();
     println!("HashMap insert {} unique keys: {:?}", n, insert_time);
@@ -146,7 +165,10 @@ fn profile_hashmap_perf(n: usize) {
         sum += v.len();
     }
     let iter_time = start.elapsed();
-    println!("HashMap iterate {} entries: {:?} (sum={})", n, iter_time, sum);
+    println!(
+        "HashMap iterate {} entries: {:?} (sum={})",
+        n, iter_time, sum
+    );
 
     // Simulate consuming iteration
     let start = Instant::now();
@@ -155,7 +177,10 @@ fn profile_hashmap_perf(n: usize) {
         sum += v.len();
     }
     let consume_time = start.elapsed();
-    println!("HashMap consume {} entries: {:?} (sum={})", n, consume_time, sum);
+    println!(
+        "HashMap consume {} entries: {:?} (sum={})",
+        n, consume_time, sum
+    );
 }
 
 fn profile_allocations(n: usize) {
@@ -163,7 +188,7 @@ fn profile_allocations(n: usize) {
     let start = Instant::now();
     let mut vecs: Vec<Vec<usize>> = Vec::with_capacity(n);
     for i in 0..n {
-        vecs.push(vec![i]);  // Single-element vec (common case)
+        vecs.push(vec![i]); // Single-element vec (common case)
     }
     let single_vec_time = start.elapsed();
     println!("Allocate {} single-element Vecs: {:?}", n, single_vec_time);
@@ -173,9 +198,7 @@ fn profile_allocations(n: usize) {
     let start = Instant::now();
     let mut vecs: Vec<Vec<usize>> = Vec::with_capacity(n);
     for i in 0..n {
-        let mut v = Vec::with_capacity(1);
-        v.push(i);
-        vecs.push(v);
+        vecs.push(vec![i]);
     }
     let presized_time = start.elapsed();
     println!("Allocate {} pre-sized Vecs: {:?}", n, presized_time);
@@ -210,7 +233,7 @@ fn profile_sweep_with_output(n: usize) {
     // Create events (all same timestamp = many conflicts)
     let mut events: Vec<(i64, bool, u32, u32)> = Vec::with_capacity(n * 2);
     for i in 0..n {
-        events.push((0, true, i as u32, i as u32));   // (time, is_start, value_id, record_id)
+        events.push((0, true, i as u32, i as u32)); // (time, is_start, value_id, record_id)
         events.push((100, false, i as u32, i as u32));
     }
     events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -228,29 +251,32 @@ fn profile_sweep_with_output(n: usize) {
         }
         if *is_start {
             *active.entry(*value).or_insert(0) += 1;
-        } else {
-            if let Some(c) = active.get_mut(value) {
-                *c -= 1;
-                if *c == 0 { active.remove(value); }
+        } else if let Some(c) = active.get_mut(value) {
+            *c -= 1;
+            if *c == 0 {
+                active.remove(value);
             }
         }
         last_time = Some(*time);
     }
     let sweep_only_time = start.elapsed();
-    println!("Sweep line (count only): {:?} ({} conflicts)", sweep_only_time, conflict_count);
+    println!(
+        "Sweep line (count only): {:?} ({} conflicts)",
+        sweep_only_time, conflict_count
+    );
 
     // Sweep with output allocation (simulating real behavior)
     let start = Instant::now();
     let mut active: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut conflicts: Vec<(i64, i64, Vec<(u32, Vec<u32>)>)> = Vec::new();
+    type ConflictEntry = (i64, i64, Vec<(u32, Vec<u32>)>);
+    let mut conflicts: Vec<ConflictEntry> = Vec::new();
     let mut last_time: Option<i64> = None;
     for (time, is_start, value, record) in &events {
         if let Some(lt) = last_time {
             if *time > lt && active.len() > 1 {
                 // Create conflict output (this is expensive!)
-                let values: Vec<(u32, Vec<u32>)> = active.iter()
-                    .map(|(v, r)| (*v, r.clone()))
-                    .collect();
+                let values: Vec<(u32, Vec<u32>)> =
+                    active.iter().map(|(v, r)| (*v, r.clone())).collect();
                 conflicts.push((lt, *time, values));
             }
         }
@@ -262,9 +288,15 @@ fn profile_sweep_with_output(n: usize) {
         last_time = Some(*time);
     }
     let sweep_output_time = start.elapsed();
-    println!("Sweep line (with output): {:?} ({} conflicts)", sweep_output_time, conflicts.len());
+    println!(
+        "Sweep line (with output): {:?} ({} conflicts)",
+        sweep_output_time,
+        conflicts.len()
+    );
 
     // The difference shows the cost of conflict output creation
-    println!("Output allocation overhead: {:?}",
-             sweep_output_time.saturating_sub(sweep_only_time));
+    println!(
+        "Output allocation overhead: {:?}",
+        sweep_output_time.saturating_sub(sweep_only_time)
+    );
 }

@@ -405,6 +405,115 @@ fn bench_conflict_detection(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark comparing sweep-line vs atomic intervals algorithms.
+fn bench_conflict_algorithm(c: &mut Criterion) {
+    use unirust_rs::conflicts::{detect_attribute_conflicts, ConflictAlgorithm};
+
+    let mut group = c.benchmark_group("conflicts_algorithm");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(3));
+
+    // Test different descriptor counts (simulating different cluster sizes)
+    for &descriptor_count in &[100, 500, 1000, 2000] {
+        // Test with different overlap patterns
+        for &overlap_ratio in &["none", "half", "all"] {
+            let label = format!("{}_descs_{}_overlap", descriptor_count, overlap_ratio);
+            group.throughput(Throughput::Elements(descriptor_count as u64));
+
+            // Sweep-line algorithm
+            group.bench_function(BenchmarkId::new("sweep_line", &label), |b| {
+                b.iter_batched(
+                    || {
+                        let attr = AttrId(1);
+                        let mut descriptors = Vec::with_capacity(descriptor_count);
+
+                        for i in 0..descriptor_count {
+                            let record_id = RecordId(i as u32);
+                            let value = ValueId(i as u32); // Each record has unique value (conflict scenario)
+
+                            let interval = match overlap_ratio {
+                                "none" => {
+                                    // Non-overlapping: each descriptor in separate time slot
+                                    Interval::new(i as i64 * 100, (i as i64 + 1) * 100).unwrap()
+                                }
+                                "half" => {
+                                    // Half overlap: alternating overlap pattern
+                                    if i % 2 == 0 {
+                                        Interval::new(0, 100).unwrap()
+                                    } else {
+                                        Interval::new(100, 200).unwrap()
+                                    }
+                                }
+                                "all" => {
+                                    // Full overlap: all descriptors at same time
+                                    Interval::new(0, 100).unwrap()
+                                }
+                                _ => Interval::new(0, 100).unwrap(),
+                            };
+
+                            descriptors.push((record_id, value, interval));
+                        }
+
+                        (attr, descriptors)
+                    },
+                    |(attr, descriptors)| {
+                        black_box(detect_attribute_conflicts(
+                            attr,
+                            descriptors,
+                            ConflictAlgorithm::SweepLine,
+                        ));
+                    },
+                    BatchSize::SmallInput,
+                )
+            });
+
+            // Atomic intervals algorithm
+            group.bench_function(BenchmarkId::new("atomic_intervals", &label), |b| {
+                b.iter_batched(
+                    || {
+                        let attr = AttrId(1);
+                        let mut descriptors = Vec::with_capacity(descriptor_count);
+
+                        for i in 0..descriptor_count {
+                            let record_id = RecordId(i as u32);
+                            let value = ValueId(i as u32);
+
+                            let interval = match overlap_ratio {
+                                "none" => {
+                                    Interval::new(i as i64 * 100, (i as i64 + 1) * 100).unwrap()
+                                }
+                                "half" => {
+                                    if i % 2 == 0 {
+                                        Interval::new(0, 100).unwrap()
+                                    } else {
+                                        Interval::new(100, 200).unwrap()
+                                    }
+                                }
+                                "all" => Interval::new(0, 100).unwrap(),
+                                _ => Interval::new(0, 100).unwrap(),
+                            };
+
+                            descriptors.push((record_id, value, interval));
+                        }
+
+                        (attr, descriptors)
+                    },
+                    |(attr, descriptors)| {
+                        black_box(detect_attribute_conflicts(
+                            attr,
+                            descriptors,
+                            ConflictAlgorithm::AtomicIntervals,
+                        ));
+                    },
+                    BatchSize::SmallInput,
+                )
+            });
+        }
+    }
+
+    group.finish();
+}
+
 // =============================================================================
 // GOLDEN RECORD BENCHMARKS
 // =============================================================================
@@ -685,7 +794,11 @@ criterion_group!(
 
 criterion_group!(index_benches, bench_store_lookup);
 
-criterion_group!(conflict_benches, bench_conflict_detection);
+criterion_group!(
+    conflict_benches,
+    bench_conflict_detection,
+    bench_conflict_algorithm
+);
 
 criterion_group!(graph_benches, bench_golden_record);
 
