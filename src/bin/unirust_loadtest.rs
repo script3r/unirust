@@ -1,0 +1,1536 @@
+//! Large-scale distributed load test TUI for Unirust.
+//!
+//! Generates cybersecurity entities and streams them to a distributed cluster
+//! while displaying real-time performance metrics.
+//!
+//! Usage:
+//! ```bash
+//! cargo run --bin unirust_loadtest --features test-support -- \
+//!   --count 100000 \
+//!   --router http://127.0.0.1:50060 \
+//!   --shards "127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063" \
+//!   --streams 4 \
+//!   --batch 1000 \
+//!   --overlap 0.1 \
+//!   --log /tmp/loadtest.log
+//! ```
+
+use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use ratatui::{
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Gauge, Paragraph, Row, Table},
+    Frame, Terminal,
+};
+use tokio::sync::RwLock;
+use tonic::transport::Channel;
+
+use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
+use unirust_rs::distributed::proto::shard_service_client::ShardServiceClient;
+use unirust_rs::distributed::proto::{
+    ApplyOntologyRequest, IdentityKeyConfig, IngestRecordsRequest, MetricsRequest, OntologyConfig,
+    RecordDescriptor, RecordIdentity, RecordInput, StatsRequest,
+};
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+#[derive(Debug, Clone)]
+pub struct LoadTestConfig {
+    pub count: u64,
+    pub router_addr: String,
+    pub shard_addrs: Vec<String>,
+    pub stream_count: usize,
+    pub batch_size: usize,
+    pub overlap_probability: f64,
+    pub log_file: Option<PathBuf>,
+    pub seed: u64,
+}
+
+impl Default for LoadTestConfig {
+    fn default() -> Self {
+        Self {
+            count: 100_000,
+            router_addr: "http://127.0.0.1:50060".to_string(),
+            shard_addrs: vec![],
+            stream_count: 4,
+            batch_size: 1000,
+            overlap_probability: 0.1,
+            log_file: None,
+            seed: 42,
+        }
+    }
+}
+
+fn parse_args() -> LoadTestConfig {
+    let mut config = LoadTestConfig::default();
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--count" | "-c" => {
+                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                    config.count = v;
+                }
+            }
+            "--router" | "-r" => {
+                if let Some(v) = args.next() {
+                    config.router_addr = v;
+                }
+            }
+            "--shards" | "-s" => {
+                if let Some(v) = args.next() {
+                    config.shard_addrs = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            "--streams" => {
+                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                    config.stream_count = v;
+                }
+            }
+            "--batch" => {
+                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                    config.batch_size = v;
+                }
+            }
+            "--overlap" => {
+                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                    config.overlap_probability = v;
+                }
+            }
+            "--log" => {
+                config.log_file = args.next().map(PathBuf::from);
+            }
+            "--seed" => {
+                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                    config.seed = v;
+                }
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
+    config
+}
+
+fn print_help() {
+    println!(
+        r#"unirust_loadtest - Large-scale distributed load test TUI
+
+USAGE:
+    unirust_loadtest [OPTIONS]
+
+OPTIONS:
+    -c, --count <N>       Total entities to generate (default: 100000)
+    -r, --router <ADDR>   Router gRPC address (default: http://127.0.0.1:50060)
+    -s, --shards <ADDRS>  Comma-separated shard addresses for direct metrics
+    --streams <N>         Number of concurrent streams (default: 4)
+    --batch <N>           Batch size per request (default: 1000)
+    --overlap <F>         Overlap probability 0.0-1.0 (default: 0.1)
+    --log <PATH>          Log file path (logs to file only)
+    --seed <N>            Random seed for reproducibility (default: 42)
+    -h, --help            Print help
+
+EXAMPLES:
+    # Basic test with 100K entities
+    unirust_loadtest --count 100000 --router http://127.0.0.1:50060
+
+    # Large scale with custom parallelism
+    unirust_loadtest -c 1000000 --streams 8 --batch 2000 --overlap 0.15
+
+    # With shard metrics and logging
+    unirust_loadtest -c 500000 -s "127.0.0.1:50061,127.0.0.1:50062" --log /tmp/test.log
+"#
+    );
+}
+
+// =============================================================================
+// CYBERSECURITY ONTOLOGY
+// =============================================================================
+
+/// Entity types in the cybersecurity domain
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntityType {
+    User,
+    Session,
+    Process,
+    NetworkConnection,
+    Asset,
+    Vulnerability,
+    Alert,
+    File,
+}
+
+impl EntityType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            EntityType::User => "user",
+            EntityType::Session => "session",
+            EntityType::Process => "process",
+            EntityType::NetworkConnection => "network_connection",
+            EntityType::Asset => "asset",
+            EntityType::Vulnerability => "vulnerability",
+            EntityType::Alert => "alert",
+            EntityType::File => "file",
+        }
+    }
+
+    fn all() -> &'static [EntityType] {
+        &[
+            EntityType::User,
+            EntityType::Session,
+            EntityType::Process,
+            EntityType::NetworkConnection,
+            EntityType::Asset,
+            EntityType::Vulnerability,
+            EntityType::Alert,
+            EntityType::File,
+        ]
+    }
+
+    fn weight(&self) -> u32 {
+        // Distribution weights for entity type selection
+        match self {
+            EntityType::User => 15,
+            EntityType::Session => 20,
+            EntityType::Process => 25,
+            EntityType::NetworkConnection => 15,
+            EntityType::Asset => 10,
+            EntityType::Vulnerability => 5,
+            EntityType::Alert => 5,
+            EntityType::File => 5,
+        }
+    }
+}
+
+/// Data perspectives/sources in the cybersecurity domain
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Perspective {
+    LDAP,
+    SSO,
+    ActiveDirectory,
+    ServerLogs,
+    EDR,
+    SIEM,
+    VulnScanner,
+    AssetInventory,
+}
+
+impl Perspective {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Perspective::LDAP => "ldap",
+            Perspective::SSO => "sso",
+            Perspective::ActiveDirectory => "active_directory",
+            Perspective::ServerLogs => "server_logs",
+            Perspective::EDR => "edr",
+            Perspective::SIEM => "siem",
+            Perspective::VulnScanner => "vuln_scanner",
+            Perspective::AssetInventory => "asset_inventory",
+        }
+    }
+
+    fn for_entity_type(entity_type: EntityType) -> &'static [Perspective] {
+        match entity_type {
+            EntityType::User => &[
+                Perspective::LDAP,
+                Perspective::SSO,
+                Perspective::ActiveDirectory,
+            ],
+            EntityType::Session => &[Perspective::SSO, Perspective::ServerLogs, Perspective::SIEM],
+            EntityType::Process => &[Perspective::EDR, Perspective::ServerLogs],
+            EntityType::NetworkConnection => &[Perspective::EDR, Perspective::SIEM],
+            EntityType::Asset => &[
+                Perspective::AssetInventory,
+                Perspective::EDR,
+                Perspective::VulnScanner,
+            ],
+            EntityType::Vulnerability => &[Perspective::VulnScanner, Perspective::SIEM],
+            EntityType::Alert => &[Perspective::SIEM, Perspective::EDR],
+            EntityType::File => &[Perspective::EDR, Perspective::VulnScanner],
+        }
+    }
+}
+
+fn build_ontology_config() -> OntologyConfig {
+    OntologyConfig {
+        identity_keys: vec![
+            IdentityKeyConfig {
+                name: "user_identity".to_string(),
+                attributes: vec!["user_sid".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "user_upn_key".to_string(),
+                attributes: vec!["user_upn".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "session_identity".to_string(),
+                attributes: vec!["session_id".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "process_identity".to_string(),
+                attributes: vec!["process_id".to_string(), "asset_id".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "connection_identity".to_string(),
+                attributes: vec!["flow_id".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "asset_identity".to_string(),
+                attributes: vec!["asset_id".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "asset_hostname".to_string(),
+                attributes: vec!["hostname".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "vuln_identity".to_string(),
+                attributes: vec!["cve_id".to_string(), "asset_id".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "alert_identity".to_string(),
+                attributes: vec!["alert_id".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "file_identity".to_string(),
+                attributes: vec!["file_hash".to_string()],
+            },
+        ],
+        strong_identifiers: vec![
+            "user_sid".to_string(),
+            "session_id".to_string(),
+            "process_hash".to_string(),
+            "flow_id".to_string(),
+            "asset_id".to_string(),
+            "cve_id".to_string(),
+            "alert_id".to_string(),
+            "file_hash".to_string(),
+        ],
+        constraints: vec![],
+    }
+}
+
+// =============================================================================
+// ENTITY GENERATOR
+// =============================================================================
+
+/// Seed data for creating overlapping entities
+struct UserSeed {
+    user_sid: String,
+    user_upn: String,
+    employee_id: String,
+    department: String,
+}
+
+struct AssetSeed {
+    asset_id: String,
+    hostname: String,
+    ip_address: String,
+    os_type: String,
+}
+
+pub struct CyberEntityGenerator {
+    rng: StdRng,
+    overlap_probability: f64,
+    next_id: u64,
+    base_time: i64,
+
+    // Entity pools for overlap creation
+    user_pool: Vec<UserSeed>,
+    asset_pool: Vec<AssetSeed>,
+
+    // Weight sum for entity type selection
+    total_weight: u32,
+}
+
+impl CyberEntityGenerator {
+    pub fn new(seed: u64, overlap_probability: f64) -> Self {
+        let total_weight: u32 = EntityType::all().iter().map(|e| e.weight()).sum();
+
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+            overlap_probability,
+            next_id: 0,
+            base_time: 1704067200, // 2024-01-01 00:00:00 UTC
+            user_pool: Vec::with_capacity(1000),
+            asset_pool: Vec::with_capacity(500),
+            total_weight,
+        }
+    }
+
+    fn select_entity_type(&mut self) -> EntityType {
+        let mut roll = self.rng.random_range(0..self.total_weight);
+        for entity_type in EntityType::all() {
+            let weight = entity_type.weight();
+            if roll < weight {
+                return *entity_type;
+            }
+            roll -= weight;
+        }
+        EntityType::User // Fallback
+    }
+
+    fn select_perspective(&mut self, entity_type: EntityType) -> Perspective {
+        let perspectives = Perspective::for_entity_type(entity_type);
+        let idx = self.rng.random_range(0..perspectives.len());
+        perspectives[idx]
+    }
+
+    fn should_overlap(&mut self) -> bool {
+        self.rng.random_bool(self.overlap_probability)
+    }
+
+    fn generate_interval(&mut self) -> (i64, i64) {
+        let start = self.base_time + self.rng.random_range(0..86400 * 30); // Within 30 days
+        let duration = self.rng.random_range(60..86400); // 1 minute to 1 day
+        (start, start + duration)
+    }
+
+    fn next_uid(&mut self) -> String {
+        self.next_id += 1;
+        format!("{:012}", self.next_id)
+    }
+
+    pub fn generate_batch(&mut self, count: usize) -> Vec<RecordInput> {
+        let mut batch = Vec::with_capacity(count);
+
+        for idx in 0..count {
+            let entity_type = self.select_entity_type();
+            let perspective = self.select_perspective(entity_type);
+            let (start, end) = self.generate_interval();
+            let uid = self.next_uid();
+
+            let descriptors = match entity_type {
+                EntityType::User => self.generate_user_descriptors(start, end),
+                EntityType::Session => self.generate_session_descriptors(start, end),
+                EntityType::Process => self.generate_process_descriptors(start, end),
+                EntityType::NetworkConnection => self.generate_connection_descriptors(start, end),
+                EntityType::Asset => self.generate_asset_descriptors(start, end),
+                EntityType::Vulnerability => self.generate_vulnerability_descriptors(start, end),
+                EntityType::Alert => self.generate_alert_descriptors(start, end),
+                EntityType::File => self.generate_file_descriptors(start, end),
+            };
+
+            batch.push(RecordInput {
+                index: idx as u32,
+                identity: Some(RecordIdentity {
+                    entity_type: entity_type.as_str().to_string(),
+                    perspective: perspective.as_str().to_string(),
+                    uid,
+                }),
+                descriptors,
+            });
+        }
+
+        batch
+    }
+
+    fn generate_user_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let (user_sid, user_upn, employee_id, department) = if self.should_overlap()
+            && !self.user_pool.is_empty()
+        {
+            let idx = self.rng.random_range(0..self.user_pool.len());
+            let seed = &self.user_pool[idx];
+            (
+                seed.user_sid.clone(),
+                seed.user_upn.clone(),
+                seed.employee_id.clone(),
+                seed.department.clone(),
+            )
+        } else {
+            let user_sid = format!("S-1-5-21-{}-{}", self.rng.random::<u32>(), self.next_id);
+            let user_upn = format!("user{}@corp.local", self.next_id);
+            let employee_id = format!("EMP{:08}", self.rng.random_range(10000..99999999u32));
+            let departments = ["Engineering", "Sales", "HR", "Finance", "IT", "Security"];
+            let department = departments[self.rng.random_range(0..departments.len())].to_string();
+
+            if self.user_pool.len() < 1000 {
+                self.user_pool.push(UserSeed {
+                    user_sid: user_sid.clone(),
+                    user_upn: user_upn.clone(),
+                    employee_id: employee_id.clone(),
+                    department: department.clone(),
+                });
+            }
+
+            (user_sid, user_upn, employee_id, department)
+        };
+
+        vec![
+            RecordDescriptor {
+                attr: "user_sid".to_string(),
+                value: user_sid,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "user_upn".to_string(),
+                value: user_upn,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "employee_id".to_string(),
+                value: employee_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "department".to_string(),
+                value: department,
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_session_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let session_id = format!("SES-{:016X}", self.rng.random::<u64>());
+        let user_ref = if !self.user_pool.is_empty() {
+            let idx = self.rng.random_range(0..self.user_pool.len());
+            self.user_pool[idx].user_sid.clone()
+        } else {
+            format!("S-1-5-21-{}", self.rng.random::<u32>())
+        };
+        let source_ip = format!(
+            "10.{}.{}.{}",
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(1..255u16)
+        );
+
+        vec![
+            RecordDescriptor {
+                attr: "session_id".to_string(),
+                value: session_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "user_ref".to_string(),
+                value: user_ref,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "source_ip".to_string(),
+                value: source_ip,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "login_time".to_string(),
+                value: start.to_string(),
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_process_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let process_id = self.rng.random_range(1000..65535u32);
+        let process_hash = format!("{:064x}", self.rng.random::<u128>());
+        let process_names = [
+            "svchost.exe",
+            "chrome.exe",
+            "powershell.exe",
+            "cmd.exe",
+            "explorer.exe",
+            "python.exe",
+            "java.exe",
+            "notepad.exe",
+        ];
+        let process_name = process_names[self.rng.random_range(0..process_names.len())].to_string();
+        let parent_pid = self.rng.random_range(1..process_id);
+        let asset_ref = if !self.asset_pool.is_empty() {
+            let idx = self.rng.random_range(0..self.asset_pool.len());
+            self.asset_pool[idx].asset_id.clone()
+        } else {
+            format!("ASSET-{:08}", self.rng.random::<u32>())
+        };
+
+        vec![
+            RecordDescriptor {
+                attr: "process_id".to_string(),
+                value: process_id.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "process_hash".to_string(),
+                value: process_hash,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "process_name".to_string(),
+                value: process_name,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "parent_pid".to_string(),
+                value: parent_pid.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_id".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_connection_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let flow_id = format!("FLOW-{:016X}", self.rng.random::<u64>());
+        let src_ip = format!(
+            "10.{}.{}.{}",
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(1..255u16)
+        );
+        let dst_ip = format!(
+            "{}.{}.{}.{}",
+            self.rng.random_range(1..224u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(1..255u16)
+        );
+        let src_port = self.rng.random_range(1024..65535u16);
+        let dst_port = [80, 443, 22, 3389, 8080, 8443][self.rng.random_range(0..6)];
+        let protocols = ["TCP", "UDP"];
+        let protocol = protocols[self.rng.random_range(0..protocols.len())].to_string();
+
+        vec![
+            RecordDescriptor {
+                attr: "flow_id".to_string(),
+                value: flow_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "src_ip".to_string(),
+                value: src_ip,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "dst_ip".to_string(),
+                value: dst_ip,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "src_port".to_string(),
+                value: src_port.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "dst_port".to_string(),
+                value: dst_port.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "protocol".to_string(),
+                value: protocol,
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_asset_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let (asset_id, hostname, ip_address, os_type) =
+            if self.should_overlap() && !self.asset_pool.is_empty() {
+                let idx = self.rng.random_range(0..self.asset_pool.len());
+                let seed = &self.asset_pool[idx];
+                (
+                    seed.asset_id.clone(),
+                    seed.hostname.clone(),
+                    seed.ip_address.clone(),
+                    seed.os_type.clone(),
+                )
+            } else {
+                let asset_id = format!("ASSET-{:08X}", self.rng.random::<u32>());
+                let hostname = format!("HOST-{:06}", self.rng.random_range(1..999999u32));
+                let ip_address = format!(
+                    "10.{}.{}.{}",
+                    self.rng.random_range(0..256u16),
+                    self.rng.random_range(0..256u16),
+                    self.rng.random_range(1..255u16)
+                );
+                let os_types = [
+                    "Windows 10",
+                    "Windows 11",
+                    "Windows Server 2019",
+                    "Ubuntu 22.04",
+                    "RHEL 8",
+                    "macOS 14",
+                ];
+                let os_type = os_types[self.rng.random_range(0..os_types.len())].to_string();
+
+                if self.asset_pool.len() < 500 {
+                    self.asset_pool.push(AssetSeed {
+                        asset_id: asset_id.clone(),
+                        hostname: hostname.clone(),
+                        ip_address: ip_address.clone(),
+                        os_type: os_type.clone(),
+                    });
+                }
+
+                (asset_id, hostname, ip_address, os_type)
+            };
+
+        let mac_address = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>()
+        );
+
+        vec![
+            RecordDescriptor {
+                attr: "asset_id".to_string(),
+                value: asset_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "hostname".to_string(),
+                value: hostname,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "ip_address".to_string(),
+                value: ip_address,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "mac_address".to_string(),
+                value: mac_address,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "os_type".to_string(),
+                value: os_type,
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_vulnerability_descriptors(
+        &mut self,
+        start: i64,
+        end: i64,
+    ) -> Vec<RecordDescriptor> {
+        let cve_id = format!(
+            "CVE-{}-{}",
+            self.rng.random_range(2020..2025u16),
+            self.rng.random_range(1000..99999u32)
+        );
+        let asset_ref = if !self.asset_pool.is_empty() {
+            let idx = self.rng.random_range(0..self.asset_pool.len());
+            self.asset_pool[idx].asset_id.clone()
+        } else {
+            format!("ASSET-{:08}", self.rng.random::<u32>())
+        };
+        let severities = ["Critical", "High", "Medium", "Low", "Info"];
+        let severity = severities[self.rng.random_range(0..severities.len())].to_string();
+        let cvss_score = format!("{:.1}", self.rng.random_range(0..100u32) as f32 / 10.0);
+        let statuses = ["Open", "In Progress", "Remediated", "Accepted"];
+        let status = statuses[self.rng.random_range(0..statuses.len())].to_string();
+
+        vec![
+            RecordDescriptor {
+                attr: "cve_id".to_string(),
+                value: cve_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_ref".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "severity".to_string(),
+                value: severity,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "cvss_score".to_string(),
+                value: cvss_score,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "remediation_status".to_string(),
+                value: status,
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_alert_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let alert_id = format!("ALERT-{:016X}", self.rng.random::<u64>());
+        let alert_types = [
+            "Malware",
+            "Phishing",
+            "Brute Force",
+            "Data Exfiltration",
+            "Lateral Movement",
+            "Privilege Escalation",
+            "C2 Communication",
+        ];
+        let alert_type = alert_types[self.rng.random_range(0..alert_types.len())].to_string();
+        let severities = ["Critical", "High", "Medium", "Low"];
+        let severity = severities[self.rng.random_range(0..severities.len())].to_string();
+        let asset_ref = if !self.asset_pool.is_empty() {
+            let idx = self.rng.random_range(0..self.asset_pool.len());
+            self.asset_pool[idx].asset_id.clone()
+        } else {
+            format!("ASSET-{:08}", self.rng.random::<u32>())
+        };
+
+        vec![
+            RecordDescriptor {
+                attr: "alert_id".to_string(),
+                value: alert_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "alert_type".to_string(),
+                value: alert_type,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "severity".to_string(),
+                value: severity,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_ref".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
+        ]
+    }
+
+    fn generate_file_descriptors(&mut self, start: i64, end: i64) -> Vec<RecordDescriptor> {
+        let file_hash = format!("{:064x}", self.rng.random::<u128>());
+        let paths = [
+            "C:\\Windows\\System32\\",
+            "C:\\Users\\Public\\",
+            "C:\\Program Files\\",
+            "/usr/bin/",
+            "/tmp/",
+            "/home/user/",
+        ];
+        let exts = [".exe", ".dll", ".ps1", ".sh", ".py", ".bat"];
+        let file_path = format!(
+            "{}file{:06}{}",
+            paths[self.rng.random_range(0..paths.len())],
+            self.rng.random_range(1..999999u32),
+            exts[self.rng.random_range(0..exts.len())]
+        );
+        let file_size = self.rng.random_range(1024..10485760u64); // 1KB to 10MB
+        let asset_ref = if !self.asset_pool.is_empty() {
+            let idx = self.rng.random_range(0..self.asset_pool.len());
+            self.asset_pool[idx].asset_id.clone()
+        } else {
+            format!("ASSET-{:08}", self.rng.random::<u32>())
+        };
+
+        vec![
+            RecordDescriptor {
+                attr: "file_hash".to_string(),
+                value: file_hash,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "file_path".to_string(),
+                value: file_path,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "file_size".to_string(),
+                value: file_size.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_ref".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
+        ]
+    }
+}
+
+// =============================================================================
+// METRICS
+// =============================================================================
+
+#[derive(Debug, Default)]
+pub struct StreamStats {
+    pub records_sent: AtomicU64,
+    pub records_acked: AtomicU64,
+    pub last_latency_micros: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+pub struct ShardStats {
+    pub shard_id: u32,
+    pub record_count: AtomicU64,
+    pub cluster_count: AtomicU64,
+    pub ingest_latency_avg: AtomicU64,
+}
+
+pub struct LoadTestMetrics {
+    pub start_time: Instant,
+    pub total_entities: u64,
+    pub entities_sent: AtomicU64,
+    pub entities_acked: AtomicU64,
+    pub cluster_count: AtomicU64,
+    pub conflicts_detected: AtomicU64,
+    pub merges_performed: AtomicU64,
+    pub stream_stats: Vec<StreamStats>,
+    pub shard_stats: Vec<ShardStats>,
+    pub completed: AtomicBool,
+    pub error_message: RwLock<Option<String>>,
+}
+
+impl LoadTestMetrics {
+    pub fn new(stream_count: usize, shard_count: usize, total_entities: u64) -> Self {
+        let stream_stats = (0..stream_count).map(|_| StreamStats::default()).collect();
+        let shard_stats = (0..shard_count)
+            .map(|i| ShardStats {
+                shard_id: i as u32,
+                ..Default::default()
+            })
+            .collect();
+
+        Self {
+            start_time: Instant::now(),
+            total_entities,
+            entities_sent: AtomicU64::new(0),
+            entities_acked: AtomicU64::new(0),
+            cluster_count: AtomicU64::new(0),
+            conflicts_detected: AtomicU64::new(0),
+            merges_performed: AtomicU64::new(0),
+            stream_stats,
+            shard_stats,
+            completed: AtomicBool::new(false),
+            error_message: RwLock::new(None),
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    pub fn progress(&self) -> f64 {
+        let acked = self.entities_acked.load(Ordering::Relaxed);
+        if self.total_entities == 0 {
+            1.0
+        } else {
+            acked as f64 / self.total_entities as f64
+        }
+    }
+
+    pub fn throughput(&self) -> f64 {
+        let acked = self.entities_acked.load(Ordering::Relaxed);
+        let elapsed = self.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            acked as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    pub fn eta(&self) -> Option<Duration> {
+        let acked = self.entities_acked.load(Ordering::Relaxed);
+        let remaining = self.total_entities.saturating_sub(acked);
+        let throughput = self.throughput();
+        if throughput > 0.0 && remaining > 0 {
+            Some(Duration::from_secs_f64(remaining as f64 / throughput))
+        } else {
+            None
+        }
+    }
+}
+
+// =============================================================================
+// PARALLEL STREAMING
+// =============================================================================
+
+async fn run_parallel_streams(
+    config: &LoadTestConfig,
+    metrics: Arc<LoadTestMetrics>,
+) -> Result<()> {
+    let (tx, rx) = async_channel::bounded::<Vec<RecordInput>>(32);
+
+    // Generator task
+    let gen_config = config.clone();
+    let gen_metrics = metrics.clone();
+    let gen_tx = tx.clone();
+    let generator_handle = tokio::spawn(async move {
+        let mut generator =
+            CyberEntityGenerator::new(gen_config.seed, gen_config.overlap_probability);
+        let mut remaining = gen_config.count;
+
+        while remaining > 0 {
+            let batch_size = gen_config.batch_size.min(remaining as usize);
+            let batch = generator.generate_batch(batch_size);
+            remaining -= batch_size as u64;
+            gen_metrics
+                .entities_sent
+                .fetch_add(batch_size as u64, Ordering::Relaxed);
+
+            if gen_tx.send(batch).await.is_err() {
+                break; // Channel closed
+            }
+        }
+    });
+
+    // Stream tasks
+    let stream_handles: Vec<_> = (0..config.stream_count)
+        .map(|i| {
+            let rx = rx.clone();
+            let metrics = metrics.clone();
+            let router = config.router_addr.clone();
+
+            tokio::spawn(async move {
+                let mut client = match RouterServiceClient::connect(router).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(stream = i, error = %e, "Failed to connect to router");
+                        metrics.stream_stats[i]
+                            .errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+
+                while let Ok(batch) = rx.recv().await {
+                    let batch_len = batch.len();
+                    let start = Instant::now();
+
+                    match client
+                        .ingest_records(IngestRecordsRequest { records: batch })
+                        .await
+                    {
+                        Ok(response) => {
+                            let count = response.into_inner().assignments.len();
+                            metrics.stream_stats[i]
+                                .records_acked
+                                .fetch_add(count as u64, Ordering::Relaxed);
+                            metrics
+                                .entities_acked
+                                .fetch_add(count as u64, Ordering::Relaxed);
+                            metrics.stream_stats[i]
+                                .last_latency_micros
+                                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::error!(stream = i, error = %e, "Ingest failed");
+                            metrics.stream_stats[i]
+                                .errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            // Still count as sent for progress tracking
+                            metrics
+                                .entities_acked
+                                .fetch_add(batch_len as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Wait for generator to finish
+    let _ = generator_handle.await;
+
+    // Close the channel to signal streams to stop
+    drop(tx);
+
+    // Wait for all streams to finish
+    for handle in stream_handles {
+        let _ = handle.await;
+    }
+
+    metrics.completed.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+// =============================================================================
+// METRICS POLLING
+// =============================================================================
+
+async fn poll_metrics_task(
+    config: &LoadTestConfig,
+    metrics: Arc<LoadTestMetrics>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+
+    // Connect to router
+    let mut router_client = RouterServiceClient::connect(config.router_addr.clone())
+        .await
+        .ok();
+
+    // Connect to shards
+    let mut shard_clients: Vec<Option<ShardServiceClient<Channel>>> = Vec::new();
+    for addr in &config.shard_addrs {
+        let client = ShardServiceClient::connect(format!("http://{}", addr))
+            .await
+            .ok();
+        shard_clients.push(client);
+    }
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                // Poll router for aggregated stats
+                if let Some(ref mut client) = router_client {
+                    if let Ok(response) = client.get_stats(StatsRequest {}).await {
+                        let stats = response.into_inner();
+                        metrics.cluster_count.store(stats.cluster_count, Ordering::Relaxed);
+                        metrics.conflicts_detected.store(stats.conflict_count, Ordering::Relaxed);
+                    }
+                }
+
+                // Poll individual shards
+                for (i, client_opt) in shard_clients.iter_mut().enumerate() {
+                    if let Some(ref mut client) = client_opt {
+                        if let Ok(response) = client.get_metrics(MetricsRequest {}).await {
+                            let m = response.into_inner();
+                            if i < metrics.shard_stats.len() {
+                                metrics.shard_stats[i].record_count.store(m.ingest_records, Ordering::Relaxed);
+                                if let Some(latency) = m.ingest_latency {
+                                    if latency.count > 0 {
+                                        metrics.shard_stats[i].ingest_latency_avg.store(
+                                            latency.total_micros / latency.count,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(response) = client.get_stats(StatsRequest {}).await {
+                            let stats = response.into_inner();
+                            if i < metrics.shard_stats.len() {
+                                metrics.shard_stats[i].cluster_count.store(stats.cluster_count, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// TUI
+// =============================================================================
+
+fn format_number(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+}
+
+fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Length(3), // Config
+            Constraint::Length(4), // Progress
+            Constraint::Length(5), // Throughput + Clusters
+            Constraint::Min(4),    // Streams
+            Constraint::Length(4), // Shards (if any)
+            Constraint::Length(1), // Footer
+        ])
+        .split(frame.area());
+
+    // Header
+    let elapsed = format_duration(metrics.elapsed());
+    let status = if metrics.completed.load(Ordering::Relaxed) {
+        Span::styled(
+            " COMPLETED ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            " RUNNING ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Unirust Load Test",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        status,
+        Span::raw("                                    "),
+        Span::styled(
+            format!("Elapsed: {}", elapsed),
+            Style::default().fg(Color::White),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    // Config
+    let config_text = format!(
+        "Count: {} | Router: {} | Streams: {} | Batch: {} | Overlap: {:.0}%",
+        format_number(config.count),
+        config.router_addr.replace("http://", ""),
+        config.stream_count,
+        config.batch_size,
+        config.overlap_probability * 100.0
+    );
+    let config_para = Paragraph::new(config_text)
+        .style(Style::default().fg(Color::Gray))
+        .block(Block::default().title(" Config ").borders(Borders::ALL));
+    frame.render_widget(config_para, chunks[1]);
+
+    // Progress
+    let progress = metrics.progress();
+    let acked = metrics.entities_acked.load(Ordering::Relaxed);
+    let eta_str = metrics
+        .eta()
+        .map(|d| format!("ETA: {}", format_duration(d)))
+        .unwrap_or_else(|| "ETA: --:--:--".to_string());
+
+    let gauge = Gauge::default()
+        .block(Block::default().title(" Progress ").borders(Borders::ALL))
+        .gauge_style(Style::default().fg(Color::Cyan))
+        .percent((progress * 100.0) as u16)
+        .label(format!(
+            "{} / {} ({:.1}%) | {}",
+            format_number(acked),
+            format_number(config.count),
+            progress * 100.0,
+            eta_str
+        ));
+    frame.render_widget(gauge, chunks[2]);
+
+    // Throughput + Clusters (side by side)
+    let metrics_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[3]);
+
+    let throughput = metrics.throughput();
+    let avg_latency: u64 = metrics
+        .stream_stats
+        .iter()
+        .map(|s| s.last_latency_micros.load(Ordering::Relaxed))
+        .sum::<u64>()
+        / metrics.stream_stats.len().max(1) as u64;
+
+    let throughput_text = format!(
+        "Records/sec: {:.0}\nAvg Latency: {:.2} ms",
+        throughput,
+        avg_latency as f64 / 1000.0
+    );
+    let throughput_para = Paragraph::new(throughput_text)
+        .style(Style::default().fg(Color::Green))
+        .block(Block::default().title(" Throughput ").borders(Borders::ALL));
+    frame.render_widget(throughput_para, metrics_chunks[0]);
+
+    let cluster_count = metrics.cluster_count.load(Ordering::Relaxed);
+    let conflicts = metrics.conflicts_detected.load(Ordering::Relaxed);
+    let merges = metrics.merges_performed.load(Ordering::Relaxed);
+
+    let clusters_text = format!(
+        "Total: {}\nConflicts: {} | Merges: {}",
+        format_number(cluster_count),
+        format_number(conflicts),
+        format_number(merges)
+    );
+    let clusters_para = Paragraph::new(clusters_text)
+        .style(Style::default().fg(Color::Yellow))
+        .block(Block::default().title(" Clusters ").borders(Borders::ALL));
+    frame.render_widget(clusters_para, metrics_chunks[1]);
+
+    // Stream stats
+    let stream_rows: Vec<Row> = metrics
+        .stream_stats
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let acked = s.records_acked.load(Ordering::Relaxed);
+            let latency = s.last_latency_micros.load(Ordering::Relaxed);
+            let errors = s.errors.load(Ordering::Relaxed);
+
+            Row::new(vec![
+                format!("#{}", i),
+                format!("{} sent", format_number(acked)),
+                format!("{} ack", format_number(acked)),
+                format!("{:.1}ms", latency as f64 / 1000.0),
+                if errors > 0 {
+                    format!("{} err", errors)
+                } else {
+                    "OK".to_string()
+                },
+            ])
+        })
+        .collect();
+
+    let stream_table = Table::new(
+        stream_rows,
+        [
+            Constraint::Length(4),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(8),
+        ],
+    )
+    .header(
+        Row::new(vec!["#", "Sent", "Acked", "Latency", "Status"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::default().title(" Streams ").borders(Borders::ALL));
+    frame.render_widget(stream_table, chunks[4]);
+
+    // Shard stats (if any)
+    if !metrics.shard_stats.is_empty() {
+        let shard_rows: Vec<Row> = metrics
+            .shard_stats
+            .iter()
+            .map(|s| {
+                let records = s.record_count.load(Ordering::Relaxed);
+                let clusters = s.cluster_count.load(Ordering::Relaxed);
+                let latency = s.ingest_latency_avg.load(Ordering::Relaxed);
+
+                Row::new(vec![
+                    format!("Shard {}", s.shard_id),
+                    format!("{} rec", format_number(records)),
+                    format!("{} clusters", format_number(clusters)),
+                    format!("{:.1}ms avg", latency as f64 / 1000.0),
+                ])
+            })
+            .collect();
+
+        let shard_table = Table::new(
+            shard_rows,
+            [
+                Constraint::Length(10),
+                Constraint::Length(14),
+                Constraint::Length(16),
+                Constraint::Length(14),
+            ],
+        )
+        .block(Block::default().title(" Shards ").borders(Borders::ALL));
+        frame.render_widget(shard_table, chunks[5]);
+    }
+
+    // Footer
+    let footer = Paragraph::new("[q] Quit").style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[6]);
+}
+
+async fn run_tui(
+    config: LoadTestConfig,
+    metrics: Arc<LoadTestMetrics>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<()> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let tick_rate = Duration::from_millis(100);
+
+    loop {
+        // Draw
+        terminal.draw(|f| draw_ui(f, &config, &metrics))?;
+
+        // Handle events
+        if event::poll(tick_rate)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Check if streaming completed
+        if metrics.completed.load(Ordering::Relaxed) {
+            // Show final state for a moment
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            terminal.draw(|f| draw_ui(f, &config, &metrics))?;
+
+            // Wait for user to press q
+            loop {
+                if event::poll(Duration::from_millis(100))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    let _ = shutdown_tx.send(true);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                // Redraw to keep the display active
+                terminal.draw(|f| draw_ui(f, &config, &metrics))?;
+            }
+            break;
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = parse_args();
+
+    // Setup file logging if specified
+    if let Some(log_path) = &config.log_file {
+        let file = std::fs::File::create(log_path)?;
+        tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+    }
+
+    // Initialize metrics
+    let metrics = Arc::new(LoadTestMetrics::new(
+        config.stream_count,
+        config.shard_addrs.len(),
+        config.count,
+    ));
+
+    // Create shutdown channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Set ontology on router first
+    {
+        let mut client = RouterServiceClient::connect(config.router_addr.clone()).await?;
+        client
+            .set_ontology(ApplyOntologyRequest {
+                config: Some(build_ontology_config()),
+            })
+            .await?;
+    }
+
+    // Spawn streaming task
+    let stream_config = config.clone();
+    let stream_metrics = metrics.clone();
+    let streaming_handle = tokio::spawn(async move {
+        if let Err(e) = run_parallel_streams(&stream_config, stream_metrics.clone()).await {
+            tracing::error!(error = %e, "Streaming failed");
+            *stream_metrics.error_message.write().await = Some(e.to_string());
+        }
+    });
+
+    // Spawn metrics polling task
+    let poll_config = config.clone();
+    let poll_metrics_arc = metrics.clone();
+    let poll_shutdown = shutdown_rx.clone();
+    let metrics_handle = tokio::spawn(async move {
+        poll_metrics_task(&poll_config, poll_metrics_arc, poll_shutdown).await;
+    });
+
+    // Run TUI (blocks until quit)
+    run_tui(config, metrics, shutdown_tx).await?;
+
+    // Wait for background tasks
+    let _ = streaming_handle.await;
+    let _ = metrics_handle.await;
+
+    Ok(())
+}
