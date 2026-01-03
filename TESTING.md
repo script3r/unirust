@@ -21,12 +21,10 @@ cargo test --test distributed_conflicts_presets
 cargo test --test distributed_wal_replay
 ```
 
-## Performance regression loop (fast)
+## Performance regression loop
 
 ```bash
-cargo bench --bench perf_suite -- ingest_smoke
-cargo bench --bench perf_suite -- query_smoke
-cargo bench --bench perf_suite -- ingest_persistent_smoke
+cargo bench --bench bench_quick
 ```
 
 ## Latency regression gates (optional)
@@ -39,14 +37,20 @@ UNIRUST_ENABLE_LATENCY_GATES=1 UNIRUST_GATE_RECORDS=50000 UNIRUST_GATE_QUERIES=1
 ## Full benchmark runs
 
 ```bash
-cargo bench --bench entity_benchmark -- entity_resolution
-cargo bench --bench entity_benchmark -- entity_resolution_sharded
-cargo bench --bench entity_benchmark -- entity_resolution_large
+cargo bench --bench bench_quick       # ~30s  - CI/dev feedback
+cargo bench --bench bench_scale       # ~3-5m - Pre-merge validation
+cargo bench --bench bench_micro       # ~1m   - Component internals
+cargo bench --bench bench_diagnostic  # One-shot deep analysis
+```
+
+## Scale benchmarks with custom parameters
+
+```bash
+UNIRUST_SCALE_COUNT=500000 UNIRUST_SCALE_OVERLAP=0.05 cargo bench --bench bench_scale
 ```
 
 ## Profiling hot paths
 
 ```bash
-UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_5000
-UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_100k
+UNIRUST_PROFILE=1 cargo bench --bench bench_scale --features profiling
 ```

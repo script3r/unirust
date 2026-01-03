@@ -100,7 +100,14 @@ let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
 let mut unirust = Unirust::with_store_and_tuning(ontology, Store::new(), tuning);
 ```
 
-Available profiles: `Balanced` (default), `LowLatency`, `HighThroughput`, `BulkIngest`, `MemorySaver`.
+Available profiles:
+- `Balanced` (default) - General purpose
+- `LowLatency` - Optimized for fast response
+- `HighThroughput` - Optimized for bulk processing
+- `BulkIngest` - Maximum ingest speed
+- `MemorySaver` - Reduced memory footprint
+- `BillionScale` - Persistent DSU for billion-entity datasets
+- `BillionScaleHighPerformance` - Billion-scale with larger caches
 
 ## Query master entities
 
@@ -138,24 +145,23 @@ unirust-rs = "0.1.0"
 cargo test
 ```
 
-### Benchmarks and profiling
+### Benchmarks
 
-Benchmarks live in `benches/entity_benchmark.rs` and `benches/perf_suite.rs`.
-
-```bash
-cargo bench --bench entity_benchmark -- entity_resolution
-cargo bench --bench entity_benchmark -- entity_resolution_large
-cargo bench --bench entity_benchmark -- entity_resolution_sharded
-```
-
-Enable the lightweight profiler (feature-gated) to print hot-path timings:
+Four benchmark tiers for different use cases:
 
 ```bash
-UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_5000
-UNIRUST_PROFILE=1 cargo bench --bench entity_benchmark --features profiling -- profile_100k
+cargo bench --bench bench_quick       # ~30s  - CI/dev feedback
+cargo bench --bench bench_scale       # ~3-5m - Pre-merge validation
+cargo bench --bench bench_micro       # ~1m   - Component internals
+cargo bench --bench bench_diagnostic  # One-shot deep analysis
 ```
 
-Benchmark notes: see `BENCHMARKS.md`. Testing notes: see `TESTING.md`. Architecture notes: see `DESIGN.md`.
+Configure scale benchmarks via environment variables:
+```bash
+UNIRUST_SCALE_COUNT=500000 UNIRUST_SCALE_OVERLAP=0.05 cargo bench --bench bench_scale
+```
+
+See `BENCHMARKS.md` for details. Testing: `TESTING.md`. Architecture: `DESIGN.md`.
 
 ## License
 

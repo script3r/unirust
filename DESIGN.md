@@ -20,11 +20,16 @@
 ## Key modules
 
 - `store`: in-memory record storage and attribute/value interning.
+- `persistence`: RocksDB-backed persistent store with column families.
 - `linker`: streaming entity resolution with temporal DSU and identity-key indexing.
+- `dsu`: temporal DSU with persistent backend support and merge guards.
+- `index`: tiered identity-key index (hot/warm/cold) with LRU eviction.
+- `config`: streaming tuning profiles and linker state configuration.
 - `conflicts`: conflict detection and constraint violations.
 - `graph`: knowledge graph snapshots and incremental updates.
 - `query`: conflict-aware master-entity queries.
-- `sharding`: parallel streaming ingest and reconciliation.
+- `sharding`: cluster-aware sharding with boundary tracking and cross-shard merges.
+- `distributed`: gRPC services for shards and router.
 - `profile`: lightweight hot-path profiler (feature gated).
 
 ## Streaming resolution
@@ -139,16 +144,23 @@ The query outcome enforces the invariant: at any time instant, at most one maste
 - Distributed E2E tests validate shard/router ingestion, query behavior, and conflict summaries.
 - Sharded reconciliation tests assert equivalence with single-stream conflicts and clusters.
 
-## Scaling constraints and next steps
+## Scaling infrastructure (implemented)
 
-To reach billions of entities, we need to push more work into indexed, incremental paths
-and avoid global scans:
+The following scaling features are now implemented:
 
-- Replace in-memory `Store` with a sharded persistence layer that can serve
-  attribute-value and identity-key lookups in O(log n) per descriptor.
-- Maintain cluster-level summaries (golden copy + active attribute intervals) in the
-  persistence layer to avoid re-walking all records for query and conflict checks.
-- Partition workloads by entity type and identity key to enable parallel ingestion and
-  reduce hotspot keys.
-- Add streaming invalidation for clusters impacted by a new record (descriptor-level
-  delta updates rather than full conflict scans).
+- **Persistent DSU**: RocksDB-backed DSU with configurable caching. Supports billion-scale
+  datasets without holding all parent/rank data in memory.
+- **Tiered index**: Hot/warm/cold tiers with LRU eviction. Hot tier in memory, warm/cold
+  spill to disk. Configurable via `TierConfig`.
+- **Cluster-aware sharding**: Tracks cluster boundaries across shards. Detects cross-shard
+  merges and maintains locality index for efficient reconciliation.
+- **LRU linker state**: Bounded memory for cluster IDs, global IDs, and summaries with
+  dirty buffer batching for persistence.
+- **Tuning profiles**: `BillionScale` and `BillionScaleHighPerformance` profiles configure
+  appropriate cache sizes and persistence settings.
+
+## Remaining scaling work
+
+- Streaming invalidation for descriptor-level delta updates
+- Background compaction and TTL strategies for temporal data
+- Query acceleration with coordinator cache for recent intervals

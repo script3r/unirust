@@ -1,113 +1,105 @@
 # Storage and Persistence (RocksDB)
 
-This document captures the current persistence strategy, why it exists, and the plan to scale it.
-It is intentionally critical so we can see the gaps before they hurt us in production.
+## Overview
 
-## Goals
+Unirust uses RocksDB for persistent storage with column families for different data types.
+The persistence layer supports both simple restart-safe storage and billion-scale datasets.
 
-- Preserve shard state across restarts (records + interned strings + ontology).
-- Keep ingest fast and predictable.
-- Preserve deterministic reconciliation within a shard.
-- Support tens to hundreds of millions of records per shard without redesigning the entire system.
+## Column Families
 
-## Current Reality (Before Persistence)
-
-- All shard state lived in memory.
-- Restarting a shard loses records, indices, and interner state.
-- Streaming reconcile assumes a consistent interner; without persistence this is lost.
+| Column Family | Purpose |
+|---------------|---------|
+| `default` | General metadata |
+| `records` | `record_id -> Record` (bincode) |
+| `interner` | String interner state |
+| `metadata` | `next_record_id`, ontology config |
+| `dsu_parent` | DSU parent pointers |
+| `dsu_rank` | DSU rank values |
+| `dsu_guards` | Temporal merge guards |
+| `index_hot` | Hot tier identity-key postings |
+| `index_warm` | Warm tier identity-key postings |
+| `index_cold` | Cold tier identity-key postings |
+| `linker_cluster_ids` | Record to cluster ID mappings |
+| `linker_global_ids` | Record to global cluster ID mappings |
+| `linker_metadata` | Linker state (next_cluster_id, etc.) |
 
 ## Access Patterns
 
-- **Ingest**: append-heavy, per-record updates, low contention, mostly sequential.
-- **Query**: indexed lookups by attribute/value + temporal overlap; must be fast.
-- **Conflicts**: derived from clusters; often full or partial scans.
-- **Graph export**: full scan of the shard’s records.
+- **Ingest**: Append-heavy, per-record updates, batched writes via WriteBatch
+- **Query**: Indexed lookups by attribute/value + temporal overlap
+- **DSU operations**: find() uses cached parents with disk fallback, merge() batches writes
+- **Index lookups**: Hot tier in memory, warm/cold read from disk with LRU promotion
 
-## Persistence Model (v1)
+## Persistent DSU
 
-We persist per shard using RocksDB with column families:
+The DSU backend supports two modes:
 
-- `records`: `record_id -> Record` (bincode)
-- `interner`: `interner -> StringInterner` (bincode)
-- `metadata`: `next_record_id`, `ontology_config`
+1. **In-memory**: All parent/rank data in HashMap (default for small datasets)
+2. **Persistent**: RocksDB-backed with configurable LRU cache
 
-On startup:
-- Load interner + metadata.
-- Load all records into an in-memory `Store` (and rebuild indices).
-- Rebuild ontology from the stored or CLI config.
-
-Usage (per shard):
-```
-unirust_shard --listen 0.0.0.0:50061 --shard-id 0 --data-dir /var/lib/unirust/shard0
+Configuration via `PersistentDSUConfig`:
+```rust
+PersistentDSUConfig {
+    cache_capacity: 1_000_000,  // LRU cache size
+    write_batch_size: 10_000,   // Batch writes
+}
 ```
 
-This guarantees correct behavior across restarts with minimal impact on the rest of the codebase.
+## Tiered Index
 
-### Critical limitations of v1
+Identity-key index uses three tiers:
 
-- **Memory bound**: all records are still loaded into memory.
-- **Full scans**: building clusters and conflicts still require full-store scans.
-- **Interner persistence is coarse**: we snapshot the entire interner on each ingest batch.
-- **No durability for derived state**: clusters and graphs are recomputed on demand.
+- **Hot**: In-memory LRU, fastest access
+- **Warm**: On-disk, moderate access frequency
+- **Cold**: On-disk, infrequent access
 
-This is correct and simple, but **not yet sufficient** for hundreds of millions of entities.
+Configuration via `TierConfig`:
+```rust
+TierConfig {
+    hot_capacity: 100_000,
+    warm_capacity: 1_000_000,
+    promotion_threshold: 3,  // Accesses before promotion
+}
+```
 
-## Scaling Strategy (v2+)
+## Tuning Profiles
 
-To support 100M+ entities per shard, we must move away from “full in-memory store”:
+Storage behavior varies by tuning profile:
 
-1) **RecordStore API evolution**
-   - Return owned records, iterators, or streaming cursors instead of `&Record`.
-   - Make query and linker components operate on iterators instead of full scans.
+| Profile | DSU Backend | Index Tiers | Cache Sizes |
+|---------|-------------|-------------|-------------|
+| Balanced | In-memory | Hot only | Default |
+| BillionScale | Persistent | Hot/Warm/Cold | Large |
+| BillionScaleHighPerformance | Persistent | Hot/Warm/Cold | Very large |
 
-2) **RocksDB-native secondary indexes**
-   - `attr/value -> posting list of record ids`
-   - `entity_type -> record ids`
-   - `perspective -> record ids`
-   - `temporal buckets -> record ids`
+## Environment Variables
 
-3) **Incremental interner persistence**
-   - Store mappings as separate key/value entries instead of full snapshots.
+RocksDB tuning via environment:
 
-4) **Background compaction + TTL strategies**
-   - Use time-partitioned keys for temporal data.
-   - Apply compaction filters for expired intervals.
+- `UNIRUST_BLOCK_CACHE_MB` (default 512)
+- `UNIRUST_WRITE_BUFFER_MB` (default 128)
+- `UNIRUST_MAX_WRITE_BUFFERS` (default 4)
+- `UNIRUST_TARGET_FILE_MB` (default 128)
+- `UNIRUST_LEVEL_BASE_MB` (default 512)
+- `UNIRUST_BLOOM_BITS_PER_KEY` (default 10.0)
+- `UNIRUST_RATE_LIMIT_MBPS` (default 0, disabled)
 
-5) **Operational safety**
-   - Periodic snapshots.
-   - Write-ahead log (WAL) enabled.
-   - Validation pass on startup (detect corruption, partial writes).
+## Usage
 
-## Implementation Plan (v1)
+```rust
+use unirust_rs::{PersistentStore, Unirust, StreamingTuning, TuningProfile};
 
-- Add `PersistentStore` (RocksDB-backed) that delegates to the existing `Store`.
-- Persist records + interner + metadata on each write.
-- Load from disk on startup so shards survive restart.
-- Persist ontology config so shards restore deterministically.
-- Keep API stable so all existing tests and demos keep working.
+// Open persistent store
+let store = PersistentStore::open("/var/lib/unirust/data")?;
 
-## Plan Critique
+// Use BillionScale tuning for large datasets
+let tuning = StreamingTuning::from_profile(TuningProfile::BillionScale);
+let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning);
+```
 
-What this plan does well:
-- Preserves correctness and determinism.
-- Minimal change risk.
-- Explicit, reversible, and testable.
+## Operational Notes
 
-What it does poorly:
-- Does not address memory growth at all.
-- Doesn’t improve query scalability beyond current in-memory indexes.
-- Expensive interner snapshots on each ingest.
-
-## Plan Refinement (v1.5)
-
-Before moving to a full v2 refactor, the following pragmatic upgrades will help:
-
-- Persist interner entries incrementally (append-only CF).
-- Add a lightweight record-id index by attribute/value directly in RocksDB.
-- Add a startup option to skip full in-memory load for “cold start” query-only tasks.
-
-## Summary
-
-The current implementation is correct and restart-safe, but it is **not yet scale-safe**.
-We should view v1 as the durable foundation and build toward v2 indexing and streaming
-so we can confidently handle hundreds of millions of entities per shard.
+- WAL is enabled by default for durability
+- Periodic snapshots recommended for backup
+- Monitor `running_compactions` and `running_flushes` via metrics
+- Reserve 20% free disk space to avoid compaction stalls
