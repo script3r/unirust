@@ -229,6 +229,12 @@ pub trait RecordStore: Send + Sync {
     fn metrics(&self) -> Option<StoreMetrics> {
         None
     }
+
+    /// Get a shared reference to the underlying database, if available.
+    /// Used by persistent DSU and tiered index backends.
+    fn shared_db(&self) -> Option<std::sync::Arc<rocksdb::DB>> {
+        None
+    }
 }
 
 /// Main in-memory storage for records and metadata

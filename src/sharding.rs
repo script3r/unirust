@@ -1,14 +1,453 @@
 //! Sharded ingestion for parallel streaming.
 
 use crate::linker::StreamingLinker;
+use crate::model::ClusterId;
 use crate::model::StringInterner;
-use crate::model::{Descriptor, KeyValue, Record, RecordId};
+use crate::model::{Descriptor, GlobalClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
 use crate::store::Store;
-use crate::{ClusterId, StreamedClusterAssignment};
+use crate::temporal::{is_overlapping, Interval};
+use crate::ClusterAssignment;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+/// A signature of identity key values for fast lookup.
+/// This is a 32-byte hash of the identity key's attribute-value pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IdentityKeySignature(pub [u8; 32]);
+
+impl IdentityKeySignature {
+    /// Create a new signature from identity key values.
+    pub fn from_key_values(entity_type: &str, key_values: &[KeyValue]) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Use two hashers to fill 32 bytes
+        let mut hasher1 = DefaultHasher::new();
+        let mut hasher2 = DefaultHasher::new();
+
+        entity_type.hash(&mut hasher1);
+        entity_type.hash(&mut hasher2);
+
+        for (i, kv) in key_values.iter().enumerate() {
+            kv.hash(&mut hasher1);
+            // Mix in index for hasher2 to get different bits
+            (kv, i).hash(&mut hasher2);
+        }
+
+        let h1 = hasher1.finish().to_le_bytes();
+        let h2 = hasher2.finish().to_le_bytes();
+
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&h1);
+        bytes[8..16].copy_from_slice(&h2);
+        // Fill remaining with XOR variations
+        for i in 0..8 {
+            bytes[16 + i] = h1[i] ^ h2[7 - i];
+            bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
+        }
+
+        Self(bytes)
+    }
+
+    /// Convert to bytes for storage.
+    pub fn to_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Create from stored bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Simple bloom filter for fast negative lookups.
+/// Uses 16MB of memory by default (~128M bits).
+#[derive(Debug, Clone)]
+pub struct BloomFilter {
+    bits: Vec<u64>,
+    num_hashes: usize,
+}
+
+impl BloomFilter {
+    /// Create a new bloom filter with the specified size in bytes.
+    pub fn new(size_bytes: usize) -> Self {
+        let num_u64s = size_bytes / 8;
+        Self {
+            bits: vec![0u64; num_u64s.max(1)],
+            num_hashes: 7, // Optimal for ~1% false positive rate
+        }
+    }
+
+    /// Create a 16MB bloom filter (default for shard boundaries).
+    pub fn new_16mb() -> Self {
+        Self::new(16 * 1024 * 1024)
+    }
+
+    /// Create a smaller 1MB bloom filter.
+    pub fn new_1mb() -> Self {
+        Self::new(1024 * 1024)
+    }
+
+    /// Insert a key into the bloom filter.
+    pub fn insert(&mut self, key: &IdentityKeySignature) {
+        let bit_count = self.bits.len() * 64;
+        for i in 0..self.num_hashes {
+            let hash = self.hash_with_seed(key, i);
+            let bit_index = (hash as usize) % bit_count;
+            let word_index = bit_index / 64;
+            let bit_offset = bit_index % 64;
+            self.bits[word_index] |= 1u64 << bit_offset;
+        }
+    }
+
+    /// Check if a key might be in the bloom filter.
+    /// Returns true if the key might be present, false if definitely not.
+    pub fn may_contain(&self, key: &IdentityKeySignature) -> bool {
+        let bit_count = self.bits.len() * 64;
+        for i in 0..self.num_hashes {
+            let hash = self.hash_with_seed(key, i);
+            let bit_index = (hash as usize) % bit_count;
+            let word_index = bit_index / 64;
+            let bit_offset = bit_index % 64;
+            if (self.bits[word_index] & (1u64 << bit_offset)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Clear all bits.
+    pub fn clear(&mut self) {
+        for word in &mut self.bits {
+            *word = 0;
+        }
+    }
+
+    fn hash_with_seed(&self, key: &IdentityKeySignature, seed: usize) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.0.hash(&mut hasher);
+        seed.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// Entry in the cluster boundary index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundaryEntry {
+    pub cluster_id: GlobalClusterId,
+    pub interval: Interval,
+    pub shard_id: u16,
+}
+
+/// Index tracking identity keys at shard boundaries.
+///
+/// This enables incremental reconciliation by tracking which clusters
+/// share identity keys across shards. When a new record arrives with
+/// a matching boundary key, we can directly merge clusters without
+/// loading all records.
+#[derive(Debug)]
+pub struct ClusterBoundaryIndex {
+    /// Map from identity key signature to boundary entries.
+    boundary_keys: HashMap<IdentityKeySignature, Vec<BoundaryEntry>>,
+    /// Bloom filter for fast negative lookups.
+    key_bloom: BloomFilter,
+    /// Version number for cache invalidation.
+    version: u64,
+    /// This shard's ID.
+    shard_id: u16,
+}
+
+impl ClusterBoundaryIndex {
+    /// Create a new boundary index for a shard.
+    pub fn new(shard_id: u16) -> Self {
+        Self {
+            boundary_keys: HashMap::new(),
+            key_bloom: BloomFilter::new_16mb(),
+            version: 0,
+            shard_id,
+        }
+    }
+
+    /// Create a boundary index with a smaller bloom filter (for testing).
+    pub fn new_small(shard_id: u16) -> Self {
+        Self {
+            boundary_keys: HashMap::new(),
+            key_bloom: BloomFilter::new_1mb(),
+            version: 0,
+            shard_id,
+        }
+    }
+
+    /// Register a cluster's identity key at a shard boundary.
+    pub fn register_boundary_key(
+        &mut self,
+        signature: IdentityKeySignature,
+        cluster_id: GlobalClusterId,
+        interval: Interval,
+    ) {
+        self.key_bloom.insert(&signature);
+
+        let entry = BoundaryEntry {
+            cluster_id,
+            interval,
+            shard_id: self.shard_id,
+        };
+
+        self.boundary_keys.entry(signature).or_default().push(entry);
+
+        self.version += 1;
+    }
+
+    /// Check if a key might have boundary entries (fast bloom check).
+    pub fn may_have_boundary(&self, signature: &IdentityKeySignature) -> bool {
+        self.key_bloom.may_contain(signature)
+    }
+
+    /// Get boundary entries for a signature.
+    pub fn get_boundaries(&self, signature: &IdentityKeySignature) -> Option<&[BoundaryEntry]> {
+        self.boundary_keys.get(signature).map(|v| v.as_slice())
+    }
+
+    /// Find all boundary entries that overlap with a given interval.
+    pub fn find_overlapping_boundaries(
+        &self,
+        signature: &IdentityKeySignature,
+        interval: &Interval,
+    ) -> Vec<&BoundaryEntry> {
+        if !self.may_have_boundary(signature) {
+            return Vec::new();
+        }
+
+        self.boundary_keys
+            .get(signature)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| is_overlapping(&e.interval, interval))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Update a cluster ID after a merge.
+    pub fn update_cluster_id(
+        &mut self,
+        signature: &IdentityKeySignature,
+        old_id: GlobalClusterId,
+        new_id: GlobalClusterId,
+    ) {
+        if let Some(entries) = self.boundary_keys.get_mut(signature) {
+            for entry in entries {
+                if entry.cluster_id == old_id {
+                    entry.cluster_id = new_id;
+                }
+            }
+            self.version += 1;
+        }
+    }
+
+    /// Get the current version.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Get the number of registered boundary keys.
+    pub fn len(&self) -> usize {
+        self.boundary_keys.len()
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.boundary_keys.is_empty()
+    }
+
+    /// Clear all boundary data.
+    pub fn clear(&mut self) {
+        self.boundary_keys.clear();
+        self.key_bloom.clear();
+        self.version += 1;
+    }
+
+    /// Export boundary metadata for sharing with other shards.
+    pub fn export_metadata(&self) -> BoundaryMetadata {
+        BoundaryMetadata {
+            shard_id: self.shard_id,
+            version: self.version,
+            entries: self
+                .boundary_keys
+                .iter()
+                .map(|(sig, entries)| (*sig, entries.clone()))
+                .collect(),
+        }
+    }
+
+    /// Import boundary metadata from another shard.
+    pub fn import_metadata(&mut self, metadata: &BoundaryMetadata) {
+        for (sig, entries) in &metadata.entries {
+            self.key_bloom.insert(sig);
+            self.boundary_keys
+                .entry(*sig)
+                .or_default()
+                .extend(entries.iter().cloned());
+        }
+        self.version += 1;
+    }
+}
+
+/// Serializable boundary metadata for cross-shard exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundaryMetadata {
+    pub shard_id: u16,
+    pub version: u64,
+    pub entries: Vec<(IdentityKeySignature, Vec<BoundaryEntry>)>,
+}
+
+/// Result of incremental reconciliation.
+#[derive(Debug, Default)]
+pub struct ReconciliationResult {
+    /// Number of cross-shard merges performed.
+    pub merges_performed: usize,
+    /// Clusters that were merged.
+    pub merged_clusters: Vec<(GlobalClusterId, GlobalClusterId)>,
+    /// Number of boundary keys checked.
+    pub keys_checked: usize,
+    /// Number of keys that matched across shards.
+    pub keys_matched: usize,
+}
+
+/// Incremental reconciler for cross-shard cluster merges.
+///
+/// Instead of loading all records from all shards (O(n)),
+/// this uses boundary indices to find and merge only clusters
+/// that share identity keys (O(k) where k = boundary keys).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct IncrementalReconciler {
+    /// Boundary indices from all shards.
+    shard_boundaries: Vec<ClusterBoundaryIndex>,
+    /// Pending merges to apply.
+    pending_merges: Vec<(GlobalClusterId, GlobalClusterId)>,
+}
+
+#[allow(dead_code)]
+impl IncrementalReconciler {
+    /// Create a new reconciler.
+    pub fn new() -> Self {
+        Self {
+            shard_boundaries: Vec::new(),
+            pending_merges: Vec::new(),
+        }
+    }
+
+    /// Add a shard's boundary index.
+    pub fn add_shard_boundary(&mut self, boundary: ClusterBoundaryIndex) {
+        self.shard_boundaries.push(boundary);
+    }
+
+    /// Find clusters that need to be merged based on shared identity keys.
+    pub fn find_cross_shard_merges(&self) -> Vec<(GlobalClusterId, GlobalClusterId)> {
+        let mut merges = Vec::new();
+
+        // Build a map of all signatures to their entries across all shards
+        let mut all_entries: HashMap<IdentityKeySignature, Vec<&BoundaryEntry>> = HashMap::new();
+
+        for boundary in &self.shard_boundaries {
+            for (sig, entries) in &boundary.boundary_keys {
+                all_entries.entry(*sig).or_default().extend(entries.iter());
+            }
+        }
+
+        // Find signatures that appear in multiple shards
+        for (_sig, entries) in all_entries {
+            if entries.len() < 2 {
+                continue;
+            }
+
+            // Group by shard and find overlapping intervals
+            let mut shard_entries: HashMap<u16, Vec<&BoundaryEntry>> = HashMap::new();
+            for entry in &entries {
+                shard_entries.entry(entry.shard_id).or_default().push(entry);
+            }
+
+            // If entries exist in multiple shards, check for temporal overlap
+            if shard_entries.len() > 1 {
+                let entries_vec: Vec<_> = entries.iter().collect();
+                for i in 0..entries_vec.len() {
+                    for j in (i + 1)..entries_vec.len() {
+                        let e1 = entries_vec[i];
+                        let e2 = entries_vec[j];
+
+                        // Only merge if from different shards and intervals overlap
+                        if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval)
+                        {
+                            // Merge into the lower shard_id for consistency
+                            let (primary, secondary) = if e1.shard_id < e2.shard_id {
+                                (e1.cluster_id, e2.cluster_id)
+                            } else {
+                                (e2.cluster_id, e1.cluster_id)
+                            };
+                            merges.push((primary, secondary));
+                        }
+                    }
+                }
+            }
+        }
+
+        merges
+    }
+
+    /// Perform incremental reconciliation.
+    ///
+    /// Returns the reconciliation result without loading full records.
+    pub fn reconcile(&mut self) -> ReconciliationResult {
+        let merges = self.find_cross_shard_merges();
+
+        let mut result = ReconciliationResult {
+            merges_performed: merges.len(),
+            merged_clusters: merges.clone(),
+            keys_checked: self
+                .shard_boundaries
+                .iter()
+                .map(|b| b.boundary_keys.len())
+                .sum(),
+            keys_matched: 0,
+        };
+
+        // Count matched keys
+        let mut seen_sigs: HashMap<IdentityKeySignature, usize> = HashMap::new();
+        for boundary in &self.shard_boundaries {
+            for sig in boundary.boundary_keys.keys() {
+                *seen_sigs.entry(*sig).or_insert(0) += 1;
+            }
+        }
+        result.keys_matched = seen_sigs.values().filter(|&&count| count > 1).count();
+
+        // Store pending merges
+        self.pending_merges = merges;
+
+        result
+    }
+
+    /// Get pending merges.
+    pub fn pending_merges(&self) -> &[(GlobalClusterId, GlobalClusterId)] {
+        &self.pending_merges
+    }
+
+    /// Clear pending merges after they've been applied.
+    pub fn clear_pending(&mut self) {
+        self.pending_merges.clear();
+    }
+}
+
+impl Default for IncrementalReconciler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardedClusterAssignment {
@@ -17,13 +456,11 @@ pub struct ShardedClusterAssignment {
     pub cluster_id: ClusterId,
 }
 
-#[derive(Debug)]
 pub struct ShardedStreamEngine {
     shards: Vec<ShardState>,
     next_sequence: usize,
 }
 
-#[derive(Debug)]
 struct ShardState {
     store: Store,
     streamer: StreamingLinker,
@@ -191,7 +628,7 @@ impl ShardedStreamEngine {
 }
 
 impl ShardState {
-    fn ingest(&mut self, records: Vec<(Record, usize)>) -> Result<Vec<StreamedClusterAssignment>> {
+    fn ingest(&mut self, records: Vec<(Record, usize)>) -> Result<Vec<ClusterAssignment>> {
         let mut assignments = Vec::with_capacity(records.len());
         for (record, sequence) in records {
             let record_id = self.store.add_record(record)?;
@@ -199,7 +636,7 @@ impl ShardState {
             let cluster_id = self
                 .streamer
                 .link_record(&self.store, &self.ontology, record_id)?;
-            assignments.push(StreamedClusterAssignment {
+            assignments.push(ClusterAssignment {
                 record_id,
                 cluster_id,
             });
@@ -390,5 +827,191 @@ mod tests {
         let second = shard_for_record(&record, &ontology, 8);
         assert_eq!(first, second);
         assert!(first < 8);
+    }
+
+    #[test]
+    fn test_identity_key_signature() {
+        use crate::model::{AttrId, ValueId};
+
+        let kv1 = vec![
+            KeyValue::new(AttrId(1), ValueId(10)),
+            KeyValue::new(AttrId(2), ValueId(20)),
+        ];
+        let kv2 = vec![
+            KeyValue::new(AttrId(1), ValueId(10)),
+            KeyValue::new(AttrId(2), ValueId(20)),
+        ];
+        let kv3 = vec![
+            KeyValue::new(AttrId(1), ValueId(10)),
+            KeyValue::new(AttrId(2), ValueId(21)), // Different value
+        ];
+
+        let sig1 = IdentityKeySignature::from_key_values("person", &kv1);
+        let sig2 = IdentityKeySignature::from_key_values("person", &kv2);
+        let sig3 = IdentityKeySignature::from_key_values("person", &kv3);
+        let sig4 = IdentityKeySignature::from_key_values("company", &kv1); // Different entity type
+
+        // Same key values should produce same signature
+        assert_eq!(sig1, sig2);
+        // Different values should produce different signatures
+        assert_ne!(sig1, sig3);
+        // Different entity type should produce different signature
+        assert_ne!(sig1, sig4);
+    }
+
+    #[test]
+    fn test_bloom_filter() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut bloom = BloomFilter::new(1024); // 1KB for testing
+
+        let kv = vec![KeyValue::new(AttrId(1), ValueId(10))];
+        let sig1 = IdentityKeySignature::from_key_values("person", &kv);
+        let sig2 = IdentityKeySignature::from_key_values("company", &kv);
+
+        // Initially empty
+        assert!(!bloom.may_contain(&sig1));
+        assert!(!bloom.may_contain(&sig2));
+
+        // Insert sig1
+        bloom.insert(&sig1);
+
+        // sig1 should now be found
+        assert!(bloom.may_contain(&sig1));
+
+        // sig2 might be found (false positive) or not, but definitely not guaranteed
+        // We just check that the bloom filter is working
+
+        // Clear and verify empty
+        bloom.clear();
+        assert!(!bloom.may_contain(&sig1));
+    }
+
+    #[test]
+    fn test_cluster_boundary_index() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut index = ClusterBoundaryIndex::new_small(0);
+
+        let kv = vec![KeyValue::new(AttrId(1), ValueId(10))];
+        let sig = IdentityKeySignature::from_key_values("person", &kv);
+        let cluster_id = GlobalClusterId::new(0, 100, 0);
+        let interval = Interval::new(0, 100).unwrap();
+
+        // Initially empty
+        assert!(index.is_empty());
+        assert!(!index.may_have_boundary(&sig));
+
+        // Register boundary key
+        index.register_boundary_key(sig, cluster_id, interval);
+
+        // Should now find it
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 1);
+        assert!(index.may_have_boundary(&sig));
+
+        let boundaries = index.get_boundaries(&sig).unwrap();
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].cluster_id, cluster_id);
+        assert_eq!(boundaries[0].interval, interval);
+    }
+
+    #[test]
+    fn test_cluster_boundary_overlapping() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut index = ClusterBoundaryIndex::new_small(0);
+
+        let kv = vec![KeyValue::new(AttrId(1), ValueId(10))];
+        let sig = IdentityKeySignature::from_key_values("person", &kv);
+
+        // Add two entries with different intervals
+        let cluster1 = GlobalClusterId::new(0, 100, 0);
+        let interval1 = Interval::new(0, 50).unwrap();
+        index.register_boundary_key(sig, cluster1, interval1);
+
+        let cluster2 = GlobalClusterId::new(0, 200, 0);
+        let interval2 = Interval::new(100, 150).unwrap();
+        index.register_boundary_key(sig, cluster2, interval2);
+
+        // Query with overlapping interval
+        let query_interval = Interval::new(25, 75).unwrap();
+        let overlapping = index.find_overlapping_boundaries(&sig, &query_interval);
+        assert_eq!(overlapping.len(), 1);
+        assert_eq!(overlapping[0].cluster_id, cluster1);
+
+        // Query with interval that overlaps second entry
+        let query_interval2 = Interval::new(110, 120).unwrap();
+        let overlapping2 = index.find_overlapping_boundaries(&sig, &query_interval2);
+        assert_eq!(overlapping2.len(), 1);
+        assert_eq!(overlapping2[0].cluster_id, cluster2);
+    }
+
+    #[test]
+    fn test_incremental_reconciler() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut reconciler = IncrementalReconciler::new();
+
+        // Create two shard boundaries with shared keys
+        let mut shard0 = ClusterBoundaryIndex::new_small(0);
+        let mut shard1 = ClusterBoundaryIndex::new_small(1);
+
+        let kv = vec![KeyValue::new(AttrId(1), ValueId(10))];
+        let sig = IdentityKeySignature::from_key_values("person", &kv);
+
+        // Shard 0 has cluster 100 with this key
+        let cluster0 = GlobalClusterId::new(0, 100, 0);
+        let interval0 = Interval::new(0, 100).unwrap();
+        shard0.register_boundary_key(sig, cluster0, interval0);
+
+        // Shard 1 has cluster 200 with the same key and overlapping interval
+        let cluster1 = GlobalClusterId::new(1, 200, 0);
+        let interval1 = Interval::new(50, 150).unwrap();
+        shard1.register_boundary_key(sig, cluster1, interval1);
+
+        reconciler.add_shard_boundary(shard0);
+        reconciler.add_shard_boundary(shard1);
+
+        // Reconcile should find the cross-shard merge
+        let result = reconciler.reconcile();
+
+        assert_eq!(result.merges_performed, 1);
+        assert_eq!(result.keys_matched, 1);
+        assert_eq!(result.merged_clusters.len(), 1);
+
+        // The merge should be from shard 0 (lower) to shard 1
+        let (primary, secondary) = result.merged_clusters[0];
+        assert_eq!(primary.shard_id, 0);
+        assert_eq!(secondary.shard_id, 1);
+    }
+
+    #[test]
+    fn test_boundary_metadata_export_import() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut index1 = ClusterBoundaryIndex::new_small(0);
+
+        let kv = vec![KeyValue::new(AttrId(1), ValueId(10))];
+        let sig = IdentityKeySignature::from_key_values("person", &kv);
+        let cluster_id = GlobalClusterId::new(0, 100, 0);
+        let interval = Interval::new(0, 100).unwrap();
+
+        index1.register_boundary_key(sig, cluster_id, interval);
+
+        // Export metadata
+        let metadata = index1.export_metadata();
+        assert_eq!(metadata.shard_id, 0);
+        assert_eq!(metadata.entries.len(), 1);
+
+        // Import into another index
+        let mut index2 = ClusterBoundaryIndex::new_small(1);
+        index2.import_metadata(&metadata);
+
+        // Should now contain the imported entry
+        assert!(index2.may_have_boundary(&sig));
+        let boundaries = index2.get_boundaries(&sig).unwrap();
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].cluster_id, cluster_id);
     }
 }

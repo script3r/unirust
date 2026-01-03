@@ -1,7 +1,4 @@
-#[path = "../src/test_support.rs"]
-mod test_support;
-
-use test_support::{default_ontology, generate_dataset};
+use unirust_rs::test_support::{default_ontology, generate_dataset};
 use unirust_rs::{Store, Unirust};
 
 #[test]

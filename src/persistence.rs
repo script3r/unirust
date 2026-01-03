@@ -7,7 +7,7 @@ use rocksdb::{
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, DB,
 };
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const CF_RECORDS: &str = "records";
 const CF_METADATA: &str = "metadata";
@@ -20,6 +20,21 @@ const CF_INDEX_IDENTITY: &str = "index_identity";
 const CF_CONFLICT_SUMMARIES: &str = "conflict_summaries";
 const CF_CLUSTER_ASSIGNMENTS: &str = "cluster_assignments";
 
+// DSU persistence column families
+const CF_DSU_PARENT: &str = "dsu_parent";
+const CF_DSU_RANK: &str = "dsu_rank";
+const CF_DSU_GUARDS: &str = "dsu_guards";
+const CF_DSU_METADATA: &str = "dsu_metadata";
+
+// Tiered index column families
+const CF_INDEX_IDENTITY_KEYS: &str = "index_identity_keys"; // Cold tier storage
+const CF_INDEX_KEY_STATS: &str = "index_key_stats"; // Access statistics
+
+// Linker state column families (for restart recovery)
+const CF_LINKER_CLUSTER_IDS: &str = "linker_cluster_ids";
+const CF_LINKER_GLOBAL_IDS: &str = "linker_global_ids";
+const CF_LINKER_METADATA: &str = "linker_metadata";
+
 const KEY_NEXT_RECORD_ID: &[u8] = b"next_record_id";
 const KEY_INTERNER: &[u8] = b"interner";
 const KEY_ONTOLOGY_CONFIG: &[u8] = b"ontology_config";
@@ -30,6 +45,10 @@ const KEY_NEXT_VALUE_ID: &[u8] = b"next_value_id";
 const KEY_RECORD_COUNT: &[u8] = b"record_count";
 const KEY_CLUSTER_COUNT: &[u8] = b"cluster_count";
 const KEY_CONFLICT_SUMMARY_COUNT: &[u8] = b"conflict_summary_count";
+
+// DSU metadata keys
+const KEY_DSU_NEXT_CLUSTER_ID: &[u8] = b"dsu_next_cluster_id";
+const KEY_DSU_CLUSTER_COUNT: &[u8] = b"dsu_cluster_count";
 
 const STORAGE_FORMAT_VERSION: u32 = 1;
 const INDEX_FORMAT_VERSION: u32 = 2;
@@ -60,7 +79,7 @@ struct StorageManifest {
 
 pub struct PersistentStore {
     inner: Store,
-    db: DB,
+    db: Arc<DB>,
     cache: Mutex<LruCache<RecordId, Record>>,
     staged_records: Mutex<Vec<Record>>,
     persisted_attr_id: u32,
@@ -102,7 +121,7 @@ impl PersistentStore {
 
         let mut instance = Self {
             inner: store,
-            db,
+            db: Arc::new(db),
             cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("cache capacity"),
             )),
@@ -1011,6 +1030,10 @@ impl RecordStore for PersistentStore {
     fn checkpoint(&self, path: &Path) -> Result<()> {
         PersistentStore::checkpoint(self, path)
     }
+
+    fn shared_db(&self) -> Option<Arc<DB>> {
+        Some(Arc::clone(&self.db))
+    }
 }
 
 impl Drop for PersistentStore {
@@ -1200,6 +1223,45 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
         ColumnFamilyDescriptor::new(
             CF_CLUSTER_ASSIGNMENTS,
             build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        // DSU column families - 4-byte record_id keys, optimized for sequential access
+        ColumnFamilyDescriptor::new(
+            CF_DSU_PARENT,
+            build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_DSU_RANK,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_DSU_GUARDS,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_DSU_METADATA,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        // Tiered index column families - variable length keys, optimized for range scans
+        ColumnFamilyDescriptor::new(
+            CF_INDEX_IDENTITY_KEYS,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_INDEX_KEY_STATS,
+            build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        // Linker state column families - for restart recovery
+        ColumnFamilyDescriptor::new(
+            CF_LINKER_CLUSTER_IDS,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_LINKER_GLOBAL_IDS,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_LINKER_METADATA,
+            build_cf_options(&base, &data_block_opts, None, None),
         ),
     ];
     Ok(DB::open_cf_descriptors(&base, path, cfs)?)
@@ -1604,6 +1666,494 @@ fn remove_metadata_key(db: &DB, key: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow!("missing metadata column family"))?;
     db.delete_cf(metadata_cf, key)?;
     Ok(())
+}
+
+// ============================================================================
+// DSU Persistence Support
+// ============================================================================
+
+/// DSU key/value encoding helpers - all keys are 4-byte big-endian u32
+pub mod dsu_encoding {
+    use crate::dsu::TemporalGuard;
+    use crate::model::RecordId;
+
+    /// Encode a record ID as a 4-byte big-endian key
+    #[inline]
+    pub fn encode_record_key(record_id: RecordId) -> [u8; 4] {
+        record_id.0.to_be_bytes()
+    }
+
+    /// Decode a record ID from a 4-byte big-endian key
+    #[inline]
+    pub fn decode_record_key(bytes: &[u8]) -> Option<RecordId> {
+        if bytes.len() != 4 {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(bytes);
+        Some(RecordId(u32::from_be_bytes(buf)))
+    }
+
+    /// Encode a parent record ID as a 4-byte value
+    #[inline]
+    pub fn encode_parent_value(parent_id: RecordId) -> [u8; 4] {
+        parent_id.0.to_be_bytes()
+    }
+
+    /// Decode a parent record ID from a 4-byte value
+    #[inline]
+    pub fn decode_parent_value(bytes: &[u8]) -> Option<RecordId> {
+        decode_record_key(bytes)
+    }
+
+    /// Encode a rank as a 4-byte value
+    #[inline]
+    pub fn encode_rank_value(rank: u32) -> [u8; 4] {
+        rank.to_be_bytes()
+    }
+
+    /// Decode a rank from a 4-byte value
+    #[inline]
+    pub fn decode_rank_value(bytes: &[u8]) -> Option<u32> {
+        if bytes.len() != 4 {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(bytes);
+        Some(u32::from_be_bytes(buf))
+    }
+
+    /// Encode guards as bincode serialized bytes
+    pub fn encode_guards(guards: &[TemporalGuard]) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(guards)
+    }
+
+    /// Decode guards from bincode serialized bytes
+    pub fn decode_guards(bytes: &[u8]) -> Result<Vec<TemporalGuard>, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+/// Column family names for DSU persistence (re-exported for external use)
+pub mod dsu_cf {
+    pub const PARENT: &str = super::CF_DSU_PARENT;
+    pub const RANK: &str = super::CF_DSU_RANK;
+    pub const GUARDS: &str = super::CF_DSU_GUARDS;
+    pub const METADATA: &str = super::CF_DSU_METADATA;
+}
+
+/// DSU metadata keys (re-exported for external use)
+pub mod dsu_keys {
+    pub const NEXT_CLUSTER_ID: &[u8] = super::KEY_DSU_NEXT_CLUSTER_ID;
+    pub const CLUSTER_COUNT: &[u8] = super::KEY_DSU_CLUSTER_COUNT;
+}
+
+/// Column family names for tiered index persistence
+pub mod index_cf {
+    pub const IDENTITY_KEYS: &str = super::CF_INDEX_IDENTITY_KEYS;
+    pub const KEY_STATS: &str = super::CF_INDEX_KEY_STATS;
+}
+
+/// Encoding helpers for tiered index persistence
+pub mod index_encoding {
+    use crate::model::{KeyValue, RecordId};
+    use crate::temporal::Interval;
+    use serde::{Deserialize, Serialize};
+
+    /// Compact bucket format for warm/cold tier storage
+    /// Uses 16 bytes per interval vs 32+ for full IntervalTree node
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CompactBucketData {
+        /// Record intervals: (record_id, start, end)
+        pub record_intervals: Vec<(u32, i64, i64)>,
+        /// Cluster intervals: (root_id, start, end)
+        pub cluster_intervals: Vec<(u32, i64, i64)>,
+    }
+
+    /// Access statistics for tiering decisions
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct KeyAccessStats {
+        /// Number of accesses in current epoch
+        pub access_count: u32,
+        /// Last access timestamp (epoch seconds)
+        pub last_access: i64,
+        /// Total query count since creation
+        pub total_queries: u64,
+        /// Cardinality (number of unique records)
+        pub cardinality: u32,
+    }
+
+    impl KeyAccessStats {
+        /// Calculate tier score (0.0 to 1.0)
+        /// Score = 0.4 * recency + 0.4 * frequency + 0.2 * (1 - cardinality_penalty)
+        pub fn tier_score(&self, current_time: i64, max_cardinality: u32) -> f64 {
+            // Recency score: decay over 24 hours
+            let age_seconds = (current_time - self.last_access).max(0) as f64;
+            let recency = (-age_seconds / 86400.0).exp();
+
+            // Frequency score: normalized by access count
+            let frequency = (self.access_count as f64 / 100.0).min(1.0);
+
+            // Cardinality penalty: high cardinality keys are less useful
+            let cardinality_ratio = self.cardinality as f64 / max_cardinality.max(1) as f64;
+            let cardinality_score = 1.0 - cardinality_ratio.min(1.0);
+
+            0.4 * recency + 0.4 * frequency + 0.2 * cardinality_score
+        }
+    }
+
+    /// Encode identity key as bytes for RocksDB key
+    /// Format: entity_type_len (2 bytes) + entity_type + key_values (bincode)
+    pub fn encode_identity_key(entity_type: &str, key_values: &[KeyValue]) -> Vec<u8> {
+        let entity_bytes = entity_type.as_bytes();
+        let mut result = Vec::with_capacity(2 + entity_bytes.len() + key_values.len() * 8);
+
+        // Length-prefixed entity type
+        let len = entity_bytes.len() as u16;
+        result.extend_from_slice(&len.to_be_bytes());
+        result.extend_from_slice(entity_bytes);
+
+        // Key values as bincode
+        if let Ok(kv_bytes) = bincode::serialize(key_values) {
+            result.extend_from_slice(&kv_bytes);
+        }
+
+        result
+    }
+
+    /// Decode identity key from bytes
+    pub fn decode_identity_key(bytes: &[u8]) -> Option<(String, Vec<KeyValue>)> {
+        if bytes.len() < 2 {
+            return None;
+        }
+
+        let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        if bytes.len() < 2 + len {
+            return None;
+        }
+
+        let entity_type = String::from_utf8(bytes[2..2 + len].to_vec()).ok()?;
+        let key_values: Vec<KeyValue> = bincode::deserialize(&bytes[2 + len..]).ok()?;
+
+        Some((entity_type, key_values))
+    }
+
+    /// Encode compact bucket data
+    pub fn encode_compact_bucket(data: &CompactBucketData) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(data)
+    }
+
+    /// Decode compact bucket data
+    pub fn decode_compact_bucket(bytes: &[u8]) -> Result<CompactBucketData, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Encode key access stats
+    pub fn encode_key_stats(stats: &KeyAccessStats) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(stats)
+    }
+
+    /// Decode key access stats
+    pub fn decode_key_stats(bytes: &[u8]) -> Result<KeyAccessStats, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Convert full intervals to compact format
+    pub fn intervals_to_compact(intervals: &[(RecordId, Interval)]) -> Vec<(u32, i64, i64)> {
+        intervals
+            .iter()
+            .map(|(id, interval)| (id.0, interval.start, interval.end))
+            .collect()
+    }
+
+    /// Convert compact format back to full intervals
+    pub fn compact_to_intervals(compact: &[(u32, i64, i64)]) -> Vec<(RecordId, Interval)> {
+        compact
+            .iter()
+            .filter_map(|(id, start, end)| {
+                Interval::new(*start, *end)
+                    .ok()
+                    .map(|interval| (RecordId(*id), interval))
+            })
+            .collect()
+    }
+}
+
+impl PersistentStore {
+    /// Get a reference to the underlying RocksDB database.
+    /// Used for persistent DSU operations.
+    pub fn db(&self) -> &DB {
+        &self.db
+    }
+
+    /// Get a shared reference to the RocksDB database.
+    /// Used for sharing DB with persistent DSU and tiered index.
+    pub fn db_shared(&self) -> Arc<DB> {
+        Arc::clone(&self.db)
+    }
+
+    /// Get DSU parent column family handle
+    pub fn dsu_parent_cf(&self) -> Option<&rocksdb::ColumnFamily> {
+        self.db.cf_handle(CF_DSU_PARENT)
+    }
+
+    /// Get DSU rank column family handle
+    pub fn dsu_rank_cf(&self) -> Option<&rocksdb::ColumnFamily> {
+        self.db.cf_handle(CF_DSU_RANK)
+    }
+
+    /// Get DSU guards column family handle
+    pub fn dsu_guards_cf(&self) -> Option<&rocksdb::ColumnFamily> {
+        self.db.cf_handle(CF_DSU_GUARDS)
+    }
+
+    /// Get DSU metadata column family handle
+    pub fn dsu_metadata_cf(&self) -> Option<&rocksdb::ColumnFamily> {
+        self.db.cf_handle(CF_DSU_METADATA)
+    }
+
+    /// Load DSU metadata value
+    pub fn load_dsu_metadata<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<T>> {
+        let cf = self
+            .dsu_metadata_cf()
+            .ok_or_else(|| anyhow!("missing DSU metadata column family"))?;
+        if let Some(bytes) = self.db.get_cf(cf, key)? {
+            Ok(Some(bincode::deserialize(&bytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Save DSU metadata value
+    pub fn save_dsu_metadata<T: serde::Serialize>(&self, key: &[u8], value: &T) -> Result<()> {
+        let cf = self
+            .dsu_metadata_cf()
+            .ok_or_else(|| anyhow!("missing DSU metadata column family"))?;
+        let bytes = bincode::serialize(value)?;
+        self.db.put_cf(cf, key, bytes)?;
+        Ok(())
+    }
+
+    /// Create a write batch for DSU operations
+    pub fn dsu_write_batch(&self) -> WriteBatch {
+        WriteBatch::default()
+    }
+
+    /// Write a DSU batch to the database
+    pub fn write_dsu_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.db.write(batch)?;
+        Ok(())
+    }
+}
+
+/// Column family names for linker state persistence
+pub mod linker_cf {
+    pub const CLUSTER_IDS: &str = super::CF_LINKER_CLUSTER_IDS;
+    pub const GLOBAL_IDS: &str = super::CF_LINKER_GLOBAL_IDS;
+    pub const METADATA: &str = super::CF_LINKER_METADATA;
+}
+
+/// Encoding helpers for linker state persistence
+pub mod linker_encoding {
+    use crate::model::{ClusterId, GlobalClusterId, RecordId};
+
+    /// Encode a record ID as a 4-byte big-endian key.
+    pub fn encode_record_key(record_id: RecordId) -> [u8; 4] {
+        record_id.0.to_be_bytes()
+    }
+
+    /// Decode a record ID from a 4-byte big-endian key.
+    pub fn decode_record_key(bytes: &[u8]) -> Option<RecordId> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        Some(RecordId(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ])))
+    }
+
+    /// Encode a cluster ID as a 4-byte big-endian value.
+    pub fn encode_cluster_id(cluster_id: ClusterId) -> [u8; 4] {
+        cluster_id.0.to_be_bytes()
+    }
+
+    /// Decode a cluster ID from a 4-byte big-endian value.
+    pub fn decode_cluster_id(bytes: &[u8]) -> Option<ClusterId> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        Some(ClusterId(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ])))
+    }
+
+    /// Encode a global cluster ID as an 8-byte value.
+    /// Format: shard_id (2 bytes) + version (2 bytes) + local_id (4 bytes)
+    pub fn encode_global_cluster_id(global_id: GlobalClusterId) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        bytes[0..2].copy_from_slice(&global_id.shard_id.to_be_bytes());
+        bytes[2..4].copy_from_slice(&global_id.version.to_be_bytes());
+        bytes[4..8].copy_from_slice(&global_id.local_id.to_be_bytes());
+        bytes
+    }
+
+    /// Decode a global cluster ID from an 8-byte value.
+    pub fn decode_global_cluster_id(bytes: &[u8]) -> Option<GlobalClusterId> {
+        if bytes.len() < 8 {
+            return None;
+        }
+        let shard_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let version = u16::from_be_bytes([bytes[2], bytes[3]]);
+        let local_id = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        Some(GlobalClusterId {
+            shard_id,
+            local_id,
+            version,
+        })
+    }
+
+    /// Encode next_cluster_id as a 4-byte value.
+    pub fn encode_next_cluster_id(next_id: u32) -> [u8; 4] {
+        next_id.to_be_bytes()
+    }
+
+    /// Decode next_cluster_id from a 4-byte value.
+    pub fn decode_next_cluster_id(bytes: &[u8]) -> Option<u32> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// The metadata key for next_cluster_id
+    pub const KEY_NEXT_CLUSTER_ID: &[u8] = b"linker_next_cluster_id";
+}
+
+/// Linker state persistence operations
+pub struct LinkerStatePersistence<'a> {
+    db: &'a DB,
+}
+
+impl<'a> LinkerStatePersistence<'a> {
+    /// Create a new linker state persistence helper.
+    pub fn new(db: &'a DB) -> Self {
+        Self { db }
+    }
+
+    /// Flush cluster ID mappings to the database.
+    pub fn flush_cluster_ids<I>(&self, mappings: I) -> Result<()>
+    where
+        I: Iterator<Item = (crate::model::RecordId, crate::model::ClusterId)>,
+    {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::CLUSTER_IDS)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::CLUSTER_IDS))?;
+        let mut batch = WriteBatch::default();
+        for (record_id, cluster_id) in mappings {
+            batch.put_cf(
+                &cf,
+                linker_encoding::encode_record_key(record_id),
+                linker_encoding::encode_cluster_id(cluster_id),
+            );
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Flush global cluster ID mappings to the database.
+    pub fn flush_global_cluster_ids<I>(&self, mappings: I) -> Result<()>
+    where
+        I: Iterator<Item = (crate::model::RecordId, crate::model::GlobalClusterId)>,
+    {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::GLOBAL_IDS)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::GLOBAL_IDS))?;
+        let mut batch = WriteBatch::default();
+        for (record_id, global_id) in mappings {
+            batch.put_cf(
+                &cf,
+                linker_encoding::encode_record_key(record_id),
+                linker_encoding::encode_global_cluster_id(global_id),
+            );
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Save the next_cluster_id value.
+    pub fn save_next_cluster_id(&self, next_id: u32) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        self.db.put_cf(
+            &cf,
+            linker_encoding::KEY_NEXT_CLUSTER_ID,
+            linker_encoding::encode_next_cluster_id(next_id),
+        )?;
+        Ok(())
+    }
+
+    /// Load the next_cluster_id value.
+    pub fn load_next_cluster_id(&self) -> Result<Option<u32>> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        match self.db.get_cf(&cf, linker_encoding::KEY_NEXT_CLUSTER_ID)? {
+            Some(bytes) => Ok(linker_encoding::decode_next_cluster_id(&bytes)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load all cluster ID mappings from the database.
+    pub fn load_cluster_ids(
+        &self,
+    ) -> Result<Vec<(crate::model::RecordId, crate::model::ClusterId)>> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::CLUSTER_IDS)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::CLUSTER_IDS))?;
+        let mut mappings = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if let (Some(record_id), Some(cluster_id)) = (
+                linker_encoding::decode_record_key(&key),
+                linker_encoding::decode_cluster_id(&value),
+            ) {
+                mappings.push((record_id, cluster_id));
+            }
+        }
+        Ok(mappings)
+    }
+
+    /// Load all global cluster ID mappings from the database.
+    pub fn load_global_cluster_ids(
+        &self,
+    ) -> Result<Vec<(crate::model::RecordId, crate::model::GlobalClusterId)>> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::GLOBAL_IDS)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::GLOBAL_IDS))?;
+        let mut mappings = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if let (Some(record_id), Some(global_id)) = (
+                linker_encoding::decode_record_key(&key),
+                linker_encoding::decode_global_cluster_id(&value),
+            ) {
+                mappings.push((record_id, global_id));
+            }
+        }
+        Ok(mappings)
+    }
 }
 
 #[cfg(test)]

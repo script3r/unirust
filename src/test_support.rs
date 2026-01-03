@@ -1,22 +1,22 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
-use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
-use unirust_rs::temporal::Interval;
-use unirust_rs::RecordStore;
+use crate::model::{AttrId, Descriptor, Record, RecordId, RecordIdentity, ValueId};
+use crate::ontology::{IdentityKey, Ontology, StrongIdentifier};
+use crate::temporal::Interval;
+use crate::RecordStore;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TestSchema {
-    pub name_attr: unirust_rs::model::AttrId,
-    pub email_attr: unirust_rs::model::AttrId,
-    pub phone_attr: unirust_rs::model::AttrId,
-    pub ssn_attr: unirust_rs::model::AttrId,
-    pub name_value: unirust_rs::model::ValueId,
-    pub email_value: unirust_rs::model::ValueId,
-    pub phone_value: unirust_rs::model::ValueId,
-    pub ssn_value: unirust_rs::model::ValueId,
+    pub name_attr: AttrId,
+    pub email_attr: AttrId,
+    pub phone_attr: AttrId,
+    pub ssn_attr: AttrId,
+    pub name_value: ValueId,
+    pub email_value: ValueId,
+    pub phone_value: ValueId,
+    pub ssn_value: ValueId,
 }
 
 #[derive(Debug, Clone)]

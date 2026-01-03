@@ -1,4 +1,6 @@
 use crate::conflicts::ConflictAlgorithm;
+use crate::dsu::PersistentDSUConfig;
+use crate::index::TierConfig;
 
 #[derive(Debug, Clone)]
 pub struct StreamingTuning {
@@ -10,6 +12,22 @@ pub struct StreamingTuning {
     pub adaptive_mid_cap: usize,
     pub deferred_reconciliation: bool,
     pub hot_key_threshold: usize,
+    /// Configuration for persistent DSU (used when `use_persistent_dsu` is true)
+    pub dsu_config: Option<PersistentDSUConfig>,
+    /// Whether to use persistent DSU for billion-scale datasets
+    pub use_persistent_dsu: bool,
+    /// Configuration for tiered index storage (used when `use_tiered_index` is true)
+    pub tier_config: Option<TierConfig>,
+    /// Whether to use tiered index for billion-scale datasets
+    pub use_tiered_index: bool,
+    /// Shard ID for this node (used for boundary tracking in distributed mode)
+    pub shard_id: u16,
+    /// Whether to track boundary signatures for cross-shard reconciliation.
+    /// Default false - enable only in distributed mode to reduce memory overhead.
+    pub enable_boundary_tracking: bool,
+    /// Configuration for linker state memory management (LRU caches).
+    /// Default: None (uses HashMap, unlimited capacity).
+    pub linker_state_config: Option<LinkerStateConfig>,
 }
 
 /// Configuration for conflict detection algorithms.
@@ -108,6 +126,10 @@ pub enum TuningProfile {
     HighThroughput,
     BulkIngest,
     MemorySaver,
+    /// Optimized for billion-scale datasets with persistent DSU
+    BillionScale,
+    /// High-performance billion-scale with larger caches
+    BillionScaleHighPerformance,
 }
 
 impl Default for StreamingTuning {
@@ -121,6 +143,13 @@ impl Default for StreamingTuning {
             adaptive_mid_cap: 1000,
             deferred_reconciliation: true,
             hot_key_threshold: 50_000,
+            dsu_config: None,
+            use_persistent_dsu: false,
+            tier_config: None,
+            use_tiered_index: false,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: None,
         }
     }
 }
@@ -133,6 +162,8 @@ impl StreamingTuning {
             TuningProfile::HighThroughput => Self::high_throughput(),
             TuningProfile::BulkIngest => Self::bulk_ingest(),
             TuningProfile::MemorySaver => Self::memory_saver(),
+            TuningProfile::BillionScale => Self::billion_scale(),
+            TuningProfile::BillionScaleHighPerformance => Self::billion_scale_high_performance(),
         }
     }
 
@@ -150,6 +181,13 @@ impl StreamingTuning {
             adaptive_mid_cap: 500,
             deferred_reconciliation: true,
             hot_key_threshold: 20_000,
+            dsu_config: None,
+            use_persistent_dsu: false,
+            tier_config: None,
+            use_tiered_index: false,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: None,
         }
     }
 
@@ -163,6 +201,13 @@ impl StreamingTuning {
             adaptive_mid_cap: 2500,
             deferred_reconciliation: true,
             hot_key_threshold: 100_000,
+            dsu_config: None,
+            use_persistent_dsu: false,
+            tier_config: None,
+            use_tiered_index: false,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: None,
         }
     }
 
@@ -176,6 +221,13 @@ impl StreamingTuning {
             adaptive_mid_cap: 300,
             deferred_reconciliation: true,
             hot_key_threshold: 10_000,
+            dsu_config: None,
+            use_persistent_dsu: false,
+            tier_config: None,
+            use_tiered_index: false,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: None,
         }
     }
 
@@ -189,6 +241,138 @@ impl StreamingTuning {
             adaptive_mid_cap: 0,
             deferred_reconciliation: true,
             hot_key_threshold: 5_000,
+            dsu_config: Some(PersistentDSUConfig::memory_saver()),
+            use_persistent_dsu: false,
+            tier_config: Some(TierConfig::memory_saver()),
+            use_tiered_index: false,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: None,
+        }
+    }
+
+    /// Configuration optimized for billion-scale datasets with persistent DSU and tiered index
+    pub fn billion_scale() -> Self {
+        Self {
+            candidate_cap: 2000,
+            adaptive_candidate_cap: true,
+            adaptive_high_threshold: 10_000,
+            adaptive_mid_threshold: 2_000,
+            adaptive_high_cap: 500,
+            adaptive_mid_cap: 1000,
+            deferred_reconciliation: true,
+            hot_key_threshold: 100_000,
+            dsu_config: Some(PersistentDSUConfig::default()),
+            use_persistent_dsu: true,
+            tier_config: Some(TierConfig::default()),
+            use_tiered_index: true,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: Some(LinkerStateConfig::default()),
+        }
+    }
+
+    /// High-performance configuration for billion-scale with larger caches
+    pub fn billion_scale_high_performance() -> Self {
+        Self {
+            candidate_cap: 4000,
+            adaptive_candidate_cap: true,
+            adaptive_high_threshold: 20_000,
+            adaptive_mid_threshold: 5000,
+            adaptive_high_cap: 1500,
+            adaptive_mid_cap: 2500,
+            deferred_reconciliation: true,
+            hot_key_threshold: 200_000,
+            dsu_config: Some(PersistentDSUConfig::high_performance()),
+            use_persistent_dsu: true,
+            tier_config: Some(TierConfig::high_performance()),
+            use_tiered_index: true,
+            shard_id: 0,
+            enable_boundary_tracking: false,
+            linker_state_config: Some(LinkerStateConfig::high_performance()),
+        }
+    }
+
+    /// Enable boundary tracking for distributed mode
+    pub fn with_boundary_tracking(mut self, enable: bool) -> Self {
+        self.enable_boundary_tracking = enable;
+        self
+    }
+
+    /// Set the shard ID for distributed mode.
+    pub fn with_shard_id(mut self, shard_id: u16) -> Self {
+        self.shard_id = shard_id;
+        self
+    }
+}
+
+/// Configuration for linker state memory management.
+/// Controls LRU cache sizes for cluster IDs, summaries, and perspectives.
+#[derive(Debug, Clone)]
+pub struct LinkerStateConfig {
+    /// Maximum number of cluster ID mappings to keep in memory.
+    /// Default: 5_000_000 (~80MB with overhead)
+    pub cluster_ids_capacity: usize,
+    /// Maximum number of global cluster ID mappings to keep in memory.
+    /// Default: 1_000_000 (~24MB with overhead)
+    pub global_ids_capacity: usize,
+    /// Maximum number of strong ID summaries to keep in memory.
+    /// Default: 500_000 (~100MB depending on summary size)
+    pub summaries_capacity: usize,
+    /// Maximum number of record perspectives to keep in memory.
+    /// Default: 5_000_000 (~160MB depending on perspective length)
+    pub perspectives_capacity: usize,
+    /// Size of dirty buffer before flushing to disk (if persistence enabled).
+    /// Default: 100_000
+    pub dirty_buffer_size: usize,
+}
+
+impl Default for LinkerStateConfig {
+    fn default() -> Self {
+        Self {
+            cluster_ids_capacity: 5_000_000,
+            global_ids_capacity: 1_000_000,
+            summaries_capacity: 500_000,
+            perspectives_capacity: 5_000_000,
+            dirty_buffer_size: 100_000,
+        }
+    }
+}
+
+impl LinkerStateConfig {
+    /// Configuration optimized for memory-constrained environments.
+    /// Uses smaller caches (~200MB total).
+    pub fn memory_saver() -> Self {
+        Self {
+            cluster_ids_capacity: 500_000,
+            global_ids_capacity: 100_000,
+            summaries_capacity: 50_000,
+            perspectives_capacity: 500_000,
+            dirty_buffer_size: 10_000,
+        }
+    }
+
+    /// Configuration optimized for high-performance environments.
+    /// Uses larger caches (~1GB total).
+    pub fn high_performance() -> Self {
+        Self {
+            cluster_ids_capacity: 20_000_000,
+            global_ids_capacity: 5_000_000,
+            summaries_capacity: 2_000_000,
+            perspectives_capacity: 20_000_000,
+            dirty_buffer_size: 500_000,
+        }
+    }
+
+    /// Unlimited capacity (disables LRU eviction).
+    /// Only use for small datasets where everything fits in memory.
+    pub fn unlimited() -> Self {
+        Self {
+            cluster_ids_capacity: usize::MAX,
+            global_ids_capacity: usize::MAX,
+            summaries_capacity: usize::MAX,
+            perspectives_capacity: usize::MAX,
+            dirty_buffer_size: usize::MAX,
         }
     }
 }

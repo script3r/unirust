@@ -19,13 +19,123 @@ impl fmt::Display for RecordId {
     }
 }
 
-/// Compact identifier for clusters
+/// Compact identifier for clusters (local to a shard)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub u32);
 
 impl fmt::Display for ClusterId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "C{}", self.0)
+    }
+}
+
+/// Global cluster identifier for distributed entity resolution.
+///
+/// Encodes shard ownership, local cluster ID, and merge version in a single 64-bit value.
+/// Format: `(shard_id << 48) | (version << 32) | local_id`
+///
+/// This enables:
+/// - Tracking which shard owns a cluster
+/// - Detecting stale references after cross-shard merges
+/// - Efficient comparison and hashing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GlobalClusterId {
+    /// The shard that owns this cluster
+    pub shard_id: u16,
+    /// Local cluster ID within the shard
+    pub local_id: u32,
+    /// Merge version (incremented on cross-shard merges)
+    pub version: u16,
+}
+
+impl GlobalClusterId {
+    /// Create a new global cluster ID
+    pub fn new(shard_id: u16, local_id: u32, version: u16) -> Self {
+        Self {
+            shard_id,
+            local_id,
+            version,
+        }
+    }
+
+    /// Create from a local cluster ID on a specific shard
+    pub fn from_local(shard_id: u16, local_id: ClusterId) -> Self {
+        Self {
+            shard_id,
+            local_id: local_id.0,
+            version: 0,
+        }
+    }
+
+    /// Encode as a 64-bit integer for efficient storage/comparison
+    /// Format: `(shard_id << 48) | (version << 32) | local_id`
+    pub fn to_u64(&self) -> u64 {
+        ((self.shard_id as u64) << 48) | ((self.version as u64) << 32) | (self.local_id as u64)
+    }
+
+    /// Decode from a 64-bit integer
+    pub fn from_u64(value: u64) -> Self {
+        Self {
+            shard_id: ((value >> 48) & 0xFFFF) as u16,
+            version: ((value >> 32) & 0xFFFF) as u16,
+            local_id: (value & 0xFFFFFFFF) as u32,
+        }
+    }
+
+    /// Encode as bytes for storage
+    pub fn to_bytes(&self) -> [u8; 8] {
+        self.to_u64().to_be_bytes()
+    }
+
+    /// Decode from bytes
+    pub fn from_bytes(bytes: [u8; 8]) -> Self {
+        Self::from_u64(u64::from_be_bytes(bytes))
+    }
+
+    /// Get the local cluster ID
+    pub fn local_cluster_id(&self) -> ClusterId {
+        ClusterId(self.local_id)
+    }
+
+    /// Create a new version of this cluster (after a merge)
+    pub fn with_new_version(&self, new_version: u16) -> Self {
+        Self {
+            shard_id: self.shard_id,
+            local_id: self.local_id,
+            version: new_version,
+        }
+    }
+
+    /// Create with a new owner shard (for cross-shard merge)
+    pub fn with_new_owner(&self, new_shard_id: u16, new_version: u16) -> Self {
+        Self {
+            shard_id: new_shard_id,
+            local_id: self.local_id,
+            version: new_version,
+        }
+    }
+
+    /// Check if this cluster belongs to a specific shard
+    pub fn is_owned_by(&self, shard_id: u16) -> bool {
+        self.shard_id == shard_id
+    }
+}
+
+impl fmt::Display for GlobalClusterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GC{}.{}.v{}", self.shard_id, self.local_id, self.version)
+    }
+}
+
+impl From<GlobalClusterId> for u64 {
+    fn from(id: GlobalClusterId) -> u64 {
+        id.to_u64()
+    }
+}
+
+impl From<u64> for GlobalClusterId {
+    fn from(value: u64) -> GlobalClusterId {
+        GlobalClusterId::from_u64(value)
     }
 }
 
@@ -411,5 +521,74 @@ mod tests {
 
         let interval_descriptors = record.descriptors_in_interval(Interval::new(120, 180).unwrap());
         assert_eq!(interval_descriptors.len(), 2);
+    }
+
+    #[test]
+    fn test_global_cluster_id() {
+        let id = GlobalClusterId::new(1, 12345, 0);
+        assert_eq!(id.shard_id, 1);
+        assert_eq!(id.local_id, 12345);
+        assert_eq!(id.version, 0);
+
+        // Test encoding/decoding
+        let encoded = id.to_u64();
+        let decoded = GlobalClusterId::from_u64(encoded);
+        assert_eq!(id, decoded);
+
+        // Test bytes encoding
+        let bytes = id.to_bytes();
+        let from_bytes = GlobalClusterId::from_bytes(bytes);
+        assert_eq!(id, from_bytes);
+    }
+
+    #[test]
+    fn test_global_cluster_id_encoding() {
+        // Test that encoding preserves all bits correctly
+        let id = GlobalClusterId::new(0xABCD, 0x12345678, 0x9876);
+        let encoded = id.to_u64();
+
+        // Check bit positions
+        assert_eq!((encoded >> 48) & 0xFFFF, 0xABCD);
+        assert_eq!((encoded >> 32) & 0xFFFF, 0x9876);
+        assert_eq!(encoded & 0xFFFFFFFF, 0x12345678);
+
+        let decoded = GlobalClusterId::from_u64(encoded);
+        assert_eq!(decoded.shard_id, 0xABCD);
+        assert_eq!(decoded.version, 0x9876);
+        assert_eq!(decoded.local_id, 0x12345678);
+    }
+
+    #[test]
+    fn test_global_cluster_id_from_local() {
+        let local = ClusterId(42);
+        let global = GlobalClusterId::from_local(5, local);
+
+        assert_eq!(global.shard_id, 5);
+        assert_eq!(global.local_id, 42);
+        assert_eq!(global.version, 0);
+        assert_eq!(global.local_cluster_id(), local);
+    }
+
+    #[test]
+    fn test_global_cluster_id_versioning() {
+        let id = GlobalClusterId::new(1, 100, 0);
+
+        let v1 = id.with_new_version(1);
+        assert_eq!(v1.shard_id, 1);
+        assert_eq!(v1.local_id, 100);
+        assert_eq!(v1.version, 1);
+
+        let transferred = id.with_new_owner(2, 1);
+        assert_eq!(transferred.shard_id, 2);
+        assert_eq!(transferred.local_id, 100);
+        assert_eq!(transferred.version, 1);
+    }
+
+    #[test]
+    fn test_global_cluster_id_ownership() {
+        let id = GlobalClusterId::new(3, 100, 0);
+        assert!(id.is_owned_by(3));
+        assert!(!id.is_owned_by(1));
+        assert!(!id.is_owned_by(5));
     }
 }

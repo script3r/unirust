@@ -18,6 +18,11 @@ chrono = { version = "0.4.42", features = ["serde"] }
 
 # Collections and hashing
 hashbrown = { version = "0.16.1", features = ["serde"] }
+smallvec = "1.13"
+rustc-hash = "2.0"
+
+# Parallelism
+rayon = "1.10"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -46,31 +51,40 @@ tracing-subscriber = "0.3.19"
 # String interning
 string-interner = "0.19.0"
 
+# Optional dependencies
+rand = { version = "0.9.2", optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.8.1", features = ["html_reports"] }
 proptest = "1.9.0"
-rand = "0.9.2"
 tempfile = "3.12.0"
+unirust-rs = { path = ".", features = ["test-support"] }
 
 [build-dependencies]
 tonic-build = "0.11"
 
+# Quick benchmarks (~30s) - CI/dev feedback
 [[bench]]
-name = "entity_benchmark"
+name = "bench_quick"
 harness = false
 
+# Scale benchmarks (~3-5min) - pre-merge validation
 [[bench]]
-name = "perf_suite"
+name = "bench_scale"
 harness = false
 
+# Microbenchmarks (~1min) - component internals
 [[bench]]
-name = "scale_benchmark"
+name = "bench_micro"
 harness = false
 
+# Diagnostic tool (one-shot) - deep analysis
 [[bench]]
-name = "micro_benchmarks"
+name = "bench_diagnostic"
 harness = false
 
 [features]
 default = []
 profiling = []
+# Enable test support module (used by integration tests and benchmarks)
+test-support = ["rand"]

@@ -1,7 +1,5 @@
-#[path = "../src/test_support.rs"]
-mod test_support;
-
 use tempfile::tempdir;
+use unirust_rs::test_support;
 use unirust_rs::{PersistentStore, RecordStore};
 
 #[test]

@@ -1,11 +1,13 @@
 use crate::conflicts::ConflictSummary;
 use crate::graph::GoldenDescriptor;
-use crate::model::{AttrId, Record, RecordId, RecordIdentity};
+use crate::model::{AttrId, GlobalClusterId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::persistence::PersistentOpenOptions;
 use crate::query::{QueryDescriptor, QueryOutcome};
+use crate::sharding::{BloomFilter, IdentityKeySignature};
+use crate::store::StoreMetrics;
 use crate::temporal::Interval;
-use crate::{PersistentStore, StoreMetrics, StreamingTuning, Unirust};
+use crate::{PersistentStore, StreamingTuning, Unirust};
 use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -147,6 +149,223 @@ impl IngestWal {
 
 pub mod proto {
     tonic::include_proto!("unirust");
+}
+
+/// Locality information for a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterLocality {
+    /// The shard that owns this cluster.
+    pub shard_id: u16,
+    /// The global cluster ID.
+    pub cluster_id: GlobalClusterId,
+    /// When this locality was last updated.
+    pub last_updated: u64,
+}
+
+/// Index for cluster-aware routing.
+///
+/// Tracks which shards own which identity key signatures,
+/// enabling routing of related records to the same shard.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ClusterLocalityIndex {
+    /// Map from identity key signature to cluster locality.
+    key_to_shard: HashMap<[u8; 32], ClusterLocality>,
+    /// Bloom filter for fast negative lookups.
+    bloom: BloomFilter,
+    /// Number of entries in the index.
+    entry_count: usize,
+    /// Maximum entries before cleanup.
+    max_entries: usize,
+}
+
+#[allow(dead_code)]
+impl ClusterLocalityIndex {
+    /// Create a new locality index with default settings.
+    pub fn new() -> Self {
+        Self {
+            key_to_shard: HashMap::new(),
+            bloom: BloomFilter::new_1mb(),
+            entry_count: 0,
+            max_entries: 1_000_000, // 1M entries by default
+        }
+    }
+
+    /// Create a locality index with custom capacity.
+    pub fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            key_to_shard: HashMap::with_capacity(max_entries / 10),
+            bloom: BloomFilter::new_1mb(),
+            entry_count: 0,
+            max_entries,
+        }
+    }
+
+    /// Register a cluster's identity key signature with a shard.
+    pub fn register(
+        &mut self,
+        signature: IdentityKeySignature,
+        shard_id: u16,
+        cluster_id: GlobalClusterId,
+        timestamp: u64,
+    ) {
+        self.bloom.insert(&signature);
+
+        let locality = ClusterLocality {
+            shard_id,
+            cluster_id,
+            last_updated: timestamp,
+        };
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.key_to_shard.entry(signature.0) {
+            e.insert(locality);
+            self.entry_count += 1;
+        } else {
+            // Update existing entry if newer
+            if let Some(existing) = self.key_to_shard.get_mut(&signature.0) {
+                if timestamp > existing.last_updated {
+                    *existing = locality;
+                }
+            }
+        }
+
+        // Cleanup if too many entries
+        if self.entry_count > self.max_entries {
+            self.cleanup_stale_entries(timestamp);
+        }
+    }
+
+    /// Check if a signature might be in the index (fast bloom check).
+    pub fn may_contain(&self, signature: &IdentityKeySignature) -> bool {
+        self.bloom.may_contain(signature)
+    }
+
+    /// Get the locality for a signature if known.
+    pub fn get_locality(&self, signature: &IdentityKeySignature) -> Option<&ClusterLocality> {
+        if !self.may_contain(signature) {
+            return None;
+        }
+        self.key_to_shard.get(&signature.0)
+    }
+
+    /// Route a record to an existing cluster's shard if possible.
+    ///
+    /// Returns (primary_shard, optional_secondary_shard) tuple.
+    /// If the signature is known, routes to the known shard.
+    /// Otherwise returns None for both, indicating fallback to hash-based routing.
+    pub fn route_to_cluster(&self, signature: &IdentityKeySignature) -> Option<u16> {
+        self.get_locality(signature).map(|loc| loc.shard_id)
+    }
+
+    /// Remove entries older than the given threshold.
+    fn cleanup_stale_entries(&mut self, current_time: u64) {
+        let threshold = current_time.saturating_sub(3600); // 1 hour threshold
+        self.key_to_shard
+            .retain(|_, locality| locality.last_updated > threshold);
+        self.entry_count = self.key_to_shard.len();
+
+        // Note: We don't rebuild the bloom filter on cleanup
+        // This may lead to some false positives, but they're harmless
+    }
+
+    /// Get the number of entries in the index.
+    pub fn len(&self) -> usize {
+        self.entry_count
+    }
+
+    /// Check if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entry_count == 0
+    }
+
+    /// Clear all entries.
+    pub fn clear(&mut self) {
+        self.key_to_shard.clear();
+        self.bloom.clear();
+        self.entry_count = 0;
+    }
+
+    /// Update the cluster ID for a signature after a merge.
+    pub fn update_cluster_id(
+        &mut self,
+        signature: &IdentityKeySignature,
+        new_cluster_id: GlobalClusterId,
+        timestamp: u64,
+    ) {
+        if let Some(locality) = self.key_to_shard.get_mut(&signature.0) {
+            locality.cluster_id = new_cluster_id;
+            locality.last_updated = timestamp;
+        }
+    }
+}
+
+impl Default for ClusterLocalityIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Helper to create an IdentityKeySignature from a proto record.
+#[allow(dead_code)]
+fn signature_from_proto_record(
+    config: &DistributedOntologyConfig,
+    record: &proto::RecordInput,
+) -> Option<IdentityKeySignature> {
+    let identity = record.identity.as_ref()?;
+    let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
+    for descriptor in &record.descriptors {
+        descriptors_by_attr.insert(descriptor.attr.as_str(), descriptor.value.as_str());
+    }
+
+    // Try to find a matching identity key
+    for key in &config.identity_keys {
+        let mut has_all = true;
+        let mut key_values = Vec::new();
+
+        for attr in &key.attributes {
+            if let Some(value) = descriptors_by_attr.get(attr.as_str()) {
+                // Create a pseudo KeyValue for hashing
+                // We use the string values directly for hashing
+                key_values.push((attr.as_str(), *value));
+            } else {
+                has_all = false;
+                break;
+            }
+        }
+
+        if has_all {
+            // Hash the entity type and key values
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher1 = DefaultHasher::new();
+            let mut hasher2 = DefaultHasher::new();
+
+            identity.entity_type.hash(&mut hasher1);
+            identity.entity_type.hash(&mut hasher2);
+
+            for (i, (attr, value)) in key_values.iter().enumerate() {
+                attr.hash(&mut hasher1);
+                value.hash(&mut hasher1);
+                (attr, value, i).hash(&mut hasher2);
+            }
+
+            let h1 = hasher1.finish().to_le_bytes();
+            let h2 = hasher2.finish().to_le_bytes();
+
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&h1);
+            bytes[8..16].copy_from_slice(&h2);
+            for i in 0..8 {
+                bytes[16 + i] = h1[i] ^ h2[7 - i];
+                bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
+            }
+
+            return Some(IdentityKeySignature(bytes));
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Default)]
@@ -712,6 +931,8 @@ impl ShardNode {
         repair_on_start: bool,
         config_version: Option<String>,
     ) -> AnyResult<Self> {
+        // Set shard_id in tuning for boundary tracking
+        let tuning = tuning.with_shard_id(shard_id as u16);
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         let worker_count = ingest_worker_count();
         if let Some(path) = data_dir.clone() {
@@ -841,7 +1062,7 @@ impl ShardNode {
     }
 
     fn cluster_key_from_graph(
-        cluster_id: crate::ClusterId,
+        cluster_id: crate::model::ClusterId,
         graph: &crate::graph::KnowledgeGraph,
     ) -> String {
         graph
@@ -855,7 +1076,7 @@ impl ShardNode {
 
     fn to_proto_match(
         shard_id: u32,
-        cluster_id: crate::ClusterId,
+        cluster_id: crate::model::ClusterId,
         interval: Interval,
         golden: &[GoldenDescriptor],
         cluster_key: Option<String>,
@@ -1315,7 +1536,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         .map_err(|err| Status::internal(err.to_string()))?;
         let unirust = self.unirust.read().await;
         unirust
-            .checkpoint(&target)
+            .checkpoint_to_path(&target)
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(proto::CheckpointResponse {
             paths: vec![target.to_string_lossy().to_string()],
@@ -1613,6 +1834,124 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
         Ok(Response::new(proto::Empty {}))
     }
+
+    async fn get_boundary_metadata(
+        &self,
+        request: Request<proto::GetBoundaryMetadataRequest>,
+    ) -> Result<Response<proto::GetBoundaryMetadataResponse>, Status> {
+        let since_version = request.into_inner().since_version;
+
+        // Export boundary metadata from the streaming linker
+        let unirust = self.unirust.read().await;
+        let boundary_index = unirust.export_boundary_index();
+
+        let metadata = match boundary_index {
+            Some(index) => {
+                let exported = index.export_metadata();
+                // Only return if version is newer than requested
+                if exported.version <= since_version {
+                    proto::BoundaryMetadata {
+                        shard_id: self.shard_id,
+                        version: exported.version,
+                        entries: Vec::new(),
+                    }
+                } else {
+                    proto::BoundaryMetadata {
+                        shard_id: self.shard_id,
+                        version: exported.version,
+                        entries: exported
+                            .entries
+                            .into_iter()
+                            .map(|(sig, entries)| proto::BoundaryKeyEntries {
+                                signature: Some(proto::IdentityKeySignature {
+                                    signature: sig.0.to_vec(),
+                                }),
+                                entries: entries
+                                    .into_iter()
+                                    .map(|e| proto::ClusterBoundaryEntry {
+                                        cluster_id: Some(proto::GlobalClusterId {
+                                            shard_id: e.cluster_id.shard_id as u32,
+                                            local_id: e.cluster_id.local_id,
+                                            version: e.cluster_id.version as u32,
+                                        }),
+                                        interval_start: e.interval.start,
+                                        interval_end: e.interval.end,
+                                        shard_id: e.shard_id as u32,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    }
+                }
+            }
+            None => proto::BoundaryMetadata {
+                shard_id: self.shard_id,
+                version: 0,
+                entries: Vec::new(),
+            },
+        };
+
+        Ok(Response::new(proto::GetBoundaryMetadataResponse {
+            metadata: Some(metadata),
+        }))
+    }
+
+    async fn apply_merge(
+        &self,
+        request: Request<proto::ApplyMergeRequest>,
+    ) -> Result<Response<proto::ApplyMergeResponse>, Status> {
+        let req = request.into_inner();
+
+        let primary = req
+            .primary
+            .ok_or_else(|| Status::invalid_argument("primary cluster ID is required"))?;
+        let secondary = req
+            .secondary
+            .ok_or_else(|| Status::invalid_argument("secondary cluster ID is required"))?;
+
+        let primary_id = GlobalClusterId::new(
+            primary.shard_id as u16,
+            primary.local_id,
+            primary.version as u16,
+        );
+        let secondary_id = GlobalClusterId::new(
+            secondary.shard_id as u16,
+            secondary.local_id,
+            secondary.version as u16,
+        );
+
+        // Only apply if we own one of the clusters
+        if primary_id.shard_id != self.shard_id as u16
+            && secondary_id.shard_id != self.shard_id as u16
+        {
+            return Ok(Response::new(proto::ApplyMergeResponse {
+                success: true,
+                records_updated: 0,
+                error: String::new(),
+            }));
+        }
+
+        // Get write lock on unirust
+        let mut unirust = self.unirust.write().await;
+
+        // Apply the merge via the streaming linker's DSU
+        let records_updated = match unirust.apply_cross_shard_merge(primary_id, secondary_id) {
+            Ok(count) => count,
+            Err(err) => {
+                return Ok(Response::new(proto::ApplyMergeResponse {
+                    success: false,
+                    records_updated: 0,
+                    error: err.to_string(),
+                }));
+            }
+        };
+
+        Ok(Response::new(proto::ApplyMergeResponse {
+            success: true,
+            records_updated: records_updated as u32,
+            error: String::new(),
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -1622,6 +1961,8 @@ pub struct RouterNode {
     config_version: String,
     metrics: Arc<Metrics>,
     balancer: Option<Arc<ShardBalancer>>,
+    /// Cluster locality index for cluster-aware routing.
+    locality_index: Arc<StdRwLock<ClusterLocalityIndex>>,
 }
 
 impl RouterNode {
@@ -1667,6 +2008,7 @@ impl RouterNode {
             config_version,
             metrics: Arc::new(Metrics::new()),
             balancer: ShardBalancer::new(shard_count).map(Arc::new),
+            locality_index: Arc::new(StdRwLock::new(ClusterLocalityIndex::new())),
         })
     }
 
@@ -1710,6 +2052,65 @@ impl RouterNode {
             )));
         }
         Ok(self.shard_clients[idx].clone())
+    }
+
+    /// Get read access to the cluster locality index.
+    pub fn locality_index(&self) -> std::sync::RwLockReadGuard<'_, ClusterLocalityIndex> {
+        self.locality_index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register a cluster's identity key signature with a shard.
+    pub fn register_cluster_locality(
+        &self,
+        signature: IdentityKeySignature,
+        shard_id: u16,
+        cluster_id: GlobalClusterId,
+    ) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if let Ok(mut index) = self.locality_index.write() {
+            index.register(signature, shard_id, cluster_id, timestamp);
+        }
+    }
+
+    /// Update locality index from ingestion assignments.
+    fn update_locality_from_assignments(
+        &self,
+        config: &DistributedOntologyConfig,
+        records: &[proto::RecordInput],
+        assignments: &[proto::IngestAssignment],
+    ) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut index = match self.locality_index.write() {
+            Ok(guard) => guard,
+            Err(e) => e.into_inner(),
+        };
+
+        // Build a map of record index to assignment
+        let assignment_map: HashMap<u32, &proto::IngestAssignment> =
+            assignments.iter().map(|a| (a.index, a)).collect();
+
+        for record in records {
+            if let Some(sig) = signature_from_proto_record(config, record) {
+                if let Some(assignment) = assignment_map.get(&record.index) {
+                    let global_id = GlobalClusterId::new(
+                        assignment.shard_id as u16,
+                        assignment.cluster_id,
+                        0, // version 0 for initial assignments
+                    );
+                    index.register(sig, assignment.shard_id as u16, global_id, timestamp);
+                }
+            }
+        }
     }
 
     fn merge_query_responses(
@@ -1815,26 +2216,47 @@ impl proto::router_service_server::RouterService for RouterNode {
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
         let start = Instant::now();
         let batch = request.into_inner();
-        let record_count = batch.records.len();
+        let all_records = batch.records.clone(); // Keep for locality update
+        let record_count = all_records.len();
         let shard_count = self.shard_clients.len();
         let config = self.ontology_config.lock().await.clone();
         let mut shard_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
         let mut shadow_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
 
-        for record in batch.records {
-            if let Some(balancer) = &self.balancer {
-                let (primary, secondary) = balancer.route_record(&config, &record);
-                if let Some(secondary) = secondary {
-                    shard_batches[primary].push(record.clone());
-                    shadow_batches[secondary].push(record);
+        // Route all records synchronously before any await
+        // Use a scope to ensure the lock is released before await
+        {
+            let locality_index = self
+                .locality_index
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+
+            for record in batch.records {
+                // First, try cluster-aware routing via the locality index
+                let cluster_aware_shard = signature_from_proto_record(&config, &record)
+                    .and_then(|sig| locality_index.route_to_cluster(&sig))
+                    .map(|shard_id| shard_id as usize)
+                    .filter(|&idx| idx < shard_count);
+
+                if let Some(shard_idx) = cluster_aware_shard {
+                    // Route to the known cluster's shard
+                    shard_batches[shard_idx].push(record);
+                } else if let Some(balancer) = &self.balancer {
+                    // Fall back to load-balanced routing
+                    let (primary, secondary) = balancer.route_record(&config, &record);
+                    if let Some(secondary) = secondary {
+                        shard_batches[primary].push(record.clone());
+                        shadow_batches[secondary].push(record);
+                    } else {
+                        shard_batches[primary].push(record);
+                    }
                 } else {
-                    shard_batches[primary].push(record);
+                    // Fall back to hash-based routing
+                    let shard_idx = hash_record_to_shard(&config, &record, shard_count);
+                    shard_batches[shard_idx].push(record);
                 }
-            } else {
-                let shard_idx = hash_record_to_shard(&config, &record, shard_count);
-                shard_batches[shard_idx].push(record);
             }
-        }
+        } // locality_index lock released here
 
         let mut results: Vec<proto::IngestAssignment> = Vec::new();
         for (idx, records) in shard_batches.into_iter().enumerate() {
@@ -1848,6 +2270,9 @@ impl proto::router_service_server::RouterService for RouterNode {
                 .map_err(|err| Status::unavailable(err.to_string()))?;
             results.extend(response.into_inner().assignments);
         }
+
+        // Update locality index with the new assignments
+        self.update_locality_from_assignments(&config, &all_records, &results);
 
         for (idx, records) in shadow_batches.into_iter().enumerate() {
             if records.is_empty() {
@@ -2234,6 +2659,140 @@ impl proto::router_service_server::RouterService for RouterNode {
                 .map_err(|err| Status::unavailable(err.to_string()))?;
         }
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn reconcile(
+        &self,
+        request: Request<proto::ReconcileRequest>,
+    ) -> Result<Response<proto::ReconcileResponse>, Status> {
+        let req = request.into_inner();
+
+        // Collect boundary metadata from all shards if not provided
+        let shard_metadata = if req.shard_metadata.is_empty() {
+            let mut metadata = Vec::new();
+            for client in &self.shard_clients {
+                let mut client = client.clone();
+                if let Ok(response) = client
+                    .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
+                        since_version: 0,
+                    }))
+                    .await
+                {
+                    if let Some(m) = response.into_inner().metadata {
+                        metadata.push(m);
+                    }
+                }
+            }
+            metadata
+        } else {
+            req.shard_metadata
+        };
+
+        // Use IncrementalReconciler to find cross-shard merges
+        let mut reconciler = crate::sharding::IncrementalReconciler::new();
+
+        for metadata in &shard_metadata {
+            let mut boundary_index =
+                crate::sharding::ClusterBoundaryIndex::new_small(metadata.shard_id as u16);
+
+            for key_entries in &metadata.entries {
+                if let Some(sig_proto) = &key_entries.signature {
+                    if sig_proto.signature.len() == 32 {
+                        let mut sig_bytes = [0u8; 32];
+                        sig_bytes.copy_from_slice(&sig_proto.signature);
+                        let sig = IdentityKeySignature::from_bytes(sig_bytes);
+
+                        for entry in &key_entries.entries {
+                            if let Some(cluster_id_proto) = &entry.cluster_id {
+                                let cluster_id = GlobalClusterId::new(
+                                    cluster_id_proto.shard_id as u16,
+                                    cluster_id_proto.local_id,
+                                    cluster_id_proto.version as u16,
+                                );
+                                if let Ok(interval) = crate::temporal::Interval::new(
+                                    entry.interval_start,
+                                    entry.interval_end,
+                                ) {
+                                    boundary_index.register_boundary_key(sig, cluster_id, interval);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            reconciler.add_shard_boundary(boundary_index);
+        }
+
+        let result = reconciler.reconcile();
+
+        // Apply merges to affected shards
+        let mut total_records_updated = 0u32;
+        for (primary, secondary) in &result.merged_clusters {
+            // Apply to primary's shard
+            if let Ok(mut client) = self.shard_client(primary.shard_id as u32) {
+                let _ = client
+                    .apply_merge(Request::new(proto::ApplyMergeRequest {
+                        primary: Some(proto::GlobalClusterId {
+                            shard_id: primary.shard_id as u32,
+                            local_id: primary.local_id,
+                            version: primary.version as u32,
+                        }),
+                        secondary: Some(proto::GlobalClusterId {
+                            shard_id: secondary.shard_id as u32,
+                            local_id: secondary.local_id,
+                            version: secondary.version as u32,
+                        }),
+                    }))
+                    .await
+                    .map(|resp| total_records_updated += resp.into_inner().records_updated);
+            }
+
+            // Apply to secondary's shard if different
+            if secondary.shard_id != primary.shard_id {
+                if let Ok(mut client) = self.shard_client(secondary.shard_id as u32) {
+                    let _ = client
+                        .apply_merge(Request::new(proto::ApplyMergeRequest {
+                            primary: Some(proto::GlobalClusterId {
+                                shard_id: primary.shard_id as u32,
+                                local_id: primary.local_id,
+                                version: primary.version as u32,
+                            }),
+                            secondary: Some(proto::GlobalClusterId {
+                                shard_id: secondary.shard_id as u32,
+                                local_id: secondary.local_id,
+                                version: secondary.version as u32,
+                            }),
+                        }))
+                        .await
+                        .map(|resp| total_records_updated += resp.into_inner().records_updated);
+                }
+            }
+        }
+
+        let merges = result
+            .merged_clusters
+            .iter()
+            .map(|(primary, secondary)| proto::ClusterMerge {
+                primary: Some(proto::GlobalClusterId {
+                    shard_id: primary.shard_id as u32,
+                    local_id: primary.local_id,
+                    version: primary.version as u32,
+                }),
+                secondary: Some(proto::GlobalClusterId {
+                    shard_id: secondary.shard_id as u32,
+                    local_id: secondary.local_id,
+                    version: secondary.version as u32,
+                }),
+            })
+            .collect();
+
+        Ok(Response::new(proto::ReconcileResponse {
+            merges_performed: result.merges_performed as u32,
+            keys_checked: result.keys_checked as u32,
+            keys_matched: result.keys_matched as u32,
+            merges,
+        }))
     }
 }
 

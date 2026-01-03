@@ -1,7 +1,16 @@
-//! Microbenchmarks for hot paths in the unirust codebase.
+//! Microbenchmarks for internal hot paths (~1 minute).
+//!
+//! Run with:
+//! ```
+//! cargo bench --bench bench_micro
+//! ```
 //!
 //! These benchmarks target specific internal operations that are frequently
-//! called in tight loops or have significant algorithmic complexity.
+//! called in tight loops or have significant algorithmic complexity:
+//! - DSU: find, merge, get_clusters
+//! - Temporal: interval operations, coalescing
+//! - Store: record lookups
+//! - Conflicts: detection algorithms
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::collections::HashMap;
