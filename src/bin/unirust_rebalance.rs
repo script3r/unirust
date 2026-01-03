@@ -1,12 +1,11 @@
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::shard_service_client::ShardServiceClient;
 use unirust_rs::distributed::proto::{
-    ExportRecordsRequest, ImportRecordsRequest, RecordIdRangeRequest,
-    ImportRecordsChunk,
+    ExportRecordsRequest, ImportRecordsChunk, ImportRecordsRequest, RecordIdRangeRequest,
     RouterExportRecordsRequest, RouterImportRecordsRequest, RouterRecordIdRangeRequest,
 };
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -22,7 +21,8 @@ fn has_flag(flag: &str) -> bool {
     std::env::args().any(|arg| arg == flag)
 }
 
-fn normalize_addr(addr: &str) -> String {
+fn normalize_addr(addr: impl AsRef<str>) -> String {
+    let addr = addr.as_ref();
     if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
     } else {
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--shard-id is required with --router"))?
                 .parse()?;
-            let mut client = RouterServiceClient::connect(normalize_addr(&router)).await?;
+            let mut client = RouterServiceClient::connect(normalize_addr(router)).await?;
             client
                 .get_record_id_range(RouterRecordIdRangeRequest { shard_id })
                 .await?
@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
             let shard = shard_arg
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--shard is required for --range"))?;
-            let mut client = ShardServiceClient::connect(normalize_addr(&shard)).await?;
+            let mut client = ShardServiceClient::connect(normalize_addr(shard)).await?;
             client
                 .get_record_id_range(RecordIdRangeRequest {})
                 .await?
@@ -64,31 +64,27 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Shard is empty");
             }
+        } else if let Some(shard_id) = shard_id_arg.as_deref() {
+            println!(
+                "Shard {} range: {}..={} (count {})",
+                shard_id, response.min_id, response.max_id, response.record_count
+            );
+        } else if let Some(shard) = shard_arg.as_deref() {
+            println!(
+                "Shard {} range: {}..={} (count {})",
+                shard, response.min_id, response.max_id, response.record_count
+            );
         } else {
-            if let Some(shard_id) = shard_id_arg.as_deref() {
-                println!(
-                    "Shard {} range: {}..={} (count {})",
-                    shard_id, response.min_id, response.max_id, response.record_count
-                );
-            } else if let Some(shard) = shard_arg.as_deref() {
-                println!(
-                    "Shard {} range: {}..={} (count {})",
-                    shard, response.min_id, response.max_id, response.record_count
-                );
-            } else {
-                println!(
-                    "Shard range: {}..={} (count {})",
-                    response.min_id, response.max_id, response.record_count
-                );
-            }
+            println!(
+                "Shard range: {}..={} (count {})",
+                response.min_id, response.max_id, response.record_count
+            );
         }
         return Ok(());
     }
 
-    let source = parse_arg("--source")
-        .ok_or_else(|| anyhow::anyhow!("--source is required"))?;
-    let target = parse_arg("--target")
-        .ok_or_else(|| anyhow::anyhow!("--target is required"))?;
+    let source = parse_arg("--source").ok_or_else(|| anyhow::anyhow!("--source is required"))?;
+    let target = parse_arg("--target").ok_or_else(|| anyhow::anyhow!("--target is required"))?;
     let start_id: u32 = parse_arg("--start-id")
         .unwrap_or_else(|| "0".to_string())
         .parse()?;
@@ -102,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
 
     let use_router = router.is_some();
     let mut router_client = if let Some(router) = router {
-        Some(RouterServiceClient::connect(normalize_addr(&router)).await?)
+        Some(RouterServiceClient::connect(normalize_addr(router)).await?)
     } else {
         None
     };
@@ -116,8 +112,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(ShardServiceClient::connect(normalize_addr(&target)).await?)
     };
-    let source_shard_id = if use_router { Some(source.parse::<u32>()?) } else { None };
-    let target_shard_id = if use_router { Some(target.parse::<u32>()?) } else { None };
+    let source_shard_id = if use_router {
+        Some(source.parse::<u32>()?)
+    } else {
+        None
+    };
+    let target_shard_id = if use_router {
+        Some(target.parse::<u32>()?)
+    } else {
+        None
+    };
 
     let mut next_start_id = start_id;
     let mut total_imported = 0u64;
@@ -149,7 +153,14 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let mut export_stream: std::pin::Pin<
-            Box<dyn tokio_stream::Stream<Item = Result<unirust_rs::distributed::proto::ExportRecordsChunk, anyhow::Error>> + Send>,
+            Box<
+                dyn tokio_stream::Stream<
+                        Item = Result<
+                            unirust_rs::distributed::proto::ExportRecordsChunk,
+                            anyhow::Error,
+                        >,
+                    > + Send,
+            >,
         > = if let Some(client) = router_client.as_mut() {
             let shard_id = source_shard_id.expect("source shard id");
             let stream = client
@@ -184,9 +195,11 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             let count = chunk.records.len() as u64;
-            tx.send(ImportRecordsChunk { records: chunk.records })
-                .await
-                .map_err(|_| anyhow::anyhow!("import stream closed"))?;
+            tx.send(ImportRecordsChunk {
+                records: chunk.records,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("import stream closed"))?;
             total_imported += count;
             println!("Imported {} records (total {})", count, total_imported);
         }
@@ -246,10 +259,7 @@ async fn main() -> anyhow::Result<()> {
                     .imported
             };
             total_imported += imported;
-            println!(
-                "Imported {} records (total {})",
-                imported, total_imported
-            );
+            println!("Imported {} records (total {})", imported, total_imported);
 
             if !response.has_more {
                 break;

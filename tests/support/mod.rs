@@ -1,7 +1,9 @@
-use unirust_rs::distributed::{ConstraintConfig, ConstraintKind, DistributedOntologyConfig, IdentityKeyConfig};
 use unirust_rs::distributed::proto::{
     ConstraintConfig as ProtoConstraintConfig, ConstraintKind as ProtoConstraintKind,
     IdentityKeyConfig as ProtoIdentityKeyConfig, OntologyConfig,
+};
+use unirust_rs::distributed::{
+    ConstraintConfig, ConstraintKind, DistributedOntologyConfig, IdentityKeyConfig,
 };
 
 #[allow(dead_code)]

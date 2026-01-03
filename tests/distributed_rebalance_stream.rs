@@ -1,18 +1,18 @@
 use std::net::SocketAddr;
 
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
-    self, router_service_client::RouterServiceClient,
-    shard_service_client::ShardServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
-    RecordDescriptor, RecordIdentity as ProtoRecordIdentity, RecordInput,
-    RouterExportRecordsRequest, RouterImportRecordsRequest,
+    self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
+    ApplyOntologyRequest, IngestRecordsRequest, RecordDescriptor,
+    RecordIdentity as ProtoRecordIdentity, RecordInput, RouterExportRecordsRequest,
+    RouterImportRecordsRequest,
 };
 use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
 use unirust_rs::{StreamingTuning, TuningProfile};
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
 
 mod support;
 

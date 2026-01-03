@@ -4,10 +4,10 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
-    self, router_service_client::RouterServiceClient,
-    shard_service_client::ShardServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
-    RecordDescriptor, RecordIdentity as ProtoRecordIdentity, RecordInput,
-    RouterExportRecordsRequest, RouterImportRecordsRequest, RouterRecordIdRangeRequest,
+    self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
+    ApplyOntologyRequest, IngestRecordsRequest, RecordDescriptor,
+    RecordIdentity as ProtoRecordIdentity, RecordInput, RouterExportRecordsRequest,
+    RouterImportRecordsRequest, RouterRecordIdRangeRequest,
 };
 use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
 use unirust_rs::{StreamingTuning, TuningProfile};

@@ -2,8 +2,8 @@ use std::fs;
 
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::{
-    ApplyOntologyRequest, ConstraintConfig, ConstraintKind, IdentityKeyConfig, OntologyConfig,
-    IngestRecordsRequest, QueryDescriptor, QueryEntitiesRequest, RecordDescriptor,
+    ApplyOntologyRequest, ConstraintConfig, ConstraintKind, IdentityKeyConfig,
+    IngestRecordsRequest, OntologyConfig, QueryDescriptor, QueryEntitiesRequest, RecordDescriptor,
     RecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::DistributedOntologyConfig;

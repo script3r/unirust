@@ -2,28 +2,28 @@ use crate::conflicts::ConflictSummary;
 use crate::graph::GoldenDescriptor;
 use crate::model::{AttrId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
+use crate::persistence::PersistentOpenOptions;
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::temporal::Interval;
-use crate::persistence::PersistentOpenOptions;
 use crate::{PersistentStore, StoreMetrics, StreamingTuning, Unirust};
 use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{fs};
-use tokio::sync::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
-use std::pin::Pin;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRecordIdentity {
@@ -52,6 +52,7 @@ struct IngestWal {
     temp_path: PathBuf,
 }
 
+#[allow(clippy::result_large_err)]
 impl IngestWal {
     fn new(data_dir: &Path) -> Self {
         let path = data_dir.join("ingest_wal.json");
@@ -69,14 +70,13 @@ impl IngestWal {
             .collect::<Result<_, Status>>()?;
         let payload =
             serde_json::to_vec(&inputs).map_err(|err| Status::internal(err.to_string()))?;
-        let mut file = fs::File::create(&self.temp_path)
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut file =
+            fs::File::create(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
         file.write_all(&payload)
             .map_err(|err| Status::internal(err.to_string()))?;
         file.sync_all()
             .map_err(|err| Status::internal(err.to_string()))?;
-        fs::rename(&self.temp_path, &self.path)
-            .map_err(|err| Status::internal(err.to_string()))?;
+        fs::rename(&self.temp_path, &self.path).map_err(|err| Status::internal(err.to_string()))?;
         Ok(())
     }
 
@@ -129,14 +129,11 @@ impl IngestWal {
             .duration_since(UNIX_EPOCH)
             .map_err(|err| Status::internal(err.to_string()))?
             .as_secs();
-        let corrupt_path = self
-            .path
-            .with_extension(format!("json.corrupt.{}", suffix));
+        let corrupt_path = self.path.with_extension(format!("json.corrupt.{}", suffix));
         if self.path.exists() {
             if let Err(err) = fs::rename(&self.path, &corrupt_path) {
                 if self.path.exists() {
-                    fs::remove_file(&self.path)
-                        .map_err(|err| Status::internal(err.to_string()))?;
+                    fs::remove_file(&self.path).map_err(|err| Status::internal(err.to_string()))?;
                 }
                 return Err(Status::internal(err.to_string()));
             }
@@ -325,6 +322,7 @@ fn map_proto_config(config: &proto::OntologyConfig) -> DistributedOntologyConfig
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn json_from_proto_input(input: &proto::RecordInput) -> Result<JsonRecordInput, Status> {
     let identity = input
         .identity
@@ -395,18 +393,15 @@ async fn fetch_record_batch_from_url(url: &str) -> Result<proto::IngestRecordsRe
         .bytes()
         .await
         .map_err(|err| Status::unavailable(err.to_string()))?;
-    let inputs: Vec<JsonRecordInput> = serde_json::from_slice(&bytes)
-        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+    let inputs: Vec<JsonRecordInput> =
+        serde_json::from_slice(&bytes).map_err(|err| Status::invalid_argument(err.to_string()))?;
 
     let records = inputs.into_iter().map(proto_from_json_input).collect();
 
     Ok(proto::IngestRecordsRequest { records })
 }
 
-fn hash_record_to_u64(
-    config: &DistributedOntologyConfig,
-    record: &proto::RecordInput,
-) -> u64 {
+fn hash_record_to_u64(config: &DistributedOntologyConfig, record: &proto::RecordInput) -> u64 {
     let identity = record.identity.as_ref();
     let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
     for descriptor in &record.descriptors {
@@ -583,7 +578,7 @@ impl ShardBalancer {
             return;
         }
         let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % self.rebalance_every != 0 {
+        if !count.is_multiple_of(self.rebalance_every) {
             return;
         }
 
@@ -836,12 +831,8 @@ impl ShardNode {
                 .descriptors
                 .iter()
                 .map(|descriptor| proto::RecordDescriptor {
-                    attr: unirust
-                        .resolve_attr(descriptor.attr)
-                        .unwrap_or_default(),
-                    value: unirust
-                        .resolve_value(descriptor.value)
-                        .unwrap_or_default(),
+                    attr: unirust.resolve_attr(descriptor.attr).unwrap_or_default(),
+                    value: unirust.resolve_value(descriptor.value).unwrap_or_default(),
                     start: descriptor.interval.start,
                     end: descriptor.interval.end,
                 })
@@ -890,6 +881,7 @@ impl ShardNode {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, Status> {
     if requested.is_empty() {
         let timestamp = SystemTime::now()
@@ -1003,6 +995,7 @@ async fn dispatch_ingest_records(
     Ok(assignments)
 }
 
+#[allow(clippy::result_large_err)]
 fn process_ingest_batch(
     unirust: &mut Unirust,
     shard_id: u32,
@@ -1014,7 +1007,8 @@ fn process_ingest_batch(
         let update = unirust
             .stream_record_update_graph(record_input)
             .map_err(|err| Status::internal(err.to_string()))?;
-        let cluster_key = ShardNode::cluster_key_from_graph(update.assignment.cluster_id, &update.graph);
+        let cluster_key =
+            ShardNode::cluster_key_from_graph(update.assignment.cluster_id, &update.graph);
 
         assignments.push(proto::IngestAssignment {
             index: record.index,
@@ -1105,12 +1099,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let start = Instant::now();
         let records = request.into_inner().records;
         let record_count = records.len();
-        let assignments = dispatch_ingest_records(
-            &self.ingest_txs,
-            self.ingest_wal.as_deref(),
-            records,
-        )
-        .await?;
+        let assignments =
+            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?;
 
         self.metrics
             .record_ingest(record_count, start.elapsed().as_micros() as u64);
@@ -1308,7 +1298,6 @@ impl proto::shard_service_server::ShardService for ShardNode {
         Ok(Response::new(response))
     }
 
-
     async fn checkpoint(
         &self,
         request: Request<proto::CheckpointRequest>,
@@ -1427,8 +1416,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
             loop {
                 let (records, has_more, next_start_id) = {
                     let unirust_guard = unirust.read().await;
-                    let mut records =
-                        unirust_guard.records_in_id_range(RecordId(start_id), RecordId(end_id), limit + 1);
+                    let mut records = unirust_guard.records_in_id_range(
+                        RecordId(start_id),
+                        RecordId(end_id),
+                        limit + 1,
+                    );
                     let has_more = records.len() > limit;
                     if has_more {
                         records.truncate(limit);
@@ -1585,7 +1577,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let response = proto::ListConflictsResponse {
             conflicts: summaries
                 .into_iter()
-                .map(|summary| to_proto_conflict_summary(summary))
+                .map(to_proto_conflict_summary)
                 .collect(),
         };
         Ok(Response::new(response))
@@ -1704,6 +1696,7 @@ impl RouterNode {
         Self::connect_with_version(shard_addrs, ontology_config, config_version).await
     }
 
+    #[allow(clippy::result_large_err)]
     fn shard_client(
         &self,
         shard_id: u32,
@@ -2138,9 +2131,7 @@ impl proto::router_service_server::RouterService for RouterNode {
                             .await
                             .is_err()
                         {
-                            let _ = err_tx.send(Err(Status::unavailable(
-                                "import channel closed",
-                            )));
+                            let _ = err_tx.send(Err(Status::unavailable("import channel closed")));
                             return;
                         }
                     }
@@ -2166,7 +2157,6 @@ impl proto::router_service_server::RouterService for RouterNode {
             Err(_) => Err(Status::unavailable("import stream dropped")),
         }
     }
-
 
     async fn checkpoint(
         &self,

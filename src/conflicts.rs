@@ -315,8 +315,7 @@ impl ConflictDetector {
         }
 
         let mut observations = Vec::new();
-        let target: std::collections::HashSet<ClusterId> =
-            cluster_ids.iter().copied().collect();
+        let target: std::collections::HashSet<ClusterId> = cluster_ids.iter().copied().collect();
 
         for cluster in &clusters.clusters {
             if !target.contains(&cluster.id) {
@@ -326,11 +325,8 @@ impl ConflictDetector {
             for conflict in direct_conflicts {
                 observations.push(Observation::direct_conflict(conflict));
             }
-            let violations = Self::detect_constraint_violations_for_cluster(
-                store,
-                cluster,
-                ontology,
-            )?;
+            let violations =
+                Self::detect_constraint_violations_for_cluster(store, cluster, ontology)?;
             for violation in violations {
                 let conflict = IndirectConflict::new(
                     "constraint_violation".to_string(),
@@ -449,8 +445,7 @@ impl ConflictDetector {
             }
             for record_id in &cluster.records {
                 if let Some(record) = store.get_record(*record_id) {
-                    let mut descriptors_by_attr: HashMap<AttrId, Vec<Descriptor>> =
-                        HashMap::new();
+                    let mut descriptors_by_attr: HashMap<AttrId, Vec<Descriptor>> = HashMap::new();
                     for descriptor in &record.descriptors {
                         descriptors_by_attr
                             .entry(descriptor.attr)
@@ -785,9 +780,8 @@ impl ConflictDetector {
                         if !target.contains(&cluster.id) {
                             continue;
                         }
-                        let interval =
-                            Self::interval_for_key_values(store, cluster, &key_values)
-                                .unwrap_or_else(|| Interval::new(0, 1).unwrap());
+                        let interval = Self::interval_for_key_values(store, cluster, &key_values)
+                            .unwrap_or_else(|| Interval::new(0, 1).unwrap());
                         let conflict = IndirectConflict::new(
                             "indirect".to_string(),
                             "strong_id_conflict".to_string(),

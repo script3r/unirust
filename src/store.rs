@@ -166,8 +166,12 @@ pub trait RecordStore: Send + Sync {
     fn is_empty(&self) -> bool;
 
     /// Get records in an ID range [start, end), limited to max_results.
-    fn records_in_id_range(&self, start: RecordId, end: RecordId, max_results: usize)
-        -> Vec<Record>;
+    fn records_in_id_range(
+        &self,
+        start: RecordId,
+        end: RecordId,
+        max_results: usize,
+    ) -> Vec<Record>;
 
     /// Get min/max record IDs if any records exist.
     fn record_id_bounds(&self) -> Option<(RecordId, RecordId)>;

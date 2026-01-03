@@ -4,10 +4,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
-    self, router_service_client::RouterServiceClient,
-    shard_service_client::ShardServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
-    MetricsRequest, QueryDescriptor, QueryEntitiesRequest, RecordDescriptor,
-    RecordIdentity as ProtoRecordIdentity, RecordInput,
+    self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
+    ApplyOntologyRequest, IngestRecordsRequest, MetricsRequest, QueryDescriptor,
+    QueryEntitiesRequest, RecordDescriptor, RecordIdentity as ProtoRecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
 use unirust_rs::{StreamingTuning, TuningProfile};
@@ -126,19 +125,13 @@ async fn metrics_report_requests() -> anyhow::Result<()> {
         })
         .await?;
 
-    let router_metrics = router
-        .get_metrics(MetricsRequest {})
-        .await?
-        .into_inner();
+    let router_metrics = router.get_metrics(MetricsRequest {}).await?.into_inner();
     assert!(router_metrics.ingest_requests >= 1);
     assert!(router_metrics.query_requests >= 1);
     assert_eq!(router_metrics.shards_reporting, 1);
 
     let mut shard = ShardServiceClient::connect(format!("http://{}", shard_addr)).await?;
-    let shard_metrics = shard
-        .get_metrics(MetricsRequest {})
-        .await?
-        .into_inner();
+    let shard_metrics = shard.get_metrics(MetricsRequest {}).await?.into_inner();
     assert!(shard_metrics.ingest_requests >= 1);
     assert!(shard_metrics.query_requests >= 1);
     assert_eq!(shard_metrics.shards_reporting, 1);

@@ -4,9 +4,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
-    self, shard_service_client::ShardServiceClient, ApplyOntologyRequest,
-    ExportRecordsRequest, ImportRecordsRequest, IngestRecordsRequest, RecordDescriptor,
-    RecordIdRangeRequest, RecordIdentity as ProtoRecordIdentity, RecordInput,
+    self, shard_service_client::ShardServiceClient, ApplyOntologyRequest, ExportRecordsRequest,
+    ImportRecordsRequest, IngestRecordsRequest, RecordDescriptor, RecordIdRangeRequest,
+    RecordIdentity as ProtoRecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::{DistributedOntologyConfig, ShardNode};
 use unirust_rs::{StreamingTuning, TuningProfile};
@@ -146,7 +146,9 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
 
     assert_eq!(all_records.len(), 3);
     for record_id in &record_ids {
-        assert!(all_records.iter().any(|record| record.record_id == *record_id));
+        assert!(all_records
+            .iter()
+            .any(|record| record.record_id == *record_id));
     }
 
     shard1
@@ -169,8 +171,11 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
         })
         .await?
         .into_inner();
-    let exported_ids: Vec<u32> =
-        exported.records.iter().map(|record| record.record_id).collect();
+    let exported_ids: Vec<u32> = exported
+        .records
+        .iter()
+        .map(|record| record.record_id)
+        .collect();
     for record_id in record_ids {
         assert!(exported_ids.contains(&record_id));
     }

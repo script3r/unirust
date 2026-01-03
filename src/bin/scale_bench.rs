@@ -1,9 +1,9 @@
 use std::time::Instant;
+use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
+use unirust_rs::Store;
 use unirust_rs::{
     Descriptor, Interval, Record, RecordId, RecordIdentity, StreamingTuning, TuningProfile, Unirust,
 };
-use unirust_rs::Store;
-use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
 
 fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)
@@ -109,5 +109,8 @@ fn main() {
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let throughput = (total as f64) / secs;
-    println!("scale_bench: {total} records in {:.3}s ({:.2} rec/s)", secs, throughput);
+    println!(
+        "scale_bench: {total} records in {:.3}s ({:.2} rec/s)",
+        secs, throughput
+    );
 }

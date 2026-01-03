@@ -1,9 +1,11 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 use std::hint::black_box;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use unirust_rs::{StreamingTuning, TuningProfile, Unirust};
 use unirust_rs::Store;
+use unirust_rs::{StreamingTuning, TuningProfile, Unirust};
 
 #[path = "../src/test_support.rs"]
 mod test_support;
@@ -43,7 +45,8 @@ fn benchmark_scale_ingest(c: &mut Criterion) {
         &(total, batch, overlap),
         |b, (total, batch, overlap)| {
             b.iter_custom(|_iterations| {
-                let cache = SCALE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+                let cache =
+                    SCALE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
                 let key = format!("{}_{}_{}", total, batch, overlap);
                 if let Some(duration) = cache.lock().unwrap().get(&key).copied() {
                     return duration;
@@ -63,13 +66,7 @@ fn benchmark_scale_ingest(c: &mut Criterion) {
                 while offset <= *total {
                     let remaining = total - offset + 1;
                     let count = (*batch).min(remaining);
-                    let records = generate_batch(
-                        unirust.store_mut(),
-                        offset,
-                        count,
-                        *overlap,
-                        42,
-                    );
+                    let records = generate_batch(unirust.store_mut(), offset, count, *overlap, 42);
                     black_box(unirust.stream_records(records).unwrap());
                     offset += count;
                 }

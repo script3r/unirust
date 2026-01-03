@@ -26,8 +26,8 @@ pub mod utils;
 pub use config::{StreamingTuning, TuningProfile};
 pub use model::{ClusterId, Descriptor, Record, RecordId, RecordIdentity};
 pub use ontology::Ontology;
-pub use query::{QueryConflict, QueryDescriptor, QueryDescriptorOverlap, QueryMatch, QueryOutcome};
 pub use persistence::PersistentStore;
+pub use query::{QueryConflict, QueryDescriptor, QueryDescriptorOverlap, QueryMatch, QueryOutcome};
 pub use store::{RecordStore, Store, StoreMetrics};
 pub use temporal::Interval;
 
@@ -470,11 +470,8 @@ impl Unirust {
         if cache_guard.is_none() {
             let clusters = self.build_clusters()?;
             let golden = query::build_golden_cache(self.store.as_ref(), &clusters);
-            let cluster_keys = query::build_cluster_key_cache(
-                self.store.as_ref(),
-                &clusters,
-                &self.ontology,
-            );
+            let cluster_keys =
+                query::build_cluster_key_cache(self.store.as_ref(), &clusters, &self.ontology);
             *cache_guard = Some(QueryCache {
                 clusters,
                 golden,

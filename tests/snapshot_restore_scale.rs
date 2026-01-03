@@ -26,9 +26,7 @@ fn snapshot_restore_preserves_scale_state() -> anyhow::Result<()> {
     assert!(restored
         .get_record_id_by_identity(&sample.identity)
         .is_some());
-    assert!(restored
-        .resolve_attr(sample.descriptors[0].attr)
-        .is_some());
+    assert!(restored.resolve_attr(sample.descriptors[0].attr).is_some());
 
     Ok(())
 }

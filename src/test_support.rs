@@ -184,7 +184,10 @@ pub fn generate_batch(
 #[allow(dead_code)]
 pub fn default_ontology(schema: &TestSchema) -> Ontology {
     let mut ontology = Ontology::new();
-    let identity_key = IdentityKey::new(vec![schema.name_attr, schema.email_attr], "name_email".to_string());
+    let identity_key = IdentityKey::new(
+        vec![schema.name_attr, schema.email_attr],
+        "name_email".to_string(),
+    );
     ontology.add_identity_key(identity_key);
     let ssn_strong_id = StrongIdentifier::new(schema.ssn_attr, "ssn".to_string());
     ontology.add_strong_identifier(ssn_strong_id);

@@ -6,8 +6,8 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
-    self, router_service_client::RouterServiceClient, ApplyOntologyRequest,
-    IngestRecordsRequest, RecordDescriptor, RecordIdentity, RecordInput,
+    self, router_service_client::RouterServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
+    RecordDescriptor, RecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::{
     DistributedOntologyConfig, IdentityKeyConfig, RouterNode, ShardNode,
@@ -250,10 +250,7 @@ async fn distributed_conflict_presets_match_local() -> anyhow::Result<()> {
         .await?;
 
     for preset in presets {
-        client
-            .reset(proto::Empty {})
-            .await
-            .expect("reset");
+        client.reset(proto::Empty {}).await.expect("reset");
 
         let mut local_store = unirust_rs::Store::new();
         let local_ontology = config.clone().build_ontology(&mut local_store);

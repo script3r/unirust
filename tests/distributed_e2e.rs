@@ -5,8 +5,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
-    RecordDescriptor, RecordIdentity as ProtoRecordIdentity, RecordInput,
-    StatsRequest,
+    RecordDescriptor, RecordIdentity as ProtoRecordIdentity, RecordInput, StatsRequest,
 };
 use unirust_rs::distributed::{
     hash_record_to_shard, DistributedOntologyConfig, RouterNode, ShardNode,

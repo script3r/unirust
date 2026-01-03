@@ -5,7 +5,9 @@ use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use unirust_rs::distributed::proto::{self, shard_service_client::ShardServiceClient, StatsRequest};
+use unirust_rs::distributed::proto::{
+    self, shard_service_client::ShardServiceClient, StatsRequest,
+};
 use unirust_rs::distributed::ShardNode;
 use unirust_rs::{StreamingTuning, TuningProfile};
 
@@ -55,10 +57,7 @@ async fn shard_replays_ingest_wal_on_start() -> anyhow::Result<()> {
 
     let (addr, handle) = spawn_shard_with_data_dir(0, dir.path().to_path_buf()).await?;
     let mut client = ShardServiceClient::connect(format!("http://{}", addr)).await?;
-    let stats = client
-        .get_stats(StatsRequest {})
-        .await?
-        .into_inner();
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
 
     assert_eq!(stats.record_count, 1);
     assert!(!wal_path.exists());

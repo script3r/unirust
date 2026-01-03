@@ -2,9 +2,9 @@ use std::fs;
 
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::{
-    ApplyOntologyRequest, ConstraintConfig, ConstraintKind, IdentityKeyConfig, OntologyConfig,
-    IngestRecordsRequest, QueryDescriptor, QueryEntitiesRequest, RecordDescriptor, RecordIdentity,
-    RecordInput,
+    ApplyOntologyRequest, ConstraintConfig, ConstraintKind, IdentityKeyConfig,
+    IngestRecordsRequest, OntologyConfig, QueryDescriptor, QueryEntitiesRequest, RecordDescriptor,
+    RecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::DistributedOntologyConfig;
 
@@ -21,8 +21,8 @@ fn parse_arg(flag: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let router = parse_arg("--router").unwrap_or_else(|| "http://127.0.0.1:50060".to_string());
-    let ontology_path = parse_arg("--ontology")
-        .ok_or_else(|| anyhow::anyhow!("--ontology is required"))?;
+    let ontology_path =
+        parse_arg("--ontology").ok_or_else(|| anyhow::anyhow!("--ontology is required"))?;
     let mut client = RouterServiceClient::connect(router).await?;
 
     let ontology = load_ontology(ontology_path)?;
@@ -104,10 +104,7 @@ async fn main() -> anyhow::Result<()> {
         start: 0,
         end: 10,
     };
-    let conflict_response = client
-        .query_entities(conflict_query)
-        .await?
-        .into_inner();
+    let conflict_response = client.query_entities(conflict_query).await?.into_inner();
     println!("Conflict query response: {:?}", conflict_response);
 
     Ok(())

@@ -52,7 +52,10 @@ impl QuerySelectivityStats {
             })
             .collect::<Vec<_>>();
         ordered.sort_by_key(|(estimate, idx, _)| (*estimate, *idx));
-        ordered.into_iter().map(|(_, _, descriptor)| descriptor).collect()
+        ordered
+            .into_iter()
+            .map(|(_, _, descriptor)| descriptor)
+            .collect()
     }
 
     pub fn record(&mut self, descriptor: QueryDescriptor, matches: usize) {
@@ -155,8 +158,8 @@ pub fn query_master_entities_with_cache(
             std::collections::HashMap::new();
 
         for (record_id, record_interval) in matches {
-            if let Some(&cluster_id) = record_to_cluster.get(&record_id) {
-                if let Some(overlap) = crate::temporal::intersect(&record_interval, &interval) {
+            if let Some(&cluster_id) = record_to_cluster.get(record_id) {
+                if let Some(overlap) = crate::temporal::intersect(record_interval, &interval) {
                     next.entry(cluster_id).or_default().push(overlap);
                 }
             }

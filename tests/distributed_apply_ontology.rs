@@ -5,8 +5,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
-    QueryDescriptor, QueryEntitiesRequest, RecordDescriptor,
-    RecordIdentity as ProtoRecordIdentity, RecordInput,
+    QueryDescriptor, QueryEntitiesRequest, RecordDescriptor, RecordIdentity as ProtoRecordIdentity,
+    RecordInput,
 };
 use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
 use unirust_rs::{StreamingTuning, TuningProfile};

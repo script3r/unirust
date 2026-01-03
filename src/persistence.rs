@@ -3,8 +3,8 @@ use crate::store::{RecordStore, Store, StoreMetrics};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
-    checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, Direction,
-    IteratorMode, Options, SliceTransform, WriteBatch, DB, DBCompressionType,
+    checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
+    Direction, IteratorMode, Options, SliceTransform, WriteBatch, DB,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -69,15 +69,9 @@ pub struct PersistentStore {
     conflict_summary_count: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PersistentOpenOptions {
     pub repair: bool,
-}
-
-impl Default for PersistentOpenOptions {
-    fn default() -> Self {
-        Self { repair: false }
-    }
 }
 
 impl PersistentStore {
@@ -109,8 +103,7 @@ impl PersistentStore {
             inner: store,
             db,
             cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
-                    .expect("cache capacity"),
+                std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("cache capacity"),
             )),
             persisted_attr_id,
             persisted_value_id,
@@ -165,12 +158,16 @@ impl PersistentStore {
         self.persisted_attr_id = next_attr;
         self.persisted_value_id = next_value;
         batch.put_cf(
-            self.db.cf_handle(CF_METADATA).ok_or_else(|| anyhow!("missing metadata column family"))?,
+            self.db
+                .cf_handle(CF_METADATA)
+                .ok_or_else(|| anyhow!("missing metadata column family"))?,
             KEY_NEXT_ATTR_ID,
             bincode::serialize(&next_attr)?,
         );
         batch.put_cf(
-            self.db.cf_handle(CF_METADATA).ok_or_else(|| anyhow!("missing metadata column family"))?,
+            self.db
+                .cf_handle(CF_METADATA)
+                .ok_or_else(|| anyhow!("missing metadata column family"))?,
             KEY_NEXT_VALUE_ID,
             bincode::serialize(&next_value)?,
         );
@@ -366,7 +363,11 @@ impl RecordStore for PersistentStore {
         };
         self.db
             .iterator_cf(records_cf, IteratorMode::Start)
-            .filter_map(|entry| entry.ok().and_then(|(_, value)| bincode::deserialize(&value).ok()))
+            .filter_map(|entry| {
+                entry
+                    .ok()
+                    .and_then(|(_, value)| bincode::deserialize(&value).ok())
+            })
             .collect()
     }
 
@@ -387,11 +388,13 @@ impl RecordStore for PersistentStore {
             Some(cf) => cf,
             None => return,
         };
-        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
-            if let Ok((_key, value)) = entry {
-                if let Ok(record) = bincode::deserialize(&value) {
-                    f(record);
-                }
+        for (_key, value) in self
+            .db
+            .iterator_cf(records_cf, IteratorMode::Start)
+            .flatten()
+        {
+            if let Ok(record) = bincode::deserialize(&value) {
+                f(record);
             }
         }
     }
@@ -402,10 +405,9 @@ impl RecordStore for PersistentStore {
             None => return Vec::new(),
         };
         let prefix = encode_string_prefix(entity_type);
-        let iter = self.db.iterator_cf(
-            cf,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
         let mut seen = std::collections::HashSet::new();
         let mut records = Vec::new();
         for entry in iter {
@@ -433,10 +435,9 @@ impl RecordStore for PersistentStore {
             None => return Vec::new(),
         };
         let prefix = encode_string_prefix(perspective);
-        let iter = self.db.iterator_cf(
-            cf,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
         let mut seen = std::collections::HashSet::new();
         let mut records = Vec::new();
         for entry in iter {
@@ -464,10 +465,9 @@ impl RecordStore for PersistentStore {
             None => return Vec::new(),
         };
         let prefix = encode_attr_prefix(attr.0);
-        let iter = self.db.iterator_cf(
-            cf,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
         let mut seen = std::collections::HashSet::new();
         let mut records = Vec::new();
         for entry in iter {
@@ -497,10 +497,9 @@ impl RecordStore for PersistentStore {
         let mut candidates = std::collections::HashSet::new();
         for bucket in buckets_for_interval(interval.start, interval.end) {
             let prefix = bucket.to_be_bytes();
-            let iter = self.db.iterator_cf(
-                cf,
-                IteratorMode::From(&prefix, Direction::Forward),
-            );
+            let iter = self
+                .db
+                .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
             for entry in iter {
                 let (key, _) = match entry {
                     Ok(pair) => pair,
@@ -538,10 +537,9 @@ impl RecordStore for PersistentStore {
             None => return Vec::new(),
         };
         let prefix = encode_attr_value_prefix(attr.0, value.0);
-        let iter = self.db.iterator_cf(
-            cf,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
         let mut matches = Vec::new();
         for entry in iter {
             let (key, _) = match entry {
@@ -652,7 +650,9 @@ impl RecordStore for PersistentStore {
         let existing = self.db.get_cf(cf, key).ok().flatten();
         let existing_len = existing
             .as_ref()
-            .and_then(|bytes| bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(bytes).ok())
+            .and_then(|bytes| {
+                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(bytes).ok()
+            })
             .map(|summaries| summaries.len())
             .unwrap_or(0);
         let new_len = summaries.len();
@@ -672,16 +672,14 @@ impl RecordStore for PersistentStore {
     fn load_conflict_summaries(&self) -> Option<Vec<crate::conflicts::ConflictSummary>> {
         let cf = self.db.cf_handle(CF_CONFLICT_SUMMARIES)?;
         let mut summaries = Vec::new();
-        for entry in self.db.iterator_cf(cf, IteratorMode::Start) {
-            if let Ok((key, value)) = entry {
-                if key.as_ref() == b"latest" {
-                    continue;
-                }
-                if let Ok(mut parsed) =
-                    bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&value)
-                {
-                    summaries.append(&mut parsed);
-                }
+        for (key, value) in self.db.iterator_cf(cf, IteratorMode::Start).flatten() {
+            if key.as_ref() == b"latest" {
+                continue;
+            }
+            if let Ok(mut parsed) =
+                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&value)
+            {
+                summaries.append(&mut parsed);
             }
         }
         if summaries.is_empty() {
@@ -722,11 +720,11 @@ impl RecordStore for PersistentStore {
         };
         let mut records = Vec::new();
         let start_key = start.0.to_be_bytes();
-        let mut iter = self.db.iterator_cf(
+        let iter = self.db.iterator_cf(
             records_cf,
             IteratorMode::From(&start_key, Direction::Forward),
         );
-        while let Some(entry) = iter.next() {
+        for entry in iter {
             let (key, value) = match entry {
                 Ok(pair) => pair,
                 Err(_) => break,
@@ -832,11 +830,12 @@ fn load_tuning() -> RocksDbTuning {
     let write_buffer_mb = env_u64(ENV_WRITE_BUFFER_MB, DEFAULT_WRITE_BUFFER_MB).max(8);
     let target_file_mb = env_u64(ENV_TARGET_FILE_MB, DEFAULT_TARGET_FILE_MB).max(8);
     let level_base_mb = env_u64(ENV_LEVEL_BASE_MB, DEFAULT_LEVEL_BASE_MB).max(64);
-    let max_write_buffers =
-        env_i32(ENV_MAX_WRITE_BUFFERS, DEFAULT_MAX_WRITE_BUFFERS).max(1);
+    let max_write_buffers = env_i32(ENV_MAX_WRITE_BUFFERS, DEFAULT_MAX_WRITE_BUFFERS).max(1);
     let bloom_bits_per_key = env_f64(ENV_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_BITS_PER_KEY);
-    let memtable_prefix_bloom_ratio =
-        env_f64(ENV_MEMTABLE_PREFIX_BLOOM_RATIO, DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO);
+    let memtable_prefix_bloom_ratio = env_f64(
+        ENV_MEMTABLE_PREFIX_BLOOM_RATIO,
+        DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO,
+    );
     let rate_limit_mbps = env_u64(ENV_RATE_LIMIT_MBPS, 0) as i64;
 
     RocksDbTuning {
@@ -893,13 +892,17 @@ fn build_base_options(tuning: &RocksDbTuning) -> Options {
     options.set_compression_type(DBCompressionType::Zstd);
     if tuning.rate_limit_bytes_per_sec > 0 {
         options.set_ratelimiter(tuning.rate_limit_bytes_per_sec, 100_000, 10);
-        options.set_bytes_per_sync(1 * 1024 * 1024);
-        options.set_wal_bytes_per_sync(1 * 1024 * 1024);
+        options.set_bytes_per_sync(1024 * 1024);
+        options.set_wal_bytes_per_sync(1024 * 1024);
     }
     options
 }
 
-fn build_block_options(cache: &Cache, bloom_bits_per_key: f64, with_filter: bool) -> BlockBasedOptions {
+fn build_block_options(
+    cache: &Cache,
+    bloom_bits_per_key: f64,
+    with_filter: bool,
+) -> BlockBasedOptions {
     let mut block_opts = BlockBasedOptions::default();
     block_opts.set_block_cache(cache);
     if with_filter {
@@ -943,9 +946,18 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
     let temporal_prefix = SliceTransform::create_fixed_prefix(8);
 
     let cfs = vec![
-        ColumnFamilyDescriptor::new(CF_RECORDS, build_cf_options(&base, &data_block_opts, None, None)),
-        ColumnFamilyDescriptor::new(CF_METADATA, build_cf_options(&base, &data_block_opts, None, None)),
-        ColumnFamilyDescriptor::new(CF_INTERNER, build_cf_options(&base, &data_block_opts, None, None)),
+        ColumnFamilyDescriptor::new(
+            CF_RECORDS,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_METADATA,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_INTERNER,
+            build_cf_options(&base, &data_block_opts, None, None),
+        ),
         ColumnFamilyDescriptor::new(
             CF_INDEX_ATTR_VALUE,
             build_cf_options(
@@ -988,13 +1000,7 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
     Ok(DB::open_cf_descriptors(&base, path, cfs)?)
 }
 
-fn encode_attr_value_index(
-    attr: u32,
-    value: u32,
-    start: i64,
-    end: i64,
-    record_id: u32,
-) -> Vec<u8> {
+fn encode_attr_value_index(attr: u32, value: u32, start: i64, end: i64, record_id: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + 4 + 8 + 8 + 4);
     key.extend_from_slice(&attr.to_be_bytes());
     key.extend_from_slice(&value.to_be_bytes());
@@ -1130,7 +1136,6 @@ impl PersistentStore {
         save_metadata(&self.db, KEY_INDEX_VERSION, INDEX_FORMAT_VERSION)?;
         Ok(())
     }
-
 }
 
 fn save_metadata<T: serde::Serialize>(db: &DB, key: &[u8], value: T) -> Result<()> {
@@ -1232,7 +1237,8 @@ fn ensure_interner_reverse_index(db: &DB, interner_cf: &rocksdb::ColumnFamily) -
         }
         let string = String::from_utf8(value.to_vec())?;
         let id = u32::from_be_bytes([key[1], key[2], key[3], key[4]]);
-        let lookup_key = encode_interner_lookup_key(if prefix == b'a' { b'A' } else { b'V' }, &string);
+        let lookup_key =
+            encode_interner_lookup_key(if prefix == b'a' { b'A' } else { b'V' }, &string);
         batch.put_cf(interner_cf, lookup_key, id.to_be_bytes());
         pending += 1;
         if pending >= 10_000 {
@@ -1398,12 +1404,12 @@ fn remove_metadata_key(db: &DB, key: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Descriptor, RecordIdentity};
-    use crate::ontology::{IdentityKey, Ontology, StrongIdentifier};
-    use crate::temporal::Interval;
     use crate::distributed::{DistributedOntologyConfig, IdentityKeyConfig};
     use crate::linker::build_clusters;
+    use crate::model::{Descriptor, RecordIdentity};
+    use crate::ontology::{IdentityKey, Ontology, StrongIdentifier};
     use crate::query::{query_master_entities, QueryDescriptor, QueryOutcome};
+    use crate::temporal::Interval;
     use crate::{StreamingTuning, Unirust};
     use tempfile::tempdir;
 
@@ -1489,11 +1495,8 @@ mod tests {
         ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
         ontology.add_strong_identifier(StrongIdentifier::new(email_attr, "email".to_string()));
 
-        let mut unirust = Unirust::with_store_and_tuning(
-            ontology,
-            store,
-            StreamingTuning::default(),
-        );
+        let mut unirust =
+            Unirust::with_store_and_tuning(ontology, store, StreamingTuning::default());
 
         let record_a = Record::new(
             RecordId(0),
@@ -1525,11 +1528,7 @@ mod tests {
         ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
         ontology.add_strong_identifier(StrongIdentifier::new(email_attr, "email".to_string()));
 
-        let unirust = Unirust::with_store_and_tuning(
-            ontology,
-            store,
-            StreamingTuning::default(),
-        );
+        let unirust = Unirust::with_store_and_tuning(ontology, store, StreamingTuning::default());
         let clusters = unirust.build_clusters().unwrap();
         let observations = unirust.detect_conflicts(&clusters).unwrap();
         assert_eq!(observations.len(), conflict_count);
@@ -1542,9 +1541,7 @@ mod tests {
 
         let mut store = PersistentStore::open(path).unwrap();
         let email_attr = store.interner_mut().intern_attr("email");
-        let email_value = store
-            .interner_mut()
-            .intern_value("alice@example.com");
+        let email_value = store.interner_mut().intern_value("alice@example.com");
 
         let mut ontology = Ontology::new();
         ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
@@ -1580,9 +1577,7 @@ mod tests {
 
         let mut store = PersistentStore::open(path).unwrap();
         let email_attr = store.interner_mut().intern_attr("email");
-        let email_value = store
-            .interner_mut()
-            .intern_value("alice@example.com");
+        let email_value = store.interner_mut().intern_value("alice@example.com");
         let mut ontology = Ontology::new();
         ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
 

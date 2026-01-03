@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
+use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
+use unirust_rs::RecordStore;
 use unirust_rs::{
     Descriptor, Interval, PersistentStore, Record, RecordId, RecordIdentity, StreamingTuning,
     TuningProfile, Unirust,
 };
-use unirust_rs::ontology::{IdentityKey, Ontology, StrongIdentifier};
-use unirust_rs::RecordStore;
 
 fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)
@@ -112,12 +112,7 @@ fn main() {
             let ssn_value = if id % 5 == 0 {
                 shared_ssn
             } else {
-                let ssn = format!(
-                    "{:03}-{:02}-{:04}",
-                    id % 1000,
-                    (id / 10) % 100,
-                    id % 10000
-                );
+                let ssn = format!("{:03}-{:02}-{:04}", id % 1000, (id / 10) % 100, id % 10000);
                 unirust.store_mut().intern_value(&ssn)
             };
 

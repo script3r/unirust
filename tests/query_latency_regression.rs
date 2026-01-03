@@ -4,8 +4,8 @@ use std::time::Duration;
 mod test_support;
 
 use test_support::{default_ontology, generate_dataset};
-use unirust_rs::{QueryDescriptor, Store, Unirust};
 use unirust_rs::temporal::Interval;
+use unirust_rs::{QueryDescriptor, Store, Unirust};
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)

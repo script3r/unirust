@@ -166,7 +166,8 @@ fn benchmark_entity_resolution_sharded(c: &mut Criterion) {
                     }
 
                     let mut base_store = Store::new();
-                    let dataset = generate_dataset(&mut base_store, *entity_count, *overlap_prob, 42);
+                    let dataset =
+                        generate_dataset(&mut base_store, *entity_count, *overlap_prob, 42);
                     let ontology = default_ontology(&dataset.schema);
                     let records = dataset.records;
                     let mut engine = ShardedStreamEngine::new(ontology, *shard_count).unwrap();

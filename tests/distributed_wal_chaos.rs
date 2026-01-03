@@ -5,7 +5,9 @@ use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use unirust_rs::distributed::proto::{self, shard_service_client::ShardServiceClient, StatsRequest};
+use unirust_rs::distributed::proto::{
+    self, shard_service_client::ShardServiceClient, StatsRequest,
+};
 use unirust_rs::distributed::ShardNode;
 use unirust_rs::{
     Descriptor, Interval, PersistentStore, Record, RecordId, RecordIdentity, RecordStore,
@@ -112,10 +114,7 @@ async fn wal_replay_skips_duplicate_records() -> anyhow::Result<()> {
 
     let (addr, handle) = spawn_shard_with_data_dir(0, data_dir).await?;
     let mut client = ShardServiceClient::connect(format!("http://{}", addr)).await?;
-    let stats = client
-        .get_stats(StatsRequest {})
-        .await?
-        .into_inner();
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
 
     assert_eq!(stats.record_count, 2);
     assert!(!wal_path.exists());
@@ -135,10 +134,7 @@ async fn wal_replay_quarantines_corrupt_file() -> anyhow::Result<()> {
 
     let (addr, handle) = spawn_shard_with_data_dir(0, data_dir.clone()).await?;
     let mut client = ShardServiceClient::connect(format!("http://{}", addr)).await?;
-    let stats = client
-        .get_stats(StatsRequest {})
-        .await?
-        .into_inner();
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
 
     assert_eq!(stats.record_count, 0);
     assert!(!wal_path.exists());

@@ -1,12 +1,10 @@
-use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Duration;
 use tempfile::TempDir;
-use unirust_rs::{QueryDescriptor, StreamingTuning, TuningProfile, Unirust};
-use unirust_rs::{PersistentStore, Store};
 use unirust_rs::temporal::Interval;
+use unirust_rs::{PersistentStore, Store};
+use unirust_rs::{QueryDescriptor, StreamingTuning, TuningProfile, Unirust};
 
 #[path = "../src/test_support.rs"]
 mod test_support;
@@ -51,12 +49,7 @@ fn bench_ingest_smoke(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let mut store = store.clone();
-                    let dataset = generate_dataset(
-                        &mut store,
-                        *graph_count,
-                        *overlap_prob,
-                        43,
-                    );
+                    let dataset = generate_dataset(&mut store, *graph_count, *overlap_prob, 43);
                     (store, ontology.clone(), dataset.records)
                 },
                 |(store, ontology, records)| {
@@ -122,8 +115,7 @@ fn bench_ingest_persistent_smoke(c: &mut Criterion) {
             || {
                 let temp = TempDir::new().expect("temp dir");
                 let mut store = PersistentStore::open(temp.path()).expect("open store");
-                let dataset =
-                    generate_dataset(store.inner_mut(), entity_count, overlap_prob, 42);
+                let dataset = generate_dataset(store.inner_mut(), entity_count, overlap_prob, 42);
                 let ontology = default_ontology(&dataset.schema);
                 (temp, store, ontology, dataset.records)
             },
