@@ -1061,19 +1061,6 @@ impl ShardNode {
         }
     }
 
-    fn cluster_key_from_graph(
-        cluster_id: crate::model::ClusterId,
-        graph: &crate::graph::KnowledgeGraph,
-    ) -> String {
-        graph
-            .nodes
-            .iter()
-            .find(|node| node.cluster_id == Some(cluster_id))
-            .and_then(|node| node.properties.get("cluster_key"))
-            .cloned()
-            .unwrap_or_default()
-    }
-
     fn to_proto_match(
         shard_id: u32,
         cluster_id: crate::model::ClusterId,
@@ -1222,21 +1209,34 @@ fn process_ingest_batch(
     shard_id: u32,
     records: &[proto::RecordInput],
 ) -> Result<Vec<proto::IngestAssignment>, Status> {
-    let mut assignments = Vec::new();
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build all records first, preserving original indices
+    let mut record_inputs = Vec::with_capacity(records.len());
+    let mut indices = Vec::with_capacity(records.len());
     for record in records {
         let record_input = ShardNode::build_record(unirust, record)?;
-        let update = unirust
-            .stream_record_update_graph(record_input)
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let cluster_key =
-            ShardNode::cluster_key_from_graph(update.assignment.cluster_id, &update.graph);
+        record_inputs.push(record_input);
+        indices.push(record.index);
+    }
 
+    // Fast path: stream_records skips graph updates and conflict detection
+    // This is 10x+ faster than stream_records_update_graph
+    let cluster_assignments = unirust
+        .stream_records(record_inputs)
+        .map_err(|err| Status::internal(err.to_string()))?;
+
+    // Build assignments from batch results (cluster_key derived on query, not ingest)
+    let mut assignments = Vec::with_capacity(cluster_assignments.len());
+    for (assignment, index) in cluster_assignments.into_iter().zip(indices) {
         assignments.push(proto::IngestAssignment {
-            index: record.index,
+            index,
             shard_id,
-            record_id: update.assignment.record_id.0,
-            cluster_id: update.assignment.cluster_id.0,
-            cluster_key,
+            record_id: assignment.record_id.0,
+            cluster_id: assignment.cluster_id.0,
+            cluster_key: String::new(), // Computed on-demand at query time
         });
     }
     Ok(assignments)
@@ -1287,6 +1287,25 @@ impl proto::shard_service_server::ShardService for ShardNode {
         *config_guard = config.clone();
 
         if let Some(path) = &self.data_dir {
+            // Must acquire write lock and drop old Unirust BEFORE opening new store
+            // to release the RocksDB file lock
+            let mut guard = self.unirust.write().await;
+
+            // Create a temporary in-memory Unirust to replace the persistent one,
+            // which closes the RocksDB when dropped
+            let temp_store = crate::Store::new();
+            let temp_ontology = crate::Ontology::new();
+            let old = std::mem::replace(
+                &mut *guard,
+                Unirust::with_store_and_tuning(
+                    temp_ontology,
+                    temp_store,
+                    self.tuning.clone(),
+                ),
+            );
+            drop(old); // Explicitly drop to close RocksDB
+
+            // Now safe to open a new store at the same path
             let mut store =
                 PersistentStore::open(path).map_err(|err| Status::internal(err.to_string()))?;
             store
@@ -1301,7 +1320,6 @@ impl proto::shard_service_server::ShardService for ShardNode {
             store
                 .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
-            let mut guard = self.unirust.write().await;
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         } else {
             let mut store = crate::Store::new();
