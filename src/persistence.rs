@@ -300,7 +300,10 @@ impl PersistentStore {
     /// Flush all staged records to the database in a single batch write.
     pub fn flush_staged_records(&mut self) -> Result<usize> {
         let records = {
-            let mut staged = self.staged_records.lock().map_err(|_| anyhow!("lock error"))?;
+            let mut staged = self
+                .staged_records
+                .lock()
+                .map_err(|_| anyhow!("lock error"))?;
             std::mem::take(&mut *staged)
         };
 
@@ -412,7 +415,9 @@ impl RecordStore for PersistentStore {
         }
 
         // Persist interner and metadata once for the entire batch
-        let next_count = self.record_count.saturating_add(prepared_records.len() as u64);
+        let next_count = self
+            .record_count
+            .saturating_add(prepared_records.len() as u64);
         self.persist_interner(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 
@@ -487,7 +492,9 @@ impl RecordStore for PersistentStore {
         }
 
         // Persist interner and metadata once
-        let next_count = self.record_count.saturating_add(prepared_records.len() as u64);
+        let next_count = self
+            .record_count
+            .saturating_add(prepared_records.len() as u64);
         self.persist_interner(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 

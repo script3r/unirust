@@ -402,59 +402,85 @@ impl Unirust {
         let graph_state = self
             .graph_state
             .get_or_insert_with(graph::IncrementalKnowledgeGraph::new);
+        // Cache the initial graph to avoid rebuilding it 200 times
+        let initial_graph = graph_state.to_knowledge_graph();
         let mut updates = Vec::with_capacity(records.len());
+        let mut assignments_batch = Vec::with_capacity(records.len());
+        let mut pending_graph_update = false;
         let cluster_count = {
             let streaming = self.streaming.as_mut().unwrap();
 
             for record in records {
-                let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+                // Use staging to defer DB writes
+                let (record_id, inserted) = self.store.stage_record_if_absent(record)?;
                 let cluster_id = if inserted {
                     streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
                 } else {
                     streaming.cluster_id_for(record_id)
                 };
-                let _ = self.store.set_cluster_assignment(record_id, cluster_id);
+                assignments_batch.push((record_id, cluster_id));
                 let assignment = StreamedClusterAssignment {
                     record_id,
                     cluster_id,
                 };
 
-                let observations = if inserted {
-                    let clusters = streaming
-                        .clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?;
-                    let observations = conflicts::detect_conflicts(
-                        self.store.as_ref(),
-                        &clusters,
-                        &self.ontology,
-                    )?;
-                    let summaries =
-                        conflicts::summarize_conflicts(self.store.as_ref(), &observations);
-                    if let Err(err) = self.store.set_conflict_summaries(&summaries) {
-                        eprintln!("Failed to persist conflict summaries: {err}");
-                    }
-                    *self.conflict_cache.lock().unwrap() = Some(summaries);
+                // Mark that we need a graph update, but defer the expensive computation
+                if inserted {
+                    pending_graph_update = true;
+                }
 
-                    graph_state.update(
-                        self.store.as_ref(),
-                        &clusters,
-                        &observations,
-                        &self.ontology,
-                    )?;
-                    observations
-                } else {
-                    Vec::new()
-                };
-                let graph = graph_state.to_knowledge_graph();
-
+                // Use cached graph for intermediate updates
                 updates.push(StreamedGraphUpdate {
                     assignment,
-                    observations,
-                    graph,
+                    observations: Vec::new(),
+                    graph: initial_graph.clone(),
                 });
             }
 
             streaming.cluster_count()
         };
+
+        // Perform graph update once at the end if any records were inserted
+        if pending_graph_update {
+            if let Some(streaming) = self.streaming.as_mut() {
+                let clusters = streaming.clusters();
+                let observations =
+                    conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
+                graph_state.update(
+                    self.store.as_ref(),
+                    &clusters,
+                    &observations,
+                    &self.ontology,
+                )?;
+                let final_graph = graph_state.to_knowledge_graph();
+                // Update all entries with final graph state
+                for update in &mut updates {
+                    update.graph = final_graph.clone();
+                }
+                // Update last entry with observations
+                if let Some(last) = updates.last_mut() {
+                    last.observations = observations;
+                }
+            }
+        }
+
+        // Flush all staged records in a single batch write
+        let _ = self.store.flush_staged_records();
+
+        // Batch write all cluster assignments
+        let _ = self.store.set_cluster_assignments_batch(&assignments_batch);
+
+        // Final conflict detection and summary (once at end)
+        if let Some(streaming) = self.streaming.as_mut() {
+            let clusters = streaming.clusters();
+            let observations =
+                conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
+            let summaries = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
+            if let Err(err) = self.store.set_conflict_summaries(&summaries) {
+                eprintln!("Failed to persist conflict summaries: {err}");
+            }
+            *self.conflict_cache.lock().unwrap() = Some(summaries);
+        }
 
         self.invalidate_query_cache();
         let _ = self.store.set_cluster_count(cluster_count);

@@ -205,8 +205,10 @@ impl Ontology {
     }
 
     /// Check if an attribute is a strong identifier for a given entity type
-    pub fn is_strong_identifier(&self, entity_type: &str, attribute: AttrId) -> bool {
-        self.strong_identifiers_for_type(entity_type)
+    #[inline]
+    pub fn is_strong_identifier(&self, _entity_type: &str, attribute: AttrId) -> bool {
+        // Direct iteration without allocation - O(n) where n is number of strong identifiers
+        self.strong_identifiers
             .iter()
             .any(|strong_id| strong_id.attribute == attribute)
     }

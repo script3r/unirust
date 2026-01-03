@@ -13,10 +13,64 @@ use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 // use std::collections::HashSet;
 
+/// Small-vector-optimized participants list.
+/// Most intervals have only one participant, so avoid heap allocation.
+#[derive(Debug, Clone)]
+enum Participants {
+    One(RecordId),
+    Many(Vec<RecordId>),
+}
+
+impl Participants {
+    #[inline]
+    fn one(id: RecordId) -> Self {
+        Participants::One(id)
+    }
+
+    #[inline]
+    fn extend(&mut self, other: Self) {
+        match other {
+            Participants::One(b) => match self {
+                Participants::One(a) => {
+                    *self = Participants::Many(vec![*a, b]);
+                }
+                Participants::Many(ref mut v) => {
+                    v.push(b);
+                }
+            },
+            Participants::Many(mut other_v) => match self {
+                Participants::One(a) => {
+                    other_v.push(*a);
+                    *self = Participants::Many(other_v);
+                }
+                Participants::Many(ref mut v) => {
+                    v.append(&mut other_v);
+                }
+            },
+        }
+    }
+
+    #[inline]
+    fn sort_dedup(&mut self) {
+        if let Participants::Many(ref mut v) = self {
+            v.sort();
+            v.dedup();
+        }
+    }
+
+    #[inline]
+    fn to_vec(&self) -> Vec<RecordId> {
+        match self {
+            Participants::One(id) => vec![*id],
+            Participants::Many(v) => v.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ValueInterval {
     interval: Interval,
-    participants: Vec<RecordId>,
+    participants: Participants,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,11 +84,11 @@ struct IntervalEvent {
     time: i64,
     kind: EventKind,
     value: ValueId,
-    participants: Vec<RecordId>,
+    participants: Participants,
 }
 
 impl IntervalEvent {
-    fn start(time: i64, value: ValueId, participants: Vec<RecordId>) -> Self {
+    fn start(time: i64, value: ValueId, participants: Participants) -> Self {
         Self {
             time,
             kind: EventKind::Start,
@@ -48,7 +102,7 @@ impl IntervalEvent {
             time,
             kind: EventKind::End,
             value,
-            participants: Vec::new(),
+            participants: Participants::Many(Vec::new()),
         }
     }
 }
@@ -363,8 +417,10 @@ impl ConflictDetector {
     ) -> Result<Vec<DirectConflict>> {
         let mut conflicts = Vec::new();
 
-        // Group descriptors by attribute, keeping record IDs for participants.
-        let mut descriptors_by_attr: HashMap<AttrId, Vec<(RecordId, Descriptor)>> = HashMap::new();
+        // Group descriptors by attribute - only extract needed fields (no clone)
+        // Use (ValueId, Interval) tuple instead of full Descriptor
+        let mut descriptors_by_attr: HashMap<AttrId, Vec<(RecordId, ValueId, Interval)>> =
+            HashMap::new();
 
         for record_id in &cluster.records {
             if let Some(record) = store.get_record(*record_id) {
@@ -372,14 +428,14 @@ impl ConflictDetector {
                     descriptors_by_attr
                         .entry(descriptor.attr)
                         .or_default()
-                        .push((*record_id, descriptor.clone()));
+                        .push((*record_id, descriptor.value, descriptor.interval));
                 }
             }
         }
 
         // Check each attribute for conflicts
         for (attr, descriptors) in descriptors_by_attr {
-            let conflicts_for_attr = Self::detect_conflicts_for_attribute(descriptors, attr)?;
+            let conflicts_for_attr = Self::detect_conflicts_for_attribute_fast(descriptors, attr)?;
             conflicts.extend(conflicts_for_attr);
         }
 
@@ -394,32 +450,33 @@ impl ConflictDetector {
     ) -> Result<Vec<DirectConflict>> {
         let mut conflicts = Vec::new();
 
-        // Iterate through each entity individually (like Java: snapshotMap.forEach)
+        // Iterate through each entity individually
         let mut error: Option<anyhow::Error> = None;
         store.for_each_record(&mut |record| {
-            // Group descriptors by attribute for this entity
-            let mut descriptors_by_attr: HashMap<AttrId, Vec<Descriptor>> = HashMap::new();
+            // Only group descriptors for strong identifier attributes (skip others early)
+            // Use (ValueId, Interval) tuples to avoid cloning
+            let mut descriptors_by_attr: HashMap<AttrId, Vec<(ValueId, Interval)>> = HashMap::new();
             for descriptor in &record.descriptors {
-                descriptors_by_attr
-                    .entry(descriptor.attr)
-                    .or_default()
-                    .push(descriptor.clone());
+                // Early filter: only process strong identifiers
+                if ontology.is_strong_identifier(&record.identity.entity_type, descriptor.attr) {
+                    descriptors_by_attr
+                        .entry(descriptor.attr)
+                        .or_default()
+                        .push((descriptor.value, descriptor.interval));
+                }
             }
 
             // Check each attribute for intra-entity conflicts
             for (attr, descriptors) in descriptors_by_attr {
-                // Only check attributes that are strong identifiers (like Java: IDENTIFIER, PARTIAL_IDENTIFIER, DESCRIPTOR)
-                if ontology.is_strong_identifier(&record.identity.entity_type, attr) {
-                    match Self::detect_intra_entity_conflicts_for_attribute(
-                        descriptors,
-                        attr,
-                        record.id,
-                    ) {
-                        Ok(entity_conflicts) => conflicts.extend(entity_conflicts),
-                        Err(err) => {
-                            error = Some(err);
-                            return;
-                        }
+                match Self::detect_intra_entity_conflicts_for_attribute_fast(
+                    descriptors,
+                    attr,
+                    record.id,
+                ) {
+                    Ok(entity_conflicts) => conflicts.extend(entity_conflicts),
+                    Err(err) => {
+                        error = Some(err);
+                        return;
                     }
                 }
             }
@@ -445,23 +502,27 @@ impl ConflictDetector {
             }
             for record_id in &cluster.records {
                 if let Some(record) = store.get_record(*record_id) {
-                    let mut descriptors_by_attr: HashMap<AttrId, Vec<Descriptor>> = HashMap::new();
+                    // Only group descriptors for strong identifier attributes
+                    let mut descriptors_by_attr: HashMap<AttrId, Vec<(ValueId, Interval)>> =
+                        HashMap::new();
                     for descriptor in &record.descriptors {
-                        descriptors_by_attr
-                            .entry(descriptor.attr)
-                            .or_default()
-                            .push(descriptor.clone());
+                        if ontology
+                            .is_strong_identifier(&record.identity.entity_type, descriptor.attr)
+                        {
+                            descriptors_by_attr
+                                .entry(descriptor.attr)
+                                .or_default()
+                                .push((descriptor.value, descriptor.interval));
+                        }
                     }
                     for (attr, descriptors) in descriptors_by_attr {
-                        if ontology.is_strong_identifier(&record.identity.entity_type, attr) {
-                            let entity_conflicts =
-                                Self::detect_intra_entity_conflicts_for_attribute(
-                                    descriptors,
-                                    attr,
-                                    record.id,
-                                )?;
-                            conflicts.extend(entity_conflicts);
-                        }
+                        let entity_conflicts =
+                            Self::detect_intra_entity_conflicts_for_attribute_fast(
+                                descriptors,
+                                attr,
+                                record.id,
+                            )?;
+                        conflicts.extend(entity_conflicts);
                     }
                 }
             }
@@ -469,20 +530,21 @@ impl ConflictDetector {
         Ok(conflicts)
     }
 
-    /// Detect conflicts within a single entity for a specific attribute (PEIC1 logic)
-    fn detect_intra_entity_conflicts_for_attribute(
-        descriptors: Vec<Descriptor>,
+    /// Detect conflicts within a single entity for a specific attribute.
+    fn detect_intra_entity_conflicts_for_attribute_fast(
+        descriptors: Vec<(ValueId, Interval)>,
         attribute: AttrId,
         entity_id: RecordId,
     ) -> Result<Vec<DirectConflict>> {
-        let mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>> = HashMap::new();
-        for descriptor in descriptors {
+        let mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>> =
+            HashMap::with_capacity(descriptors.len());
+        for (value, interval) in descriptors {
             descriptors_by_value
-                .entry(descriptor.value)
-                .or_default()
+                .entry(value)
+                .or_insert_with(|| Vec::with_capacity(2))
                 .push(ValueInterval {
-                    interval: descriptor.interval,
-                    participants: vec![entity_id],
+                    interval,
+                    participants: Participants::one(entity_id),
                 });
         }
 
@@ -493,18 +555,19 @@ impl ConflictDetector {
     }
 
     /// Detect conflicts for a specific attribute.
-    fn detect_conflicts_for_attribute(
-        descriptors: Vec<(RecordId, Descriptor)>,
+    fn detect_conflicts_for_attribute_fast(
+        descriptors: Vec<(RecordId, ValueId, Interval)>,
         attribute: AttrId,
     ) -> Result<Vec<DirectConflict>> {
-        let mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>> = HashMap::new();
-        for (record_id, descriptor) in descriptors {
+        let mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>> =
+            HashMap::with_capacity(descriptors.len() / 4 + 1);
+        for (record_id, value, interval) in descriptors {
             descriptors_by_value
-                .entry(descriptor.value)
-                .or_default()
+                .entry(value)
+                .or_insert_with(|| Vec::with_capacity(4))
                 .push(ValueInterval {
-                    interval: descriptor.interval,
-                    participants: vec![record_id],
+                    interval,
+                    participants: Participants::one(record_id),
                 });
         }
 
@@ -546,34 +609,39 @@ impl ConflictDetector {
     ) -> Vec<DirectConflict> {
         let mut conflicts = Vec::new();
 
+        // First pass: merge intervals for each value
         for intervals in descriptors_by_value.values_mut() {
             *intervals = Self::merge_value_intervals(std::mem::take(intervals));
         }
 
-        let mut events = Vec::new();
-        for (value, intervals) in &descriptors_by_value {
+        // Calculate total event count for pre-allocation
+        let event_count: usize = descriptors_by_value.values().map(|v| v.len() * 2).sum();
+        let mut events = Vec::with_capacity(event_count);
+
+        // Consume the HashMap to avoid cloning participants
+        for (value, intervals) in descriptors_by_value {
             for entry in intervals {
                 events.push(IntervalEvent::start(
                     entry.interval.start,
-                    *value,
-                    entry.participants.clone(),
+                    value,
+                    entry.participants, // Move instead of clone
                 ));
-                events.push(IntervalEvent::end(entry.interval.end, *value));
+                events.push(IntervalEvent::end(entry.interval.end, value));
             }
         }
 
-        events.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.kind.cmp(&b.kind)));
+        events.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| a.kind.cmp(&b.kind)));
 
-        let mut active: HashMap<ValueId, Vec<RecordId>> = HashMap::new();
+        let mut active: HashMap<ValueId, Participants> = HashMap::new();
         let mut last_time: Option<i64> = None;
 
         for event in events {
             if let Some(start_time) = last_time {
                 if event.time > start_time && active.len() > 1 {
                     if let Ok(interval) = Interval::new(start_time, event.time) {
-                        let mut values = Vec::new();
+                        let mut values = Vec::with_capacity(active.len());
                         for (value, participants) in &active {
-                            values.push(ConflictValue::new(*value, participants.clone()));
+                            values.push(ConflictValue::new(*value, participants.to_vec()));
                         }
                         conflicts.push(DirectConflict::new(
                             "direct".to_string(),
@@ -590,10 +658,8 @@ impl ConflictDetector {
                     active.remove(&event.value);
                 }
                 EventKind::Start => {
-                    let mut participants = event.participants;
-                    participants.sort();
-                    participants.dedup();
-                    active.insert(event.value, participants);
+                    // Participants already sorted/deduped by merge_value_intervals
+                    active.insert(event.value, event.participants);
                 }
             }
 
@@ -609,7 +675,7 @@ impl ConflictDetector {
         }
 
         intervals.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
-        let mut merged: Vec<ValueInterval> = Vec::new();
+        let mut merged: Vec<ValueInterval> = Vec::with_capacity(intervals.len());
 
         for current in intervals {
             if let Some(last) = merged.last_mut() {
@@ -619,19 +685,17 @@ impl ConflictDetector {
                         last.interval.end.max(current.interval.end),
                     )
                     .unwrap_or(last.interval);
+                    // Defer sort/dedup - just extend for now
                     last.participants.extend(current.participants);
-                    last.participants.sort();
-                    last.participants.dedup();
                     continue;
                 }
             }
-            let mut participants = current.participants;
-            participants.sort();
-            participants.dedup();
-            merged.push(ValueInterval {
-                interval: current.interval,
-                participants,
-            });
+            merged.push(current);
+        }
+
+        // Sort and dedup participants once at the end
+        for interval in &mut merged {
+            interval.participants.sort_dedup();
         }
 
         merged

@@ -6,8 +6,8 @@
 use crate::model::{ClusterId, RecordId};
 use crate::temporal::Interval;
 // use anyhow::Result;
+use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// A temporal guard that validates whether two records can be merged
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,13 +127,33 @@ impl TemporalDSU {
         self.parent.contains_key(&record_id)
     }
 
-    /// Find the root of a record (with path compression)
+    /// Find the root of a record (with path compression via path halving)
     pub fn find(&mut self, record_id: RecordId) -> RecordId {
-        if self.parent[&record_id] != record_id {
-            let root = self.find(self.parent[&record_id]);
-            self.parent.insert(record_id, root);
+        // Quick check - if already root, return immediately
+        let mut current = record_id;
+        let mut parent = self.parent[&current];
+        if parent == current {
+            return current;
         }
-        self.parent[&record_id]
+
+        // Path halving: point every other node to its grandparent
+        // This is a single-pass algorithm that compresses while finding
+        loop {
+            let grandparent = self.parent[&parent];
+            if grandparent == parent {
+                // Parent is root
+                break;
+            }
+            // Point current to grandparent (skip parent)
+            self.parent.insert(current, grandparent);
+            current = grandparent;
+            parent = self.parent[&current];
+            if parent == current {
+                break;
+            }
+        }
+
+        parent
     }
 
     /// Check if two records are in the same cluster
@@ -224,19 +244,37 @@ impl TemporalDSU {
     /// Get all clusters.
     /// Cluster IDs are assigned on demand and are not stable across calls.
     pub fn get_clusters(&mut self) -> Clusters {
-        let mut cluster_map: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-
-        let record_ids: Vec<RecordId> = self.parent.keys().cloned().collect();
-        for record_id in record_ids {
-            let root = self.find(record_id);
-            cluster_map.entry(root).or_default().push(record_id);
+        let num_records = self.parent.len();
+        if num_records == 0 {
+            return Clusters {
+                clusters: Vec::new(),
+            };
         }
 
-        let mut clusters = Vec::new();
+        // Single pass: compute roots and group in one iteration
+        // We need to collect keys first since find() mutates parent
+        let record_ids: Vec<RecordId> = self.parent.keys().copied().collect();
+
+        // Group records by root - use estimated cluster count for capacity
+        let estimated_clusters = self.cluster_count.max(1);
+        let avg_cluster_size = (num_records / estimated_clusters).max(4);
+        let mut cluster_map: HashMap<RecordId, Vec<RecordId>> =
+            HashMap::with_capacity(estimated_clusters);
+
+        for record_id in record_ids {
+            let root = self.find(record_id);
+            // Use entry API with pre-allocated Vec capacity
+            cluster_map
+                .entry(root)
+                .or_insert_with(|| Vec::with_capacity(avg_cluster_size))
+                .push(record_id);
+        }
+
+        // Build clusters - consume the map to avoid cloning
+        let mut clusters = Vec::with_capacity(cluster_map.len());
         for (root, records) in cluster_map {
             let cluster_id = ClusterId(self.next_cluster_id);
             self.next_cluster_id += 1;
-
             clusters.push(Cluster {
                 id: cluster_id,
                 root,
