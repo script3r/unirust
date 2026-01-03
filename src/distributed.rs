@@ -676,12 +676,25 @@ fn hash_record_to_u64(config: &DistributedOntologyConfig, record: &proto::Record
     state.finish()
 }
 
+/// Mix hash bits for better distribution with small modulo values.
+/// Uses fibonacci hashing to reduce clustering.
+#[inline]
+fn mix_hash(hash: u64) -> u64 {
+    // Fibonacci hashing: multiply by golden ratio and take high bits
+    // This provides excellent distribution for small modulo values
+    const GOLDEN_RATIO: u64 = 0x9E3779B97F4A7C15;
+    hash.wrapping_mul(GOLDEN_RATIO)
+}
+
 pub fn hash_record_to_shard(
     config: &DistributedOntologyConfig,
     record: &proto::RecordInput,
     shard_count: usize,
 ) -> usize {
-    (hash_record_to_u64(config, record) as usize) % shard_count
+    let hash = hash_record_to_u64(config, record);
+    let mixed = mix_hash(hash);
+    // Use high bits which have better distribution after mixing
+    ((mixed >> 32) as usize) % shard_count
 }
 
 fn hash_record_to_bucket(
@@ -689,7 +702,9 @@ fn hash_record_to_bucket(
     record: &proto::RecordInput,
     bucket_count: usize,
 ) -> usize {
-    (hash_record_to_u64(config, record) as usize) % bucket_count
+    let hash = hash_record_to_u64(config, record);
+    let mixed = mix_hash(hash);
+    ((mixed >> 32) as usize) % bucket_count
 }
 
 struct BucketAssignment {
@@ -1975,7 +1990,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
 #[derive(Clone)]
 pub struct RouterNode {
     shard_clients: Vec<proto::shard_service_client::ShardServiceClient<tonic::transport::Channel>>,
-    ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
+    /// RwLock for ontology config - read-heavy, written only during set_ontology
+    ontology_config: Arc<RwLock<DistributedOntologyConfig>>,
     config_version: String,
     metrics: Arc<Metrics>,
     balancer: Option<Arc<ShardBalancer>>,
@@ -2022,7 +2038,7 @@ impl RouterNode {
         }
         Ok(Self {
             shard_clients,
-            ontology_config: Arc::new(Mutex::new(ontology_config)),
+            ontology_config: Arc::new(RwLock::new(ontology_config)),
             config_version,
             metrics: Arc::new(Metrics::new()),
             balancer: ShardBalancer::new(shard_count).map(Arc::new),
@@ -2215,7 +2231,7 @@ impl proto::router_service_server::RouterService for RouterNode {
             .clone()
             .ok_or_else(|| Status::invalid_argument("ontology config is required"))?;
         let mapped = map_proto_config(&config);
-        *self.ontology_config.lock().await = mapped;
+        *self.ontology_config.write().await = mapped;
 
         for client in &self.shard_clients {
             let mut client = client.clone();
@@ -2237,7 +2253,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         let all_records = batch.records.clone(); // Keep for locality update
         let record_count = all_records.len();
         let shard_count = self.shard_clients.len();
-        let config = self.ontology_config.lock().await.clone();
+        let config = self.ontology_config.read().await.clone();
         let mut shard_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
         let mut shadow_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
 
@@ -2276,32 +2292,48 @@ impl proto::router_service_server::RouterService for RouterNode {
             }
         } // locality_index lock released here
 
+        // Parallel shard ingest - spawn all shard requests concurrently
+        let shard_futures: Vec<_> = shard_batches
+            .into_iter()
+            .enumerate()
+            .filter(|(_, records)| !records.is_empty())
+            .map(|(idx, records)| {
+                let mut client = self.shard_clients[idx].clone();
+                async move {
+                    client
+                        .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
+                        .await
+                }
+            })
+            .collect();
+
+        let shard_responses = futures::future::join_all(shard_futures).await;
         let mut results: Vec<proto::IngestAssignment> = Vec::new();
-        for (idx, records) in shard_batches.into_iter().enumerate() {
-            if records.is_empty() {
-                continue;
+        for response in shard_responses {
+            match response {
+                Ok(resp) => results.extend(resp.into_inner().assignments),
+                Err(err) => return Err(Status::unavailable(err.to_string())),
             }
-            let mut client = self.shard_clients[idx].clone();
-            let response = client
-                .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?;
-            results.extend(response.into_inner().assignments);
         }
 
         // Update locality index with the new assignments
         self.update_locality_from_assignments(&config, &all_records, &results);
 
-        for (idx, records) in shadow_batches.into_iter().enumerate() {
-            if records.is_empty() {
-                continue;
-            }
-            let mut client = self.shard_clients[idx].clone();
-            let _ = client
-                .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?;
-        }
+        // Shadow writes in parallel (fire-and-forget style, but await completion)
+        let shadow_futures: Vec<_> = shadow_batches
+            .into_iter()
+            .enumerate()
+            .filter(|(_, records)| !records.is_empty())
+            .map(|(idx, records)| {
+                let mut client = self.shard_clients[idx].clone();
+                async move {
+                    let _ = client
+                        .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
+                        .await;
+                }
+            })
+            .collect();
+        futures::future::join_all(shadow_futures).await;
 
         results.sort_by_key(|assignment| assignment.index);
         self.metrics

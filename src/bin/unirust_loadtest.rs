@@ -15,11 +15,11 @@
 //!   --log /tmp/loadtest.log
 //! ```
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::{
@@ -60,6 +60,7 @@ pub struct LoadTestConfig {
     pub overlap_probability: f64,
     pub log_file: Option<PathBuf>,
     pub seed: u64,
+    pub headless: bool,
 }
 
 impl Default for LoadTestConfig {
@@ -73,6 +74,7 @@ impl Default for LoadTestConfig {
             overlap_probability: 0.1,
             log_file: None,
             seed: 42,
+            headless: false,
         }
     }
 }
@@ -121,6 +123,9 @@ fn parse_args() -> LoadTestConfig {
                     config.seed = v;
                 }
             }
+            "--headless" => {
+                config.headless = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -148,6 +153,7 @@ OPTIONS:
     --overlap <F>         Overlap probability 0.0-1.0 (default: 0.1)
     --log <PATH>          Log file path (logs to file only)
     --seed <N>            Random seed for reproducibility (default: 42)
+    --headless            Run without TUI (for automation/CI)
     -h, --help            Print help
 
 EXAMPLES:
@@ -925,6 +931,16 @@ pub struct ShardStats {
     pub record_count: AtomicU64,
     pub cluster_count: AtomicU64,
     pub ingest_latency_avg: AtomicU64,
+    // Detailed latency metrics
+    pub ingest_latency_max: AtomicU64,
+    pub ingest_latency_total: AtomicU64,
+    pub ingest_request_count: AtomicU64,
+    // Store metrics
+    pub persistent: AtomicBool,
+    pub running_compactions: AtomicU64,
+    pub running_flushes: AtomicU64,
+    pub block_cache_usage_mb: AtomicU64,
+    pub block_cache_capacity_mb: AtomicU64,
 }
 
 pub struct LoadTestMetrics {
@@ -999,6 +1015,188 @@ impl LoadTestMetrics {
             None
         }
     }
+
+    /// Generate a detailed report for analysis
+    pub fn generate_report(&self, config: &LoadTestConfig) -> String {
+        let elapsed = self.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        let entities_sent = self.entities_sent.load(Ordering::Relaxed);
+        let entities_acked = self.entities_acked.load(Ordering::Relaxed);
+        let cluster_count = self.cluster_count.load(Ordering::Relaxed);
+        let conflicts = self.conflicts_detected.load(Ordering::Relaxed);
+        let throughput = self.throughput();
+
+        let mut report = String::new();
+
+        // Header
+        report.push_str("================================================================================\n");
+        report.push_str("                         UNIRUST LOAD TEST REPORT\n");
+        report.push_str("================================================================================\n\n");
+
+        // Timestamp
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        report.push_str(&format!("Timestamp: {}\n", timestamp));
+        report.push_str(&format!("Duration: {:.2}s\n\n", elapsed_secs));
+
+        // Configuration
+        report.push_str("## Configuration\n");
+        report.push_str(&format!("  Target count:     {}\n", config.count));
+        report.push_str(&format!("  Router:           {}\n", config.router_addr));
+        report.push_str(&format!("  Shards:           {:?}\n", config.shard_addrs));
+        report.push_str(&format!("  Stream count:     {}\n", config.stream_count));
+        report.push_str(&format!("  Batch size:       {}\n", config.batch_size));
+        report.push_str(&format!("  Overlap prob:     {:.1}%\n", config.overlap_probability * 100.0));
+        report.push_str(&format!("  Seed:             {}\n\n", config.seed));
+
+        // Summary
+        report.push_str("## Summary\n");
+        report.push_str(&format!("  Entities sent:    {}\n", entities_sent));
+        report.push_str(&format!("  Entities acked:   {}\n", entities_acked));
+        report.push_str(&format!("  Clusters:         {}\n", cluster_count));
+        report.push_str(&format!("  Conflicts:        {}\n", conflicts));
+        report.push_str(&format!("  Throughput:       {:.2} rec/sec\n", throughput));
+        report.push_str(&format!("  Avg latency:      {:.2} ms/batch\n\n",
+            if throughput > 0.0 {
+                (config.batch_size as f64 / throughput) * 1000.0
+            } else {
+                0.0
+            }));
+
+        // Per-stream stats
+        report.push_str("## Stream Statistics\n");
+        report.push_str("  Stream  Sent        Acked       Latency(ms)  Errors\n");
+        report.push_str("  ------  ----------  ----------  -----------  ------\n");
+        for (i, stream) in self.stream_stats.iter().enumerate() {
+            let sent = stream.records_sent.load(Ordering::Relaxed);
+            let acked = stream.records_acked.load(Ordering::Relaxed);
+            let latency_us = stream.last_latency_micros.load(Ordering::Relaxed);
+            let errors = stream.errors.load(Ordering::Relaxed);
+            report.push_str(&format!(
+                "  #{:<5} {:>10}  {:>10}  {:>11.1}  {:>6}\n",
+                i, sent, acked, latency_us as f64 / 1000.0, errors
+            ));
+        }
+        report.push('\n');
+
+        // Per-shard stats (detailed)
+        if !self.shard_stats.is_empty() {
+            report.push_str("## Shard Statistics\n\n");
+            for shard in &self.shard_stats {
+                let rec = shard.record_count.load(Ordering::Relaxed);
+                let clusters = shard.cluster_count.load(Ordering::Relaxed);
+                let latency_avg = shard.ingest_latency_avg.load(Ordering::Relaxed);
+                let latency_max = shard.ingest_latency_max.load(Ordering::Relaxed);
+                let latency_total = shard.ingest_latency_total.load(Ordering::Relaxed);
+                let request_count = shard.ingest_request_count.load(Ordering::Relaxed);
+                let persistent = shard.persistent.load(Ordering::Relaxed);
+                let compactions = shard.running_compactions.load(Ordering::Relaxed);
+                let flushes = shard.running_flushes.load(Ordering::Relaxed);
+                let cache_usage = shard.block_cache_usage_mb.load(Ordering::Relaxed);
+                let cache_capacity = shard.block_cache_capacity_mb.load(Ordering::Relaxed);
+
+                report.push_str(&format!("### Shard {} {}\n", shard.shard_id,
+                    if persistent { "(persistent)" } else { "(in-memory)" }));
+                report.push_str(&format!("  Records ingested:   {}\n", rec));
+                report.push_str(&format!("  Clusters:           {}\n", clusters));
+                report.push_str(&format!("  Ingest requests:    {}\n", request_count));
+                report.push_str(&format!("  Latency avg:        {:.2} ms\n", latency_avg as f64 / 1000.0));
+                report.push_str(&format!("  Latency max:        {:.2} ms\n", latency_max as f64 / 1000.0));
+                report.push_str(&format!("  Latency total:      {:.2} s\n", latency_total as f64 / 1_000_000.0));
+
+                if persistent {
+                    report.push_str(&format!("  Block cache:        {} / {} MB ({:.1}%)\n",
+                        cache_usage, cache_capacity,
+                        if cache_capacity > 0 { (cache_usage as f64 / cache_capacity as f64) * 100.0 } else { 0.0 }));
+                    report.push_str(&format!("  Running compactions: {}\n", compactions));
+                    report.push_str(&format!("  Running flushes:    {}\n", flushes));
+                }
+                report.push('\n');
+            }
+
+            // Shard balance analysis
+            let total_records: u64 = self.shard_stats.iter()
+                .map(|s| s.record_count.load(Ordering::Relaxed))
+                .sum();
+            if total_records > 0 {
+                report.push_str("### Shard Balance\n");
+                let expected_per_shard = total_records as f64 / self.shard_stats.len() as f64;
+                for shard in &self.shard_stats {
+                    let rec = shard.record_count.load(Ordering::Relaxed) as f64;
+                    let deviation = ((rec - expected_per_shard) / expected_per_shard) * 100.0;
+                    report.push_str(&format!("  Shard {}: {:.1}% deviation from ideal\n",
+                        shard.shard_id, deviation));
+                }
+                report.push('\n');
+            }
+        }
+
+        // Performance metrics
+        report.push_str("## Performance Analysis\n");
+        let entities_per_stream = entities_acked as f64 / config.stream_count as f64;
+        let batches_total = entities_acked as f64 / config.batch_size as f64;
+        let batch_latency_avg = if batches_total > 0.0 {
+            elapsed_secs * 1000.0 / batches_total
+        } else {
+            0.0
+        };
+        report.push_str(&format!("  Total batches:      {:.0}\n", batches_total));
+        report.push_str(&format!("  Entities/stream:    {:.0}\n", entities_per_stream));
+        report.push_str(&format!("  Batch latency avg:  {:.2} ms\n", batch_latency_avg));
+        report.push_str(&format!("  Records/sec/stream: {:.2}\n", throughput / config.stream_count as f64));
+
+        // Bottleneck analysis
+        report.push_str("\n## Bottleneck Analysis\n");
+        if throughput < 1000.0 {
+            report.push_str("  ⚠ Throughput < 1000 rec/sec - likely I/O bound\n");
+            report.push_str("    - Check RocksDB sync writes\n");
+            report.push_str("    - Consider increasing batch size\n");
+            report.push_str("    - Check disk I/O with iostat\n");
+        }
+        if batch_latency_avg > 500.0 {
+            report.push_str("  ⚠ Batch latency > 500ms - processing bottleneck\n");
+            report.push_str("    - Check conflict detection overhead\n");
+            report.push_str("    - Consider profiling with UNIRUST_PROFILE=1\n");
+        }
+        let max_stream_latency = self.stream_stats.iter()
+            .map(|s| s.last_latency_micros.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+        let min_stream_latency = self.stream_stats.iter()
+            .map(|s| s.last_latency_micros.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(0);
+        if max_stream_latency > min_stream_latency * 2 && min_stream_latency > 0 {
+            report.push_str("  ⚠ Stream latency imbalance detected\n");
+            report.push_str("    - Uneven shard distribution or hot keys\n");
+        }
+
+        report.push_str("\n================================================================================\n");
+        report
+    }
+}
+
+/// Write the final report to a file
+fn write_report(config: &LoadTestConfig, metrics: &LoadTestMetrics) -> Result<PathBuf> {
+    let report = metrics.generate_report(config);
+
+    // Generate report filename with timestamp
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let report_path = PathBuf::from(format!("/tmp/unirust_loadtest_{}.txt", timestamp));
+
+    let mut file = std::fs::File::create(&report_path)?;
+    file.write_all(report.as_bytes())?;
+
+    // Also print to stdout
+    println!("{}", report);
+    println!("Report saved to: {}", report_path.display());
+
+    Ok(report_path)
 }
 
 // =============================================================================
@@ -1055,34 +1253,62 @@ async fn run_parallel_streams(
 
                 while let Ok(batch) = rx.recv().await {
                     let batch_len = batch.len();
+                    metrics.stream_stats[i]
+                        .records_sent
+                        .fetch_add(batch_len as u64, Ordering::Relaxed);
+                    metrics.entities_sent.fetch_add(batch_len as u64, Ordering::Relaxed);
                     let start = Instant::now();
 
-                    match client
-                        .ingest_records(IngestRecordsRequest { records: batch })
-                        .await
-                    {
-                        Ok(response) => {
-                            let count = response.into_inner().assignments.len();
-                            metrics.stream_stats[i]
-                                .records_acked
-                                .fetch_add(count as u64, Ordering::Relaxed);
-                            metrics
-                                .entities_acked
-                                .fetch_add(count as u64, Ordering::Relaxed);
-                            metrics.stream_stats[i]
-                                .last_latency_micros
-                                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    // Retry with exponential backoff
+                    const MAX_RETRIES: u32 = 3;
+                    let mut last_error = None;
+                    let mut success = false;
+
+                    for attempt in 0..=MAX_RETRIES {
+                        if attempt > 0 {
+                            // Exponential backoff: 10ms, 20ms, 40ms
+                            let delay = Duration::from_millis(10 * (1 << (attempt - 1)));
+                            tokio::time::sleep(delay).await;
+                            tracing::debug!(stream = i, attempt, "Retrying ingest");
                         }
-                        Err(e) => {
-                            tracing::error!(stream = i, error = %e, "Ingest failed");
-                            metrics.stream_stats[i]
-                                .errors
-                                .fetch_add(1, Ordering::Relaxed);
-                            // Still count as sent for progress tracking
-                            metrics
-                                .entities_acked
-                                .fetch_add(batch_len as u64, Ordering::Relaxed);
+
+                        match client
+                            .ingest_records(IngestRecordsRequest {
+                                records: batch.clone(),
+                            })
+                            .await
+                        {
+                            Ok(response) => {
+                                let count = response.into_inner().assignments.len();
+                                metrics.stream_stats[i]
+                                    .records_acked
+                                    .fetch_add(count as u64, Ordering::Relaxed);
+                                metrics
+                                    .entities_acked
+                                    .fetch_add(count as u64, Ordering::Relaxed);
+                                metrics.stream_stats[i]
+                                    .last_latency_micros
+                                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                success = true;
+                                break;
+                            }
+                            Err(e) => {
+                                last_error = Some(e);
+                            }
                         }
+                    }
+
+                    if !success {
+                        if let Some(e) = last_error {
+                            tracing::error!(stream = i, error = %e, retries = MAX_RETRIES, "Ingest failed after retries");
+                        }
+                        metrics.stream_stats[i]
+                            .errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Still count for progress tracking
+                        metrics
+                            .entities_acked
+                            .fetch_add(batch_len as u64, Ordering::Relaxed);
                     }
                 }
             })
@@ -1141,20 +1367,40 @@ async fn poll_metrics_task(
                     }
                 }
 
-                // Poll individual shards
+                // Poll individual shards for detailed metrics
                 for (i, client_opt) in shard_clients.iter_mut().enumerate() {
                     if let Some(ref mut client) = client_opt {
                         if let Ok(response) = client.get_metrics(MetricsRequest {}).await {
                             let m = response.into_inner();
                             if i < metrics.shard_stats.len() {
-                                metrics.shard_stats[i].record_count.store(m.ingest_records, Ordering::Relaxed);
+                                let shard = &metrics.shard_stats[i];
+                                shard.record_count.store(m.ingest_records, Ordering::Relaxed);
+                                shard.ingest_request_count.store(m.ingest_requests, Ordering::Relaxed);
+
                                 if let Some(latency) = m.ingest_latency {
+                                    shard.ingest_latency_total.store(latency.total_micros, Ordering::Relaxed);
+                                    shard.ingest_latency_max.store(latency.max_micros, Ordering::Relaxed);
                                     if latency.count > 0 {
-                                        metrics.shard_stats[i].ingest_latency_avg.store(
+                                        shard.ingest_latency_avg.store(
                                             latency.total_micros / latency.count,
                                             Ordering::Relaxed,
                                         );
                                     }
+                                }
+
+                                // Store metrics
+                                if let Some(store) = m.store {
+                                    shard.persistent.store(store.persistent, Ordering::Relaxed);
+                                    shard.running_compactions.store(store.running_compactions, Ordering::Relaxed);
+                                    shard.running_flushes.store(store.running_flushes, Ordering::Relaxed);
+                                    shard.block_cache_usage_mb.store(
+                                        store.block_cache_usage_bytes / (1024 * 1024),
+                                        Ordering::Relaxed,
+                                    );
+                                    shard.block_cache_capacity_mb.store(
+                                        store.block_cache_capacity_bytes / (1024 * 1024),
+                                        Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }
@@ -1434,30 +1680,12 @@ async fn run_tui(
             }
         }
 
-        // Check if streaming completed
+        // Check if streaming completed - auto-quit
         if metrics.completed.load(Ordering::Relaxed) {
-            // Show final state for a moment
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Show final state briefly
             terminal.draw(|f| draw_ui(f, &config, &metrics))?;
-
-            // Wait for user to press q
-            loop {
-                if event::poll(Duration::from_millis(100))? {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Press {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    let _ = shutdown_tx.send(true);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                // Redraw to keep the display active
-                terminal.draw(|f| draw_ui(f, &config, &metrics))?;
-            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = shutdown_tx.send(true);
             break;
         }
     }
@@ -1467,6 +1695,42 @@ async fn run_tui(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
+    Ok(())
+}
+
+async fn run_headless(
+    config: LoadTestConfig,
+    metrics: Arc<LoadTestMetrics>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<()> {
+    println!("Running in headless mode - streaming {} entities...", config.count);
+    let start = Instant::now();
+    let mut last_print = Instant::now();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Print progress every 5 seconds
+        if last_print.elapsed() >= Duration::from_secs(5) {
+            let sent = metrics.entities_sent.load(Ordering::Relaxed);
+            let acked = metrics.entities_acked.load(Ordering::Relaxed);
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { acked as f64 / elapsed } else { 0.0 };
+            println!(
+                "  Progress: {}/{} sent, {} acked ({:.0} rec/sec)",
+                sent, config.count, acked, rate
+            );
+            last_print = Instant::now();
+        }
+
+        // Check if streaming completed
+        if metrics.completed.load(Ordering::Relaxed) {
+            let _ = shutdown_tx.send(true);
+            break;
+        }
+    }
+
+    println!("Streaming complete in {:.2}s", start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1525,12 +1789,20 @@ async fn main() -> Result<()> {
         poll_metrics_task(&poll_config, poll_metrics_arc, poll_shutdown).await;
     });
 
-    // Run TUI (blocks until quit)
-    run_tui(config, metrics, shutdown_tx).await?;
+    // Run TUI or headless (blocks until quit)
+    let tui_config = config.clone();
+    if config.headless {
+        run_headless(tui_config, metrics.clone(), shutdown_tx).await?;
+    } else {
+        run_tui(tui_config, metrics.clone(), shutdown_tx).await?;
+    }
 
     // Wait for background tasks
     let _ = streaming_handle.await;
     let _ = metrics_handle.await;
+
+    // Generate and save report
+    write_report(&config, &metrics)?;
 
     Ok(())
 }

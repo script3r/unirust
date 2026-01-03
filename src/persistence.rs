@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
     checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    Direction, IteratorMode, Options, SliceTransform, WriteBatch, DB,
+    Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -87,6 +87,14 @@ pub struct PersistentStore {
     record_count: u64,
     cluster_count: u64,
     conflict_summary_count: u64,
+}
+
+/// Create WriteOptions for fast async writes (no WAL sync)
+fn fast_write_opts() -> WriteOptions {
+    let mut opts = WriteOptions::default();
+    opts.set_sync(false);
+    opts.disable_wal(false); // Keep WAL for crash recovery
+    opts
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -349,7 +357,7 @@ impl PersistentStore {
         self.persist_interner(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 
-        self.db.write(batch)?;
+        self.db.write_opt(batch, &fast_write_opts())?;
         self.record_count = next_count;
 
         Ok(count)
@@ -928,7 +936,7 @@ impl RecordStore for PersistentStore {
         for (record_id, cluster_id) in assignments {
             batch.put_cf(cf, record_id.0.to_be_bytes(), cluster_id.0.to_be_bytes());
         }
-        self.db.write(batch)?;
+        self.db.write_opt(batch, &fast_write_opts())?;
         Ok(())
     }
 
