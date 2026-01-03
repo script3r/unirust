@@ -62,6 +62,7 @@ pub struct PersistentStore {
     inner: Store,
     db: DB,
     cache: Mutex<LruCache<RecordId, Record>>,
+    staged_records: Mutex<Vec<Record>>,
     persisted_attr_id: u32,
     persisted_value_id: u32,
     record_count: u64,
@@ -105,6 +106,7 @@ impl PersistentStore {
             cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("cache capacity"),
             )),
+            staged_records: Mutex::new(Vec::new()),
             persisted_attr_id,
             persisted_value_id,
             record_count,
@@ -273,6 +275,64 @@ impl PersistentStore {
         Ok(())
     }
 
+    /// Stage a record for later batch write. Returns (record_id, inserted).
+    /// The record is added to cache immediately so it's readable, but not yet persisted to DB.
+    pub fn stage_record_if_absent(&mut self, mut record: Record) -> Result<(RecordId, bool)> {
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            return Ok((existing, false));
+        }
+
+        let record_id = self.inner.prepare_record(&mut record)?;
+
+        // Add to cache immediately so it's readable
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(record_id, record.clone());
+        }
+
+        // Stage for later batch write
+        if let Ok(mut staged) = self.staged_records.lock() {
+            staged.push(record);
+        }
+
+        Ok((record_id, true))
+    }
+
+    /// Flush all staged records to the database in a single batch write.
+    pub fn flush_staged_records(&mut self) -> Result<usize> {
+        let records = {
+            let mut staged = self.staged_records.lock().map_err(|_| anyhow!("lock error"))?;
+            std::mem::take(&mut *staged)
+        };
+
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let count = records.len();
+        let records_cf = self
+            .db
+            .cf_handle(CF_RECORDS)
+            .ok_or_else(|| anyhow!("missing records column family"))?;
+
+        let mut batch = WriteBatch::default();
+
+        for record in &records {
+            let key = record.id.0.to_be_bytes();
+            let bytes = bincode::serialize(record)?;
+            batch.put_cf(records_cf, key, bytes);
+            self.index_record_with_batch(record, &mut batch)?;
+        }
+
+        let next_count = self.record_count.saturating_add(count as u64);
+        self.persist_interner(&mut batch)?;
+        self.persist_metadata_with_count(&mut batch, next_count)?;
+
+        self.db.write(batch)?;
+        self.record_count = next_count;
+
+        Ok(count)
+    }
+
     fn persist_record_count(&self) -> Result<()> {
         let mut batch = WriteBatch::default();
         self.persist_metadata(&mut batch)?;
@@ -325,9 +385,48 @@ impl RecordStore for PersistentStore {
     }
 
     fn add_records(&mut self, records: Vec<Record>) -> Result<()> {
-        for record in records {
-            self.add_record(record)?;
+        if records.is_empty() {
+            return Ok(());
         }
+
+        let records_cf = self
+            .db
+            .cf_handle(CF_RECORDS)
+            .ok_or_else(|| anyhow!("missing records column family"))?;
+
+        let mut batch = WriteBatch::default();
+        let mut prepared_records = Vec::with_capacity(records.len());
+
+        // Prepare all records (assign IDs, intern strings) without writing
+        for mut record in records {
+            let record_id = self.inner.prepare_record(&mut record)?;
+            let key = record_id.0.to_be_bytes();
+            let bytes = bincode::serialize(&record)?;
+            batch.put_cf(records_cf, key, bytes);
+            prepared_records.push(record);
+        }
+
+        // Index all records
+        for record in &prepared_records {
+            self.index_record_with_batch(record, &mut batch)?;
+        }
+
+        // Persist interner and metadata once for the entire batch
+        let next_count = self.record_count.saturating_add(prepared_records.len() as u64);
+        self.persist_interner(&mut batch)?;
+        self.persist_metadata_with_count(&mut batch, next_count)?;
+
+        // Single write for all records
+        self.db.write(batch)?;
+        self.record_count = next_count;
+
+        // Update cache
+        if let Ok(mut cache) = self.cache.lock() {
+            for record in prepared_records {
+                cache.put(record.id, record);
+            }
+        }
+
         Ok(())
     }
 
@@ -337,6 +436,86 @@ impl RecordStore for PersistentStore {
         }
         let record_id = self.add_record(record)?;
         Ok((record_id, true))
+    }
+
+    fn add_records_if_absent(&mut self, records: Vec<Record>) -> Result<Vec<(RecordId, bool)>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // First pass: check which records already exist and separate new ones
+        let mut results = Vec::with_capacity(records.len());
+        let mut new_records = Vec::new();
+        let mut new_record_indices = Vec::new();
+
+        for (idx, record) in records.into_iter().enumerate() {
+            if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+                results.push((existing, false));
+            } else {
+                results.push((RecordId(0), true)); // Placeholder, will be filled in
+                new_record_indices.push(idx);
+                new_records.push(record);
+            }
+        }
+
+        if new_records.is_empty() {
+            return Ok(results);
+        }
+
+        // Batch insert all new records
+        let records_cf = self
+            .db
+            .cf_handle(CF_RECORDS)
+            .ok_or_else(|| anyhow!("missing records column family"))?;
+
+        let mut batch = WriteBatch::default();
+        let mut prepared_records = Vec::with_capacity(new_records.len());
+        let mut assigned_ids = Vec::with_capacity(new_records.len());
+
+        for mut record in new_records {
+            let record_id = self.inner.prepare_record(&mut record)?;
+            let key = record_id.0.to_be_bytes();
+            let bytes = bincode::serialize(&record)?;
+            batch.put_cf(records_cf, key, bytes);
+            assigned_ids.push(record_id);
+            prepared_records.push(record);
+        }
+
+        // Index all new records
+        for record in &prepared_records {
+            self.index_record_with_batch(record, &mut batch)?;
+        }
+
+        // Persist interner and metadata once
+        let next_count = self.record_count.saturating_add(prepared_records.len() as u64);
+        self.persist_interner(&mut batch)?;
+        self.persist_metadata_with_count(&mut batch, next_count)?;
+
+        // Single write for all new records
+        self.db.write(batch)?;
+        self.record_count = next_count;
+
+        // Update results with actual record IDs
+        for (i, idx) in new_record_indices.into_iter().enumerate() {
+            results[idx].0 = assigned_ids[i];
+        }
+
+        // Update cache
+        if let Ok(mut cache) = self.cache.lock() {
+            for record in prepared_records {
+                cache.put(record.id, record);
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn stage_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        PersistentStore::stage_record_if_absent(self, record)
+    }
+
+    fn flush_staged_records(&mut self) -> Result<usize> {
+        PersistentStore::flush_staged_records(self)
     }
 
     fn get_record(&self, id: RecordId) -> Option<Record> {
@@ -704,6 +883,25 @@ impl RecordStore for PersistentStore {
             .ok_or_else(|| anyhow!("missing cluster assignments column family"))?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, record_id.0.to_be_bytes(), cluster_id.0.to_be_bytes());
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    fn set_cluster_assignments_batch(
+        &mut self,
+        assignments: &[(RecordId, crate::model::ClusterId)],
+    ) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let cf = self
+            .db
+            .cf_handle(CF_CLUSTER_ASSIGNMENTS)
+            .ok_or_else(|| anyhow!("missing cluster assignments column family"))?;
+        let mut batch = WriteBatch::default();
+        for (record_id, cluster_id) in assignments {
+            batch.put_cf(cf, record_id.0.to_be_bytes(), cluster_id.0.to_be_bytes());
+        }
         self.db.write(batch)?;
         Ok(())
     }

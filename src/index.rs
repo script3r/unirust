@@ -164,6 +164,7 @@ impl IntervalTree {
         }
     }
 
+    #[allow(dead_code)]
     fn collect_overlapping(&self, interval: Interval, out: &mut Vec<(RecordId, Interval)>) {
         self.collect_overlapping_limited(interval, out, usize::MAX);
     }
@@ -266,6 +267,7 @@ impl CandidateList {
         }
     }
 
+    #[allow(dead_code)]
     fn collect_overlapping_clusters(
         &mut self,
         dsu: &mut TemporalDSU,
@@ -288,9 +290,9 @@ impl CandidateList {
     ) -> bool {
         self.rebuild_tree_if_needed();
         let mut scratch = Vec::new();
-        let limit_reached = self
-            .cluster_tree
-            .collect_overlapping_limited(interval, &mut scratch, max_tree_nodes);
+        let limit_reached =
+            self.cluster_tree
+                .collect_overlapping_limited(interval, &mut scratch, max_tree_nodes);
         for (record_id, candidate_interval) in scratch {
             let root = dsu.find(record_id);
             if seen.insert(root) {
@@ -623,6 +625,68 @@ impl IdentityKeyIndex {
         Ok(())
     }
 
+    /// Add a record using pre-extracted key values (avoids duplicate extraction).
+    /// Takes ownership of cached_keys to avoid cloning.
+    #[allow(clippy::type_complexity)]
+    pub fn add_record_with_cached_keys(
+        &mut self,
+        record_id: RecordId,
+        root_id: RecordId,
+        entity_type: &str,
+        cached_keys: Vec<(
+            &crate::ontology::IdentityKey,
+            Vec<(Vec<KeyValue>, Interval)>,
+        )>,
+    ) {
+        use hashbrown::hash_map::RawEntryMut;
+        use std::hash::{BuildHasher, Hash, Hasher};
+
+        for (identity_key, key_values_with_intervals) in cached_keys {
+            if !key_values_with_intervals.is_empty() {
+                self.record_keys
+                    .entry(record_id)
+                    .or_default()
+                    .push(identity_key.clone());
+
+                for (key_values, interval) in key_values_with_intervals {
+                    // Use raw_entry_mut to avoid allocating entity_type when key exists
+                    let ref_key = IdentityIndexKeyRef {
+                        entity_type,
+                        key_values: &key_values,
+                    };
+
+                    // Compute hash using the borrowed key
+                    #[allow(clippy::manual_hash_one)]
+                    let hash = {
+                        let mut hasher = self.index.hasher().build_hasher();
+                        ref_key.hash(&mut hasher);
+                        hasher.finish()
+                    };
+
+                    // Look up using raw entry, only allocate if inserting
+                    let candidates = match self
+                        .index
+                        .raw_entry_mut()
+                        .from_hash(hash, |k| ref_key.equivalent(k))
+                    {
+                        RawEntryMut::Occupied(entry) => entry.into_mut(),
+                        RawEntryMut::Vacant(entry) => {
+                            let owned_key = IdentityIndexKey {
+                                entity_type: entity_type.to_string(),
+                                key_values,
+                            };
+                            entry
+                                .insert_hashed_nocheck(hash, owned_key, KeyBucket::default())
+                                .1
+                        }
+                    };
+                    candidates.insert_record(record_id, interval);
+                    candidates.insert_cluster_interval(root_id, interval);
+                }
+            }
+        }
+    }
+
     /// Find records that match a given identity key
     pub fn find_matching_records(
         &mut self,
@@ -675,8 +739,14 @@ impl IdentityKeyIndex {
         key_values: &[KeyValue],
         interval: Interval,
     ) -> &[(RecordId, Interval)] {
-        self.find_matching_clusters_overlapping_limited(dsu, entity_type, key_values, interval, usize::MAX)
-            .0
+        self.find_matching_clusters_overlapping_limited(
+            dsu,
+            entity_type,
+            key_values,
+            interval,
+            usize::MAX,
+        )
+        .0
     }
 
     /// Find matching clusters with an early exit after visiting max_tree_nodes.
@@ -706,13 +776,15 @@ impl IdentityKeyIndex {
 
         cluster_overlap_buffer.clear();
         self.cluster_seen.clear();
-        let limit_reached = values.record_candidates.collect_overlapping_clusters_limited(
-            dsu,
-            interval,
-            cluster_overlap_buffer,
-            &mut self.cluster_seen,
-            max_tree_nodes,
-        );
+        let limit_reached = values
+            .record_candidates
+            .collect_overlapping_clusters_limited(
+                dsu,
+                interval,
+                cluster_overlap_buffer,
+                &mut self.cluster_seen,
+                max_tree_nodes,
+            );
         (cluster_overlap_buffer.as_slice(), limit_reached)
     }
 

@@ -70,6 +70,7 @@ struct QueryCache {
     clusters: dsu::Clusters,
     golden: std::collections::HashMap<ClusterId, Vec<graph::GoldenDescriptor>>,
     cluster_keys: std::collections::HashMap<ClusterId, graph::ClusterKey>,
+    record_to_cluster: std::collections::HashMap<RecordId, ClusterId>,
 }
 
 impl Unirust {
@@ -271,14 +272,14 @@ impl Unirust {
         let cluster_count = {
             let streaming = self.streaming.as_mut().unwrap();
 
+            // Stage all records first (adds to cache for reading, defers DB write)
             for record in records {
-                let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+                let (record_id, inserted) = self.store.stage_record_if_absent(record)?;
                 let cluster_id = if inserted {
                     streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
                 } else {
                     streaming.cluster_id_for(record_id)
                 };
-                let _ = self.store.set_cluster_assignment(record_id, cluster_id);
                 assignments.push(StreamedClusterAssignment {
                     record_id,
                     cluster_id,
@@ -296,6 +297,15 @@ impl Unirust {
             streaming.cluster_count()
         };
 
+        // Flush all staged records to DB in a single batch write
+        let _ = self.store.flush_staged_records();
+
+        // Batch write all cluster assignments at once
+        let batch_assignments: Vec<_> = assignments
+            .iter()
+            .map(|a| (a.record_id, a.cluster_id))
+            .collect();
+        let _ = self.store.set_cluster_assignments_batch(&batch_assignments);
         let _ = self.store.set_cluster_count(cluster_count);
         self.invalidate_query_cache();
         Ok(assignments)
@@ -472,10 +482,12 @@ impl Unirust {
             let golden = query::build_golden_cache(self.store.as_ref(), &clusters);
             let cluster_keys =
                 query::build_cluster_key_cache(self.store.as_ref(), &clusters, &self.ontology);
+            let record_to_cluster = query::build_record_to_cluster_map(&clusters);
             *cache_guard = Some(QueryCache {
                 clusters,
                 golden,
                 cluster_keys,
+                record_to_cluster,
             });
         }
         let cache = cache_guard.as_ref().expect("cache");
@@ -487,6 +499,7 @@ impl Unirust {
             interval,
             &cache.golden,
             &cache.cluster_keys,
+            &cache.record_to_cluster,
             &mut stats_guard,
         )
     }

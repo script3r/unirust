@@ -93,29 +93,47 @@ impl StreamingLinker {
             self.dsu.add_record(record_id);
         }
 
-        let record = store
-            .get_record(record_id)
-            .ok_or_else(|| anyhow::anyhow!("Record not found in store: {:?}", record_id))?;
+        // Try to get a reference first (avoids cloning), fall back to cloning if not available.
+        let record_owned;
+        let record: &Record = if let Some(r) = store.get_record_ref(record_id) {
+            r
+        } else {
+            record_owned = store
+                .get_record(record_id)
+                .ok_or_else(|| anyhow::anyhow!("Record not found in store: {:?}", record_id))?;
+            &record_owned
+        };
         let record_perspective = record.identity.perspective.clone();
         self.record_perspectives
             .insert(record_id, record_perspective.clone());
         self.strong_id_summaries
             .entry(record_id)
             .or_default()
-            .merge(build_record_summary(&record, ontology));
+            .merge(build_record_summary(record, ontology));
 
         let entity_type = &record.identity.entity_type;
         let identity_keys = ontology.identity_keys_for_type(entity_type);
 
-        let mut deferred_keys = Vec::new();
+        // Cache extracted key values to avoid duplicate extraction in add_record
+        #[allow(clippy::type_complexity)]
+        let mut cached_keys: Vec<(
+            &crate::ontology::IdentityKey,
+            Vec<(Vec<crate::model::KeyValue>, crate::temporal::Interval)>,
+        )> = Vec::new();
+
         for identity_key in identity_keys {
             let _key_guard = crate::profile::profile_scope("identity_key_loop");
             let key_values_with_intervals = self
                 .identity_index
-                .extract_key_values_with_intervals(&record, identity_key)?;
+                .extract_key_values_with_intervals(record, identity_key)?;
 
-            for (key_values, interval) in key_values_with_intervals {
-                let key_signature = IdentityKeySignature::new(entity_type, &key_values);
+            // Cache for later insertion (we iterate by reference to avoid cloning)
+            cached_keys.push((identity_key, key_values_with_intervals));
+            let cached_entry = &cached_keys.last().unwrap().1;
+
+            for (key_values, interval) in cached_entry.iter() {
+                let interval = *interval; // deref for use below
+                let key_signature = IdentityKeySignature::new(entity_type, key_values);
 
                 // Fast path: skip if key is already known to be tainted (O(1) set lookup).
                 // We already added to pending_keys when first tainted, no need to re-add.
@@ -141,7 +159,7 @@ impl StreamingLinker {
                     .find_matching_clusters_overlapping_limited(
                         dsu,
                         entity_type,
-                        &key_values,
+                        key_values,
                         interval,
                         max_tree_nodes,
                     );
@@ -152,17 +170,15 @@ impl StreamingLinker {
                 if is_hot {
                     tainted_identity_keys.insert(key_signature.clone());
                     if self.tuning.deferred_reconciliation {
-                        self.pending_keys.insert(key_signature.clone());
+                        self.pending_keys.insert(key_signature);
                     }
-                    deferred_keys.push((key_signature, candidate_len));
                     continue;
                 }
 
-                deferred_keys.push((key_signature.clone(), candidate_len));
                 if candidate_len > self.tuning.hot_key_threshold {
                     tainted_identity_keys.insert(key_signature.clone());
                     if self.tuning.deferred_reconciliation {
-                        self.pending_keys.insert(key_signature.clone());
+                        self.pending_keys.insert(key_signature);
                     }
                     continue;
                 }
@@ -184,10 +200,21 @@ impl StreamingLinker {
                     self.tuning.candidate_cap
                 };
                 if candidate_len > actual_cap && self.tuning.deferred_reconciliation {
-                    self.pending_keys.insert(key_signature.clone());
+                    // Record stats before moving key_signature
+                    self.key_stats
+                        .entry(key_signature.clone())
+                        .or_default()
+                        .record(candidate_len, actual_cap);
+                    self.pending_keys.insert(key_signature);
                     continue;
                 }
                 let key_is_tainted = tainted_identity_keys.contains(&key_signature);
+                // Only clone key for stats if we have candidates (skip unique keys)
+                let stats_key = if candidate_len > 0 {
+                    Some(key_signature.clone())
+                } else {
+                    None
+                };
                 let mut root_a = dsu.find(record_id);
 
                 for (candidate_id, candidate_interval) in candidates {
@@ -258,7 +285,7 @@ impl StreamingLinker {
                         reconcile_cluster_summaries(strong_id_summaries, root_a, root_b, new_root);
                         identity_index.merge_key_clusters(
                             entity_type,
-                            &key_values,
+                            key_values,
                             root_a,
                             root_b,
                             new_root,
@@ -266,34 +293,22 @@ impl StreamingLinker {
                         root_a = new_root;
                     }
                 }
+                // Record stats after candidates loop (borrows dropped)
+                // Only track stats for keys with candidates (skip unique keys)
+                if let Some(stats_key) = stats_key {
+                    self.key_stats
+                        .entry(stats_key)
+                        .or_default()
+                        .record(candidate_len, actual_cap);
+                }
             }
         }
 
-        for (key_signature, candidate_len) in deferred_keys {
-            let stats = self.key_stats.get(&key_signature);
-            let avg = stats.map(|stats| stats.average_candidates()).unwrap_or(0.0);
-            let actual_cap = if self.tuning.adaptive_candidate_cap {
-                if candidate_len >= self.tuning.adaptive_high_threshold
-                    || avg >= self.tuning.adaptive_high_threshold as f64
-                {
-                    self.tuning.candidate_cap.min(self.tuning.adaptive_high_cap)
-                } else if candidate_len >= self.tuning.adaptive_mid_threshold
-                    || avg >= self.tuning.adaptive_mid_threshold as f64
-                {
-                    self.tuning.candidate_cap.min(self.tuning.adaptive_mid_cap)
-                } else {
-                    self.tuning.candidate_cap
-                }
-            } else {
-                self.tuning.candidate_cap
-            };
-            self.record_key_stats(&key_signature, candidate_len, actual_cap);
-        }
-
         // Add the record to the index after matching to avoid self-matches.
+        let _add_guard = crate::profile::profile_scope("add_to_index");
         let root = self.dsu.find(record_id);
         self.identity_index
-            .add_record_with_root(&record, root, ontology)?;
+            .add_record_with_cached_keys(record_id, root, entity_type, cached_keys);
 
         Ok(self.get_or_assign_cluster_id(root))
     }
@@ -477,11 +492,6 @@ impl StreamingLinker {
         }
 
         Ok(())
-    }
-
-    fn record_key_stats(&mut self, key: &IdentityKeySignature, candidate_len: usize, cap: usize) {
-        let stats = self.key_stats.entry(key.clone()).or_default();
-        stats.record(candidate_len, cap);
     }
 }
 
@@ -672,6 +682,7 @@ fn get_strong_identifier_descriptor<'a>(
 }
 
 fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary {
+    let _guard = crate::profile::profile_scope("build_record_summary");
     let strong_ids = ontology.strong_identifiers_for_type(&record.identity.entity_type);
     if strong_ids.is_empty() {
         return StrongIdSummary::default();

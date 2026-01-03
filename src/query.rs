@@ -113,6 +113,7 @@ pub fn query_master_entities(
 ) -> Result<QueryOutcome> {
     let golden_cache = build_golden_cache(store, clusters);
     let cluster_key_cache = build_cluster_key_cache(store, clusters, ontology);
+    let record_to_cluster = build_record_to_cluster_map(clusters);
     query_master_entities_with_cache(
         store,
         clusters,
@@ -120,6 +121,7 @@ pub fn query_master_entities(
         interval,
         &golden_cache,
         &cluster_key_cache,
+        &record_to_cluster,
     )
 }
 
@@ -130,16 +132,10 @@ pub fn query_master_entities_with_cache(
     interval: Interval,
     golden_cache: &std::collections::HashMap<ClusterId, Vec<GoldenDescriptor>>,
     cluster_key_cache: &std::collections::HashMap<ClusterId, ClusterKey>,
+    record_to_cluster: &std::collections::HashMap<RecordId, ClusterId>,
 ) -> Result<QueryOutcome> {
     if descriptors.is_empty() {
         return Ok(QueryOutcome::Matches(Vec::new()));
-    }
-
-    let mut record_to_cluster = std::collections::HashMap::new();
-    for cluster in &clusters.clusters {
-        for record_id in &cluster.records {
-            record_to_cluster.insert(*record_id, cluster.id);
-        }
     }
 
     let mut candidate_intervals_by_cluster: std::collections::HashMap<ClusterId, Vec<Interval>> =
@@ -234,6 +230,7 @@ pub fn query_master_entities_with_cache_selective(
     interval: Interval,
     golden_cache: &std::collections::HashMap<ClusterId, Vec<GoldenDescriptor>>,
     cluster_key_cache: &std::collections::HashMap<ClusterId, ClusterKey>,
+    record_to_cluster: &std::collections::HashMap<RecordId, ClusterId>,
     stats: &mut QuerySelectivityStats,
 ) -> Result<QueryOutcome> {
     if descriptors.is_empty() {
@@ -241,12 +238,6 @@ pub fn query_master_entities_with_cache_selective(
     }
 
     let ordered = stats.order_descriptors(descriptors);
-    let mut record_to_cluster = std::collections::HashMap::new();
-    for cluster in &clusters.clusters {
-        for record_id in &cluster.records {
-            record_to_cluster.insert(*record_id, cluster.id);
-        }
-    }
 
     let mut candidate_intervals_by_cluster: std::collections::HashMap<ClusterId, Vec<Interval>> =
         std::collections::HashMap::new();
@@ -455,6 +446,18 @@ pub fn build_cluster_key_cache(
     ontology: &Ontology,
 ) -> std::collections::HashMap<ClusterId, ClusterKey> {
     cluster_keys_for_clusters(store, clusters, ontology)
+}
+
+pub fn build_record_to_cluster_map(
+    clusters: &Clusters,
+) -> std::collections::HashMap<RecordId, ClusterId> {
+    let mut map = std::collections::HashMap::new();
+    for cluster in &clusters.clusters {
+        for record_id in &cluster.records {
+            map.insert(*record_id, cluster.id);
+        }
+    }
+    map
 }
 
 fn filter_golden_for_interval(

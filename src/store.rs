@@ -36,6 +36,11 @@ pub trait RecordStore: Send + Sync {
     /// Get a record by ID.
     fn get_record(&self, id: RecordId) -> Option<Record>;
 
+    /// Get a reference to a record by ID (avoids cloning). Default uses get_record.
+    fn get_record_ref(&self, _id: RecordId) -> Option<&Record> {
+        None // Default implementation returns None, callers should use get_record
+    }
+
     /// Get a record ID by identity if present.
     fn get_record_id_by_identity(&self, _identity: &RecordIdentity) -> Option<RecordId> {
         None
@@ -162,6 +167,17 @@ pub trait RecordStore: Send + Sync {
         Ok(())
     }
 
+    /// Persist multiple record -> cluster assignments in a single batch.
+    fn set_cluster_assignments_batch(
+        &mut self,
+        assignments: &[(RecordId, crate::model::ClusterId)],
+    ) -> Result<()> {
+        for (record_id, cluster_id) in assignments {
+            self.set_cluster_assignment(*record_id, *cluster_id)?;
+        }
+        Ok(())
+    }
+
     /// Check if the store is empty.
     fn is_empty(&self) -> bool;
 
@@ -185,6 +201,28 @@ pub trait RecordStore: Send + Sync {
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         let id = self.add_record(record)?;
         Ok((id, true))
+    }
+
+    /// Batch add records if their identities have not been seen.
+    /// Returns Vec of (record_id, inserted) in the same order as input.
+    fn add_records_if_absent(&mut self, records: Vec<Record>) -> Result<Vec<(RecordId, bool)>> {
+        let mut results = Vec::with_capacity(records.len());
+        for record in records {
+            results.push(self.add_record_if_absent(record)?);
+        }
+        Ok(results)
+    }
+
+    /// Stage a record for later batch write. Returns (record_id, inserted).
+    /// Default implementation just calls add_record_if_absent.
+    fn stage_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        self.add_record_if_absent(record)
+    }
+
+    /// Flush all staged records to the database. Returns count of flushed records.
+    /// Default implementation returns 0 (no staging support).
+    fn flush_staged_records(&mut self) -> Result<usize> {
+        Ok(0)
     }
 
     /// Optional store-level metrics.
@@ -311,6 +349,11 @@ impl Store {
     /// Get a record by ID
     pub fn get_record(&self, id: RecordId) -> Option<Record> {
         self.records.get(&id).cloned()
+    }
+
+    /// Get a reference to a record by ID (avoids cloning).
+    pub fn get_record_ref(&self, id: RecordId) -> Option<&Record> {
+        self.records.get(&id)
     }
 
     pub fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
@@ -465,6 +508,10 @@ impl RecordStore for Store {
 
     fn get_record(&self, id: RecordId) -> Option<Record> {
         Store::get_record(self, id)
+    }
+
+    fn get_record_ref(&self, id: RecordId) -> Option<&Record> {
+        Store::get_record_ref(self, id)
     }
 
     fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
