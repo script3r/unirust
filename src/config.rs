@@ -12,6 +12,17 @@ pub struct StreamingTuning {
     pub adaptive_mid_cap: usize,
     pub deferred_reconciliation: bool,
     pub hot_key_threshold: usize,
+    /// Enable stochastic candidate sampling (SPER-inspired optimization).
+    /// When candidates exceed sampling_threshold, sample with probability
+    /// proportional to temporal overlap instead of hard cutoff.
+    /// This maintains expected match quality while reducing computation.
+    pub stochastic_sampling: bool,
+    /// Threshold above which stochastic sampling kicks in.
+    /// Default: 500 candidates
+    pub sampling_threshold: usize,
+    /// Target number of candidates to sample when using stochastic sampling.
+    /// Default: 200
+    pub sampling_target: usize,
     /// Configuration for persistent DSU (used when `use_persistent_dsu` is true)
     pub dsu_config: Option<PersistentDSUConfig>,
     /// Whether to use persistent DSU for billion-scale datasets
@@ -143,6 +154,9 @@ impl Default for StreamingTuning {
             adaptive_mid_cap: 1000,
             deferred_reconciliation: true,
             hot_key_threshold: 50_000,
+            stochastic_sampling: true,
+            sampling_threshold: 500,
+            sampling_target: 200,
             dsu_config: None,
             use_persistent_dsu: false,
             tier_config: None,
@@ -181,6 +195,9 @@ impl StreamingTuning {
             adaptive_mid_cap: 500,
             deferred_reconciliation: true,
             hot_key_threshold: 20_000,
+            stochastic_sampling: true,
+            sampling_threshold: 300,
+            sampling_target: 100,
             dsu_config: None,
             use_persistent_dsu: false,
             tier_config: None,
@@ -201,6 +218,9 @@ impl StreamingTuning {
             adaptive_mid_cap: 2500,
             deferred_reconciliation: true,
             hot_key_threshold: 100_000,
+            stochastic_sampling: true,
+            sampling_threshold: 800,
+            sampling_target: 400,
             dsu_config: None,
             use_persistent_dsu: false,
             tier_config: None,
@@ -221,6 +241,9 @@ impl StreamingTuning {
             adaptive_mid_cap: 300,
             deferred_reconciliation: true,
             hot_key_threshold: 10_000,
+            stochastic_sampling: true,
+            sampling_threshold: 200,
+            sampling_target: 100,
             dsu_config: None,
             use_persistent_dsu: false,
             tier_config: None,
@@ -241,6 +264,9 @@ impl StreamingTuning {
             adaptive_mid_cap: 0,
             deferred_reconciliation: true,
             hot_key_threshold: 5_000,
+            stochastic_sampling: true,
+            sampling_threshold: 200,
+            sampling_target: 50,
             dsu_config: Some(PersistentDSUConfig::memory_saver()),
             use_persistent_dsu: false,
             tier_config: Some(TierConfig::memory_saver()),
@@ -262,6 +288,9 @@ impl StreamingTuning {
             adaptive_mid_cap: 1000,
             deferred_reconciliation: true,
             hot_key_threshold: 100_000,
+            stochastic_sampling: true,
+            sampling_threshold: 500,
+            sampling_target: 200,
             dsu_config: Some(PersistentDSUConfig::default()),
             use_persistent_dsu: true,
             tier_config: Some(TierConfig::default()),
@@ -283,6 +312,9 @@ impl StreamingTuning {
             adaptive_mid_cap: 2500,
             deferred_reconciliation: true,
             hot_key_threshold: 200_000,
+            stochastic_sampling: true,
+            sampling_threshold: 800,
+            sampling_target: 400,
             dsu_config: Some(PersistentDSUConfig::high_performance()),
             use_persistent_dsu: true,
             tier_config: Some(TierConfig::high_performance()),

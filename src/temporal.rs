@@ -99,6 +99,26 @@ impl Interval {
         }
     }
 
+    /// Get the duration of this interval, returning 0 for infinite intervals.
+    /// Useful for weight calculations where infinite intervals should not dominate.
+    #[inline]
+    pub fn duration_or_zero(&self) -> i64 {
+        self.duration().unwrap_or(0)
+    }
+
+    /// Calculate the overlap duration between this interval and another.
+    /// Returns 0 if the intervals don't overlap.
+    #[inline]
+    pub fn overlap_duration(&self, other: &Interval) -> i64 {
+        let overlap_start = self.start.max(other.start);
+        let overlap_end = self.end.min(other.end);
+        if overlap_start < overlap_end {
+            overlap_end - overlap_start
+        } else {
+            0
+        }
+    }
+
     /// Check if this interval is finite (has both start and end defined)
     pub fn is_finite(&self) -> bool {
         self.start != NEG_INF && self.end != POS_INF

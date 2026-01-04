@@ -55,6 +55,8 @@ pub struct LinkerMetrics {
     pub hot_key_exits: AtomicU64,
     /// Deferred reconciliations performed.
     pub reconciliations: AtomicU64,
+    /// Stochastic sampling applied (candidates reduced).
+    pub stochastic_samples: AtomicU64,
 }
 
 impl LinkerMetrics {
@@ -74,6 +76,7 @@ impl LinkerMetrics {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             hot_key_exits: self.hot_key_exits.load(Ordering::Relaxed),
             reconciliations: self.reconciliations.load(Ordering::Relaxed),
+            stochastic_samples: self.stochastic_samples.load(Ordering::Relaxed),
         }
     }
 
@@ -87,6 +90,7 @@ impl LinkerMetrics {
         self.cache_misses.store(0, Ordering::Relaxed);
         self.hot_key_exits.store(0, Ordering::Relaxed);
         self.reconciliations.store(0, Ordering::Relaxed);
+        self.stochastic_samples.store(0, Ordering::Relaxed);
     }
 }
 
@@ -101,6 +105,7 @@ pub struct LinkerMetricsSnapshot {
     pub cache_misses: u64,
     pub hot_key_exits: u64,
     pub reconciliations: u64,
+    pub stochastic_samples: u64,
 }
 
 impl LinkerMetricsSnapshot {
@@ -654,6 +659,46 @@ impl StreamingLinker {
                     }
                     continue;
                 }
+
+                // === SPER OPTIMIZATION: Stochastic candidate sampling ===
+                // When candidate count exceeds threshold, use Bernoulli trials with
+                // probability proportional to temporal overlap weight.
+                // This achieves O(n) vs O(n log n) for sorting-based approaches.
+                let candidates = if self.tuning.stochastic_sampling
+                    && candidate_len > self.tuning.sampling_threshold
+                {
+                    self.metrics
+                        .stochastic_samples
+                        .fetch_add(1, Ordering::Relaxed);
+                    let base_prob = self.tuning.sampling_target as f64 / candidate_len as f64;
+                    let interval_len = interval.duration_or_zero();
+                    let record_hash = record_id.0 as u64;
+
+                    candidates
+                        .into_iter()
+                        .filter(|(cand_id, cand_interval)| {
+                            // Compute temporal overlap weight (0.0 to 1.0)
+                            let overlap = interval.overlap_duration(cand_interval);
+                            let cand_len = cand_interval.duration_or_zero();
+                            let min_len = interval_len.min(cand_len).max(1);
+                            let weight = (overlap as f64 / min_len as f64).min(1.0);
+
+                            // Fast deterministic hash-based selection
+                            // Hash combines record and candidate for determinism
+                            let hash =
+                                record_hash.wrapping_mul(0x517cc1b727220a95) ^ (cand_id.0 as u64);
+                            let hash_frac = (hash as f64) / (u64::MAX as f64);
+
+                            // Accept with probability: base_prob * (0.5 + 0.5 * weight)
+                            // This weights higher-overlap candidates more likely
+                            hash_frac < base_prob * (0.5 + 0.5 * weight)
+                        })
+                        .collect::<CandidateVec>()
+                } else {
+                    candidates
+                };
+                let candidate_len = candidates.len();
+
                 let stats = self.key_stats.get(&key_signature);
                 let avg = stats.map(|stats| stats.average_candidates()).unwrap_or(0.0);
                 let actual_cap = if self.tuning.adaptive_candidate_cap {
