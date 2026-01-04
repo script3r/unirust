@@ -29,6 +29,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
+// Re-export optimized components for use by ShardNode
+use crate::distributed_optimized::SharedInterner;
+
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRecordIdentity {
     entity_type: String,
@@ -890,7 +893,8 @@ fn env_f64(key: &str, default: f64) -> f64 {
 #[derive(Clone)]
 pub struct ShardNode {
     shard_id: u32,
-    unirust: Arc<RwLock<Unirust>>,
+    /// Uses parking_lot RwLock (faster for short critical sections than tokio's async RwLock)
+    unirust: Arc<parking_lot::RwLock<Unirust>>,
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
@@ -900,11 +904,27 @@ pub struct ShardNode {
     ingest_coalescer: Option<Arc<BatchCoalescer>>,
     config_version: String,
     metrics: Arc<Metrics>,
+    /// Shared string interner for lock-free interning
+    #[allow(dead_code)]
+    shared_interner: Arc<SharedInterner>,
 }
 
 const INGEST_QUEUE_CAPACITY: usize = 128;
-const DEFAULT_INGEST_WORKERS: usize = 4;
+const DEFAULT_INGEST_WORKERS: usize = 16;
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
+
+// Helper macros for lock acquisition (parking_lot RwLock - synchronous)
+macro_rules! write_unirust {
+    ($self:expr) => {
+        $self.unirust.write()
+    };
+}
+
+macro_rules! read_unirust {
+    ($self:expr) => {
+        $self.unirust.read()
+    };
+}
 
 // Batch coalescing configuration (reserved for future ingest optimization).
 #[allow(dead_code)]
@@ -1049,7 +1069,7 @@ impl ShardNode {
                 wal.replay(&mut unirust, shard_id)
                     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
             }
-            let unirust = Arc::new(RwLock::new(unirust));
+            let unirust = Arc::new(parking_lot::RwLock::new(unirust));
             let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
             let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
             return Ok(Self {
@@ -1063,13 +1083,14 @@ impl ShardNode {
                 ingest_coalescer,
                 config_version,
                 metrics: Arc::new(Metrics::new()),
+                shared_interner: Arc::new(SharedInterner::new()),
             });
         }
 
         let mut store = crate::Store::new();
         let ontology = ontology_config.clone().build_ontology(&mut store);
         let ingest_wal = None;
-        let unirust = Arc::new(RwLock::new(Unirust::with_store_and_tuning(
+        let unirust = Arc::new(parking_lot::RwLock::new(Unirust::with_store_and_tuning(
             ontology,
             store,
             tuning.clone(),
@@ -1087,6 +1108,7 @@ impl ShardNode {
             ingest_coalescer,
             config_version,
             metrics: Arc::new(Metrics::new()),
+            shared_interner: Arc::new(SharedInterner::new()),
         })
     }
 
@@ -1236,8 +1258,9 @@ fn ingest_worker_index(record: &proto::RecordInput, worker_count: usize) -> usiz
     (hasher.finish() as usize) % worker_count
 }
 
+/// Spawn ingest workers using parking_lot::RwLock for faster locking.
 fn spawn_ingest_workers(
-    unirust: Arc<RwLock<Unirust>>,
+    unirust: Arc<parking_lot::RwLock<Unirust>>,
     shard_id: u32,
     worker_count: usize,
 ) -> Vec<mpsc::Sender<IngestJob>> {
@@ -1248,7 +1271,7 @@ fn spawn_ingest_workers(
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 let result = {
-                    let mut guard = worker_unirust.write().await;
+                    let mut guard = worker_unirust.write();
                     process_ingest_batch(&mut guard, shard_id, &job.records)
                 };
                 let _ = job.respond_to.send(result);
@@ -1431,7 +1454,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         if let Some(path) = &self.data_dir {
             // Must acquire write lock and drop old Unirust BEFORE opening new store
             // to release the RocksDB file lock
-            let mut guard = self.unirust.write().await;
+            let mut guard = write_unirust!(self);
 
             // Create a temporary in-memory Unirust to replace the persistent one,
             // which closes the RocksDB when dropped
@@ -1462,7 +1485,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         } else {
             let mut store = crate::Store::new();
             let ontology = config.build_ontology(&mut store);
-            let mut guard = self.unirust.write().await;
+            let mut guard = write_unirust!(self);
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         }
 
@@ -1537,7 +1560,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::QueryEntitiesRequest>,
     ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
         let start = Instant::now();
-        let mut unirust = self.unirust.write().await;
+        let mut unirust = write_unirust!(self);
         let request = request.into_inner();
         let interval = Interval::new(request.start, request.end)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -1629,7 +1652,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
-        let unirust = self.unirust.read().await;
+        let unirust = read_unirust!(self);
         let record_count = unirust.record_count() as u64;
         let cluster_count = unirust.streaming_cluster_count().unwrap_or(0) as u64;
         let conflict_count = unirust.conflict_summary_count().unwrap_or(0) as u64;
@@ -1667,7 +1690,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::MetricsRequest>,
     ) -> Result<Response<proto::MetricsResponse>, Status> {
         let store_metrics = {
-            let unirust = self.unirust.read().await;
+            let unirust = read_unirust!(self);
             unirust.store_metrics()
         };
         let response = proto::MetricsResponse {
@@ -1698,7 +1721,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .ok_or_else(|| Status::internal("invalid checkpoint path"))?,
         )
         .map_err(|err| Status::internal(err.to_string()))?;
-        let unirust = self.unirust.read().await;
+        let unirust = read_unirust!(self);
         unirust
             .checkpoint_to_path(&target)
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -1711,7 +1734,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::RecordIdRangeRequest>,
     ) -> Result<Response<proto::RecordIdRangeResponse>, Status> {
-        let unirust = self.unirust.read().await;
+        let unirust = read_unirust!(self);
         let record_count = unirust.record_count() as u64;
         let response = match unirust.record_id_bounds() {
             Some((min_id, max_id)) => proto::RecordIdRangeResponse {
@@ -1750,7 +1773,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             return Err(Status::invalid_argument("start_id must be < end_id"));
         }
 
-        let unirust = self.unirust.read().await;
+        let unirust = read_unirust!(self);
         let mut records = unirust.records_in_id_range(start_id, end_id, limit + 1);
         let has_more = records.len() > limit;
         if has_more {
@@ -1797,33 +1820,40 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         let unirust = self.unirust.clone();
         let (tx, rx) = mpsc::channel(4);
+
+        let read_records = move |unirust: Arc<parking_lot::RwLock<Unirust>>,
+                                 start: u32,
+                                 end: u32,
+                                 lim: usize|
+              -> Pin<Box<dyn std::future::Future<Output = _> + Send>> {
+            Box::pin(async move {
+                let guard = unirust.read();
+                let mut records =
+                    guard.records_in_id_range(RecordId(start), RecordId(end), lim + 1);
+                let has_more = records.len() > lim;
+                if has_more {
+                    records.truncate(lim);
+                }
+                let next_start_id = if has_more {
+                    records
+                        .last()
+                        .map(|r| r.id.0.saturating_add(1))
+                        .unwrap_or(start)
+                } else {
+                    0
+                };
+                let snapshots = records
+                    .iter()
+                    .map(|r| ShardNode::record_to_snapshot(&guard, r))
+                    .collect::<Vec<_>>();
+                (snapshots, has_more, next_start_id)
+            })
+        };
+
         tokio::spawn(async move {
             loop {
-                let (records, has_more, next_start_id) = {
-                    let unirust_guard = unirust.read().await;
-                    let mut records = unirust_guard.records_in_id_range(
-                        RecordId(start_id),
-                        RecordId(end_id),
-                        limit + 1,
-                    );
-                    let has_more = records.len() > limit;
-                    if has_more {
-                        records.truncate(limit);
-                    }
-                    let next_start_id = if has_more {
-                        records
-                            .last()
-                            .map(|record| record.id.0.saturating_add(1))
-                            .unwrap_or(start_id)
-                    } else {
-                        0
-                    };
-                    let snapshots = records
-                        .iter()
-                        .map(|record| ShardNode::record_to_snapshot(&unirust_guard, record))
-                        .collect::<Vec<_>>();
-                    (snapshots, has_more, next_start_id)
-                };
+                let (records, has_more, next_start_id) =
+                    read_records(unirust.clone(), start_id, end_id, limit).await;
 
                 if records.is_empty() {
                     break;
@@ -1862,7 +1892,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         if request.records.is_empty() {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
         }
-        let mut unirust = self.unirust.write().await;
+        let mut unirust = write_unirust!(self);
         let mut records = Vec::with_capacity(request.records.len());
         for snapshot in &request.records {
             let identity = snapshot
@@ -1898,7 +1928,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             if chunk.records.is_empty() {
                 continue;
             }
-            let mut unirust = self.unirust.write().await;
+            let mut unirust = write_unirust!(self);
             let mut records = Vec::with_capacity(chunk.records.len());
             for snapshot in &chunk.records {
                 let identity = snapshot
@@ -1926,19 +1956,19 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
         let request = request.into_inner();
         let mut summaries = if let Some(cache) = {
-            let guard = self.unirust.read().await;
+            let guard = read_unirust!(self);
             guard.cached_conflict_summaries()
         } {
             cache
         } else if let Some(persisted) = {
-            let guard = self.unirust.read().await;
+            let guard = read_unirust!(self);
             guard.load_conflict_summaries()
         } {
-            let mut unirust = self.unirust.write().await;
+            let mut unirust = write_unirust!(self);
             unirust.set_conflict_cache(persisted.clone());
             persisted
         } else {
-            let mut unirust = self.unirust.write().await;
+            let mut unirust = write_unirust!(self);
             let clusters = unirust
                 .build_clusters()
                 .map_err(|err| Status::internal(err.to_string()))?;
@@ -1988,12 +2018,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
             store
                 .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
-            let mut guard = self.unirust.write().await;
+            let mut guard = write_unirust!(self);
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         } else {
             let mut store = crate::Store::new();
             let ontology = config.build_ontology(&mut store);
-            let mut guard = self.unirust.write().await;
+            let mut guard = write_unirust!(self);
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         }
         Ok(Response::new(proto::Empty {}))
@@ -2006,7 +2036,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let since_version = request.into_inner().since_version;
 
         // Export boundary metadata from the streaming linker
-        let unirust = self.unirust.read().await;
+        let unirust = read_unirust!(self);
         let boundary_index = unirust.export_boundary_index();
 
         let metadata = match boundary_index {
@@ -2096,7 +2126,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
 
         // Get write lock on unirust
-        let mut unirust = self.unirust.write().await;
+        let mut unirust = write_unirust!(self);
 
         // Apply the merge via the streaming linker's DSU
         let records_updated = match unirust.apply_cross_shard_merge(primary_id, secondary_id) {
