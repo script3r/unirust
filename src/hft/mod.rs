@@ -17,7 +17,9 @@ pub mod bigtable_opts;
 pub mod compression;
 pub mod interner;
 pub mod queue;
+pub mod sharded_cache;
 pub mod simd_hash;
+pub mod write_buffer;
 pub mod zero_copy;
 
 // Core types
@@ -36,3 +38,7 @@ pub use compression::{
     compress, decompress, decompress_batch, BatchCompressor, CompressionStats, StreamingCompressor,
 };
 pub use queue::{BatchAggregator, IngestJob, IngestQueue, QueueStats};
+pub use sharded_cache::{ShardedCacheConfig, ShardedCacheStats, ShardedLruCache};
+pub use write_buffer::{
+    ReservationResult, WriteBufferConfig, WriteBufferManager, WriteBufferStats,
+};
