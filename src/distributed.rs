@@ -314,7 +314,9 @@ fn signature_from_proto_record(
     let identity = record.identity.as_ref()?;
     let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
     for descriptor in &record.descriptors {
-        descriptors_by_attr.insert(descriptor.attr.as_str(), descriptor.value.as_str());
+        descriptors_by_attr
+            .entry(descriptor.attr.as_str())
+            .or_insert(descriptor.value.as_str());
     }
 
     // Try to find a matching identity key
@@ -624,7 +626,9 @@ fn hash_record_to_u64(config: &DistributedOntologyConfig, record: &proto::Record
     let identity = record.identity.as_ref();
     let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
     for descriptor in &record.descriptors {
-        descriptors_by_attr.insert(descriptor.attr.as_str(), descriptor.value.as_str());
+        descriptors_by_attr
+            .entry(descriptor.attr.as_str())
+            .or_insert(descriptor.value.as_str());
     }
 
     for key in &config.identity_keys {
@@ -926,8 +930,10 @@ const INGEST_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_INGEST_WORKERS: usize = 4;
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
 
-// Batch coalescing configuration
+// Batch coalescing configuration (reserved for future ingest optimization).
+#[allow(dead_code)]
 const COALESCE_MAX_RECORDS: usize = 2000; // Max records per coalesced batch
+#[allow(dead_code)]
 const COALESCE_MAX_WAIT_MICROS: u64 = 100; // Max wait time before processing (100µs)
 
 struct IngestJob {
@@ -936,17 +942,20 @@ struct IngestJob {
 }
 
 /// A pending job waiting to be coalesced with others
+#[allow(dead_code)]
 struct CoalescedJob {
     records: Vec<proto::RecordInput>,
     respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
 }
 
 /// Batch coalescer collects multiple ingest jobs and processes them together
+#[allow(dead_code)]
 struct BatchCoalescer {
     pending: StdMutex<Vec<CoalescedJob>>,
     notify: tokio::sync::Notify,
 }
 
+#[allow(dead_code)]
 impl BatchCoalescer {
     fn new() -> Self {
         Self {
@@ -981,10 +990,8 @@ impl BatchCoalescer {
 
 /// Spawn a coalescing ingest writer that batches multiple requests together
 /// Uses zero-wait strategy: process immediately but grab all pending work
-fn spawn_coalescing_ingest(
-    unirust: Arc<RwLock<Unirust>>,
-    shard_id: u32,
-) -> Arc<BatchCoalescer> {
+#[allow(dead_code)]
+fn spawn_coalescing_ingest(unirust: Arc<RwLock<Unirust>>, shard_id: u32) -> Arc<BatchCoalescer> {
     let coalescer = Arc::new(BatchCoalescer::new());
     let writer_coalescer = coalescer.clone();
 
@@ -1456,11 +1463,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             let temp_ontology = crate::Ontology::new();
             let old = std::mem::replace(
                 &mut *guard,
-                Unirust::with_store_and_tuning(
-                    temp_ontology,
-                    temp_store,
-                    self.tuning.clone(),
-                ),
+                Unirust::with_store_and_tuning(temp_ontology, temp_store, self.tuning.clone()),
             );
             drop(old); // Explicitly drop to close RocksDB
 
