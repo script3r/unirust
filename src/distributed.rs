@@ -29,9 +29,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-// Re-export optimized components for use by ShardNode
-use crate::distributed_optimized::SharedInterner;
-
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRecordIdentity {
     entity_type: String,
@@ -904,9 +901,6 @@ pub struct ShardNode {
     ingest_coalescer: Option<Arc<BatchCoalescer>>,
     config_version: String,
     metrics: Arc<Metrics>,
-    /// Shared string interner for lock-free interning
-    #[allow(dead_code)]
-    shared_interner: Arc<SharedInterner>,
 }
 
 const INGEST_QUEUE_CAPACITY: usize = 128;
@@ -1083,7 +1077,6 @@ impl ShardNode {
                 ingest_coalescer,
                 config_version,
                 metrics: Arc::new(Metrics::new()),
-                shared_interner: Arc::new(SharedInterner::new()),
             });
         }
 
@@ -1108,7 +1101,6 @@ impl ShardNode {
             ingest_coalescer,
             config_version,
             metrics: Arc::new(Metrics::new()),
-            shared_interner: Arc::new(SharedInterner::new()),
         })
     }
 

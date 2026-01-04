@@ -35,12 +35,10 @@
 pub mod config;
 pub mod conflicts;
 pub mod distributed;
-pub mod distributed_optimized;
 pub mod dsu;
 pub mod graph;
 pub mod index;
 pub mod linker;
-pub mod linker_optimized;
 pub mod model;
 pub mod ontology;
 pub mod persistence;
