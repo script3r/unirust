@@ -158,8 +158,11 @@ impl Partition {
         let mut results = Vec::with_capacity(count);
 
         for (index, record) in records {
-            // Add the record to our local store
-            let (record_id, inserted) = match self.store.add_record_if_absent(record) {
+            // Add the record to our local store WITHOUT re-interning!
+            // Records are pre-interned with ConcurrentInterner which has different AttrIds
+            // than this partition's Store interner. Using add_record_if_absent would replace
+            // all AttrIds with "unknown", breaking conflict detection.
+            let (record_id, inserted) = match self.store.add_record_if_absent_raw(record) {
                 Ok((id, ins)) => (id, ins),
                 Err(e) => {
                     warn!("Failed to add record: {}", e);
@@ -168,23 +171,56 @@ impl Partition {
             };
 
             // Link the record if it was newly inserted
-            let cluster_id = if inserted {
-                match self.linker.link_record(&self.store, ontology, record_id) {
+            let (cluster_id, had_conflicts) = if inserted {
+                // Track conflicts before and after linking
+                let conflicts_before = self
+                    .linker
+                    .metrics()
+                    .conflicts_detected
+                    .load(Ordering::Relaxed);
+                let merges_before = self
+                    .linker
+                    .metrics()
+                    .merges_performed
+                    .load(Ordering::Relaxed);
+                let cluster_id = match self.linker.link_record(&self.store, ontology, record_id) {
                     Ok(id) => id,
                     Err(e) => {
                         warn!("Failed to link record {:?}: {}", record_id, e);
                         ClusterId(0)
                     }
+                };
+                let conflicts_after = self
+                    .linker
+                    .metrics()
+                    .conflicts_detected
+                    .load(Ordering::Relaxed);
+                let merges_after = self
+                    .linker
+                    .metrics()
+                    .merges_performed
+                    .load(Ordering::Relaxed);
+                // Log every 1000th record to see progress
+                if record_id.0 % 1000 == 0 {
+                    eprintln!(
+                        "[P{}] record={} conflicts_delta={} merges_delta={} total_conflicts={}",
+                        self.id,
+                        record_id.0,
+                        conflicts_after - conflicts_before,
+                        merges_after - merges_before,
+                        conflicts_after
+                    );
                 }
+                (cluster_id, conflicts_after > conflicts_before)
             } else {
-                self.linker.cluster_id_for(record_id)
+                (self.linker.cluster_id_for(record_id), false)
             };
 
             results.push(PartitionIngestResult {
                 index,
                 cluster_id,
                 merges: 0,
-                had_conflicts: false,
+                had_conflicts,
             });
         }
 
@@ -279,7 +315,20 @@ impl Partition {
             external_merges_applied: self.external_merges_applied.load(Ordering::Relaxed),
             cluster_count: self.linker.cluster_count(),
             pending_merges: self.merge_rx.len(),
+            conflicts_detected: self
+                .linker
+                .metrics()
+                .conflicts_detected
+                .load(Ordering::Relaxed),
         }
+    }
+
+    /// Get the number of conflicts detected in this partition
+    pub fn conflicts_detected(&self) -> u64 {
+        self.linker
+            .metrics()
+            .conflicts_detected
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -291,6 +340,7 @@ pub struct PartitionStats {
     pub external_merges_applied: u64,
     pub cluster_count: usize,
     pub pending_merges: usize,
+    pub conflicts_detected: u64,
 }
 
 /// Partitioned Unirust for high-performance parallel processing
@@ -343,18 +393,46 @@ impl PartitionedUnirust {
         })
     }
 
-    /// Get the partition ID for a record based on its primary identity key
+    /// Get the partition ID for a record based on its primary identity key.
+    /// Uses identity KEY values (e.g., user_upn) for partitioning, NOT uid.
+    /// This ensures records that should be linked (same identity key) go to same partition.
     #[inline]
     pub fn partition_for_record(&self, record: &Record) -> usize {
-        // Use uid as partition key (deterministic)
-        // This ensures same identity always goes to same partition
-        let partition_key = &record.identity.uid;
-
-        // FxHash for speed, modulo for partition
         let mut hasher = FxHasher::default();
-        partition_key.hash(&mut hasher);
-        let hash = hasher.finish();
 
+        // Get identity keys for this entity type
+        let identity_keys = self
+            .ontology
+            .identity_keys_for_type(&record.identity.entity_type);
+
+        if !identity_keys.is_empty() {
+            // Use the FIRST identity key's values for partitioning
+            // This ensures records with same identity key go to same partition
+            let first_key = &identity_keys[0];
+            // Collect ValueIds (interned values) - same value = same ID
+            let key_value_ids: Vec<&crate::model::ValueId> = record
+                .descriptors
+                .iter()
+                .filter(|d| first_key.attributes.iter().any(|a| a == &d.attr))
+                .map(|d| &d.value)
+                .collect();
+
+            if !key_value_ids.is_empty() {
+                // Hash entity type + identity key value IDs
+                record.identity.entity_type.hash(&mut hasher);
+                for value_id in key_value_ids {
+                    value_id.hash(&mut hasher);
+                }
+            } else {
+                // Fallback to uid if no key values found
+                record.identity.uid.hash(&mut hasher);
+            }
+        } else {
+            // Fallback to uid if no identity keys defined
+            record.identity.uid.hash(&mut hasher);
+        }
+
+        let hash = hasher.finish();
         (hash as usize) % self.config.partition_count
     }
 
@@ -461,6 +539,11 @@ impl PartitionedUnirust {
         self.partitions.iter().map(|p| p.cluster_count()).sum()
     }
 
+    /// Get the total conflicts detected across all partitions
+    pub fn total_conflicts(&self) -> u64 {
+        self.partitions.iter().map(|p| p.conflicts_detected()).sum()
+    }
+
     /// Get the total records processed
     pub fn total_records(&self) -> u64 {
         self.total_records.load(Ordering::Relaxed)
@@ -514,6 +597,11 @@ impl PartitionedUnirustHandle {
         self.inner.read().total_cluster_count()
     }
 
+    /// Get total conflicts (read lock)
+    pub fn total_conflicts(&self) -> u64 {
+        self.inner.read().total_conflicts()
+    }
+
     /// Get total records (read lock)
     pub fn total_records(&self) -> u64 {
         self.inner.read().total_records()
@@ -547,14 +635,43 @@ impl ParallelPartitionedUnirust {
         })
     }
 
-    /// Get the partition ID for a record based on its primary identity key
+    /// Get the partition ID for a record based on its primary identity key.
+    /// Uses identity KEY values for partitioning, NOT uid.
     #[inline]
     pub fn partition_for_record(&self, record: &Record) -> usize {
-        let partition_key = &record.identity.uid;
+        self.compute_partition_id(record)
+    }
+
+    /// Compute partition ID for a record based on identity key values.
+    #[inline]
+    fn compute_partition_id(&self, record: &Record) -> usize {
         let mut hasher = FxHasher::default();
-        partition_key.hash(&mut hasher);
-        let hash = hasher.finish();
-        (hash as usize) % self.config.partition_count
+        let identity_keys = self
+            .ontology
+            .identity_keys_for_type(&record.identity.entity_type);
+
+        if !identity_keys.is_empty() {
+            let first_key = &identity_keys[0];
+            let key_value_ids: Vec<&crate::model::ValueId> = record
+                .descriptors
+                .iter()
+                .filter(|d| first_key.attributes.iter().any(|a| a == &d.attr))
+                .map(|d| &d.value)
+                .collect();
+
+            if !key_value_ids.is_empty() {
+                record.identity.entity_type.hash(&mut hasher);
+                for value_id in key_value_ids {
+                    value_id.hash(&mut hasher);
+                }
+            } else {
+                record.identity.uid.hash(&mut hasher);
+            }
+        } else {
+            record.identity.uid.hash(&mut hasher);
+        }
+
+        (hasher.finish() as usize) % self.config.partition_count
     }
 
     /// Partition records by their primary identity key - parallel version
@@ -563,7 +680,8 @@ impl ParallelPartitionedUnirust {
 
         // Use parallel partitioning for large batches
         if records.len() > 1000 {
-            // Pre-allocate thread-local buffers
+            // For parallel, we need to clone ontology Arc for thread safety
+            let ontology = self.ontology.clone();
             let partitioned: Vec<Vec<(u32, Record)>> = records
                 .into_par_iter()
                 .fold(
@@ -571,7 +689,30 @@ impl ParallelPartitionedUnirust {
                     |mut acc, (idx, record)| {
                         let partition_id = {
                             let mut hasher = FxHasher::default();
-                            record.identity.uid.hash(&mut hasher);
+                            let identity_keys =
+                                ontology.identity_keys_for_type(&record.identity.entity_type);
+
+                            if !identity_keys.is_empty() {
+                                let first_key = &identity_keys[0];
+                                let key_value_ids: Vec<&crate::model::ValueId> = record
+                                    .descriptors
+                                    .iter()
+                                    .filter(|d| first_key.attributes.iter().any(|a| a == &d.attr))
+                                    .map(|d| &d.value)
+                                    .collect();
+
+                                if !key_value_ids.is_empty() {
+                                    record.identity.entity_type.hash(&mut hasher);
+                                    for value_id in key_value_ids {
+                                        value_id.hash(&mut hasher);
+                                    }
+                                } else {
+                                    record.identity.uid.hash(&mut hasher);
+                                }
+                            } else {
+                                record.identity.uid.hash(&mut hasher);
+                            }
+
                             (hasher.finish() as usize) % partition_count
                         };
                         acc[partition_id].push((idx, record));
@@ -635,6 +776,50 @@ impl ParallelPartitionedUnirust {
         results
     }
 
+    /// Ingest a batch of records with pre-computed partition IDs.
+    /// Each record includes (partition_id, original_index, record).
+    /// This method is used when the caller has already computed partition IDs
+    /// using an interner (e.g., for correct conflict detection).
+    #[instrument(skip(self, records), level = "debug")]
+    pub fn ingest_batch_with_partitions(
+        &self,
+        records: Vec<(usize, u32, Record)>,
+    ) -> Vec<PartitionIngestResult> {
+        if records.is_empty() {
+            return Vec::new();
+        }
+
+        let record_count = records.len();
+        self.total_records
+            .fetch_add(record_count as u64, Ordering::Relaxed);
+
+        // Phase 1: Group records by pre-computed partition ID
+        let partition_count = self.config.partition_count;
+        let mut partitioned: Vec<Vec<(u32, Record)>> = vec![Vec::new(); partition_count];
+        for (partition_id, idx, record) in records {
+            let partition_id = partition_id % partition_count;
+            partitioned[partition_id].push((idx, record));
+        }
+
+        // Phase 2: Process ALL partitions in PARALLEL using rayon
+        let ontology = &self.ontology;
+
+        let all_results: Vec<Vec<PartitionIngestResult>> = partitioned
+            .into_par_iter()
+            .enumerate()
+            .filter(|(_, batch)| !batch.is_empty())
+            .map(|(partition_id, batch)| {
+                let mut partition = self.partitions[partition_id].lock();
+                partition.process_batch(batch, ontology)
+            })
+            .collect();
+
+        // Phase 3: Flatten and sort results by original index
+        let mut results: Vec<PartitionIngestResult> = all_results.into_iter().flatten().collect();
+        results.sort_by_key(|r| r.index);
+        results
+    }
+
     /// ULTRA-FAST ingest - skips entity resolution for maximum throughput.
     /// Uses UID hash as cluster ID. Entity resolution done lazily at query time.
     /// This is the fastest possible ingest path.
@@ -679,6 +864,14 @@ impl ParallelPartitionedUnirust {
             .sum()
     }
 
+    /// Get the total conflicts detected across all partitions
+    pub fn total_conflicts(&self) -> u64 {
+        self.partitions
+            .iter()
+            .map(|p| p.lock().conflicts_detected())
+            .sum()
+    }
+
     /// Get the total records processed
     pub fn total_records(&self) -> u64 {
         self.total_records.load(Ordering::Relaxed)
@@ -692,6 +885,11 @@ impl ParallelPartitionedUnirust {
     /// Get the partition count
     pub fn partition_count(&self) -> usize {
         self.config.partition_count
+    }
+
+    /// Get a reference to the ontology
+    pub fn ontology(&self) -> &Ontology {
+        &self.ontology
     }
 }
 

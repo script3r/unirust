@@ -589,6 +589,13 @@ impl StreamingLinker {
                 let candidates: CandidateVec = candidates_slice.iter().copied().collect();
                 let candidate_len = candidates.len();
 
+                if candidate_len > 0 {
+                    debug!(
+                        "Found {} candidates for record {:?} with key_values={:?}",
+                        candidate_len, record_id, key_values
+                    );
+                }
+
                 // If the tree query hit the limit, mark as hot and skip.
                 if is_hot || candidate_len > self.tuning.hot_key_threshold {
                     metrics.hot_key_exits.fetch_add(1, Ordering::Relaxed);
@@ -653,17 +660,26 @@ impl StreamingLinker {
                     let candidate_perspective = record_perspectives.get(&candidate_id);
                     let same_perspective_conflict = candidate_perspective
                         .map(|perspective| {
-                            perspective == &record_perspective
-                                && same_perspective_conflict_for_clusters(
-                                    strong_id_summaries,
-                                    root_a,
-                                    root_b,
-                                    perspective,
-                                )
+                            let is_same_perspective = perspective == &record_perspective;
+                            let has_conflict = same_perspective_conflict_for_clusters(
+                                strong_id_summaries,
+                                root_a,
+                                root_b,
+                                perspective,
+                            );
+                            debug!(
+                                "Conflict check: record={:?} candidate={:?} same_persp={} has_conflict={}",
+                                record_id, candidate_id, is_same_perspective, has_conflict
+                            );
+                            is_same_perspective && has_conflict
                         })
                         .unwrap_or(false);
 
                     if same_perspective_conflict {
+                        debug!(
+                            "CONFLICT DETECTED: record={:?} candidate={:?}",
+                            record_id, candidate_id
+                        );
                         metrics.conflicts_detected.fetch_add(1, Ordering::Relaxed);
                         tainted_identity_keys.insert(key_signature.clone());
                         continue;
@@ -1652,13 +1668,28 @@ fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary
     let _guard = crate::profile::profile_scope("build_record_summary");
     let strong_ids = ontology.strong_identifiers_for_type(&record.identity.entity_type);
     if strong_ids.is_empty() {
+        debug!(
+            "build_record_summary: no strong_ids for entity_type={}",
+            record.identity.entity_type
+        );
         return StrongIdSummary::default();
     }
 
     let mut strong_attrs = HashSet::new();
-    for strong_id in strong_ids {
+    for strong_id in &strong_ids {
         strong_attrs.insert(strong_id.attribute);
     }
+
+    debug!(
+        "build_record_summary: entity_type={} strong_attrs={:?} descriptor_attrs={:?}",
+        record.identity.entity_type,
+        strong_attrs,
+        record
+            .descriptors
+            .iter()
+            .map(|d| d.attr)
+            .collect::<Vec<_>>()
+    );
 
     let mut summary = StrongIdSummary::default();
     let perspective = record.identity.perspective.clone();
@@ -1667,8 +1698,10 @@ fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary
         .entry(perspective.clone())
         .or_default();
 
+    let mut matched = 0;
     for descriptor in &record.descriptors {
         if strong_attrs.contains(&descriptor.attr) {
+            matched += 1;
             entry
                 .entry(descriptor.attr)
                 .or_default()
@@ -1677,6 +1710,11 @@ fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary
                 .push(descriptor.interval);
         }
     }
+
+    debug!(
+        "build_record_summary: matched {} descriptors as strong identifiers",
+        matched
+    );
 
     if let Some(attrs) = summary.by_perspective.get_mut(&perspective) {
         for value_map in attrs.values_mut() {
@@ -1911,23 +1949,50 @@ fn same_perspective_conflict_for_clusters(
     let summary_b = get_cluster_summary(summaries, root_b);
 
     let Some(attrs_a) = summary_a.by_perspective.get(perspective) else {
+        debug!(
+            "  No attrs for perspective '{}' in summary_a (root {:?})",
+            perspective, root_a
+        );
         return false;
     };
     let Some(attrs_b) = summary_b.by_perspective.get(perspective) else {
+        debug!(
+            "  No attrs for perspective '{}' in summary_b (root {:?})",
+            perspective, root_b
+        );
         return false;
     };
+
+    debug!(
+        "  Summary A has {} attrs, Summary B has {} attrs for perspective '{}'",
+        attrs_a.len(),
+        attrs_b.len(),
+        perspective
+    );
 
     for (attr, values_a) in attrs_a {
         let Some(values_b) = attrs_b.get(attr) else {
             continue;
         };
 
+        debug!(
+            "  Comparing attr {:?}: {} values in A, {} values in B",
+            attr,
+            values_a.len(),
+            values_b.len()
+        );
+
         for (value_a, intervals_a) in values_a {
             for (value_b, intervals_b) in values_b {
                 if value_a == value_b {
                     continue;
                 }
-                if has_overlapping_interval(intervals_a, intervals_b) {
+                let overlaps = has_overlapping_interval(intervals_a, intervals_b);
+                debug!(
+                    "    value_a={:?} vs value_b={:?} overlaps={}",
+                    value_a, value_b, overlaps
+                );
+                if overlaps {
                     return true;
                 }
             }

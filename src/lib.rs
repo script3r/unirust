@@ -587,6 +587,19 @@ impl Unirust {
             .or_else(|| self.store.cluster_count())
     }
 
+    /// Get the number of conflicts detected by the streaming linker
+    pub fn streaming_conflicts_detected(&self) -> u64 {
+        self.streaming
+            .as_ref()
+            .map(|streaming| {
+                streaming
+                    .metrics()
+                    .conflicts_detected
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or(0)
+    }
+
     pub fn graph_counts(&self) -> Option<(u64, u64)> {
         self.graph_state.as_ref().map(|graph| {
             let nodes = graph.num_nodes() as u64;

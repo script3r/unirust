@@ -493,7 +493,12 @@ impl DistributedOntologyConfig {
                 .iter()
                 .map(|attr| store.interner_mut().intern_attr(attr))
                 .collect();
-            ontology.add_identity_key(IdentityKey::new(attrs, key.name.clone()));
+            // Store both AttrIds and string names for partitioning support
+            ontology.add_identity_key(IdentityKey::with_attribute_names(
+                attrs,
+                key.attributes.clone(),
+                key.name.clone(),
+            ));
         }
 
         for attr in &self.strong_identifiers {
@@ -504,6 +509,45 @@ impl DistributedOntologyConfig {
 
         for constraint in &self.constraints {
             let attr_id = store.interner_mut().intern_attr(&constraint.attribute);
+            let constraint = match constraint.kind {
+                ConstraintKind::Unique => Constraint::unique(attr_id, constraint.name.clone()),
+                ConstraintKind::UniqueWithinPerspective => {
+                    Constraint::unique_within_perspective(attr_id, constraint.name.clone())
+                }
+            };
+            ontology.add_constraint(constraint);
+        }
+
+        ontology
+    }
+
+    /// Build ontology using a ConcurrentInterner for partitioned mode.
+    /// This ensures AttrIds match between ontology and records built with the same interner.
+    pub fn build_ontology_with_interner(&self, interner: &ConcurrentInterner) -> Ontology {
+        let mut ontology = Ontology::new();
+
+        for key in &self.identity_keys {
+            let attrs: Vec<AttrId> = key
+                .attributes
+                .iter()
+                .map(|attr| interner.intern_attr(attr))
+                .collect();
+            // Store both AttrIds and string names for partitioning support
+            ontology.add_identity_key(IdentityKey::with_attribute_names(
+                attrs,
+                key.attributes.clone(),
+                key.name.clone(),
+            ));
+        }
+
+        for attr in &self.strong_identifiers {
+            let attr_id = interner.intern_attr(attr);
+            ontology
+                .add_strong_identifier(StrongIdentifier::new(attr_id, format!("{attr}_strong")));
+        }
+
+        for constraint in &self.constraints {
+            let attr_id = interner.intern_attr(&constraint.attribute);
             let constraint = match constraint.kind {
                 ConstraintKind::Unique => Constraint::unique(attr_id, constraint.name.clone()),
                 ConstraintKind::UniqueWithinPerspective => {
@@ -902,7 +946,9 @@ pub struct ShardNode {
     unirust: Arc<parking_lot::RwLock<Unirust>>,
     /// Partitioned Unirust for high-throughput parallel processing (optional)
     /// Uses per-partition locks for TRUE parallel processing - no global lock!
-    partitioned: Option<Arc<ParallelPartitionedUnirust>>,
+    /// Wrapped in RwLock to allow rebuilding when ontology changes
+    /// Inner Arc allows cloning for use across await points
+    partitioned: Arc<parking_lot::RwLock<Option<Arc<ParallelPartitionedUnirust>>>>,
     /// Concurrent interner for lock-free record building
     concurrent_interner: Arc<ConcurrentInterner>,
     tuning: StreamingTuning,
@@ -1014,7 +1060,7 @@ impl ShardNode {
             return Ok(Self {
                 shard_id,
                 unirust,
-                partitioned,
+                partitioned: Arc::new(parking_lot::RwLock::new(partitioned)),
                 concurrent_interner: Arc::new(ConcurrentInterner::new()),
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
@@ -1026,8 +1072,21 @@ impl ShardNode {
             });
         }
 
-        let mut store = crate::Store::new();
-        let ontology = ontology_config.clone().build_ontology(&mut store);
+        // Create concurrent interner FIRST - used for both ontology and records
+        let concurrent_interner = Arc::new(ConcurrentInterner::new());
+
+        // Build ontology using the concurrent interner for partitioned mode
+        // This ensures AttrIds match between ontology and records
+        let ontology = if use_partitioned {
+            ontology_config
+                .clone()
+                .build_ontology_with_interner(&concurrent_interner)
+        } else {
+            let mut store = crate::Store::new();
+            ontology_config.clone().build_ontology(&mut store)
+        };
+
+        let store = crate::Store::new();
         let ingest_wal = None;
         let unirust = Arc::new(parking_lot::RwLock::new(Unirust::with_store_and_tuning(
             ontology.clone(),
@@ -1053,8 +1112,8 @@ impl ShardNode {
         Ok(Self {
             shard_id,
             unirust,
-            partitioned,
-            concurrent_interner: Arc::new(ConcurrentInterner::new()),
+            partitioned: Arc::new(parking_lot::RwLock::new(partitioned)),
+            concurrent_interner, // Use the same interner used for ontology
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
@@ -1322,6 +1381,54 @@ async fn dispatch_ingest_records(
     Ok(assignments)
 }
 
+/// Compute partition ID for a record using the interner and ontology's identity keys.
+/// This ensures records with the same identity key values end up in the same partition.
+fn compute_partition_id_for_record(
+    record: &Record,
+    ontology: &crate::Ontology,
+    interner: &ConcurrentInterner,
+    partition_count: usize,
+) -> usize {
+    use rustc_hash::FxHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = FxHasher::default();
+    let identity_keys = ontology.identity_keys_for_type(&record.identity.entity_type);
+
+    if !identity_keys.is_empty() {
+        let first_key = &identity_keys[0];
+
+        // Use attribute_names from ontology to find matching descriptors
+        // Intern the attribute names to get AttrIds that match the record's descriptors
+        let attr_ids: Vec<_> = first_key
+            .attribute_names
+            .iter()
+            .filter_map(|name| interner.get_attr_id(name))
+            .collect();
+
+        // Find descriptor values that match the identity key attributes
+        let key_value_ids: Vec<_> = record
+            .descriptors
+            .iter()
+            .filter(|d| attr_ids.contains(&d.attr))
+            .map(|d| &d.value)
+            .collect();
+
+        if !key_value_ids.is_empty() {
+            record.identity.entity_type.hash(&mut hasher);
+            for value_id in key_value_ids {
+                value_id.hash(&mut hasher);
+            }
+        } else {
+            record.identity.uid.hash(&mut hasher);
+        }
+    } else {
+        record.identity.uid.hash(&mut hasher);
+    }
+
+    (hasher.finish() as usize) % partition_count
+}
+
 /// Dispatch records using the partitioned architecture for maximum throughput.
 /// This bypasses the worker queue entirely and processes partitions in parallel.
 ///
@@ -1345,27 +1452,41 @@ async fn dispatch_ingest_partitioned(
         wal.write_batch(&records)?;
     }
 
-    // Phase 1: Build records using concurrent interner (parallel for large batches)
-    let indexed_records: Vec<(u32, Record)> = if records.len() > 500 {
+    let partition_count = partitioned.partition_count();
+    let ontology = partitioned.ontology();
+
+    // Phase 1: Build records AND compute partition IDs using the same interner
+    // This ensures records with same identity key values go to the same partition
+    let indexed_records: Vec<(usize, u32, Record)> = if records.len() > 500 {
         records
             .par_iter()
             .filter_map(|record| {
                 ShardNode::build_record_concurrent(interner, record)
                     .ok()
-                    .map(|r| (record.index, r))
+                    .map(|r| {
+                        let partition_id = compute_partition_id_for_record(
+                            &r,
+                            ontology,
+                            interner,
+                            partition_count,
+                        );
+                        (partition_id, record.index, r)
+                    })
             })
             .collect()
     } else {
         let mut indexed_records = Vec::with_capacity(records.len());
         for record in &records {
             let record_input = ShardNode::build_record_concurrent(interner, record)?;
-            indexed_records.push((record.index, record_input));
+            let partition_id =
+                compute_partition_id_for_record(&record_input, ontology, interner, partition_count);
+            indexed_records.push((partition_id, record.index, record_input));
         }
         indexed_records
     };
 
-    // Phase 2: REAL entity resolution via partitioned processing
-    let partition_results = partitioned.ingest_batch(indexed_records);
+    // Phase 2: REAL entity resolution via partitioned processing with pre-computed partition IDs
+    let partition_results = partitioned.ingest_batch_with_partitions(indexed_records);
 
     // Phase 3: Convert to proto assignments
     let mut assignments = Vec::with_capacity(partition_results.len());
@@ -1507,6 +1628,26 @@ impl proto::shard_service_server::ShardService for ShardNode {
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         }
 
+        // Rebuild partitioned processor with the new ontology if enabled
+        // CRITICAL: The partitioned processor needs the ontology with strong identifiers
+        // for conflict detection to work!
+        if is_partitioned_enabled() {
+            let num_partitions = partition_count();
+            let partition_config = PartitionConfig::for_cores(num_partitions);
+            // Build ontology using concurrent interner to ensure AttrIds match records
+            let ontology = config.build_ontology_with_interner(&self.concurrent_interner);
+            let new_partitioned = ParallelPartitionedUnirust::new(
+                partition_config,
+                Arc::new(ontology),
+                self.tuning.clone(),
+            )
+            .map_err(|err| Status::internal(err.to_string()))?;
+
+            let mut partitioned_guard = self.partitioned.write();
+            *partitioned_guard = Some(Arc::new(new_partitioned));
+            tracing::info!("Partitioned processor rebuilt with updated ontology");
+        }
+
         Ok(Response::new(proto::ApplyOntologyResponse {}))
     }
 
@@ -1520,10 +1661,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         // Use partitioned processing for large batches (HFT mode)
         // Small batches use sequential path for correctness (query support)
-        let use_partitioned = self.partitioned.is_some() && records.len() >= 100;
+        // Clone the Arc and release the lock before awaiting (guards aren't Send)
+        let partitioned_arc = self.partitioned.read().clone();
+        let use_partitioned = partitioned_arc.is_some() && records.len() >= 100;
         let assignments = if use_partitioned {
             dispatch_ingest_partitioned(
-                self.partitioned.as_ref().unwrap(),
+                partitioned_arc.as_ref().unwrap(),
                 &self.concurrent_interner,
                 self.ingest_wal.as_deref(),
                 self.shard_id,
@@ -1560,10 +1703,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
             // Use partitioned processing for large batches (HFT mode)
             // Small batches use sequential path for correctness
-            let use_partitioned = self.partitioned.is_some() && chunk.records.len() >= 100;
+            // Clone the Arc and release the lock before awaiting (guards aren't Send)
+            let partitioned_arc = self.partitioned.read().clone();
+            let use_partitioned = partitioned_arc.is_some() && chunk.records.len() >= 100;
             let batch_assignments = if use_partitioned {
                 dispatch_ingest_partitioned(
-                    self.partitioned.as_ref().unwrap(),
+                    partitioned_arc.as_ref().unwrap(),
                     &self.concurrent_interner,
                     self.ingest_wal.as_deref(),
                     self.shard_id,
@@ -1689,22 +1834,32 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
         let unirust = read_unirust!(self);
+        let partitioned_guard = self.partitioned.read();
 
         // Sum stats from both partitioned path (large batches) and worker path (small batches)
-        let (record_count, cluster_count) = if let Some(partitioned) = &self.partitioned {
-            (
-                partitioned.total_records() + unirust.record_count() as u64,
-                partitioned.total_cluster_count() as u64
-                    + unirust.streaming_cluster_count().unwrap_or(0) as u64,
-            )
-        } else {
-            (
-                unirust.record_count() as u64,
-                unirust.streaming_cluster_count().unwrap_or(0) as u64,
-            )
-        };
+        let (record_count, cluster_count, partitioned_conflicts) =
+            if let Some(partitioned) = partitioned_guard.as_ref() {
+                (
+                    partitioned.total_records() + unirust.record_count() as u64,
+                    partitioned.total_cluster_count() as u64
+                        + unirust.streaming_cluster_count().unwrap_or(0) as u64,
+                    partitioned.total_conflicts(),
+                )
+            } else {
+                (
+                    unirust.record_count() as u64,
+                    unirust.streaming_cluster_count().unwrap_or(0) as u64,
+                    0,
+                )
+            };
 
-        let conflict_count = unirust.conflict_summary_count().unwrap_or(0) as u64;
+        // Include conflicts from:
+        // 1. Partitioned path (large batches)
+        // 2. Worker path streaming linker (small batches)
+        // 3. Stored conflict summaries (historical)
+        let worker_conflicts = unirust.streaming_conflicts_detected();
+        let stored_conflicts = unirust.conflict_summary_count().unwrap_or(0) as u64;
+        let conflict_count = partitioned_conflicts + worker_conflicts + stored_conflicts;
         let (graph_node_count, graph_edge_count) = unirust.graph_counts().unwrap_or((0, 0));
 
         Ok(Response::new(proto::StatsResponse {

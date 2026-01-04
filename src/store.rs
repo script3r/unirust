@@ -352,6 +352,41 @@ impl Store {
         Ok((id, true))
     }
 
+    /// Add a record without re-interning. Used when records are pre-interned
+    /// with an external interner (e.g., ConcurrentInterner in partitioned mode).
+    ///
+    /// IMPORTANT: Only use this when you know the AttrIds and ValueIds in the
+    /// record are valid and don't need to be re-mapped to this Store's interner.
+    pub fn add_record_raw(&mut self, mut record: Record) -> Result<RecordId> {
+        // Assign record ID without interning
+        if record.id.0 == 0 {
+            record.id = RecordId(self.next_record_id);
+            self.next_record_id += 1;
+        } else {
+            self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+        }
+
+        let record_id = record.id;
+        let identity = record.identity.clone();
+        self.records.insert(record.id, record);
+        self.identity_index.insert(identity, record_id);
+        if let Some(stored) = self.records.get(&record_id) {
+            self.attribute_value_index.add_record(stored);
+            self.temporal_index.add_record(stored);
+        }
+        Ok(record_id)
+    }
+
+    /// Add a record if its identity is new, without re-interning.
+    /// Used when records are pre-interned with an external interner.
+    pub fn add_record_if_absent_raw(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            return Ok((existing, false));
+        }
+        let id = self.add_record_raw(record)?;
+        Ok((id, true))
+    }
+
     /// Get a record by ID
     pub fn get_record(&self, id: RecordId) -> Option<Record> {
         self.records.get(&id).cloned()

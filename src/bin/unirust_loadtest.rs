@@ -291,13 +291,18 @@ impl Perspective {
 fn build_ontology_config() -> OntologyConfig {
     OntologyConfig {
         identity_keys: vec![
-            IdentityKeyConfig {
-                name: "user_identity".to_string(),
-                attributes: vec!["user_sid".to_string()],
-            },
+            // user_upn_key FIRST - critical for conflict detection!
+            // Partitioning uses the first identity key's attribute values.
+            // Conflicts have SAME user_upn but DIFFERENT user_sid.
+            // If user_sid were first, conflicts would go to different partitions
+            // and never be compared against each other.
             IdentityKeyConfig {
                 name: "user_upn_key".to_string(),
                 attributes: vec!["user_upn".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "user_identity".to_string(),
+                attributes: vec!["user_sid".to_string()],
             },
             IdentityKeyConfig {
                 name: "session_identity".to_string(),
@@ -311,13 +316,15 @@ fn build_ontology_config() -> OntologyConfig {
                 name: "connection_identity".to_string(),
                 attributes: vec!["flow_id".to_string()],
             },
-            IdentityKeyConfig {
-                name: "asset_identity".to_string(),
-                attributes: vec!["asset_id".to_string()],
-            },
+            // asset_hostname FIRST - same reasoning as user_upn_key
+            // Conflicts have SAME hostname but DIFFERENT asset_id
             IdentityKeyConfig {
                 name: "asset_hostname".to_string(),
                 attributes: vec!["hostname".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "asset_identity".to_string(),
+                attributes: vec!["asset_id".to_string()],
             },
             IdentityKeyConfig {
                 name: "vuln_identity".to_string(),
@@ -357,6 +364,7 @@ struct UserSeed {
     user_upn: String,
     employee_id: String,
     department: String,
+    perspective: String,
 }
 
 struct AssetSeed {
@@ -365,6 +373,7 @@ struct AssetSeed {
     hostname: String,
     ip_address: String,
     os_type: String,
+    perspective: String,
 }
 
 /// Generic entity seed for other types
@@ -466,26 +475,51 @@ impl CyberEntityGenerator {
 
         for idx in 0..count {
             let entity_type = self.select_entity_type();
-            let perspective = self.select_perspective(entity_type);
+            let selected_perspective = self.select_perspective(entity_type);
+            let perspective_str = selected_perspective.as_str();
             let (start, end) = self.generate_interval();
 
             // Generate entity with UID - may reuse existing UID for clustering
-            let (uid, descriptors) = match entity_type {
-                EntityType::User => self.generate_user(start, end),
-                EntityType::Session => self.generate_session(start, end),
-                EntityType::Process => self.generate_process(start, end),
-                EntityType::NetworkConnection => self.generate_connection(start, end),
-                EntityType::Asset => self.generate_asset(start, end),
-                EntityType::Vulnerability => self.generate_vulnerability(start, end),
-                EntityType::Alert => self.generate_alert(start, end),
-                EntityType::File => self.generate_file(start, end),
+            // For conflicts, the generate method returns an override perspective
+            let (uid, descriptors, perspective_override) = match entity_type {
+                EntityType::User => self.generate_user(start, end, perspective_str),
+                EntityType::Asset => self.generate_asset(start, end, perspective_str),
+                // Other entity types don't have conflict capability (identity key = strong identifier)
+                EntityType::Session => {
+                    let (uid, desc) = self.generate_session(start, end);
+                    (uid, desc, None)
+                }
+                EntityType::Process => {
+                    let (uid, desc) = self.generate_process(start, end);
+                    (uid, desc, None)
+                }
+                EntityType::NetworkConnection => {
+                    let (uid, desc) = self.generate_connection(start, end);
+                    (uid, desc, None)
+                }
+                EntityType::Vulnerability => {
+                    let (uid, desc) = self.generate_vulnerability(start, end);
+                    (uid, desc, None)
+                }
+                EntityType::Alert => {
+                    let (uid, desc) = self.generate_alert(start, end);
+                    (uid, desc, None)
+                }
+                EntityType::File => {
+                    let (uid, desc) = self.generate_file(start, end);
+                    (uid, desc, None)
+                }
             };
+
+            // Use override perspective for conflicts (ensures same perspective as original)
+            let final_perspective =
+                perspective_override.unwrap_or_else(|| perspective_str.to_string());
 
             batch.push(RecordInput {
                 index: idx as u32,
                 identity: Some(RecordIdentity {
                     entity_type: entity_type.as_str().to_string(),
-                    perspective: perspective.as_str().to_string(),
+                    perspective: final_perspective,
                     uid,
                 }),
                 descriptors,
@@ -495,37 +529,56 @@ impl CyberEntityGenerator {
         batch
     }
 
-    /// Generate a user entity. Returns (uid, descriptors).
+    /// Generate a user entity. Returns (uid, descriptors, perspective_override).
     /// When overlapping, reuses UID from pool to create clusters.
-    /// When conflicting, modifies non-identity attributes.
-    fn generate_user(&mut self, start: i64, end: i64) -> (String, Vec<RecordDescriptor>) {
+    /// When conflicting, uses same perspective and different strong identifier.
+    fn generate_user(
+        &mut self,
+        start: i64,
+        end: i64,
+        perspective: &str,
+    ) -> (String, Vec<RecordDescriptor>, Option<String>) {
         let is_overlap = self.should_overlap() && !self.user_pool.is_empty();
         let is_conflict = is_overlap && self.should_conflict();
 
-        let (uid, user_sid, user_upn, employee_id, department) = if is_overlap {
+        let (uid, user_sid, user_upn, employee_id, department, perspective_override) = if is_overlap
+        {
             let idx = self.rng.random_range(0..self.user_pool.len());
-            let seed = &self.user_pool[idx];
+            // Clone seed values upfront to avoid borrow conflicts
+            let seed_uid = self.user_pool[idx].uid.clone();
+            let seed_user_sid = self.user_pool[idx].user_sid.clone();
+            let seed_user_upn = self.user_pool[idx].user_upn.clone();
+            let seed_employee_id = self.user_pool[idx].employee_id.clone();
+            let seed_department = self.user_pool[idx].department.clone();
+            let seed_perspective = self.user_pool[idx].perspective.clone();
 
             if is_conflict {
-                // Same identity (user_sid) but different non-identity attributes
-                let departments = ["Engineering", "Sales", "HR", "Finance", "IT", "Security"];
-                let new_dept = departments[self.rng.random_range(0..departments.len())].to_string();
-                let new_emp_id = format!("EMP{:08}", self.rng.random_range(10000..99999999u32));
+                // CONFLICT: Same identity key (user_upn) but DIFFERENT strong identifier (user_sid)
+                // CRITICAL: Use NEW UID (different record), SAME perspective, SAME identity key,
+                //           but DIFFERENT strong identifier to create a true conflict
+                let new_uid = self.next_uid();
+                let new_user_sid = format!(
+                    "S-1-5-21-{}-{}",
+                    self.rng.random::<u32>(),
+                    self.rng.random::<u32>()
+                );
                 (
-                    seed.uid.clone(),
-                    seed.user_sid.clone(),
-                    seed.user_upn.clone(),
-                    new_emp_id, // CONFLICT: different employee_id
-                    new_dept,   // CONFLICT: different department
+                    new_uid,       // NEW UID - creates a new record (not a duplicate)
+                    new_user_sid,  // DIFFERENT strong identifier - creates conflict
+                    seed_user_upn, // SAME identity key - makes records candidates for merge
+                    seed_employee_id,
+                    seed_department,
+                    Some(seed_perspective), // SAME perspective - required for conflict detection
                 )
             } else {
                 // Exact overlap - same cluster, no conflict
                 (
-                    seed.uid.clone(),
-                    seed.user_sid.clone(),
-                    seed.user_upn.clone(),
-                    seed.employee_id.clone(),
-                    seed.department.clone(),
+                    seed_uid,
+                    seed_user_sid,
+                    seed_user_upn,
+                    seed_employee_id,
+                    seed_department,
+                    None,
                 )
             }
         } else {
@@ -543,10 +596,11 @@ impl CyberEntityGenerator {
                     user_upn: user_upn.clone(),
                     employee_id: employee_id.clone(),
                     department: department.clone(),
+                    perspective: perspective.to_string(),
                 });
             }
 
-            (uid, user_sid, user_upn, employee_id, department)
+            (uid, user_sid, user_upn, employee_id, department, None)
         };
 
         let descriptors = vec![
@@ -576,7 +630,7 @@ impl CyberEntityGenerator {
             },
         ];
 
-        (uid, descriptors)
+        (uid, descriptors, perspective_override)
     }
 
     fn generate_session(&mut self, start: i64, end: i64) -> (String, Vec<RecordDescriptor>) {
@@ -613,10 +667,30 @@ impl CyberEntityGenerator {
         );
 
         let descriptors = vec![
-            RecordDescriptor { attr: "session_id".to_string(), value: session_id, start, end },
-            RecordDescriptor { attr: "user_ref".to_string(), value: user_ref, start, end },
-            RecordDescriptor { attr: "source_ip".to_string(), value: source_ip, start, end },
-            RecordDescriptor { attr: "login_time".to_string(), value: start.to_string(), start, end },
+            RecordDescriptor {
+                attr: "session_id".to_string(),
+                value: session_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "user_ref".to_string(),
+                value: user_ref,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "source_ip".to_string(),
+                value: source_ip,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "login_time".to_string(),
+                value: start.to_string(),
+                start,
+                end,
+            },
         ];
         (uid, descriptors)
     }
@@ -642,8 +716,16 @@ impl CyberEntityGenerator {
         };
 
         let process_id = self.rng.random_range(1000..65535u32);
-        let process_names = ["svchost.exe", "chrome.exe", "powershell.exe", "cmd.exe",
-            "explorer.exe", "python.exe", "java.exe", "notepad.exe"];
+        let process_names = [
+            "svchost.exe",
+            "chrome.exe",
+            "powershell.exe",
+            "cmd.exe",
+            "explorer.exe",
+            "python.exe",
+            "java.exe",
+            "notepad.exe",
+        ];
         let process_name = process_names[self.rng.random_range(0..process_names.len())].to_string();
         let parent_pid = self.rng.random_range(1..process_id);
         let asset_ref = if !self.asset_pool.is_empty() {
@@ -654,11 +736,36 @@ impl CyberEntityGenerator {
         };
 
         let descriptors = vec![
-            RecordDescriptor { attr: "process_id".to_string(), value: process_id.to_string(), start, end },
-            RecordDescriptor { attr: "process_hash".to_string(), value: process_hash, start, end },
-            RecordDescriptor { attr: "process_name".to_string(), value: process_name, start, end },
-            RecordDescriptor { attr: "parent_pid".to_string(), value: parent_pid.to_string(), start, end },
-            RecordDescriptor { attr: "asset_id".to_string(), value: asset_ref, start, end },
+            RecordDescriptor {
+                attr: "process_id".to_string(),
+                value: process_id.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "process_hash".to_string(),
+                value: process_hash,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "process_name".to_string(),
+                value: process_name,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "parent_pid".to_string(),
+                value: parent_pid.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_id".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
         ];
         (uid, descriptors)
     }
@@ -683,53 +790,124 @@ impl CyberEntityGenerator {
             (uid, flow_id)
         };
 
-        let src_ip = format!("10.{}.{}.{}", self.rng.random_range(0..256u16),
-            self.rng.random_range(0..256u16), self.rng.random_range(1..255u16));
-        let dst_ip = format!("{}.{}.{}.{}", self.rng.random_range(1..224u16),
-            self.rng.random_range(0..256u16), self.rng.random_range(0..256u16),
-            self.rng.random_range(1..255u16));
+        let src_ip = format!(
+            "10.{}.{}.{}",
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(1..255u16)
+        );
+        let dst_ip = format!(
+            "{}.{}.{}.{}",
+            self.rng.random_range(1..224u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(0..256u16),
+            self.rng.random_range(1..255u16)
+        );
         let src_port = self.rng.random_range(1024..65535u16);
         let dst_port = [80, 443, 22, 3389, 8080, 8443][self.rng.random_range(0..6)];
         let protocol = ["TCP", "UDP"][self.rng.random_range(0..2)].to_string();
 
         let descriptors = vec![
-            RecordDescriptor { attr: "flow_id".to_string(), value: flow_id, start, end },
-            RecordDescriptor { attr: "src_ip".to_string(), value: src_ip, start, end },
-            RecordDescriptor { attr: "dst_ip".to_string(), value: dst_ip, start, end },
-            RecordDescriptor { attr: "src_port".to_string(), value: src_port.to_string(), start, end },
-            RecordDescriptor { attr: "dst_port".to_string(), value: dst_port.to_string(), start, end },
-            RecordDescriptor { attr: "protocol".to_string(), value: protocol, start, end },
+            RecordDescriptor {
+                attr: "flow_id".to_string(),
+                value: flow_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "src_ip".to_string(),
+                value: src_ip,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "dst_ip".to_string(),
+                value: dst_ip,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "src_port".to_string(),
+                value: src_port.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "dst_port".to_string(),
+                value: dst_port.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "protocol".to_string(),
+                value: protocol,
+                start,
+                end,
+            },
         ];
         (uid, descriptors)
     }
 
-    fn generate_asset(&mut self, start: i64, end: i64) -> (String, Vec<RecordDescriptor>) {
+    fn generate_asset(
+        &mut self,
+        start: i64,
+        end: i64,
+        perspective: &str,
+    ) -> (String, Vec<RecordDescriptor>, Option<String>) {
         let is_overlap = self.should_overlap() && !self.asset_pool.is_empty();
         let is_conflict = is_overlap && self.should_conflict();
 
-        let (uid, asset_id, hostname, ip_address, os_type) = if is_overlap {
+        let (uid, asset_id, hostname, ip_address, os_type, perspective_override) = if is_overlap {
             let idx = self.rng.random_range(0..self.asset_pool.len());
-            let seed = &self.asset_pool[idx];
+            // Clone seed values upfront to avoid borrow conflicts
+            let seed_uid = self.asset_pool[idx].uid.clone();
+            let seed_asset_id = self.asset_pool[idx].asset_id.clone();
+            let seed_hostname = self.asset_pool[idx].hostname.clone();
+            let seed_ip_address = self.asset_pool[idx].ip_address.clone();
+            let seed_os_type = self.asset_pool[idx].os_type.clone();
+            let seed_perspective = self.asset_pool[idx].perspective.clone();
+
             if is_conflict {
-                // Same asset_id but different IP or OS (conflict)
-                let new_ip = format!("10.{}.{}.{}", self.rng.random_range(0..256u16),
-                    self.rng.random_range(0..256u16), self.rng.random_range(1..255u16));
-                let os_types = ["Windows 10", "Windows 11", "Windows Server 2019",
-                    "Ubuntu 22.04", "RHEL 8", "macOS 14"];
-                let new_os = os_types[self.rng.random_range(0..os_types.len())].to_string();
-                (seed.uid.clone(), seed.asset_id.clone(), seed.hostname.clone(), new_ip, new_os)
+                // CONFLICT: Same hostname (identity key) but DIFFERENT asset_id (strong identifier)
+                // CRITICAL: Use NEW UID, SAME perspective, SAME identity key, DIFFERENT strong ID
+                let new_uid = self.next_uid();
+                let new_asset_id = format!("ASSET-{:08X}", self.rng.random::<u32>());
+                (
+                    new_uid,
+                    new_asset_id,
+                    seed_hostname,
+                    seed_ip_address,
+                    seed_os_type,
+                    Some(seed_perspective),
+                )
             } else {
-                (seed.uid.clone(), seed.asset_id.clone(), seed.hostname.clone(),
-                    seed.ip_address.clone(), seed.os_type.clone())
+                (
+                    seed_uid,
+                    seed_asset_id,
+                    seed_hostname,
+                    seed_ip_address,
+                    seed_os_type,
+                    None,
+                )
             }
         } else {
             let uid = self.next_uid();
             let asset_id = format!("ASSET-{:08X}", self.rng.random::<u32>());
             let hostname = format!("HOST-{:06}", self.rng.random_range(1..999999u32));
-            let ip_address = format!("10.{}.{}.{}", self.rng.random_range(0..256u16),
-                self.rng.random_range(0..256u16), self.rng.random_range(1..255u16));
-            let os_types = ["Windows 10", "Windows 11", "Windows Server 2019",
-                "Ubuntu 22.04", "RHEL 8", "macOS 14"];
+            let ip_address = format!(
+                "10.{}.{}.{}",
+                self.rng.random_range(0..256u16),
+                self.rng.random_range(0..256u16),
+                self.rng.random_range(1..255u16)
+            );
+            let os_types = [
+                "Windows 10",
+                "Windows 11",
+                "Windows Server 2019",
+                "Ubuntu 22.04",
+                "RHEL 8",
+                "macOS 14",
+            ];
             let os_type = os_types[self.rng.random_range(0..os_types.len())].to_string();
 
             if self.asset_pool.len() < self.pool_size {
@@ -739,23 +917,55 @@ impl CyberEntityGenerator {
                     hostname: hostname.clone(),
                     ip_address: ip_address.clone(),
                     os_type: os_type.clone(),
+                    perspective: perspective.to_string(),
                 });
             }
-            (uid, asset_id, hostname, ip_address, os_type)
+            (uid, asset_id, hostname, ip_address, os_type, None)
         };
 
-        let mac_address = format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            self.rng.random::<u8>(), self.rng.random::<u8>(), self.rng.random::<u8>(),
-            self.rng.random::<u8>(), self.rng.random::<u8>(), self.rng.random::<u8>());
+        let mac_address = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>(),
+            self.rng.random::<u8>()
+        );
 
         let descriptors = vec![
-            RecordDescriptor { attr: "asset_id".to_string(), value: asset_id, start, end },
-            RecordDescriptor { attr: "hostname".to_string(), value: hostname, start, end },
-            RecordDescriptor { attr: "ip_address".to_string(), value: ip_address, start, end },
-            RecordDescriptor { attr: "mac_address".to_string(), value: mac_address, start, end },
-            RecordDescriptor { attr: "os_type".to_string(), value: os_type, start, end },
+            RecordDescriptor {
+                attr: "asset_id".to_string(),
+                value: asset_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "hostname".to_string(),
+                value: hostname,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "ip_address".to_string(),
+                value: ip_address,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "mac_address".to_string(),
+                value: mac_address,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "os_type".to_string(),
+                value: os_type,
+                start,
+                end,
+            },
         ];
-        (uid, descriptors)
+        (uid, descriptors, perspective_override)
     }
 
     fn generate_vulnerability(&mut self, start: i64, end: i64) -> (String, Vec<RecordDescriptor>) {
@@ -767,17 +977,31 @@ impl CyberEntityGenerator {
             let seed = &self.vuln_pool[idx];
             if is_conflict {
                 let severities = ["Critical", "High", "Medium", "Low", "Info"];
-                let new_severity = severities[self.rng.random_range(0..severities.len())].to_string();
+                let new_severity =
+                    severities[self.rng.random_range(0..severities.len())].to_string();
                 let statuses = ["Open", "In Progress", "Remediated", "Accepted"];
                 let new_status = statuses[self.rng.random_range(0..statuses.len())].to_string();
-                (seed.uid.clone(), seed.identity_value.clone(), new_severity, new_status)
+                (
+                    seed.uid.clone(),
+                    seed.identity_value.clone(),
+                    new_severity,
+                    new_status,
+                )
             } else {
-                (seed.uid.clone(), seed.identity_value.clone(), "Medium".to_string(), "Open".to_string())
+                (
+                    seed.uid.clone(),
+                    seed.identity_value.clone(),
+                    "Medium".to_string(),
+                    "Open".to_string(),
+                )
             }
         } else {
             let uid = self.next_uid();
-            let cve_id = format!("CVE-{}-{}", self.rng.random_range(2020..2025u16),
-                self.rng.random_range(1000..99999u32));
+            let cve_id = format!(
+                "CVE-{}-{}",
+                self.rng.random_range(2020..2025u16),
+                self.rng.random_range(1000..99999u32)
+            );
             let severities = ["Critical", "High", "Medium", "Low", "Info"];
             let severity = severities[self.rng.random_range(0..severities.len())].to_string();
             let statuses = ["Open", "In Progress", "Remediated", "Accepted"];
@@ -802,11 +1026,36 @@ impl CyberEntityGenerator {
         let cvss_score = format!("{:.1}", self.rng.random_range(0..100u32) as f32 / 10.0);
 
         let descriptors = vec![
-            RecordDescriptor { attr: "cve_id".to_string(), value: cve_id, start, end },
-            RecordDescriptor { attr: "asset_ref".to_string(), value: asset_ref, start, end },
-            RecordDescriptor { attr: "severity".to_string(), value: severity, start, end },
-            RecordDescriptor { attr: "cvss_score".to_string(), value: cvss_score, start, end },
-            RecordDescriptor { attr: "remediation_status".to_string(), value: status, start, end },
+            RecordDescriptor {
+                attr: "cve_id".to_string(),
+                value: cve_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_ref".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "severity".to_string(),
+                value: severity,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "cvss_score".to_string(),
+                value: cvss_score,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "remediation_status".to_string(),
+                value: status,
+                start,
+                end,
+            },
         ];
         (uid, descriptors)
     }
@@ -831,8 +1080,15 @@ impl CyberEntityGenerator {
             (uid, alert_id)
         };
 
-        let alert_types = ["Malware", "Phishing", "Brute Force", "Data Exfiltration",
-            "Lateral Movement", "Privilege Escalation", "C2 Communication"];
+        let alert_types = [
+            "Malware",
+            "Phishing",
+            "Brute Force",
+            "Data Exfiltration",
+            "Lateral Movement",
+            "Privilege Escalation",
+            "C2 Communication",
+        ];
         let alert_type = alert_types[self.rng.random_range(0..alert_types.len())].to_string();
         let severities = ["Critical", "High", "Medium", "Low"];
         let severity = severities[self.rng.random_range(0..severities.len())].to_string();
@@ -844,10 +1100,30 @@ impl CyberEntityGenerator {
         };
 
         let descriptors = vec![
-            RecordDescriptor { attr: "alert_id".to_string(), value: alert_id, start, end },
-            RecordDescriptor { attr: "alert_type".to_string(), value: alert_type, start, end },
-            RecordDescriptor { attr: "severity".to_string(), value: severity, start, end },
-            RecordDescriptor { attr: "asset_ref".to_string(), value: asset_ref, start, end },
+            RecordDescriptor {
+                attr: "alert_id".to_string(),
+                value: alert_id,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "alert_type".to_string(),
+                value: alert_type,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "severity".to_string(),
+                value: severity,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_ref".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
         ];
         (uid, descriptors)
     }
@@ -872,11 +1148,21 @@ impl CyberEntityGenerator {
             (uid, file_hash)
         };
 
-        let paths = ["C:\\Windows\\System32\\", "C:\\Users\\Public\\", "C:\\Program Files\\",
-            "/usr/bin/", "/tmp/", "/home/user/"];
+        let paths = [
+            "C:\\Windows\\System32\\",
+            "C:\\Users\\Public\\",
+            "C:\\Program Files\\",
+            "/usr/bin/",
+            "/tmp/",
+            "/home/user/",
+        ];
         let exts = [".exe", ".dll", ".ps1", ".sh", ".py", ".bat"];
-        let file_path = format!("{}file{:06}{}", paths[self.rng.random_range(0..paths.len())],
-            self.rng.random_range(1..999999u32), exts[self.rng.random_range(0..exts.len())]);
+        let file_path = format!(
+            "{}file{:06}{}",
+            paths[self.rng.random_range(0..paths.len())],
+            self.rng.random_range(1..999999u32),
+            exts[self.rng.random_range(0..exts.len())]
+        );
         let file_size = self.rng.random_range(1024..10485760u64);
         let asset_ref = if !self.asset_pool.is_empty() {
             let idx = self.rng.random_range(0..self.asset_pool.len());
@@ -886,10 +1172,30 @@ impl CyberEntityGenerator {
         };
 
         let descriptors = vec![
-            RecordDescriptor { attr: "file_hash".to_string(), value: file_hash, start, end },
-            RecordDescriptor { attr: "file_path".to_string(), value: file_path, start, end },
-            RecordDescriptor { attr: "file_size".to_string(), value: file_size.to_string(), start, end },
-            RecordDescriptor { attr: "asset_ref".to_string(), value: asset_ref, start, end },
+            RecordDescriptor {
+                attr: "file_hash".to_string(),
+                value: file_hash,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "file_path".to_string(),
+                value: file_path,
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "file_size".to_string(),
+                value: file_size.to_string(),
+                start,
+                end,
+            },
+            RecordDescriptor {
+                attr: "asset_ref".to_string(),
+                value: asset_ref,
+                start,
+                end,
+            },
         ];
         (uid, descriptors)
     }

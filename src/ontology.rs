@@ -12,8 +12,10 @@ use std::fmt;
 /// An identity key defines which attributes must match for records to be considered the same entity
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdentityKey {
-    /// The attributes that form the identity key
+    /// The attributes that form the identity key (interned IDs for fast comparison)
     pub attributes: Vec<AttrId>,
+    /// Original attribute names as strings (for partitioning with different interners)
+    pub attribute_names: Vec<String>,
     /// Human-readable name for this identity key
     pub name: String,
 }
@@ -21,7 +23,24 @@ pub struct IdentityKey {
 impl IdentityKey {
     /// Create a new identity key
     pub fn new(attributes: Vec<AttrId>, name: String) -> Self {
-        Self { attributes, name }
+        Self {
+            attributes,
+            attribute_names: Vec::new(), // Will be populated when needed
+            name,
+        }
+    }
+
+    /// Create a new identity key with attribute names (for partitioning support)
+    pub fn with_attribute_names(
+        attributes: Vec<AttrId>,
+        attribute_names: Vec<String>,
+        name: String,
+    ) -> Self {
+        Self {
+            attributes,
+            attribute_names,
+            name,
+        }
     }
 
     /// Check if this identity key matches another over an overlapping interval

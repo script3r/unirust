@@ -76,6 +76,13 @@ impl ConcurrentInterner {
     pub fn value_count(&self) -> usize {
         self.value_to_id.len()
     }
+
+    /// Get the AttrId for an attribute name if it exists (without interning).
+    /// Used for lookups without modifying the interner.
+    #[inline]
+    pub fn get_attr_id(&self, attr: &str) -> Option<AttrId> {
+        self.attr_to_id.get(attr).map(|r| *r)
+    }
 }
 
 impl Default for ConcurrentInterner {
