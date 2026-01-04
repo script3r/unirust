@@ -21,3 +21,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local cluster artifacts
+cluster_data/
+cluster_logs/
+.cluster/

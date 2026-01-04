@@ -16,6 +16,7 @@ CONFIG_VERSION="${CONFIG_VERSION:-}"
 TUNING="${TUNING:-}"
 REPAIR="${REPAIR:-0}"
 CARGO_FEATURES="${CARGO_FEATURES:-}"
+SHARD_WAIT_SECS="${SHARD_WAIT_SECS:-10}"
 
 usage() {
   cat <<EOF
@@ -33,6 +34,7 @@ Environment:
   TUNING=balanced|low-latency|high-throughput|bulk-ingest|memory-saver
   REPAIR=0|1
   CARGO_FEATURES=comma-separated-cargo-features
+  SHARD_WAIT_SECS=10
 EOF
 }
 
@@ -58,12 +60,30 @@ remove_data_dir() {
   fi
 }
 
+wait_for_port() {
+  local host="$1"
+  local port="$2"
+  local timeout_secs="$3"
+  local start
+  start="$(date +%s)"
+  while true; do
+    if (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ $(( $(date +%s) - start )) -ge "$timeout_secs" ]]; then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 start_cluster() {
   build_bins
   remove_data_dir
   mkdir -p "$DATA_DIR" "$LOG_DIR" "$RUN_DIR"
 
   local shard_list=""
+  local shard_ports=()
   for i in $(seq 0 $((SHARDS - 1))); do
     local port=$((SHARD_PORT_BASE + i))
     local shard_dir="$DATA_DIR/shard-$i"
@@ -84,12 +104,21 @@ start_cluster() {
 
     "$BIN_DIR/unirust_shard" "${shard_args[@]}" >"$LOG_DIR/shard-$i.log" 2>&1 &
     echo $! >"$RUN_DIR/shard-$i.pid"
+    echo "Shard $i listening on 127.0.0.1:${port}"
+    shard_ports+=("$port")
 
     local entry="127.0.0.1:${port}"
     if [[ -z "$shard_list" ]]; then
       shard_list="$entry"
     else
       shard_list="$shard_list,$entry"
+    fi
+  done
+
+  for port in "${shard_ports[@]}"; do
+    if ! wait_for_port "127.0.0.1" "$port" "$SHARD_WAIT_SECS"; then
+      echo "Shard on port ${port} failed to start within ${SHARD_WAIT_SECS}s."
+      exit 1
     fi
   done
 
@@ -109,6 +138,8 @@ start_cluster() {
 }
 
 stop_cluster() {
+  pkill -f "/unirust_shard" >/dev/null 2>&1 || true
+  pkill -f "/unirust_router" >/dev/null 2>&1 || true
   if [[ ! -d "$RUN_DIR" ]]; then
     echo "No PID directory found."
     return 0
