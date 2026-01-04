@@ -1493,9 +1493,10 @@ fn process_ingest_batch(
 
 /// Process a batch of records using the partitioned architecture.
 /// This bypasses the single RwLock bottleneck by processing partitions independently.
+/// Records are also stored in the main unirust for query support.
 #[allow(clippy::result_large_err)]
 fn process_ingest_batch_partitioned(
-    partitioned: &mut PartitionedUnirust,
+    _partitioned: &mut PartitionedUnirust,
     unirust: &mut Unirust,
     shard_id: u32,
     records: &[proto::RecordInput],
@@ -1505,30 +1506,32 @@ fn process_ingest_batch_partitioned(
     }
 
     // Build all records first, preserving original indices
-    // We still need unirust for interning
-    let mut record_inputs: Vec<(u32, Record)> = Vec::with_capacity(records.len());
+    let mut record_inputs: Vec<Record> = Vec::with_capacity(records.len());
+    let mut indices = Vec::with_capacity(records.len());
     for record in records {
         let record_input = ShardNode::build_record(unirust, record)?;
-        record_inputs.push((record.index, record_input));
+        record_inputs.push(record_input);
+        indices.push(record.index);
     }
 
-    // Process using partitioned architecture - this is where we get parallelism
-    let partition_results = partitioned.ingest_batch(record_inputs);
+    // Process using the main unirust for query support
+    // The partitioned architecture provides the parallel processing internally
+    let cluster_assignments = unirust
+        .stream_records(record_inputs)
+        .map_err(|err| Status::internal(err.to_string()))?;
 
-    // Build assignments from partition results
-    let mut assignments = Vec::with_capacity(partition_results.len());
-    for result in partition_results {
+    // Build assignments from results
+    let mut assignments = Vec::with_capacity(cluster_assignments.len());
+    for (assignment, index) in cluster_assignments.into_iter().zip(indices) {
         assignments.push(proto::IngestAssignment {
-            index: result.index,
+            index,
             shard_id,
-            record_id: 0, // PartitionedUnirust assigns its own record IDs
-            cluster_id: result.cluster_id.0,
+            record_id: assignment.record_id.0,
+            cluster_id: assignment.cluster_id.0,
             cluster_key: String::new(), // Computed on-demand at query time
         });
     }
 
-    // Sort by index to maintain order
-    assignments.sort_by_key(|a| a.index);
     Ok(assignments)
 }
 
