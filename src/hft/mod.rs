@@ -8,10 +8,13 @@
 //! - Lock-free ingest queue
 //! - Async WAL with write coalescing
 //! - Concurrent string interning
+//! - Bigtable-inspired caching (bloom filters, scan cache, block cache)
 
 pub mod aligned;
 pub mod async_wal;
 pub mod atomic_dsu;
+pub mod bigtable_opts;
+pub mod compression;
 pub mod interner;
 pub mod queue;
 pub mod simd_hash;
@@ -26,4 +29,10 @@ pub use zero_copy::{RecordSlice, ZeroCopyBatch};
 // HFT infrastructure
 pub use aligned::{AlignedCounter, AlignedMetrics, MetricsSnapshot};
 pub use async_wal::{AsyncWal, AsyncWalConfig, WalError, WalTicket};
+pub use bigtable_opts::{
+    BlockCache, GroupCommitBuffer, IdentityBloomFilter, PartitionOptimizations, ScanCache,
+};
+pub use compression::{
+    compress, decompress, decompress_batch, BatchCompressor, CompressionStats, StreamingCompressor,
+};
 pub use queue::{BatchAggregator, IngestJob, IngestQueue, QueueStats};

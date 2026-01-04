@@ -23,9 +23,11 @@
 //! ```
 
 use crate::dsu::TemporalGuard;
+use crate::hft::bigtable_opts::PartitionOptimizations;
 use crate::linker::StreamingLinker;
-use crate::model::{ClusterId, Record, RecordId};
+use crate::model::{ClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
+use crate::sharding::IdentityKeySignature;
 use crate::store::Store;
 use crate::temporal::Interval;
 use crate::StreamingTuning;
@@ -100,7 +102,12 @@ pub struct PartitionIngestResult {
     pub had_conflicts: bool,
 }
 
-/// A single partition with exclusive ownership of its data
+/// A single partition with exclusive ownership of its data.
+///
+/// Enhanced with Bigtable-inspired optimizations:
+/// - Bloom filter for fast negative lookups on identity keys
+/// - Scan cache for temporal locality on candidate lookups
+/// - Block cache for cluster summary spatial locality
 pub struct Partition {
     /// Partition ID
     pub id: usize,
@@ -116,6 +123,8 @@ pub struct Partition {
     records_processed: AtomicU64,
     /// Merges applied from other partitions
     external_merges_applied: AtomicU64,
+    /// Bigtable-inspired optimizations (bloom filter, caches)
+    opts: PartitionOptimizations,
 }
 
 impl Partition {
@@ -130,6 +139,14 @@ impl Partition {
         let linker = StreamingLinker::new(&store, ontology, tuning)?;
         let (merge_tx, merge_rx) = bounded(merge_queue_capacity);
 
+        // Initialize Bigtable-inspired optimizations for this partition
+        let opts = if tuning.deferred_reconciliation {
+            // High-throughput mode: larger caches
+            PartitionOptimizations::high_throughput(id)
+        } else {
+            PartitionOptimizations::new(id)
+        };
+
         Ok(Self {
             id,
             linker,
@@ -138,6 +155,7 @@ impl Partition {
             merge_tx,
             records_processed: AtomicU64::new(0),
             external_merges_applied: AtomicU64::new(0),
+            opts,
         })
     }
 
@@ -148,6 +166,11 @@ impl Partition {
 
     /// Process a batch of records assigned to this partition.
     /// NO LOCKS - this partition has exclusive ownership.
+    ///
+    /// Bigtable-inspired optimizations:
+    /// - Updates bloom filter for each record's identity key
+    /// - Invalidates scan cache when new records added
+    /// - Tracks cluster merges for block cache invalidation
     #[inline]
     pub fn process_batch(
         &mut self,
@@ -158,6 +181,10 @@ impl Partition {
         let mut results = Vec::with_capacity(count);
 
         for (index, record) in records {
+            // Compute identity key signature BEFORE moving record to store
+            // This is used for bloom filter and cache operations
+            let identity_sig = self.compute_identity_signature(&record, ontology);
+
             // Add the record to our local store WITHOUT re-interning!
             // Records are pre-interned with ConcurrentInterner which has different AttrIds
             // than this partition's Store interner. Using add_record_if_absent would replace
@@ -169,6 +196,11 @@ impl Partition {
                     continue;
                 }
             };
+
+            // Update bloom filter and invalidate scan cache for this key
+            if let Some(ref sig) = identity_sig {
+                self.opts.on_record_added(sig);
+            }
 
             // Link the record if it was newly inserted
             let (cluster_id, had_conflicts) = if inserted {
@@ -200,6 +232,10 @@ impl Partition {
                     .metrics()
                     .merges_performed
                     .load(Ordering::Relaxed);
+                // Invalidate block cache if merges occurred (lazy invalidation via generation bump)
+                if merges_after > merges_before {
+                    self.opts.block_cache.invalidate_on_merge();
+                }
                 // Log every 1000th record to see progress
                 if record_id.0 % 1000 == 0 {
                     eprintln!(
@@ -302,6 +338,38 @@ impl Partition {
         self.linker.cluster_id_for(record_id)
     }
 
+    /// Compute identity key signature for a record based on ontology.
+    /// Used for bloom filter and cache operations.
+    #[inline]
+    fn compute_identity_signature(
+        &self,
+        record: &Record,
+        ontology: &Ontology,
+    ) -> Option<IdentityKeySignature> {
+        let identity_keys = ontology.identity_keys_for_type(&record.identity.entity_type);
+        if identity_keys.is_empty() {
+            return None;
+        }
+
+        // Use first identity key (primary)
+        let first_key = &identity_keys[0];
+        let key_values: Vec<KeyValue> = record
+            .descriptors
+            .iter()
+            .filter(|d| first_key.attributes.contains(&d.attr))
+            .map(|d| KeyValue::new(d.attr, d.value))
+            .collect();
+
+        if key_values.is_empty() {
+            return None;
+        }
+
+        Some(IdentityKeySignature::from_key_values(
+            &record.identity.entity_type,
+            &key_values,
+        ))
+    }
+
     /// Get the current cluster count
     pub fn cluster_count(&self) -> usize {
         self.linker.cluster_count()
@@ -309,6 +377,7 @@ impl Partition {
 
     /// Get partition statistics
     pub fn stats(&self) -> PartitionStats {
+        let opt_stats = self.opts.stats();
         PartitionStats {
             id: self.id,
             records_processed: self.records_processed.load(Ordering::Relaxed),
@@ -320,6 +389,8 @@ impl Partition {
                 .metrics()
                 .conflicts_detected
                 .load(Ordering::Relaxed),
+            bloom_keys: opt_stats.bloom_keys,
+            scan_cache_hit_rate: opt_stats.scan_cache.hit_rate(),
         }
     }
 
@@ -329,6 +400,21 @@ impl Partition {
             .metrics()
             .conflicts_detected
             .load(Ordering::Relaxed)
+    }
+
+    /// Get optimization statistics (Bigtable-style caches)
+    pub fn optimization_stats(&self) -> crate::hft::bigtable_opts::PartitionOptStats {
+        self.opts.stats()
+    }
+
+    /// Get the scan cache hit rate
+    pub fn scan_cache_hit_rate(&self) -> f64 {
+        self.opts.scan_cache.stats().hit_rate()
+    }
+
+    /// Get bloom filter key count
+    pub fn bloom_key_count(&self) -> u64 {
+        self.opts.bloom.key_count()
     }
 }
 
@@ -341,6 +427,10 @@ pub struct PartitionStats {
     pub cluster_count: usize,
     pub pending_merges: usize,
     pub conflicts_detected: u64,
+    /// Bloom filter key count
+    pub bloom_keys: u64,
+    /// Scan cache hit rate (0.0 - 1.0)
+    pub scan_cache_hit_rate: f64,
 }
 
 /// Partitioned Unirust for high-performance parallel processing
