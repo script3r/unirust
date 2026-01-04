@@ -1,10 +1,12 @@
+use tempfile::tempdir;
 use unirust_rs::test_support::{default_ontology, generate_dataset};
-use unirust_rs::{Store, Unirust};
+use unirust_rs::{PersistentStore, Unirust};
 
 #[test]
 fn streaming_ingest_is_idempotent() -> anyhow::Result<()> {
-    let mut store = Store::new();
-    let dataset = generate_dataset(&mut store, 500, 0.25, 7);
+    let temp_dir = tempdir()?;
+    let mut store = PersistentStore::open(temp_dir.path())?;
+    let dataset = generate_dataset(store.inner_mut(), 500, 0.25, 7);
     let ontology = default_ontology(&dataset.schema);
 
     let mut unirust = Unirust::with_store(ontology, store);

@@ -14,7 +14,6 @@ use anyhow::Result as AnyResult;
 use lru::LruCache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -32,15 +31,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
+/// WAL record format for binary serialization.
 #[derive(Debug, Deserialize, Serialize)]
-struct JsonRecordIdentity {
+struct WalRecordIdentity {
     entity_type: String,
     perspective: String,
     uid: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct JsonRecordDescriptor {
+struct WalRecordDescriptor {
     attr: String,
     value: String,
     start: i64,
@@ -48,10 +48,10 @@ struct JsonRecordDescriptor {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct JsonRecordInput {
+struct WalRecordInput {
     index: u32,
-    identity: JsonRecordIdentity,
-    descriptors: Vec<JsonRecordDescriptor>,
+    identity: WalRecordIdentity,
+    descriptors: Vec<WalRecordDescriptor>,
 }
 
 struct IngestWal {
@@ -62,8 +62,8 @@ struct IngestWal {
 #[allow(clippy::result_large_err)]
 impl IngestWal {
     fn new(data_dir: &Path) -> Self {
-        let path = data_dir.join("ingest_wal.json");
-        let temp_path = data_dir.join("ingest_wal.json.tmp");
+        let path = data_dir.join("ingest_wal.bin");
+        let temp_path = data_dir.join("ingest_wal.bin.tmp");
         Self { path, temp_path }
     }
 
@@ -71,12 +71,12 @@ impl IngestWal {
         if records.is_empty() {
             return self.clear();
         }
-        let inputs: Vec<JsonRecordInput> = records
+        let inputs: Vec<WalRecordInput> = records
             .iter()
-            .map(json_from_proto_input)
+            .map(wal_from_proto_input)
             .collect::<Result<_, Status>>()?;
         let payload =
-            serde_json::to_vec(&inputs).map_err(|err| Status::internal(err.to_string()))?;
+            bincode::serialize(&inputs).map_err(|err| Status::internal(err.to_string()))?;
         let mut file =
             fs::File::create(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
         file.write_all(&payload)
@@ -102,14 +102,14 @@ impl IngestWal {
         if bytes.is_empty() {
             return Ok(None);
         }
-        let inputs: Vec<JsonRecordInput> = match serde_json::from_slice(&bytes) {
+        let inputs: Vec<WalRecordInput> = match bincode::deserialize(&bytes) {
             Ok(inputs) => inputs,
             Err(_) => {
                 self.quarantine_corrupt()?;
                 return Ok(None);
             }
         };
-        let records = inputs.into_iter().map(proto_from_json_input).collect();
+        let records = inputs.into_iter().map(proto_from_wal_input).collect();
         Ok(Some(records))
     }
 
@@ -136,7 +136,7 @@ impl IngestWal {
             .duration_since(UNIX_EPOCH)
             .map_err(|err| Status::internal(err.to_string()))?
             .as_secs();
-        let corrupt_path = self.path.with_extension(format!("json.corrupt.{}", suffix));
+        let corrupt_path = self.path.with_extension(format!("bin.corrupt.{}", suffix));
         if self.path.exists() {
             if let Err(err) = fs::rename(&self.path, &corrupt_path) {
                 if self.path.exists() {
@@ -549,7 +549,7 @@ fn map_proto_config(config: &proto::OntologyConfig) -> DistributedOntologyConfig
 }
 
 #[allow(clippy::result_large_err)]
-fn json_from_proto_input(input: &proto::RecordInput) -> Result<JsonRecordInput, Status> {
+fn wal_from_proto_input(input: &proto::RecordInput) -> Result<WalRecordInput, Status> {
     let identity = input
         .identity
         .as_ref()
@@ -560,7 +560,7 @@ fn json_from_proto_input(input: &proto::RecordInput) -> Result<JsonRecordInput, 
         .map(|descriptor| {
             Interval::new(descriptor.start, descriptor.end)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
-            Ok(JsonRecordDescriptor {
+            Ok(WalRecordDescriptor {
                 attr: descriptor.attr.clone(),
                 value: descriptor.value.clone(),
                 start: descriptor.start,
@@ -568,9 +568,9 @@ fn json_from_proto_input(input: &proto::RecordInput) -> Result<JsonRecordInput, 
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
-    Ok(JsonRecordInput {
+    Ok(WalRecordInput {
         index: input.index,
-        identity: JsonRecordIdentity {
+        identity: WalRecordIdentity {
             entity_type: identity.entity_type.clone(),
             perspective: identity.perspective.clone(),
             uid: identity.uid.clone(),
@@ -579,7 +579,7 @@ fn json_from_proto_input(input: &proto::RecordInput) -> Result<JsonRecordInput, 
     })
 }
 
-fn proto_from_json_input(input: JsonRecordInput) -> proto::RecordInput {
+fn proto_from_wal_input(input: WalRecordInput) -> proto::RecordInput {
     proto::RecordInput {
         index: input.index,
         identity: Some(proto::RecordIdentity {
@@ -598,33 +598,6 @@ fn proto_from_json_input(input: JsonRecordInput) -> proto::RecordInput {
             })
             .collect(),
     }
-}
-
-async fn fetch_record_batch_from_url(url: &str) -> Result<proto::IngestRecordsRequest, Status> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(Status::invalid_argument("url must be http or https"));
-    }
-
-    let response = reqwest::get(url)
-        .await
-        .map_err(|err| Status::unavailable(err.to_string()))?;
-    if !response.status().is_success() {
-        return Err(Status::unavailable(format!(
-            "failed to fetch batch: {}",
-            response.status()
-        )));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| Status::unavailable(err.to_string()))?;
-    let inputs: Vec<JsonRecordInput> =
-        serde_json::from_slice(&bytes).map_err(|err| Status::invalid_argument(err.to_string()))?;
-
-    let records = inputs.into_iter().map(proto_from_json_input).collect();
-
-    Ok(proto::IngestRecordsRequest { records })
 }
 
 fn hash_record_to_u64(config: &DistributedOntologyConfig, record: &proto::RecordInput) -> u64 {
@@ -1465,12 +1438,12 @@ fn load_persistent_state(
     )?;
     let stored_config = store
         .load_ontology_config()?
-        .map(|payload| serde_json::from_slice(&payload))
+        .map(|payload| bincode::deserialize(&payload))
         .transpose()?;
     let config = if let Some(config) = stored_config {
         config
     } else {
-        store.save_ontology_config(&serde_json::to_vec(&fallback_config)?)?;
+        store.save_ontology_config(&bincode::serialize(&fallback_config)?)?;
         fallback_config
     };
     let ontology = config.build_ontology(store.inner_mut());
@@ -1518,7 +1491,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .reset_data()
                 .map_err(|err| Status::internal(err.to_string()))?;
             store
-                .save_ontology_config(&serde_json::to_vec(&config).map_err(|err| {
+                .save_ontology_config(&bincode::serialize(&config).map_err(|err| {
                     Status::internal(format!("failed to encode ontology config: {err}"))
                 })?)
                 .map_err(|err| Status::internal(err.to_string()))?;
@@ -1611,10 +1584,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
     async fn ingest_records_from_url(
         &self,
-        request: Request<proto::IngestRecordsFromUrlRequest>,
+        _request: Request<proto::IngestRecordsFromUrlRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
-        let batch = fetch_record_batch_from_url(&request.into_inner().url).await?;
-        self.ingest_records(Request::new(batch)).await
+        Err(Status::unimplemented(
+            "URL-based ingestion is deprecated. Use gRPC ingest_records instead.",
+        ))
     }
 
     async fn query_entities(
@@ -2072,7 +2046,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .reset_data()
                 .map_err(|err| Status::internal(err.to_string()))?;
             store
-                .save_ontology_config(&serde_json::to_vec(&config).map_err(|err| {
+                .save_ontology_config(&bincode::serialize(&config).map_err(|err| {
                     Status::internal(format!("failed to encode ontology config: {err}"))
                 })?)
                 .map_err(|err| Status::internal(err.to_string()))?;
@@ -2539,10 +2513,11 @@ impl proto::router_service_server::RouterService for RouterNode {
 
     async fn ingest_records_from_url(
         &self,
-        request: Request<proto::IngestRecordsFromUrlRequest>,
+        _request: Request<proto::IngestRecordsFromUrlRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
-        let batch = fetch_record_batch_from_url(&request.into_inner().url).await?;
-        self.ingest_records(Request::new(batch)).await
+        Err(Status::unimplemented(
+            "URL-based ingestion is deprecated. Use gRPC ingest_records instead.",
+        ))
     }
 
     async fn query_entities(

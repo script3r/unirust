@@ -2212,7 +2212,7 @@ mod tests {
             strong_identifiers: vec!["email".to_string()],
             constraints: Vec::new(),
         };
-        let payload = serde_json::to_vec(&config).unwrap();
+        let payload = bincode::serialize(&config).unwrap();
         store.save_ontology_config(&payload).unwrap();
 
         let attr = store.interner_mut().intern_attr("email");
@@ -2228,7 +2228,7 @@ mod tests {
 
         let mut store = PersistentStore::open(path).unwrap();
         let stored = store.load_ontology_config().unwrap().unwrap();
-        let decoded: DistributedOntologyConfig = serde_json::from_slice(&stored).unwrap();
+        let decoded: DistributedOntologyConfig = bincode::deserialize(&stored).unwrap();
         assert_eq!(decoded.identity_keys.len(), 1);
         assert_eq!(decoded.strong_identifiers, vec!["email".to_string()]);
 

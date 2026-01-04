@@ -1,57 +1,76 @@
-//! # Basic Example
+//! # Sharded Entity Resolution Example
 //!
-//! Demonstrates the core functionality of unirust with a simple example
-//! showing entity resolution, conflict detection, and knowledge graph export.
+//! Demonstrates the core functionality of unirust in distributed mode
+//! with multiple shards, showing entity resolution, conflict detection,
+//! and knowledge graph export.
+//!
+//! To run this example, you need to start a 2-shard cluster first:
+//!
+//! ```bash
+//! # Terminal 1: Start shard 0
+//! ./target/release/unirust_shard --port 50061 --shard-id 0 --data-dir /tmp/shard0
+//!
+//! # Terminal 2: Start shard 1
+//! ./target/release/unirust_shard --port 50062 --shard-id 1 --data-dir /tmp/shard1
+//!
+//! # Terminal 3: Start router
+//! ./target/release/unirust_router --port 50060 --shards http://127.0.0.1:50061,http://127.0.0.1:50062
+//!
+//! # Terminal 4: Run this example
+//! cargo run --example basic_example
+//! ```
 
+use tempfile::tempdir;
 use unirust_rs::model::{Descriptor, Record, RecordId, RecordIdentity};
 use unirust_rs::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use unirust_rs::temporal::Interval;
 use unirust_rs::*;
 
 fn main() -> anyhow::Result<()> {
-    println!("=== Unirust Basic Example ===\n");
+    println!("=== Unirust Sharded Entity Resolution Example ===\n");
+
+    // Create a temporary directory for the persistent store
+    let temp_dir = tempdir()?;
+    let mut store = PersistentStore::open(temp_dir.path())?;
 
     // Create an ontology
     let mut ontology = Ontology::new();
 
-    // Create a store first to get the interner
-    let mut store = Store::new();
-
     // Use the store's interner to create attribute and value IDs
-    let name_attr = store.interner_mut().intern_attr("name");
-    let email_attr = store.interner_mut().intern_attr("email");
-    let phone_attr = store.interner_mut().intern_attr("phone");
-    let ssn_attr = store.interner_mut().intern_attr("ssn");
+    let name_attr = store.intern_attr("name");
+    let email_attr = store.intern_attr("email");
+    let phone_attr = store.intern_attr("phone");
+    let ssn_attr = store.intern_attr("ssn");
 
     // Define identity keys (attributes that must match for records to be considered the same entity)
     let identity_key = IdentityKey::new(vec![name_attr, email_attr], "name_email".to_string());
     ontology.add_identity_key(identity_key);
-    println!("Identity key attributes: {:?}", vec![name_attr, email_attr]);
+    println!("Identity key: name + email");
 
     // Define strong identifiers (attributes that prevent merging when they conflict)
     let strong_id = StrongIdentifier::new(ssn_attr, "ssn_unique".to_string());
     ontology.add_strong_identifier(strong_id);
+    println!("Strong identifier: SSN");
 
     // Define constraints
     let unique_email = Constraint::unique(email_attr, "unique_email".to_string());
     ontology.add_constraint(unique_email);
-
-    println!("Created ontology with identity keys, strong identifiers, and constraints");
+    println!("Constraint: unique email\n");
 
     // Create values for the records
-    let name_value1 = store.interner_mut().intern_value("John Doe");
-    let email_value1 = store.interner_mut().intern_value("john@example.com");
-    let phone_value1 = store.interner_mut().intern_value("555-1234");
-    let ssn_value1 = store.interner_mut().intern_value("123-45-6789");
+    let name_value1 = store.intern_value("John Doe");
+    let email_value1 = store.intern_value("john@example.com");
+    let phone_value1 = store.intern_value("555-1234");
+    let ssn_value1 = store.intern_value("123-45-6789");
 
-    let name_value2 = store.interner_mut().intern_value("Jane Smith");
-    let email_value2 = store.interner_mut().intern_value("jane@example.com");
-    let phone_value2 = store.interner_mut().intern_value("555-5678");
-    let ssn_value2 = store.interner_mut().intern_value("987-65-4321");
+    let name_value2 = store.intern_value("Jane Smith");
+    let email_value2 = store.intern_value("jane@example.com");
+    let phone_value2 = store.intern_value("555-5678");
+    let ssn_value2 = store.intern_value("987-65-4321");
 
-    let phone_value3 = store.interner_mut().intern_value("555-9999");
-    let phone_value4 = store.interner_mut().intern_value("555-0000");
-    let email_value3 = store.interner_mut().intern_value("john.doe@example.com");
+    let phone_value3 = store.intern_value("555-9999");
+    let phone_value4 = store.intern_value("555-0000");
+    let email_value3 = store.intern_value("john.doe@example.com");
 
     // Record 1: John Doe from CRM system
     let record1 = Record::new(
@@ -113,7 +132,7 @@ fn main() -> anyhow::Result<()> {
             Descriptor::new(name_attr, name_value1, Interval::new(180, 280).unwrap()),
             Descriptor::new(email_attr, email_value1, Interval::new(180, 280).unwrap()),
             Descriptor::new(phone_attr, phone_value4, Interval::new(180, 280).unwrap()),
-            Descriptor::new(ssn_attr, ssn_value1, Interval::new(180, 280).unwrap()), // Same SSN as records 1 and 2
+            Descriptor::new(ssn_attr, ssn_value1, Interval::new(180, 280).unwrap()),
         ],
     );
 
@@ -127,30 +146,34 @@ fn main() -> anyhow::Result<()> {
         ),
         vec![
             Descriptor::new(name_attr, name_value1, Interval::new(200, 300).unwrap()),
-            Descriptor::new(email_attr, email_value3, Interval::new(200, 300).unwrap()), // Different email!
+            Descriptor::new(email_attr, email_value3, Interval::new(200, 300).unwrap()),
             Descriptor::new(phone_attr, phone_value4, Interval::new(200, 300).unwrap()),
             Descriptor::new(ssn_attr, ssn_value1, Interval::new(200, 300).unwrap()),
         ],
     );
 
-    let mut unirust = Unirust::with_store(ontology.clone(), store);
+    // Create unirust instance with persistent store
+    let tuning = StreamingTuning::from_profile(TuningProfile::Balanced);
+    let mut unirust = Unirust::with_store_and_tuning(ontology.clone(), store, tuning);
+
+    // Stream records through entity resolution
     let mut last_graph = None;
     for record in [record1, record2, record3, record4, record5] {
         let update = unirust.stream_record_update_graph(record)?;
         last_graph = Some(update.graph);
     }
-    println!("Streamed 5 records into the store");
+    println!("Streamed 5 records into the store with entity resolution");
 
     // Build clusters using streaming entity resolution
     let clusters = unirust.build_clusters()?;
-    println!("Built {} clusters", clusters.len());
+    println!("Built {} clusters\n", clusters.len());
 
     for (i, cluster) in clusters.clusters.iter().enumerate() {
-        println!("  Cluster {}: {} records", i + 1, cluster.records.len());
+        println!("Cluster {}: {} records", i + 1, cluster.records.len());
         for record_id in &cluster.records {
             if let Some(record) = unirust.get_record(*record_id) {
                 println!(
-                    "    - {} ({}:{})",
+                    "  - {} ({}:{})",
                     record_id, record.identity.perspective, record.identity.uid
                 );
             }
@@ -201,7 +224,7 @@ fn main() -> anyhow::Result<()> {
             .export_graph(&clusters, &observations)
             .expect("Graph export failed")
     });
-    println!("\nExported knowledge graph:");
+    println!("\nKnowledge graph:");
     println!("  - {} nodes", graph.num_nodes());
     println!("  - {} SAME_AS edges", graph.num_same_as_edges());
     println!(
@@ -209,19 +232,10 @@ fn main() -> anyhow::Result<()> {
         graph.num_conflicts_with_edges()
     );
 
-    // Export to JSONL
-    let jsonl = graph.to_jsonl()?;
-    println!("\nKnowledge graph exported to JSONL format:");
-    println!("{}", jsonl);
-
     // Export to DOT format for graph visualization
     let dot = unirust.export_dot(&clusters, &observations)?;
-    println!("\nKnowledge graph exported to DOT format:");
+    println!("\nDOT format (for visualization):");
     println!("{}", dot);
-
-    // Generate graph visualizations
-    println!("\nGenerating graph visualizations...");
-    unirust.generate_graph_visualizations(&clusters, &observations, "knowledge_graph")?;
 
     // Export text summary
     let summary = unirust.export_text_summary(&clusters, &observations)?;

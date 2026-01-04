@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -15,6 +15,29 @@ use unirust_rs::{
 };
 
 mod support;
+
+/// WAL record format for binary serialization (matches distributed.rs).
+#[derive(Debug, Deserialize, Serialize)]
+struct WalRecordIdentity {
+    entity_type: String,
+    perspective: String,
+    uid: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WalRecordDescriptor {
+    attr: String,
+    value: String,
+    start: i64,
+    end: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WalRecordInput {
+    index: u32,
+    identity: WalRecordIdentity,
+    descriptors: Vec<WalRecordDescriptor>,
+}
 
 async fn spawn_shard_with_data_dir(
     shard_id: u32,
@@ -83,34 +106,54 @@ async fn wal_replay_skips_duplicate_records() -> anyhow::Result<()> {
     store.add_record(first)?;
     drop(store);
 
-    let wal_path = data_dir.join("ingest_wal.json");
-    let payload = json!([
-        {
-            "index": 0,
-            "identity": {
-                "entity_type": "person",
-                "perspective": "crm",
-                "uid": "wal-1"
+    let wal_path = data_dir.join("ingest_wal.bin");
+    let payload: Vec<WalRecordInput> = vec![
+        WalRecordInput {
+            index: 0,
+            identity: WalRecordIdentity {
+                entity_type: "person".to_string(),
+                perspective: "crm".to_string(),
+                uid: "wal-1".to_string(),
             },
-            "descriptors": [
-                { "attr": "email", "value": "wal@example.com", "start": 0, "end": 10 },
-                { "attr": "ssn", "value": "123-45-6789", "start": 0, "end": 10 }
-            ]
+            descriptors: vec![
+                WalRecordDescriptor {
+                    attr: "email".to_string(),
+                    value: "wal@example.com".to_string(),
+                    start: 0,
+                    end: 10,
+                },
+                WalRecordDescriptor {
+                    attr: "ssn".to_string(),
+                    value: "123-45-6789".to_string(),
+                    start: 0,
+                    end: 10,
+                },
+            ],
         },
-        {
-            "index": 1,
-            "identity": {
-                "entity_type": "person",
-                "perspective": "crm",
-                "uid": "wal-2"
+        WalRecordInput {
+            index: 1,
+            identity: WalRecordIdentity {
+                entity_type: "person".to_string(),
+                perspective: "crm".to_string(),
+                uid: "wal-2".to_string(),
             },
-            "descriptors": [
-                { "attr": "email", "value": "wal2@example.com", "start": 0, "end": 10 },
-                { "attr": "ssn", "value": "987-65-4321", "start": 0, "end": 10 }
-            ]
-        }
-    ]);
-    std::fs::write(&wal_path, serde_json::to_vec(&payload)?)?;
+            descriptors: vec![
+                WalRecordDescriptor {
+                    attr: "email".to_string(),
+                    value: "wal2@example.com".to_string(),
+                    start: 0,
+                    end: 10,
+                },
+                WalRecordDescriptor {
+                    attr: "ssn".to_string(),
+                    value: "987-65-4321".to_string(),
+                    start: 0,
+                    end: 10,
+                },
+            ],
+        },
+    ];
+    std::fs::write(&wal_path, bincode::serialize(&payload)?)?;
 
     let (addr, handle) = spawn_shard_with_data_dir(0, data_dir).await?;
     let mut client = ShardServiceClient::connect(format!("http://{}", addr)).await?;
@@ -129,8 +172,8 @@ async fn wal_replay_quarantines_corrupt_file() -> anyhow::Result<()> {
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir)?;
 
-    let wal_path = data_dir.join("ingest_wal.json");
-    std::fs::write(&wal_path, b"{corrupt")?;
+    let wal_path = data_dir.join("ingest_wal.bin");
+    std::fs::write(&wal_path, b"\x00\xff\x00corrupt")?;
 
     let (addr, handle) = spawn_shard_with_data_dir(0, data_dir.clone()).await?;
     let mut client = ShardServiceClient::connect(format!("http://{}", addr)).await?;
@@ -145,7 +188,7 @@ async fn wal_replay_quarantines_corrupt_file() -> anyhow::Result<()> {
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("ingest_wal.json.corrupt")
+                .starts_with("ingest_wal.bin.corrupt")
         });
     assert!(corrupt_found);
 

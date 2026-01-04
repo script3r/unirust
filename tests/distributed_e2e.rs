@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -11,8 +12,8 @@ use unirust_rs::distributed::{
     hash_record_to_shard, DistributedOntologyConfig, RouterNode, ShardNode,
 };
 use unirust_rs::{
-    QueryDescriptor, QueryOutcome, Record, RecordId, RecordIdentity, StreamingTuning,
-    TuningProfile, Unirust,
+    PersistentStore, QueryDescriptor, QueryOutcome, Record, RecordId, RecordIdentity,
+    StreamingTuning, TuningProfile, Unirust,
 };
 
 mod support;
@@ -240,8 +241,9 @@ async fn distributed_stream_and_query() -> anyhow::Result<()> {
     assert_eq!(remote_summary.1, 1);
     assert_eq!(remote_summary.2, (0, 10));
 
-    let mut local_store = unirust_rs::Store::new();
-    let local_ontology = config.build_ontology(&mut local_store);
+    let local_temp = tempdir()?;
+    let mut local_store = PersistentStore::open(local_temp.path())?;
+    let local_ontology = config.build_ontology(local_store.inner_mut());
     let mut local = Unirust::with_store_and_tuning(
         local_ontology,
         local_store,

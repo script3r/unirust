@@ -1,3 +1,44 @@
+//! # Distributed Client Example
+//!
+//! Demonstrates connecting to a unirust cluster via gRPC
+//! and performing entity resolution operations.
+//!
+//! ## Prerequisites
+//!
+//! Start a cluster first:
+//!
+//! ```bash
+//! # Terminal 1-5: Start shards
+//! ./target/release/unirust_shard --port 50061 --shard-id 0 --data-dir /tmp/shard0
+//! ./target/release/unirust_shard --port 50062 --shard-id 1 --data-dir /tmp/shard1
+//! ./target/release/unirust_shard --port 50063 --shard-id 2 --data-dir /tmp/shard2
+//! ./target/release/unirust_shard --port 50064 --shard-id 3 --data-dir /tmp/shard3
+//! ./target/release/unirust_shard --port 50065 --shard-id 4 --data-dir /tmp/shard4
+//!
+//! # Terminal 6: Start router
+//! ./target/release/unirust_router --port 50060 --shards 5
+//! ```
+//!
+//! ## Usage
+//!
+//! ```bash
+//! cargo run --example distributed_client -- --ontology ontology.json
+//! ```
+//!
+//! ## Ontology File Format (JSON)
+//!
+//! ```json
+//! {
+//!   "identity_keys": [
+//!     { "name": "email_name", "attributes": ["email", "name"] }
+//!   ],
+//!   "strong_identifiers": ["ssn"],
+//!   "constraints": [
+//!     { "name": "unique_email", "attribute": "email", "kind": "Unique" }
+//!   ]
+//! }
+//! ```
+
 use std::fs;
 
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;

@@ -4,164 +4,142 @@
   <img src="unirust.png" alt="Unirust Logo" width="350" height="350">
 </div>
 
-Temporal-first entity mastering and conflict resolution in Rust.
+A high-performance temporal entity resolution engine in Rust.
 
-## Why Unirust
+## Overview
 
-- Time-aware entity resolution across sources and perspectives.
-- Conflict detection with explainable observations.
-- Conflict-free golden records per cluster.
-- Streaming ingest with deterministic clustering.
+Unirust is a distributed entity resolution system that clusters records from multiple sources into unified entities while respecting temporal constraints and detecting conflicts. It is designed for production workloads requiring:
 
-## How the basic example flows
+- **Correctness**: Temporal guards ensure merges only happen when constraints allow
+- **Scale**: Persistent DSU and tiered indexing support billions of records
+- **Performance**: Lock-free atomics, SIMD hashing, adaptive candidate selection
+- **Distribution**: Router and multi-shard architecture with cross-shard reconciliation
 
-The `examples/basic_example.rs` program streams five records, defines identity rules (name+email) and a strong identifier (SSN), resolves clusters, and reports conflicts.
+## Core Concepts
 
-```mermaid
-flowchart LR
-  subgraph Sources
-    CRM[CRM record]
-    CRM2[CRM record]
-    ERP[ERP record]
-    WEB[Web record]
-    MOB[Mobile record]
-  end
+### Entity Resolution Pipeline
 
-  CRM --> R1[Record + descriptors + interval]
-  CRM2 --> R3[Record + descriptors + interval]
-  ERP --> R2[Record + descriptors + interval]
-  WEB --> R4[Record + descriptors + interval]
-  MOB --> R5[Record + descriptors + interval]
-
-  R1 --> Store[Store]
-  R2 --> Store
-  R3 --> Store
-  R4 --> Store
-  R5 --> Store
-
-  Ontology[Ontology\nIdentity key: name+email\nStrong ID: SSN\nConstraint: unique email]
-  Store --> Linker[Streaming linker\nlink_record]
-  Ontology --> Linker
-
-  Linker --> Clusters[Clusters]
-  Clusters --> Conflicts[Conflict detection]
-  Store --> Conflicts
-  Ontology --> Conflicts
-
-  Conflicts --> Observations[Observations]
-  Observations --> Graph[Incremental knowledge graph]
-  Graph --> Outputs[JSONL / DOT / PNG-SVG / text summary]
+```
+Records (from multiple sources)
+    |
+    v
+Store (in-memory or RocksDB)
+    |
+    v
+Streaming Linker
+  - Phase 1: Extract identity key values (parallel)
+  - Phase 2: Find candidates in identity index
+  - Phase 3: Merge clusters via DSU with temporal guards
+  - Phase 4: Finalize assignments (parallel)
+    |
+    v
+Cluster Assignments (RecordId -> ClusterId)
+    |
+    v
+Conflict Detection -> Observations -> Knowledge Graph
 ```
 
-## Example output (derived entities)
+### Ontology
 
-```mermaid
-flowchart LR
-  subgraph Cluster0["Cluster 0"]
-    R3["R3 (crm:crm_002)\nJane Smith\njane@example.com\n555-5678\n987-65-4321"]
-  end
+Define entity matching rules:
 
-  subgraph Cluster1["Cluster 1"]
-    R1["R1 (crm:crm_001)\nJohn Doe\njohn@example.com\n555-1234\n123-45-6789"]
-    R2["R2 (erp:erp_001)\nJohn Doe\njohn@example.com\n555-9999\n123-45-6789"]
-    R4["R4 (web:web_001)\nJohn Doe\njohn@example.com\n555-0000\n123-45-6789"]
-  end
+- **Identity Keys**: Attributes that must match for records to be considered the same entity (e.g., name+email)
+- **Strong Identifiers**: Attributes that cannot conflict within a cluster (e.g., SSN)
+- **Constraints**: Uniqueness rules that prevent invalid merges
 
-  subgraph Cluster2["Cluster 2"]
-    R5["R5 (mobile:mobile_001)\nJohn Doe\njohn.doe@example.com\n555-0000\n123-45-6789"]
-  end
+### Temporal Model
 
-  R1 ---|SAME_AS all_time| R2
-  R1 ---|SAME_AS all_time| R4
-  R2 ---|SAME_AS all_time| R4
+All data has temporal validity intervals `[start, end)`. Entity resolution respects these intervals, only merging records when their values agree during overlapping time periods.
 
-  R1 -. "CONFLICTS attr:2 150-200" .- R2
-  R1 -. "CONFLICTS attr:2 180-200" .- R4
-  R2 -. "CONFLICTS attr:2 180-250" .- R4
-```
+## Quick Start
 
-## Quick start
+### Distributed Mode (Recommended)
+
+Start a 5-shard cluster:
 
 ```bash
-cargo run --example basic_example
+# Terminal 1: Start router
+./target/release/unirust_router --port 50060 --shards 5
+
+# Terminal 2-6: Start shards
+./target/release/unirust_shard --port 50061 --shard-id 0 --data-dir /tmp/shard0
+./target/release/unirust_shard --port 50062 --shard-id 1 --data-dir /tmp/shard1
+./target/release/unirust_shard --port 50063 --shard-id 2 --data-dir /tmp/shard2
+./target/release/unirust_shard --port 50064 --shard-id 3 --data-dir /tmp/shard3
+./target/release/unirust_shard --port 50065 --shard-id 4 --data-dir /tmp/shard4
 ```
 
-## Tuning
+Ingest records via gRPC:
 
-Streaming performance is controlled via `StreamingTuning`.
+```bash
+./target/release/unirust_client --router http://127.0.0.1:50060 --ontology ontology.json
+```
+
+### Load Testing
+
+```bash
+./target/release/unirust_loadtest \
+  -r http://127.0.0.1:50060 \
+  -c 10000000 \
+  --streams 16 \
+  --batch 5000
+```
+
+### Library Usage
 
 ```rust
-use unirust_rs::{StreamingTuning, TuningProfile, Unirust, Store};
+use unirust_rs::{Unirust, PersistentStore, StreamingTuning, TuningProfile};
+use unirust_rs::ontology::{Ontology, IdentityKey, StrongIdentifier, Constraint};
 
+// Create ontology
+let mut ontology = Ontology::new();
+ontology.add_identity_key(IdentityKey::new(vec![name_attr, email_attr], "name_email".to_string()));
+ontology.add_strong_identifier(StrongIdentifier::new(ssn_attr, "ssn".to_string()));
+ontology.add_constraint(Constraint::unique(email_attr, "unique_email".to_string()));
+
+// Open persistent store
+let store = PersistentStore::open("/path/to/data")?;
+
+// Create unirust instance with tuning
 let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
-// Or customize individual fields:
-// let tuning = StreamingTuning { candidate_cap: 2000, ..StreamingTuning::default() };
+let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning);
 
-let mut unirust = Unirust::with_store_and_tuning(ontology, Store::new(), tuning);
+// Stream records
+let results = unirust.stream_records(records)?;
+
+// Query entities
+let matches = unirust.query_master_entities(&descriptors, interval)?;
 ```
 
-Available profiles:
-- `Balanced` (default) - General purpose
-- `LowLatency` - Optimized for fast response
-- `HighThroughput` - Optimized for bulk processing
-- `BulkIngest` - Maximum ingest speed
-- `MemorySaver` - Reduced memory footprint
-- `BillionScale` - Persistent DSU for billion-entity datasets
-- `BillionScaleHighPerformance` - Billion-scale with larger caches
+## Tuning Profiles
 
-## Query master entities
+| Profile | Use Case |
+|---------|----------|
+| `Balanced` | General purpose (default) |
+| `LowLatency` | Fast response times |
+| `HighThroughput` | Bulk processing |
+| `BulkIngest` | Maximum ingest speed |
+| `BillionScale` | Persistent DSU for billion-entity datasets |
+| `MemorySaver` | Reduced memory footprint |
 
-```rust
-use unirust_rs::{QueryDescriptor, QueryOutcome, Interval};
+## Architecture
 
-match unirust.query_master_entities(
-    &[
-        QueryDescriptor { attr: org_attr, value: org_value },
-        QueryDescriptor { attr: role_attr, value: role_admin },
-    ],
-    Interval::new(0, 30)?,
-)? {
-    QueryOutcome::Matches(matches) => {
-        // Each interval is guaranteed to map to a single master entity.
-        // matches[i].golden includes the conflict-free golden descriptors for that cluster.
-        // matches[i].cluster_key provides a human-friendly stable key for the cluster.
-    }
-    QueryOutcome::Conflict(conflict) => {
-        // Overlapping clusters; conflict.descriptors includes overlap intervals.
-    }
-}
-```
-
-## Add to your project
-
-```toml
-[dependencies]
-unirust-rs = "0.1.0"
-```
+See [DESIGN.md](DESIGN.md) for detailed architecture documentation.
 
 ## Development
 
 ```bash
+# Run tests
 cargo test
+
+# Run benchmarks
+cargo bench --bench bench_quick   # Fast CI feedback (~30s)
+cargo bench --bench bench_micro   # Component benchmarks
+
+# Format and lint
+cargo fmt
+cargo clippy --all-targets
 ```
-
-### Benchmarks
-
-Four benchmark tiers for different use cases:
-
-```bash
-cargo bench --bench bench_quick       # ~30s  - CI/dev feedback
-cargo bench --bench bench_scale       # ~3-5m - Pre-merge validation
-cargo bench --bench bench_micro       # ~1m   - Component internals
-cargo bench --bench bench_diagnostic  # One-shot deep analysis
-```
-
-Configure scale benchmarks via environment variables:
-```bash
-UNIRUST_SCALE_COUNT=500000 UNIRUST_SCALE_OVERLAP=0.05 cargo bench --bench bench_scale
-```
-
-See `BENCHMARKS.md` for details. Testing: `TESTING.md`. Architecture: `DESIGN.md`.
 
 ## License
 

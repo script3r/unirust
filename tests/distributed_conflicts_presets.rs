@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
 use serde::Deserialize;
+use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -13,8 +14,8 @@ use unirust_rs::distributed::{
     DistributedOntologyConfig, IdentityKeyConfig, RouterNode, ShardNode,
 };
 use unirust_rs::{
-    Record, RecordId, RecordIdentity as LocalRecordIdentity, StreamingTuning, TuningProfile,
-    Unirust,
+    PersistentStore, Record, RecordId, RecordIdentity as LocalRecordIdentity, StreamingTuning,
+    TuningProfile, Unirust,
 };
 
 mod support;
@@ -252,8 +253,9 @@ async fn distributed_conflict_presets_match_local() -> anyhow::Result<()> {
     for preset in presets {
         client.reset(proto::Empty {}).await.expect("reset");
 
-        let mut local_store = unirust_rs::Store::new();
-        let local_ontology = config.clone().build_ontology(&mut local_store);
+        let local_temp = tempdir()?;
+        let mut local_store = PersistentStore::open(local_temp.path())?;
+        let local_ontology = config.clone().build_ontology(local_store.inner_mut());
         let mut local = Unirust::with_store_and_tuning(
             local_ontology,
             local_store,
