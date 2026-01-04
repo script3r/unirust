@@ -1689,8 +1689,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
         let unirust = read_unirust!(self);
-        let record_count = unirust.record_count() as u64;
-        let cluster_count = unirust.streaming_cluster_count().unwrap_or(0) as u64;
+
+        // Sum stats from both partitioned path (large batches) and worker path (small batches)
+        let (record_count, cluster_count) = if let Some(partitioned) = &self.partitioned {
+            (
+                partitioned.total_records() + unirust.record_count() as u64,
+                partitioned.total_cluster_count() as u64
+                    + unirust.streaming_cluster_count().unwrap_or(0) as u64,
+            )
+        } else {
+            (
+                unirust.record_count() as u64,
+                unirust.streaming_cluster_count().unwrap_or(0) as u64,
+            )
+        };
+
         let conflict_count = unirust.conflict_summary_count().unwrap_or(0) as u64;
         let (graph_node_count, graph_edge_count) = unirust.graph_counts().unwrap_or((0, 0));
 
