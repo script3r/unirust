@@ -93,9 +93,6 @@ pub struct ZeroCopyBatch {
     records: RecordSlice,
     /// Partition assignments: (partition_id, start_idx, len)
     partitions: Vec<(usize, usize, usize)>,
-    /// Index mapping: original_idx -> partition_idx (reserved for future use)
-    #[allow(dead_code)]
-    index_map: Vec<u32>,
 }
 
 impl ZeroCopyBatch {
@@ -108,14 +105,11 @@ impl ZeroCopyBatch {
     {
         let record_count = records.len();
         let mut partition_indices: Vec<Vec<usize>> = vec![Vec::new(); partition_count];
-        let mut index_map = vec![0u32; record_count];
 
         // Determine partition for each record
         for (idx, record) in records.iter().enumerate() {
             let partition = partition_fn(record);
-            let local_idx = partition_indices[partition].len();
             partition_indices[partition].push(idx);
-            index_map[idx] = local_idx as u32;
         }
 
         // Build partition ranges
@@ -138,20 +132,6 @@ impl ZeroCopyBatch {
         Self {
             records: RecordSlice::from_vec(reordered),
             partitions,
-            index_map,
-        }
-    }
-
-    /// Create a batch from pre-partitioned data (no reordering needed)
-    pub fn from_partitioned(
-        records: RecordSlice,
-        partitions: Vec<(usize, usize, usize)>,
-        index_map: Vec<u32>,
-    ) -> Self {
-        Self {
-            records,
-            partitions,
-            index_map,
         }
     }
 
@@ -178,8 +158,6 @@ impl ZeroCopyBatch {
             return None;
         }
 
-        // Walk through index_map to find the original index
-        // This is O(n) but only used for result mapping
         Some(*start + local_idx)
     }
 

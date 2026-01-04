@@ -1,6 +1,13 @@
+//! Streaming engine tuning configuration.
+//!
+//! These are internal tuning parameters for the entity resolution engine.
+//! Most users should select a `Profile` instead of tuning these directly.
+
 use crate::conflicts::ConflictAlgorithm;
 use crate::dsu::PersistentDSUConfig;
 use crate::index::TierConfig;
+
+use super::defaults::*;
 
 #[derive(Debug, Clone)]
 pub struct StreamingTuning {
@@ -18,10 +25,8 @@ pub struct StreamingTuning {
     /// This maintains expected match quality while reducing computation.
     pub stochastic_sampling: bool,
     /// Threshold above which stochastic sampling kicks in.
-    /// Default: 500 candidates
     pub sampling_threshold: usize,
     /// Target number of candidates to sample when using stochastic sampling.
-    /// Default: 200
     pub sampling_target: usize,
     /// Configuration for persistent DSU (used when `use_persistent_dsu` is true)
     pub dsu_config: Option<PersistentDSUConfig>,
@@ -146,17 +151,17 @@ pub enum TuningProfile {
 impl Default for StreamingTuning {
     fn default() -> Self {
         Self {
-            candidate_cap: 2000,
+            candidate_cap: DEFAULT_CANDIDATE_CAP,
             adaptive_candidate_cap: true,
-            adaptive_high_threshold: 10_000,
-            adaptive_mid_threshold: 2_000,
-            adaptive_high_cap: 500,
-            adaptive_mid_cap: 1000,
+            adaptive_high_threshold: DEFAULT_ADAPTIVE_HIGH_THRESHOLD,
+            adaptive_mid_threshold: DEFAULT_ADAPTIVE_MID_THRESHOLD,
+            adaptive_high_cap: DEFAULT_ADAPTIVE_HIGH_CAP,
+            adaptive_mid_cap: DEFAULT_ADAPTIVE_MID_CAP,
             deferred_reconciliation: true,
-            hot_key_threshold: 50_000,
+            hot_key_threshold: DEFAULT_HOT_KEY_THRESHOLD,
             stochastic_sampling: true,
-            sampling_threshold: 500,
-            sampling_target: 200,
+            sampling_threshold: DEFAULT_SAMPLING_THRESHOLD,
+            sampling_target: DEFAULT_SAMPLING_TARGET,
             dsu_config: None,
             use_persistent_dsu: false,
             tier_config: None,
@@ -280,17 +285,17 @@ impl StreamingTuning {
     /// Configuration optimized for billion-scale datasets with persistent DSU and tiered index
     pub fn billion_scale() -> Self {
         Self {
-            candidate_cap: 2000,
+            candidate_cap: DEFAULT_CANDIDATE_CAP,
             adaptive_candidate_cap: true,
-            adaptive_high_threshold: 10_000,
-            adaptive_mid_threshold: 2_000,
-            adaptive_high_cap: 500,
-            adaptive_mid_cap: 1000,
+            adaptive_high_threshold: DEFAULT_ADAPTIVE_HIGH_THRESHOLD,
+            adaptive_mid_threshold: DEFAULT_ADAPTIVE_MID_THRESHOLD,
+            adaptive_high_cap: DEFAULT_ADAPTIVE_HIGH_CAP,
+            adaptive_mid_cap: DEFAULT_ADAPTIVE_MID_CAP,
             deferred_reconciliation: true,
             hot_key_threshold: 100_000,
             stochastic_sampling: true,
-            sampling_threshold: 500,
-            sampling_target: 200,
+            sampling_threshold: DEFAULT_SAMPLING_THRESHOLD,
+            sampling_target: DEFAULT_SAMPLING_TARGET,
             dsu_config: Some(PersistentDSUConfig::default()),
             use_persistent_dsu: true,
             tier_config: Some(TierConfig::default()),
@@ -343,30 +348,25 @@ impl StreamingTuning {
 #[derive(Debug, Clone)]
 pub struct LinkerStateConfig {
     /// Maximum number of cluster ID mappings to keep in memory.
-    /// Default: 5_000_000 (~80MB with overhead)
     pub cluster_ids_capacity: usize,
     /// Maximum number of global cluster ID mappings to keep in memory.
-    /// Default: 1_000_000 (~24MB with overhead)
     pub global_ids_capacity: usize,
     /// Maximum number of strong ID summaries to keep in memory.
-    /// Default: 500_000 (~100MB depending on summary size)
     pub summaries_capacity: usize,
     /// Maximum number of record perspectives to keep in memory.
-    /// Default: 5_000_000 (~160MB depending on perspective length)
     pub perspectives_capacity: usize,
     /// Size of dirty buffer before flushing to disk (if persistence enabled).
-    /// Default: 100_000
     pub dirty_buffer_size: usize,
 }
 
 impl Default for LinkerStateConfig {
     fn default() -> Self {
         Self {
-            cluster_ids_capacity: 5_000_000,
-            global_ids_capacity: 1_000_000,
-            summaries_capacity: 500_000,
-            perspectives_capacity: 5_000_000,
-            dirty_buffer_size: 100_000,
+            cluster_ids_capacity: DEFAULT_CLUSTER_IDS_CAPACITY,
+            global_ids_capacity: DEFAULT_GLOBAL_IDS_CAPACITY,
+            summaries_capacity: DEFAULT_SUMMARIES_CAPACITY,
+            perspectives_capacity: DEFAULT_PERSPECTIVES_CAPACITY,
+            dirty_buffer_size: DEFAULT_DIRTY_BUFFER_SIZE,
         }
     }
 }

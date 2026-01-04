@@ -73,15 +73,12 @@ struct WalEntry {
 #[derive(Clone)]
 pub struct WalTicket {
     completed: Arc<AtomicBool>,
-    #[allow(dead_code)]
-    sequence: u64,
 }
 
 impl WalTicket {
-    fn new(sequence: u64) -> Self {
+    fn new() -> Self {
         Self {
             completed: Arc::new(AtomicBool::new(false)),
-            sequence,
         }
     }
 
@@ -127,9 +124,6 @@ pub struct AsyncWal {
     shutdown: Arc<AtomicBool>,
     /// Path to WAL file
     path: PathBuf,
-    /// Configuration
-    #[allow(dead_code)]
-    config: AsyncWalConfig,
 }
 
 impl AsyncWal {
@@ -167,7 +161,6 @@ impl AsyncWal {
             writer_handle: Some(writer_handle),
             shutdown,
             path,
-            config,
         })
     }
 
@@ -176,8 +169,8 @@ impl AsyncWal {
     /// Returns a ticket that can be used to wait for sync completion.
     /// The actual write happens asynchronously - this call returns immediately.
     pub fn submit(&self, data: Vec<u8>) -> Result<WalTicket, WalError> {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let ticket = WalTicket::new(sequence);
+        self.sequence.fetch_add(1, Ordering::Relaxed);
+        let ticket = WalTicket::new();
 
         let entry = WalEntry {
             data,

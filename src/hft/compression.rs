@@ -343,7 +343,7 @@ mod tests {
         let chunks = compressor.finish();
 
         // Should have multiple chunks
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
 
         // Decompress and verify
         let mut decompressed = Vec::new();

@@ -23,7 +23,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::{Mutex, RwLock};
@@ -172,7 +172,6 @@ pub struct ClusterLocality {
 /// Tracks which shards own which identity key signatures,
 /// enabling routing of related records to the same shard.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ClusterLocalityIndex {
     /// Map from identity key signature to cluster locality.
     key_to_shard: LruCache<[u8; 32], ClusterLocality>,
@@ -180,7 +179,6 @@ pub struct ClusterLocalityIndex {
     bloom: BloomFilter,
 }
 
-#[allow(dead_code)]
 impl ClusterLocalityIndex {
     /// Create a new locality index with default settings.
     pub fn new() -> Self {
@@ -284,71 +282,6 @@ impl Default for ClusterLocalityIndex {
     }
 }
 
-/// Helper to create an IdentityKeySignature from a proto record.
-#[allow(dead_code)]
-fn signature_from_proto_record(
-    config: &DistributedOntologyConfig,
-    record: &proto::RecordInput,
-) -> Option<IdentityKeySignature> {
-    let identity = record.identity.as_ref()?;
-    let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
-    for descriptor in &record.descriptors {
-        descriptors_by_attr
-            .entry(descriptor.attr.as_str())
-            .or_insert(descriptor.value.as_str());
-    }
-
-    // Try to find a matching identity key
-    for key in &config.identity_keys {
-        let mut has_all = true;
-        let mut key_values = Vec::new();
-
-        for attr in &key.attributes {
-            if let Some(value) = descriptors_by_attr.get(attr.as_str()) {
-                // Create a pseudo KeyValue for hashing
-                // We use the string values directly for hashing
-                key_values.push((attr.as_str(), *value));
-            } else {
-                has_all = false;
-                break;
-            }
-        }
-
-        if has_all {
-            // Hash the entity type and key values
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-
-            let mut hasher1 = DefaultHasher::new();
-            let mut hasher2 = DefaultHasher::new();
-
-            identity.entity_type.hash(&mut hasher1);
-            identity.entity_type.hash(&mut hasher2);
-
-            for (i, (attr, value)) in key_values.iter().enumerate() {
-                attr.hash(&mut hasher1);
-                value.hash(&mut hasher1);
-                (attr, value, i).hash(&mut hasher2);
-            }
-
-            let h1 = hasher1.finish().to_le_bytes();
-            let h2 = hasher2.finish().to_le_bytes();
-
-            let mut bytes = [0u8; 32];
-            bytes[0..8].copy_from_slice(&h1);
-            bytes[8..16].copy_from_slice(&h2);
-            for i in 0..8 {
-                bytes[16 + i] = h1[i] ^ h2[7 - i];
-                bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
-            }
-
-            return Some(IdentityKeySignature(bytes));
-        }
-    }
-
-    None
-}
-
 /// Cache-line aligned latency counters to prevent false sharing.
 /// Each counter is on its own 64-byte cache line for maximum throughput.
 #[repr(C, align(64))]
@@ -415,6 +348,8 @@ struct HftMetrics {
     query_requests: crate::hft::AlignedCounter,
     ingest_latency: AlignedLatencyCounters,
     query_latency: AlignedLatencyCounters,
+    // Cross-shard reconciliation stats (tracked at router level)
+    cross_shard_conflicts: crate::hft::AlignedCounter,
 }
 
 impl HftMetrics {
@@ -426,6 +361,7 @@ impl HftMetrics {
             query_requests: crate::hft::AlignedCounter::new(),
             ingest_latency: AlignedLatencyCounters::default(),
             query_latency: AlignedLatencyCounters::default(),
+            cross_shard_conflicts: crate::hft::AlignedCounter::new(),
         }
     }
 
@@ -723,222 +659,6 @@ pub fn hash_record_to_shard(
     ((mixed >> 32) as usize) % shard_count
 }
 
-// Rebalancing infrastructure - currently bypassed for HFT mode
-// but kept for future use with cluster-aware routing
-#[allow(dead_code)]
-fn hash_record_to_bucket(
-    config: &DistributedOntologyConfig,
-    record: &proto::RecordInput,
-    bucket_count: usize,
-) -> usize {
-    let hash = hash_record_to_u64(config, record);
-    let mixed = mix_hash(hash);
-    ((mixed >> 32) as usize) % bucket_count
-}
-
-#[allow(dead_code)]
-struct BucketAssignment {
-    primary: usize,
-    secondary: Option<usize>,
-    dual_write_until: Option<Instant>,
-    cutover_at: Option<Instant>,
-}
-
-#[allow(dead_code)]
-struct ShardBalancer {
-    bucket_count: usize,
-    shard_count: usize,
-    assignments: StdRwLock<Vec<BucketAssignment>>,
-    bucket_counts: StdMutex<Vec<u64>>,
-    rebalance_every: u64,
-    rebalance_skew: f64,
-    dual_write_for: Duration,
-    cutover_after: Option<Duration>,
-    ingest_counter: AtomicU64,
-}
-
-#[allow(dead_code)]
-impl ShardBalancer {
-    fn new(shard_count: usize) -> Option<Self> {
-        let bucket_count = env_usize("UNIRUST_REBALANCE_BUCKETS", 0);
-        if bucket_count == 0 || shard_count == 0 {
-            return None;
-        }
-        let rebalance_every = env_u64("UNIRUST_REBALANCE_EVERY", 0);
-        if rebalance_every == 0 {
-            return None;
-        }
-        let rebalance_skew = env_f64("UNIRUST_REBALANCE_SKEW", 1.25);
-        let dual_write_secs = env_u64("UNIRUST_REBALANCE_DUAL_WRITE_SECS", 300);
-        let cutover_secs = env_u64("UNIRUST_REBALANCE_CUTOVER_SECS", dual_write_secs);
-        let cutover_after = if cutover_secs == 0 {
-            None
-        } else {
-            Some(Duration::from_secs(cutover_secs))
-        };
-
-        let mut assignments = Vec::with_capacity(bucket_count);
-        for bucket in 0..bucket_count {
-            assignments.push(BucketAssignment {
-                primary: bucket % shard_count,
-                secondary: None,
-                dual_write_until: None,
-                cutover_at: None,
-            });
-        }
-
-        Some(Self {
-            bucket_count,
-            shard_count,
-            assignments: StdRwLock::new(assignments),
-            bucket_counts: StdMutex::new(vec![0; bucket_count]),
-            rebalance_every,
-            rebalance_skew,
-            dual_write_for: Duration::from_secs(dual_write_secs),
-            cutover_after,
-            ingest_counter: AtomicU64::new(0),
-        })
-    }
-
-    fn route_record(
-        &self,
-        config: &DistributedOntologyConfig,
-        record: &proto::RecordInput,
-    ) -> (usize, Option<usize>) {
-        let bucket = hash_record_to_bucket(config, record, self.bucket_count);
-        if let Ok(mut counts) = self.bucket_counts.lock() {
-            if let Some(count) = counts.get_mut(bucket) {
-                *count = count.saturating_add(1);
-            }
-        }
-
-        self.maybe_rebalance();
-
-        let now = Instant::now();
-        if let Ok(mut assignments) = self.assignments.write() {
-            let assignment = &mut assignments[bucket];
-            if let Some(cutover_at) = assignment.cutover_at {
-                if now >= cutover_at {
-                    if let Some(secondary) = assignment.secondary.take() {
-                        assignment.primary = secondary;
-                    }
-                    assignment.dual_write_until = None;
-                    assignment.cutover_at = None;
-                }
-            }
-            if assignment.cutover_at.is_none() {
-                if let Some(until) = assignment.dual_write_until {
-                    if now >= until {
-                        assignment.secondary = None;
-                        assignment.dual_write_until = None;
-                    }
-                }
-            }
-            return (assignment.primary, assignment.secondary);
-        }
-        (bucket % self.shard_count, None)
-    }
-
-    fn maybe_rebalance(&self) {
-        if self.rebalance_every == 0 || self.bucket_count == 0 {
-            return;
-        }
-        let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if !count.is_multiple_of(self.rebalance_every) {
-            return;
-        }
-
-        let assignments = match self.assignments.read() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
-        let counts = match self.bucket_counts.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
-
-        let mut shard_loads = vec![0u64; self.shard_count];
-        for (bucket, assignment) in assignments.iter().enumerate() {
-            if let Some(count) = counts.get(bucket) {
-                shard_loads[assignment.primary] =
-                    shard_loads[assignment.primary].saturating_add(*count);
-            }
-        }
-
-        let (max_shard, max_load) = shard_loads
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, load)| *load)
-            .map(|(idx, load)| (idx, *load))
-            .unwrap_or((0, 0));
-        let (min_shard, min_load) = shard_loads
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, load)| *load)
-            .map(|(idx, load)| (idx, *load))
-            .unwrap_or((0, 0));
-
-        if max_shard == min_shard {
-            return;
-        }
-        if min_load > 0 && (max_load as f64) <= (min_load as f64 * self.rebalance_skew) {
-            return;
-        }
-
-        let mut candidate_bucket = None;
-        let mut candidate_load = 0u64;
-        for (bucket, assignment) in assignments.iter().enumerate() {
-            if assignment.primary != max_shard || assignment.secondary.is_some() {
-                continue;
-            }
-            let load = counts.get(bucket).copied().unwrap_or(0);
-            if load > candidate_load {
-                candidate_load = load;
-                candidate_bucket = Some(bucket);
-            }
-        }
-        drop(assignments);
-        drop(counts);
-
-        let Some(bucket) = candidate_bucket else {
-            return;
-        };
-        let mut assignments = match self.assignments.write() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
-        let assignment = &mut assignments[bucket];
-        if assignment.primary != max_shard || assignment.secondary.is_some() {
-            return;
-        }
-        let now = Instant::now();
-        assignment.secondary = Some(min_shard);
-        assignment.dual_write_until = Some(now + self.dual_write_for);
-        assignment.cutover_at = self.cutover_after.map(|duration| now + duration);
-    }
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(default)
-}
-
 #[derive(Clone)]
 pub struct ShardNode {
     shard_id: u32,
@@ -1019,8 +739,10 @@ impl ShardNode {
         repair_on_start: bool,
         config_version: Option<String>,
     ) -> AnyResult<Self> {
-        // Set shard_id in tuning for boundary tracking
-        let tuning = tuning.with_shard_id(shard_id as u16);
+        // Set shard_id in tuning and enable boundary tracking for cross-shard reconciliation
+        let tuning = tuning
+            .with_shard_id(shard_id as u16)
+            .with_boundary_tracking(true);
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         let worker_count = ingest_worker_count();
         let use_partitioned = is_partitioned_enabled();
@@ -1862,12 +1584,30 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let conflict_count = partitioned_conflicts + worker_conflicts + stored_conflicts;
         let (graph_node_count, graph_edge_count) = unirust.graph_counts().unwrap_or((0, 0));
 
+        // Get cross-shard stats from both partitioned and non-partitioned paths
+        let (boundary_keys, cross_shard_merges) =
+            if let Some(partitioned) = partitioned_guard.as_ref() {
+                (
+                    partitioned.total_boundary_count() as u64 + unirust.boundary_count() as u64,
+                    partitioned.total_cross_shard_merge_count() as u64
+                        + unirust.cross_shard_merge_count() as u64,
+                )
+            } else {
+                (
+                    unirust.boundary_count() as u64,
+                    unirust.cross_shard_merge_count() as u64,
+                )
+            };
+
         Ok(Response::new(proto::StatsResponse {
             record_count,
             cluster_count,
             conflict_count,
             graph_node_count,
             graph_edge_count,
+            cross_shard_merges,
+            cross_shard_conflicts: 0, // Tracked at router level during reconcile
+            boundary_keys_tracked: boundary_keys,
         }))
     }
 
@@ -2350,6 +2090,221 @@ impl proto::shard_service_server::ShardService for ShardNode {
             error: String::new(),
         }))
     }
+
+    async fn get_dirty_boundary_keys(
+        &self,
+        _request: Request<proto::GetDirtyBoundaryKeysRequest>,
+    ) -> Result<Response<proto::GetDirtyBoundaryKeysResponse>, Status> {
+        let unirust = read_unirust!(self);
+        let partitioned_guard = self.partitioned.read();
+
+        // Get dirty keys from both partitioned and non-partitioned paths
+        let mut all_dirty_keys = unirust.get_dirty_boundary_keys().unwrap_or_default();
+        let mut combined_index = unirust.export_boundary_index();
+
+        // Add dirty keys from partitioned processor
+        if let Some(partitioned) = partitioned_guard.as_ref() {
+            all_dirty_keys.extend(partitioned.get_all_dirty_boundary_keys());
+            let partitioned_index = partitioned.export_boundary_index();
+            if let Some(ref mut index) = combined_index {
+                index.merge_from(&partitioned_index);
+            } else {
+                combined_index = Some(partitioned_index);
+            }
+        }
+
+        let mut dirty_key_entries = Vec::new();
+        if let Some(index) = combined_index {
+            for sig in &all_dirty_keys {
+                if let Some(entries) = index.get_boundaries(sig) {
+                    let proto_entries: Vec<proto::ClusterBoundaryEntry> = entries
+                        .iter()
+                        .map(|e| proto::ClusterBoundaryEntry {
+                            cluster_id: Some(proto::GlobalClusterId {
+                                shard_id: e.cluster_id.shard_id as u32,
+                                local_id: e.cluster_id.local_id,
+                                version: e.cluster_id.version as u32,
+                            }),
+                            interval_start: e.interval.start,
+                            interval_end: e.interval.end,
+                            shard_id: e.shard_id as u32,
+                        })
+                        .collect();
+
+                    dirty_key_entries.push(proto::DirtyBoundaryKey {
+                        signature: Some(proto::IdentityKeySignature {
+                            signature: sig.to_bytes().to_vec(),
+                        }),
+                        entries: proto_entries,
+                    });
+                }
+            }
+        }
+
+        Ok(Response::new(proto::GetDirtyBoundaryKeysResponse {
+            dirty_keys: dirty_key_entries,
+            shard_id: self.shard_id,
+        }))
+    }
+
+    async fn clear_dirty_keys(
+        &self,
+        request: Request<proto::ClearDirtyKeysRequest>,
+    ) -> Result<Response<proto::ClearDirtyKeysResponse>, Status> {
+        let req = request.into_inner();
+        let mut unirust = write_unirust!(self);
+        let partitioned_guard = self.partitioned.read();
+
+        let keys: Vec<crate::sharding::IdentityKeySignature> = req
+            .keys
+            .iter()
+            .filter_map(|sig| {
+                if sig.signature.len() == 32 {
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&sig.signature);
+                    Some(crate::sharding::IdentityKeySignature::from_bytes(bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let keys_cleared = keys.len() as u32;
+        unirust.clear_dirty_boundary_keys(&keys);
+
+        // Also clear on partitioned processor
+        if let Some(partitioned) = partitioned_guard.as_ref() {
+            partitioned.clear_dirty_boundary_keys(&keys);
+        }
+
+        Ok(Response::new(proto::ClearDirtyKeysResponse {
+            keys_cleared,
+        }))
+    }
+}
+
+// =============================================================================
+// ADAPTIVE RECONCILIATION
+// =============================================================================
+
+/// Configuration for adaptive reconciliation scheduling.
+#[derive(Debug, Clone)]
+pub struct AdaptiveReconciliationConfig {
+    /// Number of dirty keys before triggering reconciliation.
+    pub key_count_threshold: usize,
+    /// Maximum time a key can remain dirty before triggering reconciliation.
+    pub max_staleness: Duration,
+    /// Ingest rate (records/sec) below which system is considered idle.
+    pub idle_ingest_rate: f64,
+    /// Minimum interval between reconciliation runs.
+    pub min_reconcile_interval: Duration,
+}
+
+impl Default for AdaptiveReconciliationConfig {
+    fn default() -> Self {
+        Self {
+            key_count_threshold: 1000,
+            max_staleness: Duration::from_secs(60),
+            idle_ingest_rate: 1000.0,
+            min_reconcile_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+/// State for a dirty boundary key.
+#[derive(Debug)]
+struct DirtyKeyState {
+    /// Which shards have this key.
+    shards: std::collections::HashSet<u16>,
+}
+
+/// Coordinator for incremental cross-shard reconciliation.
+/// Accumulates dirty boundary keys from shards and triggers reconciliation
+/// based on adaptive conditions.
+struct ReconciliationCoordinator {
+    /// Keys that changed since last reconcile, deduplicated.
+    dirty_keys: std::collections::HashMap<crate::sharding::IdentityKeySignature, DirtyKeyState>,
+    /// When the oldest dirty key was first seen.
+    oldest_dirty: Option<Instant>,
+    /// Last time reconciliation was performed.
+    last_reconcile: Instant,
+    /// Configuration.
+    config: AdaptiveReconciliationConfig,
+}
+
+impl ReconciliationCoordinator {
+    fn new(config: AdaptiveReconciliationConfig) -> Self {
+        Self {
+            dirty_keys: std::collections::HashMap::new(),
+            oldest_dirty: None,
+            last_reconcile: Instant::now(),
+            config,
+        }
+    }
+
+    /// Add dirty keys from a shard response.
+    fn add_dirty_keys_from_shard(
+        &mut self,
+        shard_id: u16,
+        keys: Vec<crate::sharding::IdentityKeySignature>,
+    ) {
+        for sig in keys {
+            let state = self.dirty_keys.entry(sig).or_insert_with(|| {
+                if self.oldest_dirty.is_none() {
+                    self.oldest_dirty = Some(Instant::now());
+                }
+                DirtyKeyState {
+                    shards: std::collections::HashSet::new(),
+                }
+            });
+            state.shards.insert(shard_id);
+        }
+    }
+
+    /// Get the age of the oldest dirty key.
+    fn oldest_dirty_age(&self) -> Option<Duration> {
+        self.oldest_dirty.map(|t| t.elapsed())
+    }
+
+    /// Take and clear dirty keys for reconciliation.
+    fn take_dirty_keys(&mut self) -> Vec<crate::sharding::IdentityKeySignature> {
+        self.oldest_dirty = None;
+        self.last_reconcile = Instant::now();
+        self.dirty_keys.drain().map(|(k, _)| k).collect()
+    }
+
+    /// Check if we should reconcile based on adaptive conditions.
+    fn should_reconcile(&self, current_ingest_rate: f64) -> bool {
+        let dirty_count = self.dirty_keys.len();
+
+        if dirty_count == 0 {
+            return false;
+        }
+
+        // Don't reconcile too frequently
+        if self.last_reconcile.elapsed() < self.config.min_reconcile_interval {
+            return false;
+        }
+
+        // Condition 1: Enough dirty keys accumulated
+        if dirty_count >= self.config.key_count_threshold {
+            return true;
+        }
+
+        // Condition 2: Keys have been dirty too long
+        if let Some(age) = self.oldest_dirty_age() {
+            if age > self.config.max_staleness {
+                return true;
+            }
+        }
+
+        // Condition 3: System is idle, might as well reconcile
+        if current_ingest_rate < self.config.idle_ingest_rate {
+            return true;
+        }
+
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -2359,19 +2314,17 @@ pub struct RouterNode {
     ontology_config: Arc<RwLock<DistributedOntologyConfig>>,
     config_version: String,
     metrics: Arc<HftMetrics>,
-    /// Balancer is disabled in HFT mode for maximum throughput
-    #[allow(dead_code)]
-    balancer: Option<Arc<ShardBalancer>>,
-    /// Cluster locality index for cluster-aware routing (bypassed in HFT mode)
-    #[allow(dead_code)]
+    /// Cluster locality index for cluster-aware routing
     locality_index: Arc<StdRwLock<ClusterLocalityIndex>>,
+    /// Reconciliation coordinator (wrapped in mutex for interior mutability)
+    reconciliation_coordinator: Arc<tokio::sync::Mutex<ReconciliationCoordinator>>,
 }
 
 impl RouterNode {
     pub async fn connect(
         shard_addrs: Vec<String>,
         ontology_config: DistributedOntologyConfig,
-    ) -> Result<Self, Status> {
+    ) -> Result<Arc<Self>, Status> {
         Self::connect_with_version(shard_addrs, ontology_config, None).await
     }
 
@@ -2379,7 +2332,7 @@ impl RouterNode {
         shard_addrs: Vec<String>,
         ontology_config: DistributedOntologyConfig,
         config_version: Option<String>,
-    ) -> Result<Self, Status> {
+    ) -> Result<Arc<Self>, Status> {
         let shard_count = shard_addrs.len();
         let mut shard_clients = Vec::with_capacity(shard_count);
         for addr in shard_addrs {
@@ -2404,21 +2357,31 @@ impl RouterNode {
                 )));
             }
         }
-        Ok(Self {
+        let router = Arc::new(Self {
             shard_clients,
             ontology_config: Arc::new(RwLock::new(ontology_config)),
             config_version,
             metrics: Arc::new(HftMetrics::new()),
-            balancer: ShardBalancer::new(shard_count).map(Arc::new),
             locality_index: Arc::new(StdRwLock::new(ClusterLocalityIndex::new())),
-        })
+            reconciliation_coordinator: Arc::new(tokio::sync::Mutex::new(
+                ReconciliationCoordinator::new(AdaptiveReconciliationConfig::default()),
+            )),
+        });
+
+        // Start adaptive reconciliation background task automatically
+        let reconcile_router = router.clone();
+        tokio::spawn(async move {
+            reconcile_router.run_adaptive_reconciliation_loop().await;
+        });
+
+        Ok(router)
     }
 
     pub async fn connect_from_file(
         path: impl AsRef<Path>,
         ontology_config: DistributedOntologyConfig,
         config_version: Option<String>,
-    ) -> Result<Self, Status> {
+    ) -> Result<Arc<Self>, Status> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let shard_addrs = content
@@ -2480,40 +2443,208 @@ impl RouterNode {
         }
     }
 
-    /// Update locality index from ingestion assignments.
-    /// Note: Bypassed in HFT mode for maximum throughput.
-    #[allow(dead_code)]
-    fn update_locality_from_assignments(
-        &self,
-        config: &DistributedOntologyConfig,
-        records: &[proto::RecordInput],
-        assignments: &[proto::IngestAssignment],
-    ) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+    /// Start the adaptive reconciliation background task.
+    /// This task polls shards for dirty boundary keys and triggers reconciliation
+    /// based on adaptive conditions (key count, staleness, idle system).
+    pub fn start_adaptive_reconciliation(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let router = self.clone();
+        tokio::spawn(async move {
+            router.run_adaptive_reconciliation_loop().await;
+        })
+    }
 
-        let mut index = match self.locality_index.write() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
+    /// Run the adaptive reconciliation loop.
+    async fn run_adaptive_reconciliation_loop(&self) {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
 
-        // Build a map of record index to assignment
-        let assignment_map: HashMap<u32, &proto::IngestAssignment> =
-            assignments.iter().map(|a| (a.index, a)).collect();
+        loop {
+            interval.tick().await;
 
-        for record in records {
-            if let Some(sig) = signature_from_proto_record(config, record) {
-                if let Some(assignment) = assignment_map.get(&record.index) {
-                    let global_id = GlobalClusterId::new(
-                        assignment.shard_id as u16,
-                        assignment.cluster_id,
-                        0, // version 0 for initial assignments
-                    );
-                    index.register(sig, assignment.shard_id as u16, global_id, timestamp);
+            // 1. Poll all shards for dirty boundary keys
+            let mut all_dirty_keys: std::collections::HashMap<
+                crate::sharding::IdentityKeySignature,
+                Vec<(u16, proto::DirtyBoundaryKey)>,
+            > = std::collections::HashMap::new();
+
+            for (idx, client) in self.shard_clients.iter().enumerate() {
+                let mut client = client.clone();
+                if let Ok(response) = client
+                    .get_dirty_boundary_keys(Request::new(proto::GetDirtyBoundaryKeysRequest {}))
+                    .await
+                {
+                    let resp = response.into_inner();
+                    let shard_id = resp.shard_id as u16;
+
+                    for dirty_key in resp.dirty_keys {
+                        if let Some(sig_proto) = &dirty_key.signature {
+                            if sig_proto.signature.len() == 32 {
+                                let mut sig_bytes = [0u8; 32];
+                                sig_bytes.copy_from_slice(&sig_proto.signature);
+                                let sig = IdentityKeySignature::from_bytes(sig_bytes);
+
+                                all_dirty_keys
+                                    .entry(sig)
+                                    .or_default()
+                                    .push((shard_id, dirty_key.clone()));
+
+                                // Add to coordinator
+                                let mut coordinator = self.reconciliation_coordinator.lock().await;
+                                coordinator.add_dirty_keys_from_shard(shard_id, vec![sig]);
+                            }
+                        }
+                    }
+                }
+                let _ = idx; // suppress unused warning
+            }
+
+            // 2. Check if we should reconcile
+            let should_run = {
+                let coordinator = self.reconciliation_coordinator.lock().await;
+                let ingest_rate = self.current_ingest_rate();
+                coordinator.should_reconcile(ingest_rate)
+            };
+
+            if should_run {
+                // 3. Take dirty keys and perform targeted reconciliation
+                let dirty_keys = {
+                    let mut coordinator = self.reconciliation_coordinator.lock().await;
+                    coordinator.take_dirty_keys()
+                };
+
+                if !dirty_keys.is_empty() {
+                    let result = self
+                        .reconcile_dirty_keys(&dirty_keys, &all_dirty_keys)
+                        .await;
+
+                    // Update metrics
+                    if result.conflicts_blocked > 0 {
+                        self.metrics
+                            .cross_shard_conflicts
+                            .fetch_add(result.conflicts_blocked as u64, Ordering::Relaxed);
+                    }
+
+                    // 4. Clear dirty keys on shards
+                    let proto_keys: Vec<proto::IdentityKeySignature> = dirty_keys
+                        .iter()
+                        .map(|sig| proto::IdentityKeySignature {
+                            signature: sig.to_bytes().to_vec(),
+                        })
+                        .collect();
+
+                    for client in &self.shard_clients {
+                        let mut client = client.clone();
+                        let _ = client
+                            .clear_dirty_keys(Request::new(proto::ClearDirtyKeysRequest {
+                                keys: proto_keys.clone(),
+                            }))
+                            .await;
+                    }
                 }
             }
+        }
+    }
+
+    /// Perform targeted reconciliation for specific dirty keys.
+    async fn reconcile_dirty_keys(
+        &self,
+        keys: &[crate::sharding::IdentityKeySignature],
+        dirty_key_data: &std::collections::HashMap<
+            crate::sharding::IdentityKeySignature,
+            Vec<(u16, proto::DirtyBoundaryKey)>,
+        >,
+    ) -> crate::sharding::ReconciliationResult {
+        use crate::sharding::{ClusterBoundaryIndex, IncrementalReconciler};
+
+        // Build boundary indices for each shard from dirty key data
+        let mut shard_boundaries: std::collections::HashMap<u16, ClusterBoundaryIndex> =
+            std::collections::HashMap::new();
+
+        for sig in keys {
+            if let Some(entries) = dirty_key_data.get(sig) {
+                for (shard_id, dirty_key) in entries {
+                    let boundary = shard_boundaries
+                        .entry(*shard_id)
+                        .or_insert_with(|| ClusterBoundaryIndex::new_small(*shard_id));
+
+                    for entry in &dirty_key.entries {
+                        if let Some(cluster_id_proto) = &entry.cluster_id {
+                            let cluster_id = GlobalClusterId::new(
+                                cluster_id_proto.shard_id as u16,
+                                cluster_id_proto.local_id,
+                                cluster_id_proto.version as u16,
+                            );
+                            if let Ok(interval) = crate::temporal::Interval::new(
+                                entry.interval_start,
+                                entry.interval_end,
+                            ) {
+                                boundary.register_boundary_key(*sig, cluster_id, interval);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Run targeted reconciliation
+        let mut reconciler = IncrementalReconciler::new();
+        for (_shard_id, boundary) in shard_boundaries {
+            reconciler.add_shard_boundary(boundary);
+        }
+
+        let key_set: std::collections::HashSet<_> = keys.iter().copied().collect();
+        let result = reconciler.reconcile_keys(&key_set);
+
+        // Apply merges to affected shards
+        for (primary, secondary) in &result.merged_clusters {
+            // Apply to primary's shard
+            if let Ok(mut client) = self.shard_client(primary.shard_id as u32) {
+                let _ = client
+                    .apply_merge(Request::new(proto::ApplyMergeRequest {
+                        primary: Some(proto::GlobalClusterId {
+                            shard_id: primary.shard_id as u32,
+                            local_id: primary.local_id,
+                            version: primary.version as u32,
+                        }),
+                        secondary: Some(proto::GlobalClusterId {
+                            shard_id: secondary.shard_id as u32,
+                            local_id: secondary.local_id,
+                            version: secondary.version as u32,
+                        }),
+                    }))
+                    .await;
+            }
+
+            // Apply to secondary's shard if different
+            if secondary.shard_id != primary.shard_id {
+                if let Ok(mut client) = self.shard_client(secondary.shard_id as u32) {
+                    let _ = client
+                        .apply_merge(Request::new(proto::ApplyMergeRequest {
+                            primary: Some(proto::GlobalClusterId {
+                                shard_id: primary.shard_id as u32,
+                                local_id: primary.local_id,
+                                version: primary.version as u32,
+                            }),
+                            secondary: Some(proto::GlobalClusterId {
+                                shard_id: secondary.shard_id as u32,
+                                local_id: secondary.local_id,
+                                version: secondary.version as u32,
+                            }),
+                        }))
+                        .await;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get current ingest rate (records per second) from metrics.
+    fn current_ingest_rate(&self) -> f64 {
+        let elapsed = self.metrics.start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            self.metrics.ingest_records.load(Ordering::Relaxed) as f64 / elapsed
+        } else {
+            0.0
         }
     }
 
@@ -2720,6 +2851,9 @@ impl proto::router_service_server::RouterService for RouterNode {
             conflict_count: 0,
             graph_node_count: 0,
             graph_edge_count: 0,
+            cross_shard_merges: 0,
+            cross_shard_conflicts: 0,
+            boundary_keys_tracked: 0,
         };
 
         for client in &self.shard_clients {
@@ -2734,7 +2868,16 @@ impl proto::router_service_server::RouterService for RouterNode {
             totals.conflict_count += response.conflict_count;
             totals.graph_node_count += response.graph_node_count;
             totals.graph_edge_count += response.graph_edge_count;
+            totals.cross_shard_merges += response.cross_shard_merges;
+            // cross_shard_conflicts from shards is 0, we track it at router level
+            totals.boundary_keys_tracked += response.boundary_keys_tracked;
         }
+
+        // Add router-level cross-shard conflicts (tracked during reconcile)
+        totals.cross_shard_conflicts = self
+            .metrics
+            .cross_shard_conflicts
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         Ok(Response::new(totals))
     }
@@ -3113,6 +3256,14 @@ impl proto::router_service_server::RouterService for RouterNode {
 
         let result = reconciler.reconcile();
 
+        // Track cross-shard conflicts in router metrics
+        if result.conflicts_blocked > 0 {
+            self.metrics.cross_shard_conflicts.fetch_add(
+                result.conflicts_blocked as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
         // Apply merges to affected shards
         let mut total_records_updated = 0u32;
         for (primary, secondary) in &result.merged_clusters {
@@ -3179,7 +3330,159 @@ impl proto::router_service_server::RouterService for RouterNode {
             keys_checked: result.keys_checked as u32,
             keys_matched: result.keys_matched as u32,
             merges,
+            merge_candidates: result.merge_candidates as u32,
+            conflicts_blocked: result.conflicts_blocked as u32,
         }))
+    }
+}
+
+/// RouterService implementation for Arc<RouterNode> to allow use with gRPC server
+/// while returning Arc from connect methods for background task spawning.
+#[tonic::async_trait]
+impl proto::router_service_server::RouterService for Arc<RouterNode> {
+    type ExportRecordsStreamStream =
+        <RouterNode as proto::router_service_server::RouterService>::ExportRecordsStreamStream;
+
+    async fn set_ontology(
+        &self,
+        request: Request<proto::ApplyOntologyRequest>,
+    ) -> Result<Response<proto::ApplyOntologyResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::set_ontology(self, request)
+            .await
+    }
+
+    async fn ingest_records(
+        &self,
+        request: Request<proto::IngestRecordsRequest>,
+    ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::ingest_records(self, request)
+            .await
+    }
+
+    async fn ingest_records_from_url(
+        &self,
+        request: Request<proto::IngestRecordsFromUrlRequest>,
+    ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::ingest_records_from_url(
+            self, request,
+        )
+        .await
+    }
+
+    async fn query_entities(
+        &self,
+        request: Request<proto::QueryEntitiesRequest>,
+    ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::query_entities(self, request)
+            .await
+    }
+
+    async fn get_stats(
+        &self,
+        request: Request<proto::StatsRequest>,
+    ) -> Result<Response<proto::StatsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::get_stats(self, request).await
+    }
+
+    async fn health_check(
+        &self,
+        request: Request<proto::HealthCheckRequest>,
+    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::health_check(self, request)
+            .await
+    }
+
+    async fn get_config_version(
+        &self,
+        request: Request<proto::ConfigVersionRequest>,
+    ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::get_config_version(
+            self, request,
+        )
+        .await
+    }
+
+    async fn get_metrics(
+        &self,
+        request: Request<proto::MetricsRequest>,
+    ) -> Result<Response<proto::MetricsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::get_metrics(self, request)
+            .await
+    }
+
+    async fn get_record_id_range(
+        &self,
+        request: Request<proto::RouterRecordIdRangeRequest>,
+    ) -> Result<Response<proto::RecordIdRangeResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::get_record_id_range(
+            self, request,
+        )
+        .await
+    }
+
+    async fn export_records(
+        &self,
+        request: Request<proto::RouterExportRecordsRequest>,
+    ) -> Result<Response<proto::ExportRecordsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::export_records(self, request)
+            .await
+    }
+
+    async fn export_records_stream(
+        &self,
+        request: Request<proto::RouterExportRecordsRequest>,
+    ) -> Result<Response<Self::ExportRecordsStreamStream>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::export_records_stream(
+            self, request,
+        )
+        .await
+    }
+
+    async fn import_records(
+        &self,
+        request: Request<proto::RouterImportRecordsRequest>,
+    ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::import_records(self, request)
+            .await
+    }
+
+    async fn import_records_stream(
+        &self,
+        request: Request<tonic::Streaming<proto::RouterImportRecordsRequest>>,
+    ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::import_records_stream(
+            self, request,
+        )
+        .await
+    }
+
+    async fn checkpoint(
+        &self,
+        request: Request<proto::CheckpointRequest>,
+    ) -> Result<Response<proto::CheckpointResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::checkpoint(self, request).await
+    }
+
+    async fn list_conflicts(
+        &self,
+        request: Request<proto::ListConflictsRequest>,
+    ) -> Result<Response<proto::ListConflictsResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::list_conflicts(self, request)
+            .await
+    }
+
+    async fn reset(
+        &self,
+        request: Request<proto::Empty>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::reset(self, request).await
+    }
+
+    async fn reconcile(
+        &self,
+        request: Request<proto::ReconcileRequest>,
+    ) -> Result<Response<proto::ReconcileResponse>, Status> {
+        <RouterNode as proto::router_service_server::RouterService>::reconcile(self, request).await
     }
 }
 

@@ -11,7 +11,7 @@ use crate::ClusterAssignment;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 /// A signature of identity key values for fast lookup.
@@ -164,6 +164,9 @@ pub struct ClusterBoundaryIndex {
     version: u64,
     /// This shard's ID.
     shard_id: u16,
+    /// Keys that have been modified since last reconciliation.
+    /// Used for incremental/adaptive reconciliation.
+    dirty_keys: HashSet<IdentityKeySignature>,
 }
 
 impl ClusterBoundaryIndex {
@@ -174,6 +177,7 @@ impl ClusterBoundaryIndex {
             key_bloom: BloomFilter::new_16mb(),
             version: 0,
             shard_id,
+            dirty_keys: HashSet::new(),
         }
     }
 
@@ -184,6 +188,7 @@ impl ClusterBoundaryIndex {
             key_bloom: BloomFilter::new_1mb(),
             version: 0,
             shard_id,
+            dirty_keys: HashSet::new(),
         }
     }
 
@@ -216,7 +221,32 @@ impl ClusterBoundaryIndex {
 
         self.boundary_keys.entry(signature).or_default().push(entry);
 
+        // Track this key as dirty for incremental reconciliation
+        self.dirty_keys.insert(signature);
+
         self.version += 1;
+    }
+
+    /// Get the set of dirty keys (modified since last reconciliation).
+    pub fn dirty_keys(&self) -> &HashSet<IdentityKeySignature> {
+        &self.dirty_keys
+    }
+
+    /// Get dirty key count.
+    pub fn dirty_key_count(&self) -> usize {
+        self.dirty_keys.len()
+    }
+
+    /// Take and clear dirty keys, returning ownership.
+    pub fn take_dirty_keys(&mut self) -> HashSet<IdentityKeySignature> {
+        std::mem::take(&mut self.dirty_keys)
+    }
+
+    /// Clear specific keys from the dirty set (after reconciliation).
+    pub fn clear_dirty_keys(&mut self, keys: &[IdentityKeySignature]) {
+        for key in keys {
+            self.dirty_keys.remove(key);
+        }
     }
 
     /// Check if a key might have boundary entries (fast bloom check).
@@ -313,6 +343,24 @@ impl ClusterBoundaryIndex {
         }
         self.version += 1;
     }
+
+    /// Get the shard ID for this boundary index.
+    pub fn shard_id(&self) -> u16 {
+        self.shard_id
+    }
+
+    /// Merge boundary entries from another index.
+    pub fn merge_from(&mut self, other: &ClusterBoundaryIndex) {
+        for (sig, entries) in &other.boundary_keys {
+            self.key_bloom.insert(sig);
+            self.boundary_keys
+                .entry(*sig)
+                .or_default()
+                .extend(entries.iter().cloned());
+        }
+        self.dirty_keys.extend(other.dirty_keys.iter().copied());
+        self.version += 1;
+    }
 }
 
 /// Serializable boundary metadata for cross-shard exchange.
@@ -334,6 +382,10 @@ pub struct ReconciliationResult {
     pub keys_checked: usize,
     /// Number of keys that matched across shards.
     pub keys_matched: usize,
+    /// Number of potential merges evaluated (before conflict check).
+    pub merge_candidates: usize,
+    /// Number of merges blocked due to cross-shard conflicts.
+    pub conflicts_blocked: usize,
 }
 
 /// Incremental reconciler for cross-shard cluster merges.
@@ -342,7 +394,6 @@ pub struct ReconciliationResult {
 /// this uses boundary indices to find and merge only clusters
 /// that share identity keys (O(k) where k = boundary keys).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct IncrementalReconciler {
     /// Boundary indices from all shards.
     shard_boundaries: Vec<ClusterBoundaryIndex>,
@@ -350,7 +401,6 @@ pub struct IncrementalReconciler {
     pending_merges: Vec<(GlobalClusterId, GlobalClusterId)>,
 }
 
-#[allow(dead_code)]
 impl IncrementalReconciler {
     /// Create a new reconciler.
     pub fn new() -> Self {
@@ -367,7 +417,17 @@ impl IncrementalReconciler {
 
     /// Find clusters that need to be merged based on shared identity keys.
     pub fn find_cross_shard_merges(&self) -> Vec<(GlobalClusterId, GlobalClusterId)> {
+        self.find_cross_shard_merges_with_stats().0
+    }
+
+    /// Find clusters that need to be merged, returning stats about the process.
+    /// Returns (merges, merge_candidates, conflicts_blocked).
+    pub fn find_cross_shard_merges_with_stats(
+        &self,
+    ) -> (Vec<(GlobalClusterId, GlobalClusterId)>, usize, usize) {
         let mut merges = Vec::new();
+        let mut merge_candidates = 0;
+        let mut conflicts_blocked = 0;
 
         // Build a map of all signatures to their entries across all shards
         let mut all_entries: HashMap<IdentityKeySignature, Vec<&BoundaryEntry>> = HashMap::new();
@@ -401,9 +461,12 @@ impl IncrementalReconciler {
                         // Only merge if from different shards and intervals overlap
                         if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval)
                         {
+                            merge_candidates += 1;
+
                             // Check for same-perspective conflicts before proposing merge
                             if has_cross_shard_conflict(e1, e2) {
                                 // Skip this merge - clusters conflict on strong IDs
+                                conflicts_blocked += 1;
                                 continue;
                             }
 
@@ -420,14 +483,15 @@ impl IncrementalReconciler {
             }
         }
 
-        merges
+        (merges, merge_candidates, conflicts_blocked)
     }
 
     /// Perform incremental reconciliation.
     ///
     /// Returns the reconciliation result without loading full records.
     pub fn reconcile(&mut self) -> ReconciliationResult {
-        let merges = self.find_cross_shard_merges();
+        let (merges, merge_candidates, conflicts_blocked) =
+            self.find_cross_shard_merges_with_stats();
 
         let mut result = ReconciliationResult {
             merges_performed: merges.len(),
@@ -438,6 +502,8 @@ impl IncrementalReconciler {
                 .map(|b| b.boundary_keys.len())
                 .sum(),
             keys_matched: 0,
+            merge_candidates,
+            conflicts_blocked,
         };
 
         // Count matched keys
@@ -463,6 +529,89 @@ impl IncrementalReconciler {
     /// Clear pending merges after they've been applied.
     pub fn clear_pending(&mut self) {
         self.pending_merges.clear();
+    }
+
+    /// Perform targeted reconciliation for specific dirty keys only.
+    ///
+    /// This is more efficient than full reconciliation when only a subset
+    /// of keys have changed. Returns the reconciliation result.
+    pub fn reconcile_keys(&mut self, keys: &HashSet<IdentityKeySignature>) -> ReconciliationResult {
+        if keys.is_empty() {
+            return ReconciliationResult::default();
+        }
+
+        let mut merges = Vec::new();
+        let mut merge_candidates = 0;
+        let mut conflicts_blocked = 0;
+        let mut keys_matched = 0;
+
+        // For each dirty key, collect entries from all shards
+        for sig in keys {
+            let mut entries: Vec<&BoundaryEntry> = Vec::new();
+
+            for boundary in &self.shard_boundaries {
+                if let Some(boundary_entries) = boundary.boundary_keys.get(sig) {
+                    entries.extend(boundary_entries.iter());
+                }
+            }
+
+            if entries.len() < 2 {
+                continue;
+            }
+
+            // Count as matched if entries from multiple shards
+            let shard_count: HashSet<_> = entries.iter().map(|e| e.shard_id).collect();
+            if shard_count.len() > 1 {
+                keys_matched += 1;
+            }
+
+            // Check all pairs for cross-shard merges
+            for i in 0..entries.len() {
+                for j in (i + 1)..entries.len() {
+                    let e1 = entries[i];
+                    let e2 = entries[j];
+
+                    // Only merge if from different shards and intervals overlap
+                    if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval) {
+                        merge_candidates += 1;
+
+                        // Check for same-perspective conflicts before proposing merge
+                        if has_cross_shard_conflict(e1, e2) {
+                            conflicts_blocked += 1;
+                            continue;
+                        }
+
+                        // Merge into the lower shard_id for consistency
+                        let (primary, secondary) = if e1.shard_id < e2.shard_id {
+                            (e1.cluster_id, e2.cluster_id)
+                        } else {
+                            (e2.cluster_id, e1.cluster_id)
+                        };
+                        merges.push((primary, secondary));
+                    }
+                }
+            }
+        }
+
+        self.pending_merges = merges.clone();
+
+        ReconciliationResult {
+            merges_performed: merges.len(),
+            merged_clusters: merges,
+            keys_checked: keys.len(),
+            keys_matched,
+            merge_candidates,
+            conflicts_blocked,
+        }
+    }
+
+    /// Collect all dirty keys from all shard boundaries.
+    pub fn collect_all_dirty_keys(&self) -> HashSet<IdentityKeySignature> {
+        let mut all_dirty = HashSet::new();
+        for boundary in &self.shard_boundaries {
+            all_dirty.extend(boundary.dirty_keys.iter().copied());
+        }
+        all_dirty
     }
 }
 

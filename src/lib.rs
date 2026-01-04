@@ -1037,6 +1037,29 @@ impl Unirust {
         self.streaming.as_ref().map(|s| s.export_boundary_index())
     }
 
+    /// Get dirty boundary keys from the streaming linker.
+    /// Returns keys that have been modified since last reconciliation.
+    pub fn get_dirty_boundary_keys(
+        &self,
+    ) -> Option<std::collections::HashSet<sharding::IdentityKeySignature>> {
+        self.streaming.as_ref().map(|s| s.get_dirty_boundary_keys())
+    }
+
+    /// Get dirty boundary key count.
+    pub fn dirty_boundary_key_count(&self) -> usize {
+        self.streaming
+            .as_ref()
+            .map(|s| s.dirty_boundary_key_count())
+            .unwrap_or(0)
+    }
+
+    /// Clear specific dirty boundary keys after reconciliation.
+    pub fn clear_dirty_boundary_keys(&mut self, keys: &[sharding::IdentityKeySignature]) {
+        if let Some(s) = self.streaming.as_mut() {
+            s.clear_dirty_boundary_keys(keys);
+        }
+    }
+
     /// Drain boundary signatures from the streaming linker.
     /// Returns an empty Vec if streaming has not been initialized.
     pub fn drain_boundaries(

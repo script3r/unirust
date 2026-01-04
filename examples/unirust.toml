@@ -1,0 +1,59 @@
+# Unirust Configuration Example
+#
+# Copy this file to /etc/unirust/config.toml or use -c/--config to load it.
+# All settings are optional - defaults are used for missing values.
+# Environment variables override file settings (prefix: UNIRUST_)
+# CLI arguments override environment variables
+
+# Performance profile (determines internal tuning parameters)
+# Options: balanced, low-latency, high-throughput, bulk-ingest, memory-saver, billion-scale
+profile = "high-throughput"
+
+# Shard node configuration
+[shard]
+# Listen address for gRPC connections
+listen = "0.0.0.0:50061"
+# Shard ID (0-indexed, unique per shard)
+id = 0
+# Data directory for persistence (comment out for in-memory only)
+# data_dir = "/var/lib/unirust/shard-0"
+# Path to ontology configuration (JSON)
+# ontology = "/etc/unirust/ontology.json"
+# Run repair on startup (recovers from unclean shutdown)
+repair = false
+
+# Router node configuration
+[router]
+# Listen address for gRPC connections
+listen = "0.0.0.0:50060"
+# Shard addresses (http:// prefix added automatically if missing)
+shards = [
+    "shard-0:50061",
+    "shard-1:50061",
+    "shard-2:50061",
+]
+# Alternative: load shards from file (one address per line)
+# shards_file = "/etc/unirust/shards.txt"
+# Path to ontology configuration (JSON)
+# ontology = "/etc/unirust/ontology.json"
+
+# Advanced storage tuning (RocksDB)
+# These settings control the underlying storage engine performance.
+# Most users should leave these at defaults.
+[storage]
+# Block cache size in MB (larger = better read performance)
+block_cache_mb = 512
+# Write buffer size in MB (larger = better write batching)
+write_buffer_mb = 128
+# Rate limit in MB/s (0 = unlimited, useful for shared systems)
+rate_limit_mbps = 0
+# Background compaction threads
+max_background_jobs = 4
+
+# Advanced reconciliation tuning
+# Controls cross-shard cluster reconciliation in distributed mode.
+[reconciliation]
+# Maximum staleness before forced reconcile (seconds)
+max_staleness_secs = 60
+# Minimum interval between reconciles (seconds)
+min_interval_secs = 5

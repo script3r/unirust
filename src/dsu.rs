@@ -1796,28 +1796,6 @@ mod persistent_tests {
     use crate::temporal::Interval;
     use tempfile::tempdir;
 
-    #[allow(dead_code)]
-    fn create_test_persistent_dsu() -> (PersistentTemporalDSU, tempfile::TempDir) {
-        let dir = tempdir().unwrap();
-        let path = dir.path();
-
-        // Create a PersistentStore to ensure the DB is properly initialized
-        let store = PersistentStore::open(path).unwrap();
-        let db = Arc::new(unsafe { std::ptr::read(store.db() as *const _) });
-        std::mem::forget(store);
-
-        let config = PersistentDSUConfig {
-            parent_cache_size: 1000,
-            rank_cache_size: 1000,
-            guards_cache_size: 1000,
-            dirty_buffer_size: 100,
-            persist_path_compression: true,
-        };
-
-        let dsu = PersistentTemporalDSU::new(db, config).unwrap();
-        (dsu, dir)
-    }
-
     #[test]
     fn test_persistent_dsu_add_and_find() {
         let dir = tempdir().unwrap();

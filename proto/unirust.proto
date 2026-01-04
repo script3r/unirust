@@ -162,6 +162,28 @@ message GetBoundaryMetadataResponse {
   BoundaryMetadata metadata = 1;
 }
 
+// Request to get dirty boundary keys from a shard
+message GetDirtyBoundaryKeysRequest {}
+
+message DirtyBoundaryKey {
+  IdentityKeySignature signature = 1;
+  repeated ClusterBoundaryEntry entries = 2;
+}
+
+message GetDirtyBoundaryKeysResponse {
+  repeated DirtyBoundaryKey dirty_keys = 1;
+  uint32 shard_id = 2;
+}
+
+// Request to clear dirty keys after reconciliation
+message ClearDirtyKeysRequest {
+  repeated IdentityKeySignature keys = 1;
+}
+
+message ClearDirtyKeysResponse {
+  uint32 keys_cleared = 1;
+}
+
 // Request for incremental reconciliation
 message ReconcileRequest {
   repeated BoundaryMetadata shard_metadata = 1;
@@ -177,6 +199,8 @@ message ReconcileResponse {
   uint32 keys_checked = 2;
   uint32 keys_matched = 3;
   repeated ClusterMerge merges = 4;
+  uint32 merge_candidates = 5;      // Total merge candidates evaluated
+  uint32 conflicts_blocked = 6;     // Merges blocked due to cross-shard conflicts
 }
 
 // Request to apply a cross-shard cluster merge on this shard
@@ -232,6 +256,10 @@ message StatsResponse {
   uint64 conflict_count = 3;
   uint64 graph_node_count = 4;
   uint64 graph_edge_count = 5;
+  // Cross-shard reconciliation stats
+  uint64 cross_shard_merges = 6;        // Successful cross-shard merges
+  uint64 cross_shard_conflicts = 7;     // Cross-shard merges blocked by conflicts
+  uint64 boundary_keys_tracked = 8;     // Boundary keys for cross-shard detection
 }
 
 message HealthCheckRequest {}
@@ -363,6 +391,9 @@ service ShardService {
   // Cluster-aware sharding RPCs
   rpc GetBoundaryMetadata(GetBoundaryMetadataRequest) returns (GetBoundaryMetadataResponse);
   rpc ApplyMerge(ApplyMergeRequest) returns (ApplyMergeResponse);
+  // Adaptive reconciliation RPCs
+  rpc GetDirtyBoundaryKeys(GetDirtyBoundaryKeysRequest) returns (GetDirtyBoundaryKeysResponse);
+  rpc ClearDirtyKeys(ClearDirtyKeysRequest) returns (ClearDirtyKeysResponse);
 }
 
 service RouterService {

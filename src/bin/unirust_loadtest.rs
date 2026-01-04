@@ -59,6 +59,7 @@ pub struct LoadTestConfig {
     pub batch_size: usize,
     pub overlap_probability: f64,
     pub conflict_probability: f64,
+    pub cross_shard_probability: f64,
     pub log_file: Option<PathBuf>,
     pub seed: u64,
     pub headless: bool,
@@ -74,6 +75,7 @@ impl Default for LoadTestConfig {
             batch_size: 1000,
             overlap_probability: 0.1,
             conflict_probability: 0.0,
+            cross_shard_probability: 0.0,
             log_file: None,
             seed: 42,
             headless: false,
@@ -122,6 +124,11 @@ fn parse_args() -> LoadTestConfig {
                     config.conflict_probability = v;
                 }
             }
+            "--cross-shard" => {
+                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                    config.cross_shard_probability = v;
+                }
+            }
             "--log" => {
                 config.log_file = args.next().map(PathBuf::from);
             }
@@ -159,6 +166,9 @@ OPTIONS:
     --batch <N>           Batch size per request (default: 1000)
     --overlap <F>         Overlap probability 0.0-1.0 (default: 0.1)
     --conflict <F>        Conflict probability 0.0-1.0 when overlapping (default: 0.0)
+    --cross-shard <F>     Cross-shard merge probability 0.0-1.0 when overlapping (default: 0.0)
+                          Creates records that partition to different shards but share
+                          a secondary identity key, requiring cross-shard reconciliation.
     --log <PATH>          Log file path (logs to file only)
     --seed <N>            Random seed for reproducibility (default: 42)
     --headless            Run without TUI (for automation/CI)
@@ -173,6 +183,9 @@ EXAMPLES:
 
     # Test with conflicts (10% overlap, 50% of overlaps have conflicts)
     unirust_loadtest -c 500000 --overlap 0.1 --conflict 0.5
+
+    # Test cross-shard reconciliation (10% overlap, 30% create cross-shard merges)
+    unirust_loadtest -c 500000 --overlap 0.1 --cross-shard 0.3
 
     # With shard metrics and logging
     unirust_loadtest -c 500000 -s "127.0.0.1:50061,127.0.0.1:50062" --log /tmp/test.log
@@ -379,14 +392,23 @@ struct AssetSeed {
 /// Generic entity seed for other types
 struct EntitySeed {
     uid: String,
+    #[allow(dead_code)]
     identity_attr: String,
     identity_value: String,
+}
+
+/// Seed for cross-shard merge scenarios - records with same secondary identity key
+/// but different primary (partitioning) key
+struct CrossShardSeed {
+    user_sid: String, // Same across records (secondary identity key for merge)
+    perspective: String,
 }
 
 pub struct CyberEntityGenerator {
     rng: StdRng,
     overlap_probability: f64,
     conflict_probability: f64,
+    cross_shard_probability: f64,
     next_id: u64,
     base_time: i64,
 
@@ -400,6 +422,11 @@ pub struct CyberEntityGenerator {
     file_pool: Vec<EntitySeed>,
     vuln_pool: Vec<EntitySeed>,
 
+    // Pool for cross-shard merge scenarios
+    cross_shard_user_pool: Vec<CrossShardSeed>,
+    #[allow(dead_code)]
+    cross_shard_asset_pool: Vec<CrossShardSeed>,
+
     // Pool size limits - controls cluster density
     pool_size: usize,
 
@@ -408,7 +435,12 @@ pub struct CyberEntityGenerator {
 }
 
 impl CyberEntityGenerator {
-    pub fn new(seed: u64, overlap_probability: f64, conflict_probability: f64) -> Self {
+    pub fn new(
+        seed: u64,
+        overlap_probability: f64,
+        conflict_probability: f64,
+        cross_shard_probability: f64,
+    ) -> Self {
         let total_weight: u32 = EntityType::all().iter().map(|e| e.weight()).sum();
         // Pool size determines cluster density: smaller pool = denser clusters
         // For ~10 entities per cluster with 10% overlap, use pool_size ~= total_entities / 100
@@ -418,6 +450,7 @@ impl CyberEntityGenerator {
             rng: StdRng::seed_from_u64(seed),
             overlap_probability,
             conflict_probability,
+            cross_shard_probability,
             next_id: 0,
             base_time: 1704067200, // 2024-01-01 00:00:00 UTC
             user_pool: Vec::with_capacity(pool_size),
@@ -428,6 +461,8 @@ impl CyberEntityGenerator {
             alert_pool: Vec::with_capacity(pool_size),
             file_pool: Vec::with_capacity(pool_size),
             vuln_pool: Vec::with_capacity(pool_size),
+            cross_shard_user_pool: Vec::with_capacity(pool_size),
+            cross_shard_asset_pool: Vec::with_capacity(pool_size),
             pool_size,
             total_weight,
         }
@@ -435,6 +470,10 @@ impl CyberEntityGenerator {
 
     fn should_conflict(&mut self) -> bool {
         self.rng.random_bool(self.conflict_probability)
+    }
+
+    fn should_cross_shard(&mut self) -> bool {
+        self.rng.random_bool(self.cross_shard_probability)
     }
 
     fn select_entity_type(&mut self) -> EntityType {
@@ -532,6 +571,8 @@ impl CyberEntityGenerator {
     /// Generate a user entity. Returns (uid, descriptors, perspective_override).
     /// When overlapping, reuses UID from pool to create clusters.
     /// When conflicting, uses same perspective and different strong identifier.
+    /// When cross-shard, uses different user_upn (partitioning key) but same user_sid
+    /// (secondary identity key) to create cross-shard merge candidates.
     fn generate_user(
         &mut self,
         start: i64,
@@ -540,68 +581,105 @@ impl CyberEntityGenerator {
     ) -> (String, Vec<RecordDescriptor>, Option<String>) {
         let is_overlap = self.should_overlap() && !self.user_pool.is_empty();
         let is_conflict = is_overlap && self.should_conflict();
+        let is_cross_shard = is_overlap
+            && !is_conflict
+            && self.should_cross_shard()
+            && !self.cross_shard_user_pool.is_empty();
 
-        let (uid, user_sid, user_upn, employee_id, department, perspective_override) = if is_overlap
-        {
-            let idx = self.rng.random_range(0..self.user_pool.len());
-            // Clone seed values upfront to avoid borrow conflicts
-            let seed_uid = self.user_pool[idx].uid.clone();
-            let seed_user_sid = self.user_pool[idx].user_sid.clone();
-            let seed_user_upn = self.user_pool[idx].user_upn.clone();
-            let seed_employee_id = self.user_pool[idx].employee_id.clone();
-            let seed_department = self.user_pool[idx].department.clone();
-            let seed_perspective = self.user_pool[idx].perspective.clone();
+        let (uid, user_sid, user_upn, employee_id, department, perspective_override) =
+            if is_cross_shard {
+                // CROSS-SHARD: Different user_upn (different shards) but SAME user_sid
+                // This creates records that will be detected as merge candidates during
+                // cross-shard reconciliation via the user_identity key.
+                let idx = self.rng.random_range(0..self.cross_shard_user_pool.len());
+                let seed_user_sid = self.cross_shard_user_pool[idx].user_sid.clone();
+                let seed_perspective = self.cross_shard_user_pool[idx].perspective.clone();
 
-            if is_conflict {
-                // CONFLICT: Same identity key (user_upn) but DIFFERENT strong identifier (user_sid)
-                // CRITICAL: Use NEW UID (different record), SAME perspective, SAME identity key,
-                //           but DIFFERENT strong identifier to create a true conflict
-                let new_uid = self.next_uid();
-                let new_user_sid = format!(
-                    "S-1-5-21-{}-{}",
-                    self.rng.random::<u32>(),
-                    self.rng.random::<u32>()
-                );
+                let uid = self.next_uid();
+                // NEW user_upn - will hash to potentially different shard
+                let user_upn = format!("crossshard_user{}@corp.local", self.next_id);
+                let employee_id = format!("EMP{:08}", self.rng.random_range(10000..99999999u32));
+                let departments = ["Engineering", "Sales", "HR", "Finance", "IT", "Security"];
+                let department =
+                    departments[self.rng.random_range(0..departments.len())].to_string();
+
                 (
-                    new_uid,       // NEW UID - creates a new record (not a duplicate)
-                    new_user_sid,  // DIFFERENT strong identifier - creates conflict
-                    seed_user_upn, // SAME identity key - makes records candidates for merge
-                    seed_employee_id,
-                    seed_department,
-                    Some(seed_perspective), // SAME perspective - required for conflict detection
+                    uid,
+                    seed_user_sid, // SAME user_sid - creates cross-shard merge candidate
+                    user_upn,      // DIFFERENT user_upn - goes to different shard
+                    employee_id,
+                    department,
+                    Some(seed_perspective), // Use original perspective
                 )
+            } else if is_overlap {
+                let idx = self.rng.random_range(0..self.user_pool.len());
+                // Clone seed values upfront to avoid borrow conflicts
+                let seed_uid = self.user_pool[idx].uid.clone();
+                let seed_user_sid = self.user_pool[idx].user_sid.clone();
+                let seed_user_upn = self.user_pool[idx].user_upn.clone();
+                let seed_employee_id = self.user_pool[idx].employee_id.clone();
+                let seed_department = self.user_pool[idx].department.clone();
+                let seed_perspective = self.user_pool[idx].perspective.clone();
+
+                if is_conflict {
+                    // CONFLICT: Same identity key (user_upn) but DIFFERENT strong identifier (user_sid)
+                    // CRITICAL: Use NEW UID (different record), SAME perspective, SAME identity key,
+                    //           but DIFFERENT strong identifier to create a true conflict
+                    let new_uid = self.next_uid();
+                    let new_user_sid = format!(
+                        "S-1-5-21-{}-{}",
+                        self.rng.random::<u32>(),
+                        self.rng.random::<u32>()
+                    );
+                    (
+                        new_uid,       // NEW UID - creates a new record (not a duplicate)
+                        new_user_sid,  // DIFFERENT strong identifier - creates conflict
+                        seed_user_upn, // SAME identity key - makes records candidates for merge
+                        seed_employee_id,
+                        seed_department,
+                        Some(seed_perspective), // SAME perspective - required for conflict detection
+                    )
+                } else {
+                    // Exact overlap - same cluster, no conflict
+                    (
+                        seed_uid,
+                        seed_user_sid,
+                        seed_user_upn,
+                        seed_employee_id,
+                        seed_department,
+                        None,
+                    )
+                }
             } else {
-                // Exact overlap - same cluster, no conflict
-                (
-                    seed_uid,
-                    seed_user_sid,
-                    seed_user_upn,
-                    seed_employee_id,
-                    seed_department,
-                    None,
-                )
-            }
-        } else {
-            let uid = self.next_uid();
-            let user_sid = format!("S-1-5-21-{}-{}", self.rng.random::<u32>(), self.next_id);
-            let user_upn = format!("user{}@corp.local", self.next_id);
-            let employee_id = format!("EMP{:08}", self.rng.random_range(10000..99999999u32));
-            let departments = ["Engineering", "Sales", "HR", "Finance", "IT", "Security"];
-            let department = departments[self.rng.random_range(0..departments.len())].to_string();
+                let uid = self.next_uid();
+                let user_sid = format!("S-1-5-21-{}-{}", self.rng.random::<u32>(), self.next_id);
+                let user_upn = format!("user{}@corp.local", self.next_id);
+                let employee_id = format!("EMP{:08}", self.rng.random_range(10000..99999999u32));
+                let departments = ["Engineering", "Sales", "HR", "Finance", "IT", "Security"];
+                let department =
+                    departments[self.rng.random_range(0..departments.len())].to_string();
 
-            if self.user_pool.len() < self.pool_size {
-                self.user_pool.push(UserSeed {
-                    uid: uid.clone(),
-                    user_sid: user_sid.clone(),
-                    user_upn: user_upn.clone(),
-                    employee_id: employee_id.clone(),
-                    department: department.clone(),
-                    perspective: perspective.to_string(),
-                });
-            }
+                if self.user_pool.len() < self.pool_size {
+                    self.user_pool.push(UserSeed {
+                        uid: uid.clone(),
+                        user_sid: user_sid.clone(),
+                        user_upn: user_upn.clone(),
+                        employee_id: employee_id.clone(),
+                        department: department.clone(),
+                        perspective: perspective.to_string(),
+                    });
+                }
 
-            (uid, user_sid, user_upn, employee_id, department, None)
-        };
+                // Also add to cross-shard pool for future cross-shard merge candidates
+                if self.cross_shard_user_pool.len() < self.pool_size {
+                    self.cross_shard_user_pool.push(CrossShardSeed {
+                        user_sid: user_sid.clone(),
+                        perspective: perspective.to_string(),
+                    });
+                }
+
+                (uid, user_sid, user_upn, employee_id, department, None)
+            };
 
         let descriptors = vec![
             RecordDescriptor {
@@ -1239,6 +1317,10 @@ pub struct LoadTestMetrics {
     pub cluster_count: AtomicU64,
     pub conflicts_detected: AtomicU64,
     pub merges_performed: AtomicU64,
+    // Cross-shard reconciliation stats
+    pub cross_shard_merges: AtomicU64,
+    pub cross_shard_conflicts: AtomicU64,
+    pub boundary_keys_tracked: AtomicU64,
     pub stream_stats: Vec<StreamStats>,
     pub shard_stats: Vec<ShardStats>,
     pub completed: AtomicBool,
@@ -1263,6 +1345,9 @@ impl LoadTestMetrics {
             cluster_count: AtomicU64::new(0),
             conflicts_detected: AtomicU64::new(0),
             merges_performed: AtomicU64::new(0),
+            cross_shard_merges: AtomicU64::new(0),
+            cross_shard_conflicts: AtomicU64::new(0),
+            boundary_keys_tracked: AtomicU64::new(0),
             stream_stats,
             shard_stats,
             completed: AtomicBool::new(false),
@@ -1348,6 +1433,10 @@ impl LoadTestMetrics {
             "  Conflict prob:    {:.1}%\n",
             config.conflict_probability * 100.0
         ));
+        report.push_str(&format!(
+            "  Cross-shard prob: {:.1}%\n",
+            config.cross_shard_probability * 100.0
+        ));
         report.push_str(&format!("  Seed:             {}\n\n", config.seed));
 
         // Summary
@@ -1364,6 +1453,22 @@ impl LoadTestMetrics {
             } else {
                 0.0
             }
+        ));
+
+        // Cross-shard reconciliation stats
+        let cross_shard_merges = self.cross_shard_merges.load(Ordering::Relaxed);
+        let cross_shard_conflicts = self.cross_shard_conflicts.load(Ordering::Relaxed);
+        let boundary_keys = self.boundary_keys_tracked.load(Ordering::Relaxed);
+
+        report.push_str("## Cross-Shard Reconciliation\n");
+        report.push_str(&format!("  Boundary keys:    {}\n", boundary_keys));
+        report.push_str(&format!(
+            "  Cross-shard merges:    {}\n",
+            cross_shard_merges
+        ));
+        report.push_str(&format!(
+            "  Cross-shard conflicts: {}\n\n",
+            cross_shard_conflicts
         ));
 
         // Per-stream stats
@@ -1565,6 +1670,7 @@ async fn run_parallel_streams(
             gen_config.seed,
             gen_config.overlap_probability,
             gen_config.conflict_probability,
+            gen_config.cross_shard_probability,
         );
         let mut remaining = gen_config.count;
 
@@ -1714,6 +1820,9 @@ async fn poll_metrics_task(
                         let stats = response.into_inner();
                         metrics.cluster_count.store(stats.cluster_count, Ordering::Relaxed);
                         metrics.conflicts_detected.store(stats.conflict_count, Ordering::Relaxed);
+                        metrics.cross_shard_merges.store(stats.cross_shard_merges, Ordering::Relaxed);
+                        metrics.cross_shard_conflicts.store(stats.cross_shard_conflicts, Ordering::Relaxed);
+                        metrics.boundary_keys_tracked.store(stats.boundary_keys_tracked, Ordering::Relaxed);
                     }
                 }
 
@@ -1802,7 +1911,7 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
             Constraint::Length(3), // Header
             Constraint::Length(3), // Config
             Constraint::Length(4), // Progress
-            Constraint::Length(5), // Throughput + Clusters
+            Constraint::Length(6), // Throughput + Clusters (with cross-shard stats)
             Constraint::Min(4),    // Streams
             Constraint::Length(4), // Shards (if any)
             Constraint::Length(1), // Footer
@@ -1906,13 +2015,17 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
 
     let cluster_count = metrics.cluster_count.load(Ordering::Relaxed);
     let conflicts = metrics.conflicts_detected.load(Ordering::Relaxed);
-    let merges = metrics.merges_performed.load(Ordering::Relaxed);
+    let cross_shard_merges = metrics.cross_shard_merges.load(Ordering::Relaxed);
+    let cross_shard_conflicts = metrics.cross_shard_conflicts.load(Ordering::Relaxed);
+    let boundary_keys = metrics.boundary_keys_tracked.load(Ordering::Relaxed);
 
     let clusters_text = format!(
-        "Total: {}\nConflicts: {} | Merges: {}",
+        "Total: {} | Conflicts: {}\nX-Shard: {} merges, {} blocked\nBoundary keys: {}",
         format_number(cluster_count),
         format_number(conflicts),
-        format_number(merges)
+        format_number(cross_shard_merges),
+        format_number(cross_shard_conflicts),
+        format_number(boundary_keys)
     );
     let clusters_para = Paragraph::new(clusters_text)
         .style(Style::default().fg(Color::Yellow))

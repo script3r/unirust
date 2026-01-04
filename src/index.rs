@@ -164,11 +164,6 @@ impl IntervalTree {
         }
     }
 
-    #[allow(dead_code)]
-    fn collect_overlapping(&self, interval: Interval, out: &mut Vec<(RecordId, Interval)>) {
-        self.collect_overlapping_limited(interval, out, usize::MAX);
-    }
-
     /// Collect overlapping intervals with an early exit after max_results.
     /// Returns true if the limit was reached (potentially more results exist).
     fn collect_overlapping_limited(
@@ -265,17 +260,6 @@ impl CandidateList {
                 }
             }
         }
-    }
-
-    #[allow(dead_code)]
-    fn collect_overlapping_clusters(
-        &mut self,
-        dsu: &mut DsuBackend,
-        interval: Interval,
-        out: &mut Vec<(RecordId, Interval)>,
-        seen: &mut HashSet<RecordId>,
-    ) {
-        self.collect_overlapping_clusters_limited(dsu, interval, out, seen, usize::MAX);
     }
 
     /// Collect overlapping clusters with an early exit after visiting max_tree_nodes.
@@ -1039,8 +1023,6 @@ pub struct TieredIdentityKeyIndex {
     cf_identity_keys: &'static str,
     cf_key_stats: &'static str,
     /// Scratch buffers
-    #[allow(dead_code)]
-    overlap_buffer: Vec<(RecordId, Interval)>,
     cluster_overlap_buffer: Vec<(RecordId, Interval)>,
     cluster_seen: HashSet<RecordId>,
     /// Record keys mapping
@@ -1068,7 +1050,6 @@ impl TieredIdentityKeyIndex {
             last_tier_management: 0,
             cf_identity_keys: crate::persistence::index_cf::IDENTITY_KEYS,
             cf_key_stats: crate::persistence::index_cf::KEY_STATS,
-            overlap_buffer: Vec::new(),
             cluster_overlap_buffer: Vec::new(),
             cluster_seen: HashSet::new(),
             record_keys: HashMap::new(),
@@ -1081,27 +1062,6 @@ impl TieredIdentityKeyIndex {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64
-    }
-
-    /// Record an access to a key (for future use in promotion logic)
-    #[allow(dead_code)]
-    fn record_access(&mut self, key: &IdentityIndexKey) {
-        let now = Self::current_time();
-
-        // Update hot stats
-        if let Some(stats) = self.hot_stats.get_mut(key) {
-            stats.access_count = stats.access_count.saturating_add(1);
-            stats.total_queries = stats.total_queries.saturating_add(1);
-            stats.last_access = now;
-            return;
-        }
-
-        // Update warm stats
-        if let Some(stats) = self.warm_stats.get_mut(key) {
-            stats.access_count = stats.access_count.saturating_add(1);
-            stats.total_queries = stats.total_queries.saturating_add(1);
-            stats.last_access = now;
-        }
     }
 
     /// Add a record to the index

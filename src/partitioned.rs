@@ -420,6 +420,33 @@ impl Partition {
     pub fn bloom_key_count(&self) -> u64 {
         self.opts.bloom.key_count()
     }
+
+    /// Get the number of boundary keys tracked for cross-shard reconciliation
+    pub fn boundary_count(&self) -> usize {
+        self.linker.boundary_count()
+    }
+
+    /// Get the dirty boundary keys for adaptive reconciliation
+    pub fn get_dirty_boundary_keys(
+        &self,
+    ) -> std::collections::HashSet<crate::sharding::IdentityKeySignature> {
+        self.linker.get_dirty_boundary_keys()
+    }
+
+    /// Clear specific dirty boundary keys after reconciliation
+    pub fn clear_dirty_boundary_keys(&mut self, keys: &[crate::sharding::IdentityKeySignature]) {
+        self.linker.clear_dirty_boundary_keys(keys);
+    }
+
+    /// Get cross-shard merge count
+    pub fn cross_shard_merge_count(&self) -> usize {
+        self.linker.cross_shard_merge_count()
+    }
+
+    /// Export boundary index for reconciliation
+    pub fn export_boundary_index(&self) -> crate::sharding::ClusterBoundaryIndex {
+        self.linker.export_boundary_index()
+    }
 }
 
 /// Statistics for a single partition
@@ -438,7 +465,6 @@ pub struct PartitionStats {
 }
 
 /// Partitioned Unirust for high-performance parallel processing
-#[allow(dead_code)]
 pub struct PartitionedUnirust {
     /// The partitions (owned, not shared)
     partitions: Vec<Partition>,
@@ -446,8 +472,6 @@ pub struct PartitionedUnirust {
     config: PartitionConfig,
     /// Ontology reference (shared, immutable)
     ontology: Arc<Ontology>,
-    /// Tuning configuration
-    tuning: StreamingTuning,
     /// Total records ingested
     total_records: AtomicU64,
 }
@@ -482,7 +506,6 @@ impl PartitionedUnirust {
             partitions,
             config,
             ontology,
-            tuning,
             total_records: AtomicU64::new(0),
         })
     }
@@ -984,6 +1007,56 @@ impl ParallelPartitionedUnirust {
     /// Get a reference to the ontology
     pub fn ontology(&self) -> &Ontology {
         &self.ontology
+    }
+
+    /// Get the total number of boundary keys across all partitions
+    pub fn total_boundary_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|p| p.lock().boundary_count())
+            .sum()
+    }
+
+    /// Get all dirty boundary keys across all partitions
+    pub fn get_all_dirty_boundary_keys(
+        &self,
+    ) -> std::collections::HashSet<crate::sharding::IdentityKeySignature> {
+        let mut all_keys = std::collections::HashSet::new();
+        for partition in &self.partitions {
+            all_keys.extend(partition.lock().get_dirty_boundary_keys());
+        }
+        all_keys
+    }
+
+    /// Clear dirty boundary keys on all partitions
+    pub fn clear_dirty_boundary_keys(&self, keys: &[crate::sharding::IdentityKeySignature]) {
+        for partition in &self.partitions {
+            partition.lock().clear_dirty_boundary_keys(keys);
+        }
+    }
+
+    /// Get total cross-shard merge count across all partitions
+    pub fn total_cross_shard_merge_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|p| p.lock().cross_shard_merge_count())
+            .sum()
+    }
+
+    /// Export combined boundary index from all partitions
+    pub fn export_boundary_index(&self) -> crate::sharding::ClusterBoundaryIndex {
+        // Get shard_id from first partition's linker
+        let shard_id = if !self.partitions.is_empty() {
+            self.partitions[0].lock().export_boundary_index().shard_id()
+        } else {
+            0
+        };
+        let mut combined = crate::sharding::ClusterBoundaryIndex::new_small(shard_id);
+        for partition in &self.partitions {
+            let partition_index = partition.lock().export_boundary_index();
+            combined.merge_from(&partition_index);
+        }
+        combined
     }
 }
 

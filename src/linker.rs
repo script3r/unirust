@@ -353,6 +353,8 @@ pub struct StreamingLinker {
     /// Boundary keys for cross-shard reconciliation (deduplicated by key+cluster).
     /// Maps (signature, cluster) -> (interval, perspective_strong_ids) for that combination.
     boundary_signatures: HashMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
+    /// Dirty boundary keys - signatures modified since last reconciliation.
+    dirty_boundary_keys: HashSet<ShardingKeySignature>,
     /// Cross-shard merge mappings: secondary -> primary.
     /// Used to redirect cluster ID lookups after cross-shard reconciliation.
     cross_shard_merges: HashMap<GlobalClusterId, GlobalClusterId>,
@@ -478,6 +480,7 @@ impl StreamingLinker {
             tuning: tuning.clone(),
             key_stats: FxHashMap::default(),
             boundary_signatures: HashMap::new(),
+            dirty_boundary_keys: HashSet::new(),
             cross_shard_merges: HashMap::new(),
             metrics: LinkerMetrics::new(),
             partition_opts: None,
@@ -742,6 +745,10 @@ impl StreamingLinker {
                 } else {
                     None
                 };
+
+                // Track if we should record boundary after the loop
+                let mut boundary_to_track: Option<RecordId> = None;
+
                 // Use destructuring for separate mutable borrows in candidate processing
                 let StreamingLinker {
                     dsu,
@@ -847,6 +854,9 @@ impl StreamingLinker {
                             opts.on_cluster_merge(root_a, root_b);
                         }
                         root_a = new_root;
+
+                        // Mark for boundary tracking after borrows are released
+                        boundary_to_track = Some(new_root);
                     }
                 }
                 // Record stats after candidates loop (borrows dropped)
@@ -857,32 +867,16 @@ impl StreamingLinker {
                         .or_default()
                         .record(candidate_len, actual_cap);
                 }
+                // Track boundary signature for merges (borrows now released)
+                if let Some(new_root) = boundary_to_track {
+                    self.track_merge_boundary(entity_type, key_values, new_root, interval);
+                }
             }
         }
 
         // Add the record to the index after matching to avoid self-matches.
         let _add_guard = crate::profile::profile_scope("add_to_index");
         let root = self.dsu.find(record_id).unwrap_or(record_id);
-
-        // Record boundary signatures for cross-shard reconciliation.
-        // Only needed in distributed mode (shard_id > 0).
-        // Skip in single-shard mode to avoid memory overhead.
-        if self.tuning.enable_boundary_tracking {
-            let global_id = self.get_or_assign_global_cluster_id(root);
-            // Get perspective strong ID hashes for conflict detection
-            let perspective_hashes = self.compute_perspective_strong_id_hashes(root);
-            for (_identity_key, key_values_list) in &cached_keys {
-                for (key_values, interval) in key_values_list {
-                    let key_signature = LinkerKeySignature::new(entity_type, key_values);
-                    self.record_boundary_signature(
-                        &key_signature,
-                        global_id,
-                        *interval,
-                        &perspective_hashes,
-                    );
-                }
-            }
-        }
 
         self.identity_index
             .add_record_with_cached_keys(record_id, root, entity_type, cached_keys);
@@ -1209,6 +1203,23 @@ impl StreamingLinker {
         self.boundary_signatures.clear();
     }
 
+    /// Get the set of dirty boundary keys (modified since last reconciliation).
+    pub fn get_dirty_boundary_keys(&self) -> HashSet<ShardingKeySignature> {
+        self.dirty_boundary_keys.clone()
+    }
+
+    /// Get the count of dirty boundary keys.
+    pub fn dirty_boundary_key_count(&self) -> usize {
+        self.dirty_boundary_keys.len()
+    }
+
+    /// Clear specific dirty boundary keys after reconciliation.
+    pub fn clear_dirty_boundary_keys(&mut self, keys: &[ShardingKeySignature]) {
+        for key in keys {
+            self.dirty_boundary_keys.remove(key);
+        }
+    }
+
     /// Export boundary signatures to a ClusterBoundaryIndex.
     /// This can be used for cross-shard reconciliation.
     pub fn export_boundary_index(&self) -> crate::sharding::ClusterBoundaryIndex {
@@ -1233,42 +1244,23 @@ impl StreamingLinker {
             .collect()
     }
 
-    /// Compute perspective strong ID hashes for a cluster root.
-    /// Returns a map from perspective name hash to strong ID values hash.
-    fn compute_perspective_strong_id_hashes(&self, root: RecordId) -> HashMap<u64, u64> {
-        let mut result = HashMap::new();
-        if let Some(summary) = self.strong_id_summaries.peek(&root) {
-            for (perspective, attrs) in &summary.by_perspective {
-                // Hash the perspective name
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(perspective, &mut hasher);
-                let perspective_hash = std::hash::Hasher::finish(&hasher);
-
-                // Hash all (attr_id, value_id) pairs for this perspective
-                let mut value_hasher = std::collections::hash_map::DefaultHasher::new();
-                for (attr_id, values) in attrs {
-                    std::hash::Hash::hash(attr_id, &mut value_hasher);
-                    for value_id in values.keys() {
-                        std::hash::Hash::hash(value_id, &mut value_hasher);
-                    }
-                }
-                let values_hash = std::hash::Hasher::finish(&value_hasher);
-
-                result.insert(perspective_hash, values_hash);
-            }
-        }
-        result
-    }
-
-    /// Record a boundary signature for cross-shard tracking.
-    /// Deduplicates by (key_signature, global_id) and merges intervals.
-    fn record_boundary_signature(
+    /// Track boundary signature when a merge happens.
+    /// This is the optimized path - we only track boundaries when clusters actually merge,
+    /// not on every record. This significantly reduces overhead while still capturing
+    /// the important cross-shard boundary information.
+    #[inline]
+    fn track_merge_boundary(
         &mut self,
-        key_signature: &LinkerKeySignature,
-        global_id: GlobalClusterId,
+        entity_type: &str,
+        key_values: &[KeyValue],
+        new_root: RecordId,
         interval: Interval,
-        perspective_strong_ids: &HashMap<u64, u64>,
     ) {
+        if !self.tuning.enable_boundary_tracking {
+            return;
+        }
+        let key_signature = LinkerKeySignature::new(entity_type, key_values);
+        let global_id = self.get_or_assign_global_cluster_id(new_root);
         let sharding_sig = key_signature.to_sharding_signature();
         let key = (sharding_sig, global_id);
 
@@ -1276,21 +1268,19 @@ impl StreamingLinker {
         self.boundary_signatures
             .entry(key)
             .and_modify(|existing| {
-                // Extend existing interval to cover both
                 let new_start = existing.interval.start.min(interval.start);
                 let new_end = existing.interval.end.max(interval.end);
                 if let Ok(merged) = Interval::new(new_start, new_end) {
                     existing.interval = merged;
                 }
-                // Merge perspective strong IDs (keep existing for conflicts)
-                for (k, v) in perspective_strong_ids {
-                    existing.perspective_strong_ids.entry(*k).or_insert(*v);
-                }
             })
             .or_insert_with(|| BoundaryData {
                 interval,
-                perspective_strong_ids: perspective_strong_ids.clone(),
+                perspective_strong_ids: HashMap::new(),
             });
+
+        // Mark this key as dirty for adaptive reconciliation
+        self.dirty_boundary_keys.insert(sharding_sig);
     }
 
     /// Apply a cross-shard cluster merge.
@@ -1331,6 +1321,8 @@ impl StreamingLinker {
                         }
                     })
                     .or_insert(data);
+                // Mark this key as dirty for adaptive reconciliation
+                self.dirty_boundary_keys.insert(sig);
             }
         }
 
