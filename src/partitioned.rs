@@ -31,6 +31,7 @@ use crate::temporal::Interval;
 use crate::StreamingTuning;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use rayon::prelude::*;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -272,6 +273,18 @@ pub struct PartitionedUnirust {
     total_records: AtomicU64,
 }
 
+/// Thread-safe partitioned Unirust with per-partition locks for TRUE parallel processing
+pub struct ParallelPartitionedUnirust {
+    /// Each partition has its own Mutex - no global lock contention!
+    partitions: Vec<parking_lot::Mutex<Partition>>,
+    /// Configuration
+    config: PartitionConfig,
+    /// Ontology reference (shared, immutable)
+    ontology: Arc<Ontology>,
+    /// Total records ingested
+    total_records: AtomicU64,
+}
+
 impl PartitionedUnirust {
     /// Create a new partitioned Unirust instance
     pub fn new(
@@ -474,6 +487,140 @@ impl PartitionedUnirustHandle {
     /// Get partition stats (read lock)
     pub fn partition_stats(&self) -> Vec<PartitionStats> {
         self.inner.read().partition_stats()
+    }
+}
+
+impl ParallelPartitionedUnirust {
+    /// Create a new parallel partitioned Unirust instance
+    pub fn new(
+        config: PartitionConfig,
+        ontology: Arc<Ontology>,
+        tuning: StreamingTuning,
+    ) -> Result<Self> {
+        let mut partitions = Vec::with_capacity(config.partition_count);
+
+        for id in 0..config.partition_count {
+            let partition = Partition::new(id, &tuning, &ontology, config.merge_queue_capacity)?;
+            partitions.push(parking_lot::Mutex::new(partition));
+        }
+
+        Ok(Self {
+            partitions,
+            config,
+            ontology,
+            total_records: AtomicU64::new(0),
+        })
+    }
+
+    /// Get the partition ID for a record based on its primary identity key
+    #[inline]
+    pub fn partition_for_record(&self, record: &Record) -> usize {
+        let partition_key = &record.identity.uid;
+        let mut hasher = FxHasher::default();
+        partition_key.hash(&mut hasher);
+        let hash = hasher.finish();
+        (hash as usize) % self.config.partition_count
+    }
+
+    /// Partition records by their primary identity key - parallel version
+    fn partition_records(&self, records: Vec<(u32, Record)>) -> Vec<Vec<(u32, Record)>> {
+        let partition_count = self.config.partition_count;
+
+        // Use parallel partitioning for large batches
+        if records.len() > 1000 {
+            // Pre-allocate thread-local buffers
+            let partitioned: Vec<Vec<(u32, Record)>> = records
+                .into_par_iter()
+                .fold(
+                    || vec![Vec::new(); partition_count],
+                    |mut acc, (idx, record)| {
+                        let partition_id = {
+                            let mut hasher = FxHasher::default();
+                            record.identity.uid.hash(&mut hasher);
+                            (hasher.finish() as usize) % partition_count
+                        };
+                        acc[partition_id].push((idx, record));
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![Vec::new(); partition_count],
+                    |mut a, b| {
+                        for (i, v) in b.into_iter().enumerate() {
+                            a[i].extend(v);
+                        }
+                        a
+                    },
+                );
+            partitioned
+        } else {
+            // Sequential for small batches
+            let mut partitioned: Vec<Vec<(u32, Record)>> = vec![Vec::new(); partition_count];
+            for (idx, record) in records {
+                let partition_id = self.partition_for_record(&record);
+                partitioned[partition_id].push((idx, record));
+            }
+            partitioned
+        }
+    }
+
+    /// Ingest a batch of records using TRUE parallel partition processing.
+    /// Each partition is processed independently with its own lock - no global contention!
+    #[instrument(skip(self, records), level = "debug")]
+    pub fn ingest_batch(&self, records: Vec<(u32, Record)>) -> Vec<PartitionIngestResult> {
+        if records.is_empty() {
+            return Vec::new();
+        }
+
+        let record_count = records.len();
+        self.total_records
+            .fetch_add(record_count as u64, Ordering::Relaxed);
+
+        // Phase 1: Partition records by primary key (parallel for large batches)
+        let partitioned = self.partition_records(records);
+
+        // Phase 2: Process ALL partitions in PARALLEL using rayon
+        // Each partition has its own Mutex, so no global lock contention!
+        let ontology = &self.ontology;
+
+        let all_results: Vec<Vec<PartitionIngestResult>> = partitioned
+            .into_par_iter()
+            .enumerate()
+            .filter(|(_, batch)| !batch.is_empty())
+            .map(|(partition_id, batch)| {
+                // Lock only this partition - other partitions can proceed in parallel
+                let mut partition = self.partitions[partition_id].lock();
+                partition.process_batch(batch, ontology)
+            })
+            .collect();
+
+        // Phase 3: Flatten and sort results by original index
+        let mut results: Vec<PartitionIngestResult> = all_results.into_iter().flatten().collect();
+        results.sort_by_key(|r| r.index);
+        results
+    }
+
+    /// Get the total number of clusters across all partitions
+    pub fn total_cluster_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|p| p.lock().cluster_count())
+            .sum()
+    }
+
+    /// Get the total records processed
+    pub fn total_records(&self) -> u64 {
+        self.total_records.load(Ordering::Relaxed)
+    }
+
+    /// Get statistics for all partitions
+    pub fn partition_stats(&self) -> Vec<PartitionStats> {
+        self.partitions.iter().map(|p| p.lock().stats()).collect()
+    }
+
+    /// Get the partition count
+    pub fn partition_count(&self) -> usize {
+        self.config.partition_count
     }
 }
 

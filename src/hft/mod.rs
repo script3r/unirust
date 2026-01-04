@@ -7,16 +7,19 @@
 //! - Cache-line aligned metrics
 //! - Lock-free ingest queue
 //! - Async WAL with write coalescing
+//! - Concurrent string interning
 
 pub mod aligned;
 pub mod async_wal;
 pub mod atomic_dsu;
+pub mod interner;
 pub mod queue;
 pub mod simd_hash;
 pub mod zero_copy;
 
 // Core types
 pub use atomic_dsu::{AtomicDSU, AtomicMergeResult};
+pub use interner::ConcurrentInterner;
 pub use simd_hash::SimdHasher;
 pub use zero_copy::{RecordSlice, ZeroCopyBatch};
 
