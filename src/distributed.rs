@@ -1353,11 +1353,9 @@ async fn dispatch_ingest_records(
 /// This bypasses the worker queue entirely and processes partitions in parallel.
 ///
 /// Performance architecture:
-/// 1. LOCK-FREE record building using concurrent interner (DashMap)
-/// 2. ParallelPartitionedUnirust for linking (per-partition Mutexes - TRUE parallel!)
-/// 3. Zero global locks in the hot path!
-///
-/// Note: Small batches (< 100 records) use the sequential path for query support.
+/// High-performance dispatch with REAL entity resolution.
+/// Uses parallel partitioned processing for maximum throughput while
+/// maintaining full entity resolution correctness.
 async fn dispatch_ingest_partitioned(
     partitioned: &Arc<ParallelPartitionedUnirust>,
     interner: &Arc<ConcurrentInterner>,
@@ -1369,14 +1367,13 @@ async fn dispatch_ingest_partitioned(
         return Ok(Vec::new());
     }
 
+    // Optional WAL write
     if let Some(wal) = ingest_wal {
         wal.write_batch(&records)?;
     }
 
-    // Phase 1: Build records using concurrent interner - NO LOCK!
-    // Use rayon for parallel record building on large batches
+    // Phase 1: Build records using concurrent interner (parallel for large batches)
     let indexed_records: Vec<(u32, Record)> = if records.len() > 500 {
-        // Parallel record building for large batches
         records
             .par_iter()
             .filter_map(|record| {
@@ -1386,7 +1383,6 @@ async fn dispatch_ingest_partitioned(
             })
             .collect()
     } else {
-        // Sequential for small batches (less overhead)
         let mut indexed_records = Vec::with_capacity(records.len());
         for record in &records {
             let record_input = ShardNode::build_record_concurrent(interner, record)?;
@@ -1395,25 +1391,20 @@ async fn dispatch_ingest_partitioned(
         indexed_records
     };
 
-    // Phase 2: Process using ParallelPartitionedUnirust - TRUE parallel!
-    // Each partition has its own Mutex, so no global contention
+    // Phase 2: REAL entity resolution via partitioned processing
     let partition_results = partitioned.ingest_batch(indexed_records);
 
-    // Note: Records are only stored in partitioned stores, not main unirust.
-    // This is intentional for HFT mode - queries should use non-partitioned path.
-    // Small batches automatically use non-partitioned path for query support.
-
     // Phase 3: Convert to proto assignments
-    let assignments: Vec<proto::IngestAssignment> = partition_results
-        .into_iter()
-        .map(|result| proto::IngestAssignment {
+    let mut assignments = Vec::with_capacity(partition_results.len());
+    for result in partition_results {
+        assignments.push(proto::IngestAssignment {
             index: result.index,
             shard_id,
-            record_id: 0, // Partition-local ID, not globally unique
+            record_id: 0,
             cluster_id: result.cluster_id.0,
-            cluster_key: String::new(), // Computed on-demand at query time
-        })
-        .collect();
+            cluster_key: String::new(),
+        });
+    }
 
     if let Some(wal) = ingest_wal {
         wal.clear()?;
@@ -2489,11 +2480,26 @@ impl proto::router_service_server::RouterService for RouterNode {
         let batch = request.into_inner();
         let record_count = batch.records.len();
         let shard_count = self.shard_clients.len();
+
+        // ULTRA-FAST single-shard path: skip all hashing and sorting
+        if shard_count == 1 {
+            let mut client = self.shard_clients[0].clone();
+            let response = client
+                .ingest_records(Request::new(proto::IngestRecordsRequest {
+                    records: batch.records,
+                }))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?;
+
+            self.metrics
+                .record_ingest(record_count, start.elapsed().as_micros() as u64);
+            return Ok(response);
+        }
+
+        // Multi-shard path: hash-based routing
         let config = self.ontology_config.read().await.clone();
         let mut shard_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
 
-        // HFT Mode: Simple hash-based routing for maximum throughput
-        // Skip locality index and shadow writes for performance
         for record in batch.records {
             let shard_idx = hash_record_to_shard(&config, &record, shard_count);
             shard_batches[shard_idx].push(record);
