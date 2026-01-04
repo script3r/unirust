@@ -23,10 +23,10 @@
 //! ```
 
 use crate::dsu::TemporalGuard;
-use crate::hft::bigtable_opts::PartitionOptimizations;
 use crate::linker::StreamingLinker;
 use crate::model::{ClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
+use crate::perf::bigtable_opts::PartitionOptimizations;
 use crate::sharding::IdentityKeySignature;
 use crate::store::Store;
 use crate::temporal::Interval;
@@ -407,7 +407,7 @@ impl Partition {
     }
 
     /// Get optimization statistics (Bigtable-style caches)
-    pub fn optimization_stats(&self) -> crate::hft::bigtable_opts::PartitionOptStats {
+    pub fn optimization_stats(&self) -> crate::perf::bigtable_opts::PartitionOptStats {
         self.opts.stats()
     }
 

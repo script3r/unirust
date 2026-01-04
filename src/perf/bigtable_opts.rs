@@ -10,8 +10,8 @@
 //!
 //! Reference: "Bigtable: A Distributed Storage System for Structured Data" (OSDI 2006)
 
-use crate::hft::sharded_cache::{ShardedCacheConfig, ShardedLruCache};
 use crate::model::{AttrId, ClusterId, RecordId, ValueId};
+use crate::perf::sharded_cache::{ShardedCacheConfig, ShardedLruCache};
 use crate::sharding::{BloomFilter, IdentityKeySignature};
 use crate::temporal::Interval;
 use lru::LruCache;

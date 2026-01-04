@@ -13,7 +13,7 @@ LOG_DIR="${LOG_DIR:-$ROOT_DIR/cluster_logs}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/.cluster}"
 ONTOLOGY="${ONTOLOGY:-}"
 CONFIG_VERSION="${CONFIG_VERSION:-}"
-TUNING="${TUNING:-}"
+PROFILE="${PROFILE:-high-throughput}"
 REPAIR="${REPAIR:-0}"
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 SHARD_WAIT_SECS="${SHARD_WAIT_SECS:-10}"
@@ -31,7 +31,7 @@ Environment:
   RUN_DIR=$ROOT_DIR/.cluster
   ONTOLOGY=/path/to/ontology.json
   CONFIG_VERSION=optional-version-string
-  TUNING=balanced|low-latency|high-throughput|bulk-ingest|memory-saver
+  PROFILE=balanced|low-latency|high-throughput|bulk-ingest|memory-saver|billion-scale
   REPAIR=0|1
   CARGO_FEATURES=comma-separated-cargo-features
   SHARD_WAIT_SECS=10
@@ -95,8 +95,8 @@ start_cluster() {
     if [[ -n "$CONFIG_VERSION" ]]; then
       shard_args+=(--config-version "$CONFIG_VERSION")
     fi
-    if [[ -n "$TUNING" ]]; then
-      shard_args+=(--tuning "$TUNING")
+    if [[ -n "$PROFILE" ]]; then
+      shard_args+=(--profile "$PROFILE")
     fi
     if [[ "$REPAIR" == "1" ]]; then
       shard_args+=(--repair)

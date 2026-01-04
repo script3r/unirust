@@ -1,6 +1,6 @@
-//! # HFT (High-Frequency Trading) Optimizations Module
+//! # Performance Optimizations Module
 //!
-//! Ultra-low-latency optimizations for maximum throughput:
+//! Low-latency optimizations for maximum throughput:
 //! - Lock-free DSU with atomic parent links
 //! - SIMD-accelerated key hashing
 //! - Zero-copy record passing
@@ -28,7 +28,7 @@ pub use interner::ConcurrentInterner;
 pub use simd_hash::SimdHasher;
 pub use zero_copy::{RecordSlice, ZeroCopyBatch};
 
-// HFT infrastructure
+// Performance infrastructure
 pub use aligned::{AlignedCounter, AlignedMetrics, MetricsSnapshot};
 pub use async_wal::{AsyncWal, AsyncWalConfig, WalError, WalTicket};
 pub use bigtable_opts::{

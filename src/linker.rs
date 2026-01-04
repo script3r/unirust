@@ -11,10 +11,10 @@
 
 use crate::dsu::TemporalGuard;
 use crate::dsu::{Clusters, DsuBackend, MergeResult, TemporalDSU};
-use crate::hft::bigtable_opts::PartitionOptimizations;
 use crate::index::IndexBackend;
 use crate::model::{ClusterId, GlobalClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
+use crate::perf::bigtable_opts::PartitionOptimizations;
 use crate::sharding::IdentityKeySignature as ShardingKeySignature;
 use crate::sharding::IdentityKeySignature;
 use crate::store::RecordStore;

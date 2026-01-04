@@ -1,9 +1,9 @@
 use crate::conflicts::ConflictSummary;
 use crate::graph::GoldenDescriptor;
-use crate::hft::ConcurrentInterner;
 use crate::model::{AttrId, GlobalClusterId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::partitioned::{ParallelPartitionedUnirust, PartitionConfig};
+use crate::perf::ConcurrentInterner;
 use crate::persistence::PersistentOpenOptions;
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::sharding::{BloomFilter, IdentityKeySignature};
@@ -336,32 +336,32 @@ impl AlignedLatencyCounters {
     }
 }
 
-/// HFT-optimized metrics with cache-line aligned counters.
+/// high-throughput-optimized metrics with cache-line aligned counters.
 /// Eliminates false sharing when multiple threads update metrics concurrently.
 #[repr(C)]
 #[derive(Debug)]
-struct HftMetrics {
+struct PerfMetrics {
     start: Instant,
     // Each counter on its own cache line
-    ingest_requests: crate::hft::AlignedCounter,
-    ingest_records: crate::hft::AlignedCounter,
-    query_requests: crate::hft::AlignedCounter,
+    ingest_requests: crate::perf::AlignedCounter,
+    ingest_records: crate::perf::AlignedCounter,
+    query_requests: crate::perf::AlignedCounter,
     ingest_latency: AlignedLatencyCounters,
     query_latency: AlignedLatencyCounters,
     // Cross-shard reconciliation stats (tracked at router level)
-    cross_shard_conflicts: crate::hft::AlignedCounter,
+    cross_shard_conflicts: crate::perf::AlignedCounter,
 }
 
-impl HftMetrics {
+impl PerfMetrics {
     fn new() -> Self {
         Self {
             start: Instant::now(),
-            ingest_requests: crate::hft::AlignedCounter::new(),
-            ingest_records: crate::hft::AlignedCounter::new(),
-            query_requests: crate::hft::AlignedCounter::new(),
+            ingest_requests: crate::perf::AlignedCounter::new(),
+            ingest_records: crate::perf::AlignedCounter::new(),
+            query_requests: crate::perf::AlignedCounter::new(),
             ingest_latency: AlignedLatencyCounters::default(),
             query_latency: AlignedLatencyCounters::default(),
-            cross_shard_conflicts: crate::hft::AlignedCounter::new(),
+            cross_shard_conflicts: crate::perf::AlignedCounter::new(),
         }
     }
 
@@ -677,11 +677,11 @@ pub struct ShardNode {
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     config_version: String,
-    metrics: Arc<HftMetrics>,
+    metrics: Arc<PerfMetrics>,
 }
 
-const INGEST_QUEUE_CAPACITY: usize = 1024; // Increased from 128 for HFT
-const DEFAULT_INGEST_WORKERS: usize = 32; // Increased from 16 for HFT
+const INGEST_QUEUE_CAPACITY: usize = 1024; // Increased from 128 for high-throughput
+const DEFAULT_INGEST_WORKERS: usize = 32; // Increased from 16 for high-throughput
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
 
 /// Check if partitioned processing is enabled (default: true)
@@ -790,7 +790,7 @@ impl ShardNode {
                 ingest_wal,
                 ingest_txs,
                 config_version,
-                metrics: Arc::new(HftMetrics::new()),
+                metrics: Arc::new(PerfMetrics::new()),
             });
         }
 
@@ -842,7 +842,7 @@ impl ShardNode {
             ingest_wal,
             ingest_txs,
             config_version,
-            metrics: Arc::new(HftMetrics::new()),
+            metrics: Arc::new(PerfMetrics::new()),
         })
     }
 
@@ -1381,7 +1381,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let records = request.into_inner().records;
         let record_count = records.len();
 
-        // Use partitioned processing for large batches (HFT mode)
+        // Use partitioned processing for large batches (high-throughput mode)
         // Small batches use sequential path for correctness (query support)
         // Clone the Arc and release the lock before awaiting (guards aren't Send)
         let partitioned_arc = self.partitioned.read().clone();
@@ -1423,7 +1423,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             }
             record_count += chunk.records.len();
 
-            // Use partitioned processing for large batches (HFT mode)
+            // Use partitioned processing for large batches (high-throughput mode)
             // Small batches use sequential path for correctness
             // Clone the Arc and release the lock before awaiting (guards aren't Send)
             let partitioned_arc = self.partitioned.read().clone();
@@ -2313,7 +2313,7 @@ pub struct RouterNode {
     /// RwLock for ontology config - read-heavy, written only during set_ontology
     ontology_config: Arc<RwLock<DistributedOntologyConfig>>,
     config_version: String,
-    metrics: Arc<HftMetrics>,
+    metrics: Arc<PerfMetrics>,
     /// Cluster locality index for cluster-aware routing
     locality_index: Arc<StdRwLock<ClusterLocalityIndex>>,
     /// Reconciliation coordinator (wrapped in mutex for interior mutability)
@@ -2361,7 +2361,7 @@ impl RouterNode {
             shard_clients,
             ontology_config: Arc::new(RwLock::new(ontology_config)),
             config_version,
-            metrics: Arc::new(HftMetrics::new()),
+            metrics: Arc::new(PerfMetrics::new()),
             locality_index: Arc::new(StdRwLock::new(ClusterLocalityIndex::new())),
             reconciliation_coordinator: Arc::new(tokio::sync::Mutex::new(
                 ReconciliationCoordinator::new(AdaptiveReconciliationConfig::default()),

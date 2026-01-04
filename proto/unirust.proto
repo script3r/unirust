@@ -2,44 +2,52 @@ syntax = "proto3";
 
 package unirust;
 
+// =============================================================================
+// EXTERNAL API - Client-Facing Messages
+// =============================================================================
+// These are the primary messages clients use to interact with Unirust.
+// The API is intentionally minimal: ingest records, query entities, get stats.
+
+// --- Record Input ---
+
 message RecordIdentity {
-  string entity_type = 1;
-  string perspective = 2;
-  string uid = 3;
+  string entity_type = 1;  // e.g., "person", "company"
+  string perspective = 2;  // Source system, e.g., "crm", "erp"
+  string uid = 3;          // Unique ID within perspective
 }
 
 message RecordDescriptor {
-  string attr = 1;
-  string value = 2;
-  int64 start = 3;
-  int64 end = 4;
+  string attr = 1;   // Attribute name, e.g., "email", "phone"
+  string value = 2;  // Attribute value
+  int64 start = 3;   // Validity start (epoch or YYYYMM)
+  int64 end = 4;     // Validity end (exclusive)
 }
 
 message RecordInput {
-  uint32 index = 1;
-  RecordIdentity identity = 2;
-  repeated RecordDescriptor descriptors = 3;
+  uint32 index = 1;                       // Client-provided index for correlation
+  RecordIdentity identity = 2;            // Record identity
+  repeated RecordDescriptor descriptors = 3;  // Attribute values with temporal validity
 }
+
+// --- Ingest ---
 
 message IngestRecordsRequest {
   repeated RecordInput records = 1;
 }
 
-message IngestRecordsChunk {
-  repeated RecordInput records = 1;
-}
-
 message IngestAssignment {
-  uint32 index = 1;
-  uint32 shard_id = 2;
-  uint32 record_id = 3;
-  uint32 cluster_id = 4;
-  string cluster_key = 5;
+  uint32 index = 1;       // Correlates to RecordInput.index
+  uint32 shard_id = 2;    // Shard that owns this record
+  uint32 record_id = 3;   // Assigned record ID
+  uint32 cluster_id = 4;  // Assigned cluster ID
+  string cluster_key = 5; // Human-readable cluster key
 }
 
 message IngestRecordsResponse {
   repeated IngestAssignment assignments = 1;
 }
+
+// --- Query ---
 
 message QueryDescriptor {
   string attr = 1;
@@ -47,9 +55,9 @@ message QueryDescriptor {
 }
 
 message QueryEntitiesRequest {
-  repeated QueryDescriptor descriptors = 1;
-  int64 start = 2;
-  int64 end = 3;
+  repeated QueryDescriptor descriptors = 1;  // Attributes to match
+  int64 start = 2;                           // Time range start
+  int64 end = 3;                             // Time range end
 }
 
 message GoldenDescriptor {
@@ -66,7 +74,14 @@ message QueryMatch {
   int64 end = 4;
   string cluster_key = 5;
   string cluster_key_identity = 6;
-  repeated GoldenDescriptor golden = 7;
+  repeated GoldenDescriptor golden = 7;  // Merged "golden record" attributes
+}
+
+message QueryConflict {
+  int64 start = 1;
+  int64 end = 2;
+  repeated QueryMatch clusters = 3;              // Conflicting clusters
+  repeated QueryDescriptorOverlap descriptors = 4;
 }
 
 message QueryDescriptorOverlap {
@@ -75,23 +90,18 @@ message QueryDescriptorOverlap {
   int64 end = 3;
 }
 
-message QueryConflict {
-  int64 start = 1;
-  int64 end = 2;
-  repeated QueryMatch clusters = 3;
-  repeated QueryDescriptorOverlap descriptors = 4;
-}
-
 message QueryMatches {
   repeated QueryMatch matches = 1;
 }
 
 message QueryEntitiesResponse {
   oneof outcome {
-    QueryMatches matches = 1;
-    QueryConflict conflict = 2;
+    QueryMatches matches = 1;   // Normal: matching clusters found
+    QueryConflict conflict = 2; // Conflict: multiple clusters claim same identity
   }
 }
+
+// --- Conflicts ---
 
 message RecordRef {
   string perspective = 1;
@@ -99,125 +109,44 @@ message RecordRef {
 }
 
 message ConflictSummary {
-  string kind = 1;
-  string attribute = 2;
+  string kind = 1;              // "direct" or "indirect"
+  string attribute = 2;         // Conflicting attribute
   int64 start = 3;
   int64 end = 4;
-  repeated RecordRef records = 5;
+  repeated RecordRef records = 5;  // Records involved
   string cause = 6;
 }
 
 message ListConflictsRequest {
-  int64 start = 1;
+  int64 start = 1;     // Optional: filter by time range
   int64 end = 2;
-  string attribute = 3;
+  string attribute = 3; // Optional: filter by attribute
 }
 
 message ListConflictsResponse {
   repeated ConflictSummary conflicts = 1;
 }
 
-message Empty {}
+// --- Stats ---
 
-// === Cluster-Aware Sharding Messages ===
+message StatsRequest {}
 
-// Global cluster ID for cross-shard tracking
-message GlobalClusterId {
-  uint32 shard_id = 1;    // Owning shard (u16 fits in u32)
-  uint32 local_id = 2;    // Local cluster ID within shard
-  uint32 version = 3;     // Merge version (u16 fits in u32)
+message StatsResponse {
+  uint64 record_count = 1;
+  uint64 cluster_count = 2;
+  uint64 conflict_count = 3;
+  uint64 graph_node_count = 4;
+  uint64 graph_edge_count = 5;
+  uint64 cross_shard_merges = 6;
+  uint64 cross_shard_conflicts = 7;
+  uint64 boundary_keys_tracked = 8;
 }
 
-// Identity key signature for cluster boundary tracking
-message IdentityKeySignature {
-  bytes signature = 1;    // 32-byte hash
-}
-
-// Entry in the cluster boundary index
-message ClusterBoundaryEntry {
-  GlobalClusterId cluster_id = 1;
-  int64 interval_start = 2;
-  int64 interval_end = 3;
-  uint32 shard_id = 4;
-}
-
-// Boundary metadata for cross-shard exchange
-message BoundaryMetadata {
-  uint32 shard_id = 1;
-  uint64 version = 2;
-  repeated BoundaryKeyEntries entries = 3;
-}
-
-message BoundaryKeyEntries {
-  IdentityKeySignature signature = 1;
-  repeated ClusterBoundaryEntry entries = 2;
-}
-
-// Request to get boundary metadata from a shard
-message GetBoundaryMetadataRequest {
-  uint64 since_version = 1;  // Only return updates since this version
-}
-
-message GetBoundaryMetadataResponse {
-  BoundaryMetadata metadata = 1;
-}
-
-// Request to get dirty boundary keys from a shard
-message GetDirtyBoundaryKeysRequest {}
-
-message DirtyBoundaryKey {
-  IdentityKeySignature signature = 1;
-  repeated ClusterBoundaryEntry entries = 2;
-}
-
-message GetDirtyBoundaryKeysResponse {
-  repeated DirtyBoundaryKey dirty_keys = 1;
-  uint32 shard_id = 2;
-}
-
-// Request to clear dirty keys after reconciliation
-message ClearDirtyKeysRequest {
-  repeated IdentityKeySignature keys = 1;
-}
-
-message ClearDirtyKeysResponse {
-  uint32 keys_cleared = 1;
-}
-
-// Request for incremental reconciliation
-message ReconcileRequest {
-  repeated BoundaryMetadata shard_metadata = 1;
-}
-
-message ClusterMerge {
-  GlobalClusterId primary = 1;   // Cluster to merge into
-  GlobalClusterId secondary = 2; // Cluster to be merged
-}
-
-message ReconcileResponse {
-  uint32 merges_performed = 1;
-  uint32 keys_checked = 2;
-  uint32 keys_matched = 3;
-  repeated ClusterMerge merges = 4;
-  uint32 merge_candidates = 5;      // Total merge candidates evaluated
-  uint32 conflicts_blocked = 6;     // Merges blocked due to cross-shard conflicts
-}
-
-// Request to apply a cross-shard cluster merge on this shard
-message ApplyMergeRequest {
-  GlobalClusterId primary = 1;    // Cluster to merge into
-  GlobalClusterId secondary = 2;  // Cluster being merged away
-}
-
-message ApplyMergeResponse {
-  bool success = 1;
-  uint32 records_updated = 2;     // Number of records moved to new cluster
-  string error = 3;               // Error message if any
-}
+// --- Ontology Configuration ---
 
 message IdentityKeyConfig {
   string name = 1;
-  repeated string attributes = 2;
+  repeated string attributes = 2;  // Attributes that form this identity key
 }
 
 enum ConstraintKind {
@@ -244,35 +173,94 @@ message ApplyOntologyRequest {
 
 message ApplyOntologyResponse {}
 
-message IngestRecordsFromUrlRequest {
-  string url = 1;
-}
-
-message StatsRequest {}
-
-message StatsResponse {
-  uint64 record_count = 1;
-  uint64 cluster_count = 2;
-  uint64 conflict_count = 3;
-  uint64 graph_node_count = 4;
-  uint64 graph_edge_count = 5;
-  // Cross-shard reconciliation stats
-  uint64 cross_shard_merges = 6;        // Successful cross-shard merges
-  uint64 cross_shard_conflicts = 7;     // Cross-shard merges blocked by conflicts
-  uint64 boundary_keys_tracked = 8;     // Boundary keys for cross-shard detection
-}
+// --- Health Check ---
 
 message HealthCheckRequest {}
 
 message HealthCheckResponse {
-  string status = 1;
+  string status = 1;  // "ok" or error message
 }
+
+// =============================================================================
+// ROUTER SERVICE - Client-Facing API
+// =============================================================================
+// This is the primary API clients should use. The router handles distribution
+// of records across shards and aggregation of query results.
+
+service RouterService {
+  // Configure matching rules (identity keys, strong identifiers, constraints)
+  rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
+
+  // Ingest records - automatically distributed across shards
+  rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
+
+  // Query for entities matching the given descriptors in a time range
+  rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
+
+  // List detected conflicts, optionally filtered by time/attribute
+  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
+
+  // Get cluster statistics
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // --- Advanced Operations ---
+
+  // Ingest from URL (bulk loading)
+  rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
+
+  // Get config version
+  rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
+
+  // Create checkpoint (for backup/restore)
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+
+  // Get detailed metrics
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+
+  // Get record ID range for a shard
+  rpc GetRecordIdRange(RouterRecordIdRangeRequest) returns (RecordIdRangeResponse);
+
+  // Export records from a shard
+  rpc ExportRecords(RouterExportRecordsRequest) returns (ExportRecordsResponse);
+  rpc ExportRecordsStream(RouterExportRecordsRequest) returns (stream ExportRecordsChunk);
+
+  // Import records to a shard
+  rpc ImportRecords(RouterImportRecordsRequest) returns (ImportRecordsResponse);
+  rpc ImportRecordsStream(stream RouterImportRecordsRequest) returns (ImportRecordsResponse);
+
+  // Reset all state (dangerous!)
+  rpc Reset(Empty) returns (Empty);
+
+  // Trigger cross-shard reconciliation
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+}
+
+// =============================================================================
+// INTERNAL API - Shard-to-Shard and Admin Messages
+// =============================================================================
+// These messages are used for internal coordination between shards and
+// administrative operations. Clients typically don't use these directly.
+
+message Empty {}
+
+// --- URL Ingest ---
+
+message IngestRecordsFromUrlRequest {
+  string url = 1;
+}
+
+// --- Config Version ---
 
 message ConfigVersionRequest {}
 
 message ConfigVersionResponse {
   string version = 1;
 }
+
+// --- Checkpoint ---
 
 message CheckpointRequest {
   string path = 1;
@@ -281,6 +269,8 @@ message CheckpointRequest {
 message CheckpointResponse {
   repeated string paths = 1;
 }
+
+// --- Metrics ---
 
 message LatencyMetrics {
   uint64 count = 1;
@@ -308,6 +298,8 @@ message MetricsResponse {
   StoreMetrics store = 7;
   uint32 shards_reporting = 8;
 }
+
+// --- Record Export/Import (Rebalancing) ---
 
 message RecordSnapshot {
   uint32 record_id = 1;
@@ -370,49 +362,135 @@ message RouterImportRecordsRequest {
   repeated RecordSnapshot records = 2;
 }
 
+// --- Cross-Shard Reconciliation ---
+
+message GlobalClusterId {
+  uint32 shard_id = 1;
+  uint32 local_id = 2;
+  uint32 version = 3;
+}
+
+message IdentityKeySignature {
+  bytes signature = 1;  // 32-byte hash
+}
+
+message ClusterBoundaryEntry {
+  GlobalClusterId cluster_id = 1;
+  int64 interval_start = 2;
+  int64 interval_end = 3;
+  uint32 shard_id = 4;
+}
+
+message BoundaryMetadata {
+  uint32 shard_id = 1;
+  uint64 version = 2;
+  repeated BoundaryKeyEntries entries = 3;
+}
+
+message BoundaryKeyEntries {
+  IdentityKeySignature signature = 1;
+  repeated ClusterBoundaryEntry entries = 2;
+}
+
+message GetBoundaryMetadataRequest {
+  uint64 since_version = 1;
+}
+
+message GetBoundaryMetadataResponse {
+  BoundaryMetadata metadata = 1;
+}
+
+message GetDirtyBoundaryKeysRequest {}
+
+message DirtyBoundaryKey {
+  IdentityKeySignature signature = 1;
+  repeated ClusterBoundaryEntry entries = 2;
+}
+
+message GetDirtyBoundaryKeysResponse {
+  repeated DirtyBoundaryKey dirty_keys = 1;
+  uint32 shard_id = 2;
+}
+
+message ClearDirtyKeysRequest {
+  repeated IdentityKeySignature keys = 1;
+}
+
+message ClearDirtyKeysResponse {
+  uint32 keys_cleared = 1;
+}
+
+message ReconcileRequest {
+  repeated BoundaryMetadata shard_metadata = 1;
+}
+
+message ClusterMerge {
+  GlobalClusterId primary = 1;
+  GlobalClusterId secondary = 2;
+}
+
+message ReconcileResponse {
+  uint32 merges_performed = 1;
+  uint32 keys_checked = 2;
+  uint32 keys_matched = 3;
+  repeated ClusterMerge merges = 4;
+  uint32 merge_candidates = 5;
+  uint32 conflicts_blocked = 6;
+}
+
+message ApplyMergeRequest {
+  GlobalClusterId primary = 1;
+  GlobalClusterId secondary = 2;
+}
+
+message ApplyMergeResponse {
+  bool success = 1;
+  uint32 records_updated = 2;
+  string error = 3;
+}
+
+// --- Streaming Ingest ---
+
+message IngestRecordsChunk {
+  repeated RecordInput records = 1;
+}
+
+// =============================================================================
+// SHARD SERVICE - Internal API
+// =============================================================================
+// Used by the router and admin tools. Clients should use RouterService instead.
+
 service ShardService {
+  // Ontology
   rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
+
+  // Core operations
   rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
   rpc IngestRecordsStream(stream IngestRecordsChunk) returns (IngestRecordsResponse);
   rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
+  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
+
+  // Stats and health
   rpc GetStats(StatsRequest) returns (StatsResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
   rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
-  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+
+  // Admin operations
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc Reset(Empty) returns (Empty);
+
+  // Record export/import (rebalancing)
   rpc GetRecordIdRange(RecordIdRangeRequest) returns (RecordIdRangeResponse);
   rpc ExportRecords(ExportRecordsRequest) returns (ExportRecordsResponse);
   rpc ExportRecordsStream(ExportRecordsRequest) returns (stream ExportRecordsChunk);
   rpc ImportRecords(ImportRecordsRequest) returns (ImportRecordsResponse);
   rpc ImportRecordsStream(stream ImportRecordsChunk) returns (ImportRecordsResponse);
-  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
-  rpc Reset(Empty) returns (Empty);
-  // Cluster-aware sharding RPCs
+
+  // Cross-shard reconciliation
   rpc GetBoundaryMetadata(GetBoundaryMetadataRequest) returns (GetBoundaryMetadataResponse);
   rpc ApplyMerge(ApplyMergeRequest) returns (ApplyMergeResponse);
-  // Adaptive reconciliation RPCs
   rpc GetDirtyBoundaryKeys(GetDirtyBoundaryKeysRequest) returns (GetDirtyBoundaryKeysResponse);
   rpc ClearDirtyKeys(ClearDirtyKeysRequest) returns (ClearDirtyKeysResponse);
-}
-
-service RouterService {
-  rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
-  rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
-  rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
-  rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
-  rpc GetStats(StatsRequest) returns (StatsResponse);
-  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
-  rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
-  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
-  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
-  rpc GetRecordIdRange(RouterRecordIdRangeRequest) returns (RecordIdRangeResponse);
-  rpc ExportRecords(RouterExportRecordsRequest) returns (ExportRecordsResponse);
-  rpc ExportRecordsStream(RouterExportRecordsRequest) returns (stream ExportRecordsChunk);
-  rpc ImportRecords(RouterImportRecordsRequest) returns (ImportRecordsResponse);
-  rpc ImportRecordsStream(stream RouterImportRecordsRequest) returns (ImportRecordsResponse);
-  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
-  rpc Reset(Empty) returns (Empty);
-  // Cluster-aware sharding RPCs
-  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
 }

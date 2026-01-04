@@ -1,4 +1,4 @@
-//! Cache-line aligned atomic counters for HFT
+//! Cache-line aligned atomic counters for high-throughput
 //!
 //! Eliminates false sharing by ensuring each counter is on its own cache line.
 //! Typical cache line size is 64 bytes on x86_64 and ARM64.

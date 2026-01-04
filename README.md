@@ -6,125 +6,217 @@
 
 A high-performance temporal entity resolution engine in Rust.
 
-## Overview
+## What is Entity Resolution?
 
-Unirust is a distributed entity resolution system that clusters records from multiple sources into unified entities while respecting temporal constraints and detecting conflicts. It is designed for production workloads requiring:
+Entity resolution (also known as record linkage or data matching) is the process of identifying records that refer to the same real-world entity across different data sources. Unirust adds **temporal awareness** - it understands that entity attributes change over time and handles conflicts intelligently.
 
-- **Correctness**: Temporal guards ensure merges only happen when constraints allow
-- **Scale**: Persistent DSU and tiered indexing support billions of records
-- **Performance**: Lock-free atomics, SIMD hashing, adaptive candidate selection
-- **Distribution**: Router and multi-shard architecture with cross-shard reconciliation
+**Example**: Three records from different systems all referring to "John Doe":
+- CRM: `name="John Doe", email="john@old.com"` (valid 2020-2022)
+- ERP: `name="John Doe", email="john@new.com"` (valid 2022-present)
+- Web: `name="John Doe", phone="555-1234"` (valid 2021-present)
 
-## Core Concepts
+Unirust will:
+1. Cluster these as the same entity based on identity keys (name)
+2. Detect the email conflict during the overlapping 2022 period
+3. Produce a golden record for any point in time
 
-### Entity Resolution Pipeline
+## Features
 
-```
-Records (from multiple sources)
-    |
-    v
-Store (in-memory or RocksDB)
-    |
-    v
-Streaming Linker
-  - Phase 1: Extract identity key values (parallel)
-  - Phase 2: Find candidates in identity index
-  - Phase 3: Merge clusters via DSU with temporal guards
-  - Phase 4: Finalize assignments (parallel)
-    |
-    v
-Cluster Assignments (RecordId -> ClusterId)
-    |
-    v
-Conflict Detection -> Observations -> Knowledge Graph
-```
-
-### Ontology
-
-Define entity matching rules:
-
-- **Identity Keys**: Attributes that must match for records to be considered the same entity (e.g., name+email)
-- **Strong Identifiers**: Attributes that cannot conflict within a cluster (e.g., SSN)
-- **Constraints**: Uniqueness rules that prevent invalid merges
-
-### Temporal Model
-
-All data has temporal validity intervals `[start, end)`. Entity resolution respects these intervals, only merging records when their values agree during overlapping time periods.
+- **Temporal Awareness**: All data has validity intervals - merges and conflicts are evaluated per-time-period
+- **Conflict Detection**: Automatic detection of attribute conflicts within clusters
+- **Distributed**: Router + multi-shard architecture for horizontal scaling
+- **Persistent**: RocksDB storage with crash recovery
+- **High Performance**: Lock-free data structures, SIMD hashing, async WAL
 
 ## Quick Start
 
-### Distributed Mode (Recommended)
-
-Start a 5-shard cluster:
+### Installation
 
 ```bash
-# Terminal 1: Start router
-./target/release/unirust_router --port 50060 --shards 5
-
-# Terminal 2-6: Start shards
-./target/release/unirust_shard --port 50061 --shard-id 0 --data-dir /tmp/shard0
-./target/release/unirust_shard --port 50062 --shard-id 1 --data-dir /tmp/shard1
-./target/release/unirust_shard --port 50063 --shard-id 2 --data-dir /tmp/shard2
-./target/release/unirust_shard --port 50064 --shard-id 3 --data-dir /tmp/shard3
-./target/release/unirust_shard --port 50065 --shard-id 4 --data-dir /tmp/shard4
+git clone https://github.com/unirust/unirust.git
+cd unirust
+cargo build --release
 ```
 
-Ingest records via gRPC:
+### Single-Shard Mode (Development)
 
 ```bash
-./target/release/unirust_client --router http://127.0.0.1:50060 --ontology ontology.json
+# Start a single shard
+./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0
+
+# In another terminal, start the router
+./target/release/unirust_router --listen 127.0.0.1:50060 --shards 127.0.0.1:50061
 ```
 
-### Load Testing
+### Multi-Shard Cluster (Production)
 
 ```bash
-./target/release/unirust_loadtest \
-  -r http://127.0.0.1:50060 \
-  -c 10000000 \
-  --streams 16 \
-  --batch 5000
+# Use the cluster script
+SHARDS=5 ./scripts/cluster.sh start
+
+# Or start manually:
+./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0
+./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /data/shard1
+./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /data/shard2
+./target/release/unirust_shard --listen 127.0.0.1:50064 --shard-id 3 --data-dir /data/shard3
+./target/release/unirust_shard --listen 127.0.0.1:50065 --shard-id 4 --data-dir /data/shard4
+
+./target/release/unirust_router --listen 127.0.0.1:50060 \
+  --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063,127.0.0.1:50064,127.0.0.1:50065
 ```
 
-### Library Usage
+### Using the Library
 
 ```rust
 use unirust_rs::{Unirust, PersistentStore, StreamingTuning, TuningProfile};
-use unirust_rs::ontology::{Ontology, IdentityKey, StrongIdentifier, Constraint};
+use unirust_rs::ontology::{Ontology, IdentityKey, StrongIdentifier};
 
-// Create ontology
+// Create ontology (matching rules)
 let mut ontology = Ontology::new();
-ontology.add_identity_key(IdentityKey::new(vec![name_attr, email_attr], "name_email".to_string()));
-ontology.add_strong_identifier(StrongIdentifier::new(ssn_attr, "ssn".to_string()));
-ontology.add_constraint(Constraint::unique(email_attr, "unique_email".to_string()));
+ontology.add_identity_key(IdentityKey::new(
+    vec![name_attr, email_attr],
+    "name_email".to_string()
+));
+ontology.add_strong_identifier(StrongIdentifier::new(
+    ssn_attr,
+    "ssn_unique".to_string()
+));
 
 // Open persistent store
 let store = PersistentStore::open("/path/to/data")?;
 
-// Create unirust instance with tuning
+// Create engine with tuning profile
 let tuning = StreamingTuning::from_profile(TuningProfile::HighThroughput);
-let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning);
+let mut engine = Unirust::with_store_and_tuning(ontology, store, tuning);
 
-// Stream records
-let results = unirust.stream_records(records)?;
+// Ingest records
+let result = engine.ingest(records)?;
+println!("Assigned {} records to {} clusters",
+    result.assignments.len(),
+    result.cluster_count);
+println!("Detected {} conflicts", result.conflicts.len());
 
 // Query entities
-let matches = unirust.query_master_entities(&descriptors, interval)?;
+let matches = engine.query(&descriptors, interval)?;
 ```
 
-## Tuning Profiles
+## Configuration
+
+Unirust uses a layered configuration system: **CLI args > Environment variables > Config file > Defaults**
+
+### Config File (TOML)
+
+```toml
+# unirust.toml
+profile = "high-throughput"
+
+[shard]
+listen = "0.0.0.0:50061"
+id = 0
+data_dir = "/var/lib/unirust/shard-0"
+
+[router]
+listen = "0.0.0.0:50060"
+shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061"]
+
+[storage]
+block_cache_mb = 1024
+write_buffer_mb = 256
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `UNIRUST_CONFIG` | Path to config file |
+| `UNIRUST_PROFILE` | Tuning profile |
+| `UNIRUST_SHARD_LISTEN` | Shard listen address |
+| `UNIRUST_SHARD_ID` | Shard ID |
+| `UNIRUST_ROUTER_SHARDS` | Comma-separated shard addresses |
+
+### Tuning Profiles
 
 | Profile | Use Case |
 |---------|----------|
-| `Balanced` | General purpose (default) |
-| `LowLatency` | Fast response times |
-| `HighThroughput` | Bulk processing |
-| `BulkIngest` | Maximum ingest speed |
-| `BillionScale` | Persistent DSU for billion-entity datasets |
-| `MemorySaver` | Reduced memory footprint |
+| `balanced` | General purpose (default for library) |
+| `low-latency` | Interactive queries, fast responses |
+| `high-throughput` | Batch processing (default for binaries) |
+| `bulk-ingest` | Maximum ingest speed, reduced matching |
+| `memory-saver` | Constrained environments |
+| `billion-scale` | Persistent DSU for huge datasets |
+
+## API Reference
+
+### gRPC Services
+
+**Router Service** (client-facing):
+- `IngestRecords` - Ingest a batch of records
+- `QueryEntities` - Query entities by descriptors and time range
+- `ListConflicts` - List detected conflicts
+- `GetStats` - Get cluster statistics
+- `Reconcile` - Trigger cross-shard reconciliation
+
+**Shard Service** (internal):
+- Same as router, plus boundary tracking RPCs
+
+### Library API
+
+```rust
+// Core operations
+engine.ingest(records) -> IngestResult
+engine.query(descriptors, interval) -> QueryOutcome
+engine.clusters() -> Clusters
+engine.graph() -> KnowledgeGraph
+
+// Persistence
+engine.checkpoint() -> Result<()>
+
+// Metrics
+engine.stats() -> Stats
+```
 
 ## Architecture
 
-See [DESIGN.md](DESIGN.md) for detailed architecture documentation.
+See [DESIGN.md](DESIGN.md) for detailed architecture documentation, including:
+- Entity resolution algorithm (4-phase streaming linker)
+- Conflict detection algorithms (sweep-line vs atomic intervals)
+- Distributed architecture (router + shards)
+- Cross-shard reconciliation protocol
+- Storage layer (RocksDB column families)
+- Performance optimizations
+
+## Examples
+
+The `examples/` directory contains comprehensive examples:
+
+- `in_memory.rs` - In-memory entity resolution, perfect for learning
+- `persistent_shard.rs` - Single-shard with RocksDB persistence
+- `cluster.rs` - Full 3-shard distributed cluster with router
+- `unirust.toml` - Example configuration file
+
+Run examples:
+```bash
+# Simple in-memory example
+cargo run --example in_memory
+
+# Persistent storage with single shard
+cargo run --example persistent_shard
+
+# Distributed cluster (requires cluster running first)
+SHARDS=3 ./scripts/cluster.sh start
+cargo run --example cluster
+./scripts/cluster.sh stop
+```
+
+## Performance
+
+Typical throughput on a 5-shard cluster (modern hardware):
+
+| Workload | Records/sec |
+|----------|-------------|
+| Pure ingest | ~500K |
+| 10% overlap | ~400K |
+| With conflicts | ~250K |
 
 ## Development
 
@@ -132,15 +224,53 @@ See [DESIGN.md](DESIGN.md) for detailed architecture documentation.
 # Run tests
 cargo test
 
-# Run benchmarks
-cargo bench --bench bench_quick   # Fast CI feedback (~30s)
-cargo bench --bench bench_micro   # Component benchmarks
+# Run quick benchmarks (~30s)
+cargo bench --bench bench_quick
+
+# Run load test
+./target/release/unirust_loadtest \
+  --endpoint http://127.0.0.1:50060 \
+  --count 1000000 \
+  --streams 16
 
 # Format and lint
 cargo fmt
 cargo clippy --all-targets
 ```
 
+## Container Deployment
+
+```bash
+# Build image
+podman build -t unirust -f Containerfile .
+
+# Run a single shard
+podman run --rm -p 50061:50061 -v unirust-data:/data unirust shard --shard-id 0
+
+# Run router
+podman run --rm -p 50060:50060 unirust router --shards host.containers.internal:50061
+```
+
+### Cluster with Compose
+
+Deploy a 3-shard cluster:
+```bash
+# Start cluster
+podman-compose up -d
+
+# Check status
+podman-compose ps
+
+# View router logs
+podman-compose logs -f router
+
+# Run loadtest
+podman-compose run --rm loadtest
+
+# Stop and clean up
+podman-compose down -v
+```
+
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).

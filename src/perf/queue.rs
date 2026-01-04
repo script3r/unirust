@@ -1,4 +1,4 @@
-//! Lock-free ingest queue for HFT throughput
+//! Lock-free ingest queue for high-throughput throughput
 //!
 //! Replaces RwLock contention with bounded lock-free MPSC queue.
 //! Single aggregator thread processes batches with exclusive access.

@@ -1,0 +1,123 @@
+# Unirust Cluster Compose Configuration
+#
+# Deploy a 3-shard cluster with router:
+#
+#   podman-compose up -d
+#   podman-compose logs -f router
+#
+# Scale to more shards:
+#   SHARDS=5 podman-compose up -d --scale shard=5
+#
+# Run loadtest:
+#   podman-compose run --rm loadtest --endpoint http://router:50060 --count 100000
+#
+# Stop cluster:
+#   podman-compose down -v
+
+services:
+  # Shard nodes - horizontal scaling units
+  shard-0:
+    image: unirust:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    command: ["shard", "--shard-id", "0", "--data-dir", "/data"]
+    volumes:
+      - shard-0-data:/data
+    environment:
+      UNIRUST_PROFILE: high-throughput
+    networks:
+      - unirust-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50061 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  shard-1:
+    image: unirust:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    command: ["shard", "--shard-id", "1", "--data-dir", "/data"]
+    volumes:
+      - shard-1-data:/data
+    environment:
+      UNIRUST_PROFILE: high-throughput
+    networks:
+      - unirust-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50061 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  shard-2:
+    image: unirust:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    command: ["shard", "--shard-id", "2", "--data-dir", "/data"]
+    volumes:
+      - shard-2-data:/data
+    environment:
+      UNIRUST_PROFILE: high-throughput
+    networks:
+      - unirust-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50061 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Router - client-facing entry point
+  router:
+    image: unirust:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    command: ["router", "--shards", "shard-0:50061,shard-1:50061,shard-2:50061"]
+    ports:
+      - "50060:50060"
+    depends_on:
+      shard-0:
+        condition: service_healthy
+      shard-1:
+        condition: service_healthy
+      shard-2:
+        condition: service_healthy
+    networks:
+      - unirust-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50060 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # Loadtest runner (optional, run with: podman-compose run loadtest)
+  loadtest:
+    image: unirust:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    command: ["loadtest", "--endpoint", "http://router:50060", "--count", "100000", "--streams", "8"]
+    depends_on:
+      router:
+        condition: service_healthy
+    networks:
+      - unirust-net
+    profiles:
+      - tools
+
+networks:
+  unirust-net:
+    driver: bridge
+
+volumes:
+  shard-0-data:
+  shard-1-data:
+  shard-2-data:

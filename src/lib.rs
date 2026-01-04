@@ -38,12 +38,12 @@ pub mod conflicts;
 pub mod distributed;
 pub mod dsu;
 pub mod graph;
-pub mod hft;
 pub mod index;
 pub mod linker;
 pub mod model;
 pub mod ontology;
 pub mod partitioned;
+pub mod perf;
 pub mod persistence;
 pub mod profile;
 pub mod query;
@@ -164,17 +164,17 @@ pub mod advanced {
         Cluster, DsuBackend, MergeResult, PersistentDSUConfig, PersistentDSUStats,
         PersistentTemporalDSU, TemporalConflict, TemporalDSU, TemporalGuard,
     };
-    pub use crate::hft::{
-        AlignedCounter, AlignedMetrics, AsyncWal, AsyncWalConfig, AtomicDSU, AtomicMergeResult,
-        BatchAggregator, IngestJob, IngestQueue, MetricsSnapshot, QueueStats, RecordSlice,
-        SimdHasher, WalError, WalTicket, ZeroCopyBatch,
-    };
     pub use crate::index::{IndexBackend, TierConfig, TieredIdentityKeyIndex, TieredIndexStats};
     pub use crate::linker::{LinkerMetrics, LinkerMetricsSnapshot};
     pub use crate::model::{ClusterId, GlobalClusterId};
     pub use crate::partitioned::{
         CrossPartitionMerge, Partition, PartitionConfig, PartitionIngestResult, PartitionStats,
         PartitionedUnirust, PartitionedUnirustHandle,
+    };
+    pub use crate::perf::{
+        AlignedCounter, AlignedMetrics, AsyncWal, AsyncWalConfig, AtomicDSU, AtomicMergeResult,
+        BatchAggregator, IngestJob, IngestQueue, MetricsSnapshot, QueueStats, RecordSlice,
+        SimdHasher, WalError, WalTicket, ZeroCopyBatch,
     };
     pub use crate::persistence::LinkerStatePersistence;
     pub use crate::query::{QueryConflict, QueryDescriptorOverlap};
