@@ -9,12 +9,14 @@ use crate::store::StoreMetrics;
 use crate::temporal::Interval;
 use crate::{PersistentStore, StreamingTuning, Unirust};
 use anyhow::Result as AnyResult;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -170,13 +172,9 @@ pub struct ClusterLocality {
 #[allow(dead_code)]
 pub struct ClusterLocalityIndex {
     /// Map from identity key signature to cluster locality.
-    key_to_shard: HashMap<[u8; 32], ClusterLocality>,
+    key_to_shard: LruCache<[u8; 32], ClusterLocality>,
     /// Bloom filter for fast negative lookups.
     bloom: BloomFilter,
-    /// Number of entries in the index.
-    entry_count: usize,
-    /// Maximum entries before cleanup.
-    max_entries: usize,
 }
 
 #[allow(dead_code)]
@@ -184,20 +182,19 @@ impl ClusterLocalityIndex {
     /// Create a new locality index with default settings.
     pub fn new() -> Self {
         Self {
-            key_to_shard: HashMap::new(),
+            key_to_shard: LruCache::new(
+                NonZeroUsize::new(1_000_000).expect("locality cache capacity"),
+            ),
             bloom: BloomFilter::new_1mb(),
-            entry_count: 0,
-            max_entries: 1_000_000, // 1M entries by default
         }
     }
 
     /// Create a locality index with custom capacity.
     pub fn with_capacity(max_entries: usize) -> Self {
+        let capacity = NonZeroUsize::new(max_entries.max(1)).expect("locality cache capacity");
         Self {
-            key_to_shard: HashMap::with_capacity(max_entries / 10),
+            key_to_shard: LruCache::new(capacity),
             bloom: BloomFilter::new_1mb(),
-            entry_count: 0,
-            max_entries,
         }
     }
 
@@ -217,21 +214,12 @@ impl ClusterLocalityIndex {
             last_updated: timestamp,
         };
 
-        if let std::collections::hash_map::Entry::Vacant(e) = self.key_to_shard.entry(signature.0) {
-            e.insert(locality);
-            self.entry_count += 1;
-        } else {
-            // Update existing entry if newer
-            if let Some(existing) = self.key_to_shard.get_mut(&signature.0) {
-                if timestamp > existing.last_updated {
-                    *existing = locality;
-                }
+        if let Some(existing) = self.key_to_shard.get_mut(&signature.0) {
+            if timestamp > existing.last_updated {
+                *existing = locality;
             }
-        }
-
-        // Cleanup if too many entries
-        if self.entry_count > self.max_entries {
-            self.cleanup_stale_entries(timestamp);
+        } else {
+            self.key_to_shard.put(signature.0, locality);
         }
     }
 
@@ -241,11 +229,11 @@ impl ClusterLocalityIndex {
     }
 
     /// Get the locality for a signature if known.
-    pub fn get_locality(&self, signature: &IdentityKeySignature) -> Option<&ClusterLocality> {
+    pub fn get_locality(&mut self, signature: &IdentityKeySignature) -> Option<ClusterLocality> {
         if !self.may_contain(signature) {
             return None;
         }
-        self.key_to_shard.get(&signature.0)
+        self.key_to_shard.get(&signature.0).copied()
     }
 
     /// Route a record to an existing cluster's shard if possible.
@@ -253,36 +241,24 @@ impl ClusterLocalityIndex {
     /// Returns (primary_shard, optional_secondary_shard) tuple.
     /// If the signature is known, routes to the known shard.
     /// Otherwise returns None for both, indicating fallback to hash-based routing.
-    pub fn route_to_cluster(&self, signature: &IdentityKeySignature) -> Option<u16> {
+    pub fn route_to_cluster(&mut self, signature: &IdentityKeySignature) -> Option<u16> {
         self.get_locality(signature).map(|loc| loc.shard_id)
-    }
-
-    /// Remove entries older than the given threshold.
-    fn cleanup_stale_entries(&mut self, current_time: u64) {
-        let threshold = current_time.saturating_sub(3600); // 1 hour threshold
-        self.key_to_shard
-            .retain(|_, locality| locality.last_updated > threshold);
-        self.entry_count = self.key_to_shard.len();
-
-        // Note: We don't rebuild the bloom filter on cleanup
-        // This may lead to some false positives, but they're harmless
     }
 
     /// Get the number of entries in the index.
     pub fn len(&self) -> usize {
-        self.entry_count
+        self.key_to_shard.len()
     }
 
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.entry_count == 0
+        self.key_to_shard.is_empty()
     }
 
     /// Clear all entries.
     pub fn clear(&mut self) {
         self.key_to_shard.clear();
         self.bloom.clear();
-        self.entry_count = 0;
     }
 
     /// Update the cluster ID for a signature after a merge.
@@ -2415,9 +2391,9 @@ impl proto::router_service_server::RouterService for RouterNode {
         // Route all records synchronously before any await
         // Use a scope to ensure the lock is released before await
         {
-            let locality_index = self
+            let mut locality_index = self
                 .locality_index
-                .read()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
 
             for record in batch.records {
