@@ -347,20 +347,40 @@ fn signature_from_proto_record(
     None
 }
 
-#[derive(Debug, Default)]
-struct LatencyCounters {
+/// Cache-line aligned latency counters to prevent false sharing.
+/// Each counter is on its own 64-byte cache line for maximum throughput.
+#[repr(C, align(64))]
+#[derive(Debug)]
+struct AlignedLatencyCounters {
     count: AtomicU64,
+    _pad1: [u8; 56],
     total_micros: AtomicU64,
+    _pad2: [u8; 56],
     max_micros: AtomicU64,
+    _pad3: [u8; 56],
 }
 
-impl LatencyCounters {
+impl Default for AlignedLatencyCounters {
+    fn default() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            _pad1: [0u8; 56],
+            total_micros: AtomicU64::new(0),
+            _pad2: [0u8; 56],
+            max_micros: AtomicU64::new(0),
+            _pad3: [0u8; 56],
+        }
+    }
+}
+
+impl AlignedLatencyCounters {
+    #[inline]
     fn record(&self, micros: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_micros.fetch_add(micros, Ordering::Relaxed);
         let mut current = self.max_micros.load(Ordering::Relaxed);
         while micros > current {
-            match self.max_micros.compare_exchange(
+            match self.max_micros.compare_exchange_weak(
                 current,
                 micros,
                 Ordering::Relaxed,
@@ -381,37 +401,43 @@ impl LatencyCounters {
     }
 }
 
+/// HFT-optimized metrics with cache-line aligned counters.
+/// Eliminates false sharing when multiple threads update metrics concurrently.
+#[repr(C)]
 #[derive(Debug)]
-struct Metrics {
+struct HftMetrics {
     start: Instant,
-    ingest_requests: AtomicU64,
-    ingest_records: AtomicU64,
-    query_requests: AtomicU64,
-    ingest_latency: LatencyCounters,
-    query_latency: LatencyCounters,
+    // Each counter on its own cache line
+    ingest_requests: crate::hft::AlignedCounter,
+    ingest_records: crate::hft::AlignedCounter,
+    query_requests: crate::hft::AlignedCounter,
+    ingest_latency: AlignedLatencyCounters,
+    query_latency: AlignedLatencyCounters,
 }
 
-impl Metrics {
+impl HftMetrics {
     fn new() -> Self {
         Self {
             start: Instant::now(),
-            ingest_requests: AtomicU64::new(0),
-            ingest_records: AtomicU64::new(0),
-            query_requests: AtomicU64::new(0),
-            ingest_latency: LatencyCounters::default(),
-            query_latency: LatencyCounters::default(),
+            ingest_requests: crate::hft::AlignedCounter::new(),
+            ingest_records: crate::hft::AlignedCounter::new(),
+            query_requests: crate::hft::AlignedCounter::new(),
+            ingest_latency: AlignedLatencyCounters::default(),
+            query_latency: AlignedLatencyCounters::default(),
         }
     }
 
+    #[inline]
     fn record_ingest(&self, record_count: usize, micros: u64) {
-        self.ingest_requests.fetch_add(1, Ordering::Relaxed);
+        self.ingest_requests.increment();
         self.ingest_records
             .fetch_add(record_count as u64, Ordering::Relaxed);
         self.ingest_latency.record(micros);
     }
 
+    #[inline]
     fn record_query(&self, micros: u64) {
-        self.query_requests.fetch_add(1, Ordering::Relaxed);
+        self.query_requests.increment();
         self.query_latency.record(micros);
     }
 
@@ -901,14 +927,12 @@ pub struct ShardNode {
     data_dir: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
-    /// Batch coalescer for high-throughput ingest (replaces per-worker locks)
-    ingest_coalescer: Option<Arc<BatchCoalescer>>,
     config_version: String,
-    metrics: Arc<Metrics>,
+    metrics: Arc<HftMetrics>,
 }
 
-const INGEST_QUEUE_CAPACITY: usize = 128;
-const DEFAULT_INGEST_WORKERS: usize = 16;
+const INGEST_QUEUE_CAPACITY: usize = 1024; // Increased from 128 for HFT
+const DEFAULT_INGEST_WORKERS: usize = 32; // Increased from 16 for HFT
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
 
 /// Check if partitioned processing is enabled (default: true)
@@ -944,117 +968,9 @@ macro_rules! read_unirust {
     };
 }
 
-// Batch coalescing configuration (reserved for future ingest optimization).
-#[allow(dead_code)]
-const COALESCE_MAX_RECORDS: usize = 2000; // Max records per coalesced batch
-#[allow(dead_code)]
-const COALESCE_MAX_WAIT_MICROS: u64 = 100; // Max wait time before processing (100µs)
-
 struct IngestJob {
     records: Vec<proto::RecordInput>,
     respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
-}
-
-/// A pending job waiting to be coalesced with others
-#[allow(dead_code)]
-struct CoalescedJob {
-    records: Vec<proto::RecordInput>,
-    respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
-}
-
-/// Batch coalescer collects multiple ingest jobs and processes them together
-#[allow(dead_code)]
-struct BatchCoalescer {
-    pending: StdMutex<Vec<CoalescedJob>>,
-    notify: tokio::sync::Notify,
-}
-
-#[allow(dead_code)]
-impl BatchCoalescer {
-    fn new() -> Self {
-        Self {
-            pending: StdMutex::new(Vec::new()),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    /// Submit a job for coalesced processing
-    fn submit(&self, job: CoalescedJob) -> usize {
-        let mut pending = self.pending.lock().unwrap();
-        pending.push(job);
-        let count = pending.iter().map(|j| j.records.len()).sum();
-        drop(pending);
-        self.notify.notify_one();
-        count
-    }
-
-    /// Take all pending jobs for processing
-    fn take_pending(&self) -> Vec<CoalescedJob> {
-        let mut pending = self.pending.lock().unwrap();
-        std::mem::take(&mut *pending)
-    }
-
-    /// Check if we have enough records to process immediately
-    fn should_flush(&self) -> bool {
-        let pending = self.pending.lock().unwrap();
-        let total_records: usize = pending.iter().map(|j| j.records.len()).sum();
-        total_records >= COALESCE_MAX_RECORDS
-    }
-}
-
-/// Spawn a coalescing ingest writer that batches multiple requests together
-/// Uses zero-wait strategy: process immediately but grab all pending work
-#[allow(dead_code)]
-fn spawn_coalescing_ingest(unirust: Arc<RwLock<Unirust>>, shard_id: u32) -> Arc<BatchCoalescer> {
-    let coalescer = Arc::new(BatchCoalescer::new());
-    let writer_coalescer = coalescer.clone();
-
-    tokio::spawn(async move {
-        loop {
-            // Wait for at least one job
-            writer_coalescer.notify.notified().await;
-
-            // Immediately collect ALL pending jobs (zero wait)
-            let jobs = writer_coalescer.take_pending();
-            if jobs.is_empty() {
-                continue;
-            }
-
-            // Combine all records, tracking boundaries
-            let mut all_records = Vec::new();
-            let mut job_boundaries: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
-
-            for job in &jobs {
-                let start = all_records.len();
-                all_records.extend(job.records.iter().cloned());
-                job_boundaries.push((start, job.records.len()));
-            }
-
-            // Process entire batch under single lock acquisition
-            let result = {
-                let mut guard = unirust.write().await;
-                process_ingest_batch(&mut guard, shard_id, &all_records)
-            };
-
-            // Distribute results back to each job by position
-            match result {
-                Ok(all_assignments) => {
-                    for (job, (start, len)) in jobs.into_iter().zip(job_boundaries) {
-                        let end = (start + len).min(all_assignments.len());
-                        let job_assignments = all_assignments[start..end].to_vec();
-                        let _ = job.respond_to.send(Ok(job_assignments));
-                    }
-                }
-                Err(e) => {
-                    for job in jobs {
-                        let _ = job.respond_to.send(Err(Status::internal(e.to_string())));
-                    }
-                }
-            }
-        }
-    });
-
-    coalescer
 }
 
 impl ShardNode {
@@ -1108,7 +1024,6 @@ impl ShardNode {
             };
 
             let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
-            let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
             return Ok(Self {
                 shard_id,
                 unirust,
@@ -1118,9 +1033,8 @@ impl ShardNode {
                 data_dir: Some(path),
                 ingest_wal,
                 ingest_txs,
-                ingest_coalescer,
                 config_version,
-                metrics: Arc::new(Metrics::new()),
+                metrics: Arc::new(HftMetrics::new()),
             });
         }
 
@@ -1144,7 +1058,6 @@ impl ShardNode {
         };
 
         let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
-        let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
         Ok(Self {
             shard_id,
             unirust,
@@ -1154,9 +1067,8 @@ impl ShardNode {
             data_dir: None,
             ingest_wal,
             ingest_txs,
-            ingest_coalescer,
             config_version,
-            metrics: Arc::new(Metrics::new()),
+            metrics: Arc::new(HftMetrics::new()),
         })
     }
 
@@ -1328,39 +1240,6 @@ fn spawn_ingest_workers(
         senders.push(tx);
     }
     senders
-}
-
-/// Dispatch records using the batch coalescer for higher throughput
-async fn dispatch_ingest_coalesced(
-    coalescer: &BatchCoalescer,
-    ingest_wal: Option<&IngestWal>,
-    records: Vec<proto::RecordInput>,
-) -> Result<Vec<proto::IngestAssignment>, Status> {
-    if records.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if let Some(wal) = ingest_wal {
-        wal.write_batch(&records)?;
-    }
-
-    // Submit to coalescer and wait for result
-    let (tx, rx) = oneshot::channel();
-    let job = CoalescedJob {
-        records,
-        respond_to: tx,
-    };
-    coalescer.submit(job);
-
-    let assignments = rx
-        .await
-        .map_err(|_| Status::internal("coalescing writer dropped"))??;
-
-    if let Some(wal) = ingest_wal {
-        wal.clear()?;
-    }
-
-    Ok(assignments)
 }
 
 async fn dispatch_ingest_records(
@@ -1638,8 +1517,6 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 records,
             )
             .await?
-        } else if let Some(coalescer) = &self.ingest_coalescer {
-            dispatch_ingest_coalesced(coalescer, self.ingest_wal.as_deref(), records).await?
         } else {
             dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
         };
@@ -1678,9 +1555,6 @@ impl proto::shard_service_server::ShardService for ShardNode {
                     chunk.records,
                 )
                 .await?
-            } else if let Some(coalescer) = &self.ingest_coalescer {
-                dispatch_ingest_coalesced(coalescer, self.ingest_wal.as_deref(), chunk.records)
-                    .await?
             } else {
                 dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), chunk.records)
                     .await?
@@ -2300,7 +2174,7 @@ pub struct RouterNode {
     /// RwLock for ontology config - read-heavy, written only during set_ontology
     ontology_config: Arc<RwLock<DistributedOntologyConfig>>,
     config_version: String,
-    metrics: Arc<Metrics>,
+    metrics: Arc<HftMetrics>,
     balancer: Option<Arc<ShardBalancer>>,
     /// Cluster locality index for cluster-aware routing.
     locality_index: Arc<StdRwLock<ClusterLocalityIndex>>,
@@ -2347,7 +2221,7 @@ impl RouterNode {
             shard_clients,
             ontology_config: Arc::new(RwLock::new(ontology_config)),
             config_version,
-            metrics: Arc::new(Metrics::new()),
+            metrics: Arc::new(HftMetrics::new()),
             balancer: ShardBalancer::new(shard_count).map(Arc::new),
             locality_index: Arc::new(StdRwLock::new(ClusterLocalityIndex::new())),
         })

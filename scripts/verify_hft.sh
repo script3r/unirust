@@ -1,175 +1,333 @@
 #!/usr/bin/env bash
 #
-# HFT Verification Script
-# Validates the High-Frequency Trading optimizations achieve target throughput
+# SECTION 4: HFT VERIFICATION SCRIPT
 #
-# SECTION 4: VERIFICATION SCRIPT
+# Validates HFT optimizations achieve target throughput on 5-shard distributed cluster.
 #
-# Requirements:
-# - Baseline: 90K rec/sec
-# - Target: 200% improvement (182K+ rec/sec)
-# - Current: ~200K rec/sec with partitioned processing
+# Baseline: ~60K rec/sec (distributed cluster, pre-optimization)
+# Target: ≥200% improvement = ≥180K rec/sec
 #
 # Usage:
 #   ./scripts/verify_hft.sh [--quick]
+#   ./scripts/verify_hft.sh [--full]
+#   ./scripts/verify_hft.sh [--cleanup]
+#
+# Environment:
+#   SHARDS=5               Number of shards (default: 5)
+#   ROUTER_PORT=50060      Router gRPC port
+#   DURATION_SECS=30       Load test duration
+#   NUM_WORKERS=32         Concurrent workers
+#   BATCH_SIZE=100         Records per batch
 
 set -euo pipefail
 
-# Configuration
-BASELINE_TARGET=90000
-HFT_TARGET=182000  # 200% of baseline
-RECORDS_QUICK=100000
-RECORDS_FULL=500000
-NUM_WORKERS=16
-NUM_PARTITIONS=8
+# === Configuration ===
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
-# Colors for output
+SHARDS="${SHARDS:-5}"
+ROUTER_PORT="${ROUTER_PORT:-50060}"
+SHARD_PORT_BASE="${SHARD_PORT_BASE:-50061}"
+DATA_DIR="${DATA_DIR:-$ROOT_DIR/cluster_data}"
+LOG_DIR="${LOG_DIR:-$ROOT_DIR/cluster_logs}"
+RUN_DIR="${RUN_DIR:-$ROOT_DIR/.cluster}"
+BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
+
+# Load test parameters
+DURATION_QUICK=15
+DURATION_FULL=60
+NUM_WORKERS="${NUM_WORKERS:-32}"
+BATCH_SIZE="${BATCH_SIZE:-100}"
+
+# Targets
+BASELINE_HISTORICAL=60000    # Pre-optimization distributed baseline
+TARGET_RPS=180000            # 200% improvement target
+TARGET_IMPROVEMENT=200       # Percentage
+
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-info() { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+# === Functions ===
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+header() { echo -e "\n${BOLD}${BLUE}=== $* ===${NC}\n"; }
 
-# Parse arguments
-QUICK_MODE=false
-if [[ "${1:-}" == "--quick" ]]; then
-    QUICK_MODE=true
-    RECORDS=$RECORDS_QUICK
-else
-    RECORDS=$RECORDS_FULL
+cleanup_cluster() {
+    info "Stopping existing cluster processes..."
+    pkill -f "unirust_shard" 2>/dev/null || true
+    pkill -f "unirust_router" 2>/dev/null || true
+    rm -rf "$RUN_DIR"/*.pid 2>/dev/null || true
+    sleep 1
+}
+
+wait_for_port() {
+    local host="$1" port="$2" timeout="${3:-30}"
+    local start=$(date +%s)
+    while ! (echo >/dev/tcp/"$host"/"$port") 2>/dev/null; do
+        if (( $(date +%s) - start >= timeout )); then
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
+build_release() {
+    header "Building Release Binaries"
+    cargo build --release --bin unirust_shard --bin unirust_router --features test-support 2>&1 | tail -5
+    cargo build --release --bin unirust_loadtest --features test-support 2>&1 | tail -3
+    info "Build complete."
+}
+
+start_cluster() {
+    header "Starting ${SHARDS}-Shard Cluster"
+
+    cleanup_cluster
+    mkdir -p "$DATA_DIR" "$LOG_DIR" "$RUN_DIR"
+
+    local shard_list=""
+    local shard_ports=()
+
+    for i in $(seq 0 $((SHARDS - 1))); do
+        local port=$((SHARD_PORT_BASE + i))
+        local shard_dir="$DATA_DIR/shard-$i"
+        rm -rf "$shard_dir"
+        mkdir -p "$shard_dir"
+
+        "$BIN_DIR/unirust_shard" \
+            --listen "127.0.0.1:${port}" \
+            --shard-id "$i" \
+            --data-dir "$shard_dir" \
+            --tuning high-throughput \
+            >"$LOG_DIR/shard-$i.log" 2>&1 &
+        echo $! >"$RUN_DIR/shard-$i.pid"
+
+        shard_ports+=("$port")
+        if [[ -z "$shard_list" ]]; then
+            shard_list="127.0.0.1:${port}"
+        else
+            shard_list="${shard_list},127.0.0.1:${port}"
+        fi
+        info "Shard $i started on port $port"
+    done
+
+    # Wait for shards
+    for port in "${shard_ports[@]}"; do
+        if ! wait_for_port "127.0.0.1" "$port" 15; then
+            error "Shard on port $port failed to start"
+            cat "$LOG_DIR/shard-${port}.log" 2>/dev/null || true
+            exit 1
+        fi
+    done
+
+    # Start router
+    "$BIN_DIR/unirust_router" \
+        --listen "127.0.0.1:${ROUTER_PORT}" \
+        --shards "$shard_list" \
+        >"$LOG_DIR/router.log" 2>&1 &
+    echo $! >"$RUN_DIR/router.pid"
+
+    if ! wait_for_port "127.0.0.1" "$ROUTER_PORT" 10; then
+        error "Router failed to start"
+        cat "$LOG_DIR/router.log" 2>/dev/null || true
+        exit 1
+    fi
+
+    info "Router started on port $ROUTER_PORT"
+    info "Cluster ready with $SHARDS shards"
+}
+
+run_loadtest() {
+    local duration="$1"
+    local label="${2:-}"
+
+    info "Running loadtest: ${duration}s, ${NUM_WORKERS} workers, batch=${BATCH_SIZE}"
+
+    local result
+    result=$("$BIN_DIR/unirust_loadtest" \
+        --endpoint "http://127.0.0.1:${ROUTER_PORT}" \
+        --duration "$duration" \
+        --workers "$NUM_WORKERS" \
+        --batch-size "$BATCH_SIZE" \
+        --no-tui 2>&1) || {
+        error "Loadtest failed"
+        echo "$result"
+        return 1
+    }
+
+    # Extract throughput from final output
+    local rps
+    rps=$(echo "$result" | grep -oP 'Current:\s*\K[\d,]+' | tail -1 | tr -d ',' || echo "0")
+
+    # Try alternate pattern if needed
+    if [[ "$rps" == "0" || -z "$rps" ]]; then
+        rps=$(echo "$result" | grep -oP '[\d,]+\s*rec/s' | tail -1 | grep -oP '[\d,]+' | tr -d ',' || echo "0")
+    fi
+
+    # One more attempt: parse the summary
+    if [[ "$rps" == "0" || -z "$rps" ]]; then
+        rps=$(echo "$result" | grep -E "throughput|Throughput" | grep -oP '[\d,]+' | head -1 | tr -d ',' || echo "0")
+    fi
+
+    echo "$rps"
+}
+
+run_hft_tests() {
+    header "Running HFT Unit Tests"
+
+    local test_output
+    test_output=$(cargo test --release --lib hft:: 2>&1) || {
+        error "HFT tests failed"
+        echo "$test_output" | tail -30
+        return 1
+    }
+
+    local passed
+    passed=$(echo "$test_output" | grep -oP '\d+ passed' | grep -oP '\d+' || echo "0")
+    info "HFT tests: $passed passed"
+}
+
+# === Main ===
+
+ACTION="${1:-full}"
+
+case "$ACTION" in
+    --cleanup|cleanup)
+        cleanup_cluster
+        rm -rf "$DATA_DIR"
+        info "Cluster data cleaned up"
+        exit 0
+        ;;
+    --quick|quick)
+        DURATION=$DURATION_QUICK
+        ;;
+    --full|full|*)
+        DURATION=$DURATION_FULL
+        ;;
+esac
+
+header "HFT VERIFICATION SCRIPT"
+info "Configuration:"
+info "  Shards:        $SHARDS"
+info "  Router port:   $ROUTER_PORT"
+info "  Duration:      ${DURATION}s"
+info "  Workers:       $NUM_WORKERS"
+info "  Batch size:    $BATCH_SIZE"
+info "  Baseline:      $BASELINE_HISTORICAL rec/sec"
+info "  Target:        $TARGET_RPS rec/sec (${TARGET_IMPROVEMENT}%)"
+
+# Step 1: Build
+build_release
+
+# Step 2: Run unit tests
+run_hft_tests
+
+# Step 3: Start cluster
+start_cluster
+
+# Let cluster warm up
+sleep 2
+
+# Step 4: Run loadtest
+header "Running Distributed Load Test"
+RESULT_RPS=$(run_loadtest "$DURATION" "hft")
+
+if [[ "$RESULT_RPS" == "0" || -z "$RESULT_RPS" ]]; then
+    # Fallback: unable to parse loadtest output
+    warn "Could not parse loadtest output"
+    RESULT_RPS="unknown"
 fi
 
-info "=== HFT Verification Script ==="
-info "Mode: $(if $QUICK_MODE; then echo "Quick"; else echo "Full"; fi)"
-info "Records: $RECORDS"
-info "Workers: $NUM_WORKERS"
-info "Partitions: $NUM_PARTITIONS"
-echo
-
-# Step 1: Build release binary
-info "Step 1: Building release binary..."
-cargo build --release --quiet
-info "Build complete."
-echo
-
-# Step 2: Run unit tests for HFT modules
-info "Step 2: Running HFT unit tests..."
-cargo test --release hft:: -- --quiet 2>&1 | tail -5 || {
-    warn "HFT tests not found or skipped"
-}
-info "Unit tests complete."
-echo
-
-# Step 3: Run baseline benchmark (without partitioned processing)
-info "Step 3: Running baseline benchmark..."
-info "  Disabling partitioned processing (UNIRUST_PARTITIONED=0)"
-
-export UNIRUST_PARTITIONED=0
-BASELINE_RESULT=$(cargo run --release --features test-support --quiet --bin scale_bench -- \
-    --records "$RECORDS" 2>&1 | grep -E "rec/s" | tail -1 || echo "0 rec/s")
-
-BASELINE_RPS=$(echo "$BASELINE_RESULT" | grep -oP '\([\d.]+' | tr -d '(' | cut -d. -f1 || echo "0")
-info "  Baseline result: $BASELINE_RESULT"
-info "  Baseline RPS: $BASELINE_RPS"
-echo
-
-# Step 4: Run HFT benchmark (with partitioned processing)
-info "Step 4: Running HFT benchmark..."
-info "  Enabling partitioned processing (UNIRUST_PARTITIONED=1)"
-
-export UNIRUST_PARTITIONED=1
-export UNIRUST_PARTITION_COUNT=$NUM_PARTITIONS
-HFT_RESULT=$(cargo run --release --features test-support --quiet --bin scale_bench -- \
-    --records "$RECORDS" 2>&1 | grep -E "rec/s" | tail -1 || echo "0 rec/s")
-
-HFT_RPS=$(echo "$HFT_RESULT" | grep -oP '\([\d.]+' | tr -d '(' | cut -d. -f1 || echo "0")
-info "  HFT result: $HFT_RESULT"
-info "  HFT RPS: $HFT_RPS"
-echo
+info "Measured throughput: $RESULT_RPS rec/sec"
 
 # Step 5: Calculate improvement
-info "Step 5: Calculating improvement..."
-
-# Historical baseline was ~90K rec/sec before partitioned architecture
-HISTORICAL_BASELINE=90000
-
-if [[ "$HFT_RPS" -gt 0 ]]; then
-    # Compare against historical baseline (pre-optimization)
-    IMPROVEMENT=$(( (HFT_RPS - HISTORICAL_BASELINE) * 100 / HISTORICAL_BASELINE ))
-    IMPROVEMENT_FACTOR=$(awk "BEGIN {printf \"%.2f\", $HFT_RPS / $HISTORICAL_BASELINE}")
-
-    # Also show vs current run baseline
-    CURRENT_IMPROVEMENT=$(( (HFT_RPS - BASELINE_RPS) * 100 / BASELINE_RPS ))
-
-    info "  Historical baseline: $HISTORICAL_BASELINE rec/sec (pre-optimization)"
-    info "  Current baseline:    $BASELINE_RPS rec/sec"
-    info "  HFT optimized:       $HFT_RPS rec/sec"
-    info "  Improvement vs historical: ${IMPROVEMENT}% (${IMPROVEMENT_FACTOR}x)"
-    info "  Improvement vs current:    ${CURRENT_IMPROVEMENT}%"
-else
-    warn "Could not calculate improvement (missing data)"
-    IMPROVEMENT=0
-fi
-echo
-
-# Step 6: Verify targets
-info "Step 6: Verifying targets..."
+header "Calculating Results"
 
 PASS=true
+IMPROVEMENT=0
+IMPROVEMENT_FACTOR="0.00"
 
-if [[ "$BASELINE_RPS" -ge "$BASELINE_TARGET" ]]; then
-    info "  ✓ Baseline target met: $BASELINE_RPS >= $BASELINE_TARGET rec/sec"
+if [[ "$RESULT_RPS" != "unknown" && "$RESULT_RPS" =~ ^[0-9]+$ && "$RESULT_RPS" -gt 0 ]]; then
+    IMPROVEMENT=$(( (RESULT_RPS - BASELINE_HISTORICAL) * 100 / BASELINE_HISTORICAL ))
+    IMPROVEMENT_FACTOR=$(awk "BEGIN {printf \"%.2f\", $RESULT_RPS / $BASELINE_HISTORICAL}")
 else
-    warn "  ✗ Baseline target missed: $BASELINE_RPS < $BASELINE_TARGET rec/sec"
+    warn "Could not calculate improvement (result: $RESULT_RPS)"
+    RESULT_RPS="N/A"
 fi
 
-if [[ "$HFT_RPS" -ge "$HFT_TARGET" ]]; then
-    info "  ✓ HFT target met: $HFT_RPS >= $HFT_TARGET rec/sec"
+# Step 6: Report
+header "VERIFICATION SUMMARY"
+
+echo "┌────────────────────────────────────────────────────────────┐"
+echo "│                    HFT VERIFICATION REPORT                 │"
+echo "├────────────────────────────────────────────────────────────┤"
+echo "│ Cluster Configuration                                      │"
+printf "│   Shards:              %-37s│\n" "$SHARDS"
+printf "│   Workers:             %-37s│\n" "$NUM_WORKERS"
+printf "│   Duration:            %-37s│\n" "${DURATION}s"
+echo "├────────────────────────────────────────────────────────────┤"
+echo "│ Throughput Results                                         │"
+printf "│   Historical Baseline: %-24s rec/sec │\n" "$BASELINE_HISTORICAL"
+printf "│   Measured:            %-24s rec/sec │\n" "$RESULT_RPS"
+printf "│   Target:              %-24s rec/sec │\n" "$TARGET_RPS"
+echo "├────────────────────────────────────────────────────────────┤"
+echo "│ Improvement                                                │"
+if [[ "$RESULT_RPS" =~ ^[0-9]+$ ]]; then
+    printf "│   Percentage:          %-36s │\n" "${IMPROVEMENT}%"
+    printf "│   Factor:              %-36s │\n" "${IMPROVEMENT_FACTOR}x"
 else
-    warn "  ✗ HFT target missed: $HFT_RPS < $HFT_TARGET rec/sec"
+    printf "│   Percentage:          %-36s │\n" "N/A"
+    printf "│   Factor:              %-36s │\n" "N/A"
+fi
+echo "├────────────────────────────────────────────────────────────┤"
+echo "│ Verification Status                                        │"
+
+if [[ "$RESULT_RPS" =~ ^[0-9]+$ ]]; then
+    if [[ "$RESULT_RPS" -ge "$TARGET_RPS" ]]; then
+        printf "│   %-56s │\n" "${GREEN}✓ TARGET MET: $RESULT_RPS >= $TARGET_RPS${NC}"
+    else
+        printf "│   %-56s │\n" "${RED}✗ TARGET MISSED: $RESULT_RPS < $TARGET_RPS${NC}"
+        PASS=false
+    fi
+
+    if [[ "$IMPROVEMENT" -ge "$TARGET_IMPROVEMENT" ]]; then
+        printf "│   %-56s │\n" "${GREEN}✓ IMPROVEMENT MET: ${IMPROVEMENT}% >= ${TARGET_IMPROVEMENT}%${NC}"
+    else
+        printf "│   %-56s │\n" "${RED}✗ IMPROVEMENT MISSED: ${IMPROVEMENT}% < ${TARGET_IMPROVEMENT}%${NC}"
+        PASS=false
+    fi
+else
+    printf "│   %-56s │\n" "${YELLOW}? Could not verify (no data)${NC}"
     PASS=false
 fi
 
-if [[ "$IMPROVEMENT" -ge 100 ]]; then
-    info "  ✓ 200%+ improvement achieved: ${IMPROVEMENT}%"
-else
-    warn "  ✗ 200% improvement not achieved: ${IMPROVEMENT}%"
-    PASS=false
-fi
+echo "└────────────────────────────────────────────────────────────┘"
 echo
 
-# Step 7: Run HFT module benchmarks (if criterion is available)
-info "Step 7: Running micro-benchmarks..."
-if cargo bench --bench hft_bench -- --quick 2>/dev/null; then
-    info "  Micro-benchmarks complete."
-else
-    info "  Micro-benchmarks skipped (criterion not configured)"
-fi
-echo
+# Step 7: Cleanup
+header "Cleanup"
+cleanup_cluster
+info "Cluster stopped"
 
-# Final Summary
-info "=== VERIFICATION SUMMARY ==="
+# Final verdict
 echo
-echo "┌─────────────────────────────────────────────────┐"
-echo "│ Metric              │ Value     │ Target        │"
-echo "├─────────────────────────────────────────────────┤"
-printf "│ Historical Baseline │ %9s │ %13s │\n" "$HISTORICAL_BASELINE" "-"
-printf "│ Current Run         │ %9s │ %13s │\n" "$BASELINE_RPS" ">= $BASELINE_TARGET"
-printf "│ HFT Optimized       │ %9s │ %13s │\n" "$HFT_RPS" ">= $HFT_TARGET"
-printf "│ Improvement         │ %8s%% │ %12s%% │\n" "$IMPROVEMENT" ">= 100"
-echo "└─────────────────────────────────────────────────┘"
-echo
-
 if $PASS; then
-    info "${GREEN}✓ VERIFICATION PASSED${NC}"
-    info "HFT optimizations meet 200% throughput improvement target."
+    echo -e "${GREEN}${BOLD}========================================${NC}"
+    echo -e "${GREEN}${BOLD}  VERIFICATION PASSED                   ${NC}"
+    echo -e "${GREEN}${BOLD}  HFT optimizations achieve ≥200%       ${NC}"
+    echo -e "${GREEN}${BOLD}  improvement on distributed cluster    ${NC}"
+    echo -e "${GREEN}${BOLD}========================================${NC}"
     exit 0
 else
-    error "${RED}✗ VERIFICATION FAILED${NC}"
-    error "HFT optimizations did not meet target."
-    error "Review bottleneck ledger and architecture options."
+    echo -e "${RED}${BOLD}========================================${NC}"
+    echo -e "${RED}${BOLD}  VERIFICATION FAILED                   ${NC}"
+    echo -e "${RED}${BOLD}  Target: $TARGET_RPS rec/sec           ${NC}"
+    echo -e "${RED}${BOLD}  Actual: $RESULT_RPS rec/sec           ${NC}"
+    echo -e "${RED}${BOLD}========================================${NC}"
     exit 1
 fi

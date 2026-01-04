@@ -164,7 +164,11 @@ pub mod advanced {
         Cluster, DsuBackend, MergeResult, PersistentDSUConfig, PersistentDSUStats,
         PersistentTemporalDSU, TemporalConflict, TemporalDSU, TemporalGuard,
     };
-    pub use crate::hft::{AtomicDSU, AtomicMergeResult, RecordSlice, SimdHasher, ZeroCopyBatch};
+    pub use crate::hft::{
+        AlignedCounter, AlignedMetrics, AsyncWal, AsyncWalConfig, AtomicDSU, AtomicMergeResult,
+        BatchAggregator, IngestJob, IngestQueue, MetricsSnapshot, QueueStats, RecordSlice,
+        SimdHasher, WalError, WalTicket, ZeroCopyBatch,
+    };
     pub use crate::index::{IndexBackend, TierConfig, TieredIdentityKeyIndex, TieredIndexStats};
     pub use crate::linker::{LinkerMetrics, LinkerMetricsSnapshot};
     pub use crate::model::{ClusterId, GlobalClusterId};
