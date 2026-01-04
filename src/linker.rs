@@ -11,10 +11,12 @@
 
 use crate::dsu::TemporalGuard;
 use crate::dsu::{Clusters, DsuBackend, MergeResult, TemporalDSU};
+use crate::hft::bigtable_opts::PartitionOptimizations;
 use crate::index::IndexBackend;
 use crate::model::{ClusterId, GlobalClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
 use crate::sharding::IdentityKeySignature as ShardingKeySignature;
+use crate::sharding::IdentityKeySignature;
 use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
@@ -341,6 +343,8 @@ pub struct StreamingLinker {
     cross_shard_merges: HashMap<GlobalClusterId, GlobalClusterId>,
     /// Metrics for observability.
     metrics: LinkerMetrics,
+    /// Bigtable-style optimizations (bloom filter, scan cache, block cache)
+    partition_opts: Option<Arc<PartitionOptimizations>>,
 }
 
 impl StreamingLinker {
@@ -461,6 +465,7 @@ impl StreamingLinker {
             boundary_signatures: HashMap::new(),
             cross_shard_merges: HashMap::new(),
             metrics: LinkerMetrics::new(),
+            partition_opts: None,
         };
 
         if !store.is_empty() {
@@ -496,6 +501,17 @@ impl StreamingLinker {
     /// Flush DSU to disk (no-op for in-memory).
     pub fn flush_dsu(&mut self) -> Result<()> {
         self.dsu.flush()
+    }
+
+    /// Set Bigtable-style optimizations (bloom filter, scan cache).
+    /// This enables fast negative lookups and candidate caching.
+    pub fn set_partition_opts(&mut self, opts: Arc<PartitionOptimizations>) {
+        self.partition_opts = Some(opts);
+    }
+
+    /// Get partition optimizations reference if set.
+    pub fn partition_opts(&self) -> Option<&Arc<PartitionOptimizations>> {
+        self.partition_opts.as_ref()
     }
 
     /// Link a newly added record to existing clusters and return its cluster ID.
@@ -561,32 +577,62 @@ impl StreamingLinker {
                     continue;
                 }
 
-                let StreamingLinker {
-                    dsu,
-                    identity_index,
-                    cluster_ids,
-                    next_cluster_id,
-                    strong_id_summaries,
-                    tainted_identity_keys,
-                    record_perspectives,
-                    metrics,
-                    ..
-                } = self;
+                // Create identity key signature for bloom filter and scan cache lookups
+                let identity_sig = IdentityKeySignature::from_key_values(entity_type, key_values);
 
-                // Use limited query with early exit - if we visit > adaptive_high_cap tree nodes,
-                // the key is hot and we should skip expensive processing.
-                let max_tree_nodes = self.tuning.adaptive_high_cap;
-                let (candidates_slice, is_hot) = identity_index
-                    .find_matching_clusters_overlapping_limited(
-                        dsu,
-                        entity_type,
-                        key_values,
-                        interval,
-                        max_tree_nodes,
-                    );
-                // Use SmallVec to avoid heap allocation for typical cases (<=32 candidates)
-                // This eliminates allocation for 95%+ of queries
-                let candidates: CandidateVec = candidates_slice.iter().copied().collect();
+                // === BIGTABLE OPTIMIZATION: Bloom filter fast negative lookup ===
+                // If bloom filter says key definitely doesn't exist, skip index lookup entirely
+                let bloom_negative = self
+                    .partition_opts
+                    .as_ref()
+                    .map(|opts| !opts.may_have_candidates(&identity_sig))
+                    .unwrap_or(false);
+                if bloom_negative {
+                    self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // === BIGTABLE OPTIMIZATION: Scan cache for cached candidates ===
+                let cached_candidates = self
+                    .partition_opts
+                    .as_ref()
+                    .and_then(|opts| opts.get_cached_candidates(&identity_sig));
+
+                let (candidates, is_hot): (CandidateVec, bool) =
+                    if let Some(cached) = cached_candidates {
+                        // Cache hit - use cached candidates
+                        self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        (cached.into_iter().collect(), false)
+                    } else {
+                        // Cache miss or no optimizations - do index lookup
+                        // Need to use destructuring for separate mutable borrows
+                        let StreamingLinker {
+                            dsu,
+                            identity_index,
+                            partition_opts,
+                            metrics,
+                            tuning,
+                            ..
+                        } = self;
+
+                        metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+                        let max_tree_nodes = tuning.adaptive_high_cap;
+                        let (candidates_slice, is_hot) = identity_index
+                            .find_matching_clusters_overlapping_limited(
+                                dsu,
+                                entity_type,
+                                key_values,
+                                interval,
+                                max_tree_nodes,
+                            );
+                        let candidates: CandidateVec = candidates_slice.iter().copied().collect();
+                        // Cache the result for future lookups
+                        if let Some(ref opts) = partition_opts {
+                            opts.cache_candidates(&identity_sig, candidates.to_vec());
+                        }
+                        (candidates, is_hot)
+                    };
+
                 let candidate_len = candidates.len();
 
                 if candidate_len > 0 {
@@ -598,13 +644,13 @@ impl StreamingLinker {
 
                 // If the tree query hit the limit, mark as hot and skip.
                 if is_hot || candidate_len > self.tuning.hot_key_threshold {
-                    metrics.hot_key_exits.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.hot_key_exits.fetch_add(1, Ordering::Relaxed);
                     // Avoid redundant clone: only clone if we need both sets
                     if self.tuning.deferred_reconciliation {
-                        tainted_identity_keys.insert(key_signature.clone());
+                        self.tainted_identity_keys.insert(key_signature.clone());
                         self.pending_keys.insert(key_signature);
                     } else {
-                        tainted_identity_keys.insert(key_signature);
+                        self.tainted_identity_keys.insert(key_signature);
                     }
                     continue;
                 }
@@ -634,13 +680,27 @@ impl StreamingLinker {
                     self.pending_keys.insert(key_signature);
                     continue;
                 }
-                let key_is_tainted = tainted_identity_keys.contains(&key_signature);
+                let key_is_tainted = self.tainted_identity_keys.contains(&key_signature);
                 // Only clone key for stats if we have candidates (skip unique keys)
                 let stats_key = if candidate_len > 0 {
                     Some(key_signature.clone())
                 } else {
                     None
                 };
+                // Use destructuring for separate mutable borrows in candidate processing
+                let StreamingLinker {
+                    dsu,
+                    identity_index,
+                    cluster_ids,
+                    next_cluster_id,
+                    strong_id_summaries,
+                    tainted_identity_keys,
+                    record_perspectives,
+                    metrics,
+                    partition_opts,
+                    ..
+                } = self;
+
                 let mut root_a = dsu.find(record_id).unwrap_or(record_id);
 
                 for (candidate_id, candidate_interval) in candidates {
@@ -727,6 +787,10 @@ impl StreamingLinker {
                             root_b,
                             new_root,
                         );
+                        // Invalidate cache on merge - candidates changed
+                        if let Some(ref opts) = partition_opts {
+                            opts.on_cluster_merge(root_a, root_b);
+                        }
                         root_a = new_root;
                     }
                 }

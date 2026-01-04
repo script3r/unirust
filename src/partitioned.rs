@@ -123,8 +123,8 @@ pub struct Partition {
     records_processed: AtomicU64,
     /// Merges applied from other partitions
     external_merges_applied: AtomicU64,
-    /// Bigtable-inspired optimizations (bloom filter, caches)
-    opts: PartitionOptimizations,
+    /// Bigtable-inspired optimizations (bloom filter, caches) - shared with linker
+    opts: Arc<PartitionOptimizations>,
 }
 
 impl Partition {
@@ -140,12 +140,16 @@ impl Partition {
         let (merge_tx, merge_rx) = bounded(merge_queue_capacity);
 
         // Initialize Bigtable-inspired optimizations for this partition
-        let opts = if tuning.deferred_reconciliation {
+        let opts = Arc::new(if tuning.deferred_reconciliation {
             // High-throughput mode: larger caches
             PartitionOptimizations::high_throughput(id)
         } else {
             PartitionOptimizations::new(id)
-        };
+        });
+
+        // Wire the optimizations into the linker's hot path
+        let mut linker = linker;
+        linker.set_partition_opts(Arc::clone(&opts));
 
         Ok(Self {
             id,
