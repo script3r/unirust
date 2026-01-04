@@ -38,6 +38,7 @@ pub mod conflicts;
 pub mod distributed;
 pub mod dsu;
 pub mod graph;
+pub mod hft;
 pub mod index;
 pub mod linker;
 pub mod model;
@@ -163,6 +164,7 @@ pub mod advanced {
         Cluster, DsuBackend, MergeResult, PersistentDSUConfig, PersistentDSUStats,
         PersistentTemporalDSU, TemporalConflict, TemporalDSU, TemporalGuard,
     };
+    pub use crate::hft::{AtomicDSU, AtomicMergeResult, RecordSlice, SimdHasher, ZeroCopyBatch};
     pub use crate::index::{IndexBackend, TierConfig, TieredIdentityKeyIndex, TieredIndexStats};
     pub use crate::linker::{LinkerMetrics, LinkerMetricsSnapshot};
     pub use crate::model::{ClusterId, GlobalClusterId};

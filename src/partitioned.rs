@@ -528,7 +528,7 @@ mod tests {
 
         // Different key should (likely) map to different partition
         let record3 = create_test_record(3, "987-65-4321");
-        let p3 = punirust.partition_for_record(&record3);
+        let _p3 = punirust.partition_for_record(&record3);
         // Note: This might occasionally be the same due to hash collision
         // but for different keys it's likely different
     }
