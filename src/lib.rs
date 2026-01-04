@@ -32,6 +32,7 @@
 //! - `checkpoint()` - Persist state to disk
 //! - `stats()` - Get metrics and statistics
 
+pub mod coalescer;
 pub mod config;
 pub mod conflicts;
 pub mod distributed;
@@ -41,6 +42,7 @@ pub mod index;
 pub mod linker;
 pub mod model;
 pub mod ontology;
+pub mod partitioned;
 pub mod persistence;
 pub mod profile;
 pub mod query;
@@ -152,6 +154,9 @@ use store::StoreMetrics;
 
 /// Advanced types for custom backends and distributed deployments.
 pub mod advanced {
+    pub use crate::coalescer::{
+        AsyncBatchCoalescer, BatchCoalescer, CoalescerConfig, CoalescerStats,
+    };
     pub use crate::config::{ConflictAlgorithmChoice, ConflictTuning, LinkerStateConfig};
     pub use crate::distributed::{ClusterLocality, ClusterLocalityIndex};
     pub use crate::dsu::{
@@ -161,6 +166,10 @@ pub mod advanced {
     pub use crate::index::{IndexBackend, TierConfig, TieredIdentityKeyIndex, TieredIndexStats};
     pub use crate::linker::{LinkerMetrics, LinkerMetricsSnapshot};
     pub use crate::model::{ClusterId, GlobalClusterId};
+    pub use crate::partitioned::{
+        CrossPartitionMerge, Partition, PartitionConfig, PartitionIngestResult, PartitionStats,
+        PartitionedUnirust, PartitionedUnirustHandle,
+    };
     pub use crate::persistence::LinkerStatePersistence;
     pub use crate::query::{QueryConflict, QueryDescriptorOverlap};
     pub use crate::sharding::{

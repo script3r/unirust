@@ -2,6 +2,7 @@ use crate::conflicts::ConflictSummary;
 use crate::graph::GoldenDescriptor;
 use crate::model::{AttrId, GlobalClusterId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
+use crate::partitioned::{PartitionConfig, PartitionedUnirust};
 use crate::persistence::PersistentOpenOptions;
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::sharding::{BloomFilter, IdentityKeySignature};
@@ -892,6 +893,9 @@ pub struct ShardNode {
     shard_id: u32,
     /// Uses parking_lot RwLock (faster for short critical sections than tokio's async RwLock)
     unirust: Arc<parking_lot::RwLock<Unirust>>,
+    /// Partitioned Unirust for high-throughput parallel processing (optional)
+    /// When enabled, bypasses the single RwLock and processes partitions independently
+    partitioned: Option<Arc<parking_lot::RwLock<PartitionedUnirust>>>,
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
@@ -906,6 +910,26 @@ pub struct ShardNode {
 const INGEST_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_INGEST_WORKERS: usize = 16;
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
+
+/// Check if partitioned processing is enabled (default: true)
+/// Set UNIRUST_PARTITIONED=0 to disable
+fn is_partitioned_enabled() -> bool {
+    std::env::var("UNIRUST_PARTITIONED")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Get the number of partitions (defaults to CPU count or 8)
+fn partition_count() -> usize {
+    std::env::var("UNIRUST_PARTITION_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(8)
+        })
+}
 
 // Helper macros for lock acquisition (parking_lot RwLock - synchronous)
 macro_rules! write_unirust {
@@ -1054,21 +1078,41 @@ impl ShardNode {
         let tuning = tuning.with_shard_id(shard_id as u16);
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         let worker_count = ingest_worker_count();
+        let use_partitioned = is_partitioned_enabled();
+        let num_partitions = partition_count();
+
+        if use_partitioned {
+            tracing::info!(shard_id, num_partitions, "Partitioned processing enabled");
+        }
+
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
             let ingest_wal = Some(Arc::new(IngestWal::new(&path)));
-            let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
+            let mut unirust =
+                Unirust::with_store_and_tuning(ontology.clone(), store, tuning.clone());
             if let Some(wal) = ingest_wal.as_ref() {
                 wal.replay(&mut unirust, shard_id)
                     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
             }
             let unirust = Arc::new(parking_lot::RwLock::new(unirust));
+
+            // Create partitioned processor if enabled
+            let partitioned = if use_partitioned {
+                let partition_config = PartitionConfig::for_cores(num_partitions);
+                let partitioned_unirust =
+                    PartitionedUnirust::new(partition_config, Arc::new(ontology), tuning.clone())?;
+                Some(Arc::new(parking_lot::RwLock::new(partitioned_unirust)))
+            } else {
+                None
+            };
+
             let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
             let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
             return Ok(Self {
                 shard_id,
                 unirust,
+                partitioned,
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
@@ -1084,15 +1128,27 @@ impl ShardNode {
         let ontology = ontology_config.clone().build_ontology(&mut store);
         let ingest_wal = None;
         let unirust = Arc::new(parking_lot::RwLock::new(Unirust::with_store_and_tuning(
-            ontology,
+            ontology.clone(),
             store,
             tuning.clone(),
         )));
+
+        // Create partitioned processor if enabled
+        let partitioned = if use_partitioned {
+            let partition_config = PartitionConfig::for_cores(num_partitions);
+            let partitioned_unirust =
+                PartitionedUnirust::new(partition_config, Arc::new(ontology), tuning.clone())?;
+            Some(Arc::new(parking_lot::RwLock::new(partitioned_unirust)))
+        } else {
+            None
+        };
+
         let ingest_txs = spawn_ingest_workers(unirust.clone(), shard_id, worker_count);
         let ingest_coalescer = None; // Coalescing adds overhead; workers already pipeline
         Ok(Self {
             shard_id,
             unirust,
+            partitioned,
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
@@ -1360,6 +1416,42 @@ async fn dispatch_ingest_records(
     Ok(assignments)
 }
 
+/// Dispatch records using the partitioned architecture for maximum throughput.
+/// This bypasses the worker queue entirely and processes partitions in parallel.
+async fn dispatch_ingest_partitioned(
+    partitioned: &Arc<parking_lot::RwLock<PartitionedUnirust>>,
+    unirust: &Arc<parking_lot::RwLock<Unirust>>,
+    ingest_wal: Option<&IngestWal>,
+    shard_id: u32,
+    records: Vec<proto::RecordInput>,
+) -> Result<Vec<proto::IngestAssignment>, Status> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(wal) = ingest_wal {
+        wal.write_batch(&records)?;
+    }
+
+    // Process using partitioned architecture - single lock acquisition, parallel internal processing
+    let result = {
+        let mut partitioned_guard = partitioned.write();
+        let mut unirust_guard = unirust.write();
+        process_ingest_batch_partitioned(
+            &mut partitioned_guard,
+            &mut unirust_guard,
+            shard_id,
+            &records,
+        )
+    };
+
+    if let Some(wal) = ingest_wal {
+        wal.clear()?;
+    }
+
+    result
+}
+
 #[allow(clippy::result_large_err)]
 fn process_ingest_batch(
     unirust: &mut Unirust,
@@ -1396,6 +1488,47 @@ fn process_ingest_batch(
             cluster_key: String::new(), // Computed on-demand at query time
         });
     }
+    Ok(assignments)
+}
+
+/// Process a batch of records using the partitioned architecture.
+/// This bypasses the single RwLock bottleneck by processing partitions independently.
+#[allow(clippy::result_large_err)]
+fn process_ingest_batch_partitioned(
+    partitioned: &mut PartitionedUnirust,
+    unirust: &mut Unirust,
+    shard_id: u32,
+    records: &[proto::RecordInput],
+) -> Result<Vec<proto::IngestAssignment>, Status> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build all records first, preserving original indices
+    // We still need unirust for interning
+    let mut record_inputs: Vec<(u32, Record)> = Vec::with_capacity(records.len());
+    for record in records {
+        let record_input = ShardNode::build_record(unirust, record)?;
+        record_inputs.push((record.index, record_input));
+    }
+
+    // Process using partitioned architecture - this is where we get parallelism
+    let partition_results = partitioned.ingest_batch(record_inputs);
+
+    // Build assignments from partition results
+    let mut assignments = Vec::with_capacity(partition_results.len());
+    for result in partition_results {
+        assignments.push(proto::IngestAssignment {
+            index: result.index,
+            shard_id,
+            record_id: 0, // PartitionedUnirust assigns its own record IDs
+            cluster_id: result.cluster_id.0,
+            cluster_key: String::new(), // Computed on-demand at query time
+        });
+    }
+
+    // Sort by index to maintain order
+    assignments.sort_by_key(|a| a.index);
     Ok(assignments)
 }
 
@@ -1492,8 +1625,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let records = request.into_inner().records;
         let record_count = records.len();
 
-        // Use coalescer for higher throughput when available
-        let assignments = if let Some(coalescer) = &self.ingest_coalescer {
+        // Use partitioned processing for maximum throughput when available
+        let assignments = if let Some(partitioned) = &self.partitioned {
+            dispatch_ingest_partitioned(
+                partitioned,
+                &self.unirust,
+                self.ingest_wal.as_deref(),
+                self.shard_id,
+                records,
+            )
+            .await?
+        } else if let Some(coalescer) = &self.ingest_coalescer {
             dispatch_ingest_coalesced(coalescer, self.ingest_wal.as_deref(), records).await?
         } else {
             dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
@@ -1523,8 +1665,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
             }
             record_count += chunk.records.len();
 
-            // Use coalescer for higher throughput when available
-            let batch_assignments = if let Some(coalescer) = &self.ingest_coalescer {
+            // Use partitioned processing for maximum throughput when available
+            let batch_assignments = if let Some(partitioned) = &self.partitioned {
+                dispatch_ingest_partitioned(
+                    partitioned,
+                    &self.unirust,
+                    self.ingest_wal.as_deref(),
+                    self.shard_id,
+                    chunk.records,
+                )
+                .await?
+            } else if let Some(coalescer) = &self.ingest_coalescer {
                 dispatch_ingest_coalesced(coalescer, self.ingest_wal.as_deref(), chunk.records)
                     .await?
             } else {

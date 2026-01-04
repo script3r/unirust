@@ -62,6 +62,7 @@ async-channel = "2.3"
 # Concurrent data structures (for optimized modules)
 dashmap = "6"
 parking_lot = "0.12"
+crossbeam-channel = "0.5"
 
 # Optional dependencies
 rand = { version = "0.9.2", optional = true }
