@@ -35,6 +35,16 @@ use tracing::{debug, instrument, warn};
 /// 32 candidates covers 95%+ of queries based on production workload analysis
 type CandidateVec = SmallVec<[(RecordId, Interval); 32]>;
 
+/// Data stored for boundary signatures to support cross-shard conflict detection.
+#[derive(Debug, Clone)]
+struct BoundaryData {
+    /// Merged interval for this (signature, cluster) combination.
+    interval: Interval,
+    /// Strong ID hashes per perspective for conflict detection.
+    /// Key: hash of perspective name, Value: hash of (attr_id, value_id) tuples.
+    perspective_strong_ids: HashMap<u64, u64>,
+}
+
 /// Metrics for observability of the streaming linker.
 /// All counters are atomic for thread-safe access without locking.
 #[derive(Debug, Default)]
@@ -341,8 +351,8 @@ pub struct StreamingLinker {
     /// Use FxHashMap for faster key stats lookup
     key_stats: FxHashMap<LinkerKeySignature, KeyStats>,
     /// Boundary keys for cross-shard reconciliation (deduplicated by key+cluster).
-    /// Maps (signature, cluster) -> merged interval for that combination.
-    boundary_signatures: HashMap<(ShardingKeySignature, GlobalClusterId), Interval>,
+    /// Maps (signature, cluster) -> (interval, perspective_strong_ids) for that combination.
+    boundary_signatures: HashMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
     /// Cross-shard merge mappings: secondary -> primary.
     /// Used to redirect cluster ID lookups after cross-shard reconciliation.
     cross_shard_merges: HashMap<GlobalClusterId, GlobalClusterId>,
@@ -859,10 +869,17 @@ impl StreamingLinker {
         // Skip in single-shard mode to avoid memory overhead.
         if self.tuning.enable_boundary_tracking {
             let global_id = self.get_or_assign_global_cluster_id(root);
+            // Get perspective strong ID hashes for conflict detection
+            let perspective_hashes = self.compute_perspective_strong_id_hashes(root);
             for (_identity_key, key_values_list) in &cached_keys {
                 for (key_values, interval) in key_values_list {
                     let key_signature = LinkerKeySignature::new(entity_type, key_values);
-                    self.record_boundary_signature(&key_signature, global_id, *interval);
+                    self.record_boundary_signature(
+                        &key_signature,
+                        global_id,
+                        *interval,
+                        &perspective_hashes,
+                    );
                 }
             }
         }
@@ -1196,8 +1213,13 @@ impl StreamingLinker {
     /// This can be used for cross-shard reconciliation.
     pub fn export_boundary_index(&self) -> crate::sharding::ClusterBoundaryIndex {
         let mut index = crate::sharding::ClusterBoundaryIndex::new_small(self.shard_id);
-        for ((sig, global_id), interval) in &self.boundary_signatures {
-            index.register_boundary_key(*sig, *global_id, *interval);
+        for ((sig, global_id), data) in &self.boundary_signatures {
+            index.register_boundary_key_with_strong_ids(
+                *sig,
+                *global_id,
+                data.interval,
+                data.perspective_strong_ids.clone(),
+            );
         }
         index
     }
@@ -1207,8 +1229,35 @@ impl StreamingLinker {
     pub fn drain_boundaries(&mut self) -> Vec<(ShardingKeySignature, GlobalClusterId, Interval)> {
         std::mem::take(&mut self.boundary_signatures)
             .into_iter()
-            .map(|((sig, global_id), interval)| (sig, global_id, interval))
+            .map(|((sig, global_id), data)| (sig, global_id, data.interval))
             .collect()
+    }
+
+    /// Compute perspective strong ID hashes for a cluster root.
+    /// Returns a map from perspective name hash to strong ID values hash.
+    fn compute_perspective_strong_id_hashes(&self, root: RecordId) -> HashMap<u64, u64> {
+        let mut result = HashMap::new();
+        if let Some(summary) = self.strong_id_summaries.peek(&root) {
+            for (perspective, attrs) in &summary.by_perspective {
+                // Hash the perspective name
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(perspective, &mut hasher);
+                let perspective_hash = std::hash::Hasher::finish(&hasher);
+
+                // Hash all (attr_id, value_id) pairs for this perspective
+                let mut value_hasher = std::collections::hash_map::DefaultHasher::new();
+                for (attr_id, values) in attrs {
+                    std::hash::Hash::hash(attr_id, &mut value_hasher);
+                    for value_id in values.keys() {
+                        std::hash::Hash::hash(value_id, &mut value_hasher);
+                    }
+                }
+                let values_hash = std::hash::Hasher::finish(&value_hasher);
+
+                result.insert(perspective_hash, values_hash);
+            }
+        }
+        result
     }
 
     /// Record a boundary signature for cross-shard tracking.
@@ -1218,6 +1267,7 @@ impl StreamingLinker {
         key_signature: &LinkerKeySignature,
         global_id: GlobalClusterId,
         interval: Interval,
+        perspective_strong_ids: &HashMap<u64, u64>,
     ) {
         let sharding_sig = key_signature.to_sharding_signature();
         let key = (sharding_sig, global_id);
@@ -1227,13 +1277,20 @@ impl StreamingLinker {
             .entry(key)
             .and_modify(|existing| {
                 // Extend existing interval to cover both
-                let new_start = existing.start.min(interval.start);
-                let new_end = existing.end.max(interval.end);
+                let new_start = existing.interval.start.min(interval.start);
+                let new_end = existing.interval.end.max(interval.end);
                 if let Ok(merged) = Interval::new(new_start, new_end) {
-                    *existing = merged;
+                    existing.interval = merged;
+                }
+                // Merge perspective strong IDs (keep existing for conflicts)
+                for (k, v) in perspective_strong_ids {
+                    existing.perspective_strong_ids.entry(*k).or_insert(*v);
                 }
             })
-            .or_insert(interval);
+            .or_insert_with(|| BoundaryData {
+                interval,
+                perspective_strong_ids: perspective_strong_ids.clone(),
+            });
     }
 
     /// Apply a cross-shard cluster merge.
@@ -1257,19 +1314,23 @@ impl StreamingLinker {
             .collect();
 
         for (sig, _) in keys_to_update {
-            if let Some(interval) = self.boundary_signatures.remove(&(sig, secondary)) {
+            if let Some(data) = self.boundary_signatures.remove(&(sig, secondary)) {
                 let new_key = (sig, primary);
-                // Merge with existing interval for primary if present
+                // Merge with existing BoundaryData for primary if present
                 self.boundary_signatures
                     .entry(new_key)
                     .and_modify(|existing| {
-                        let new_start = existing.start.min(interval.start);
-                        let new_end = existing.end.max(interval.end);
+                        let new_start = existing.interval.start.min(data.interval.start);
+                        let new_end = existing.interval.end.max(data.interval.end);
                         if let Ok(merged) = Interval::new(new_start, new_end) {
-                            *existing = merged;
+                            existing.interval = merged;
+                        }
+                        // Merge perspective strong IDs
+                        for (k, v) in &data.perspective_strong_ids {
+                            existing.perspective_strong_ids.entry(*k).or_insert(*v);
                         }
                     })
-                    .or_insert(interval);
+                    .or_insert(data);
             }
         }
 

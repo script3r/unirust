@@ -141,6 +141,11 @@ pub struct BoundaryEntry {
     pub cluster_id: GlobalClusterId,
     pub interval: Interval,
     pub shard_id: u16,
+    /// Strong ID hashes per perspective for cross-shard conflict detection.
+    /// Key: perspective name hash, Value: hash of (attr_id, value_id) tuples.
+    /// Two clusters conflict if they share a perspective key but have different values.
+    #[serde(default)]
+    pub perspective_strong_ids: HashMap<u64, u64>,
 }
 
 /// Index tracking identity keys at shard boundaries.
@@ -189,12 +194,24 @@ impl ClusterBoundaryIndex {
         cluster_id: GlobalClusterId,
         interval: Interval,
     ) {
+        self.register_boundary_key_with_strong_ids(signature, cluster_id, interval, HashMap::new());
+    }
+
+    /// Register a cluster's identity key with strong ID hashes for conflict detection.
+    pub fn register_boundary_key_with_strong_ids(
+        &mut self,
+        signature: IdentityKeySignature,
+        cluster_id: GlobalClusterId,
+        interval: Interval,
+        perspective_strong_ids: HashMap<u64, u64>,
+    ) {
         self.key_bloom.insert(&signature);
 
         let entry = BoundaryEntry {
             cluster_id,
             interval,
             shard_id: self.shard_id,
+            perspective_strong_ids,
         };
 
         self.boundary_keys.entry(signature).or_default().push(entry);
@@ -384,6 +401,12 @@ impl IncrementalReconciler {
                         // Only merge if from different shards and intervals overlap
                         if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval)
                         {
+                            // Check for same-perspective conflicts before proposing merge
+                            if has_cross_shard_conflict(e1, e2) {
+                                // Skip this merge - clusters conflict on strong IDs
+                                continue;
+                            }
+
                             // Merge into the lower shard_id for consistency
                             let (primary, secondary) = if e1.shard_id < e2.shard_id {
                                 (e1.cluster_id, e2.cluster_id)
@@ -447,6 +470,26 @@ impl Default for IncrementalReconciler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check if two boundary entries have conflicting strong IDs.
+///
+/// Two entries conflict if they share a perspective (same key in perspective_strong_ids)
+/// but have different strong ID hashes (different values). This indicates the clusters
+/// have the same perspective but different strong identifiers, which would create a
+/// conflict if merged.
+fn has_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> bool {
+    // Check each perspective in e1 against e2
+    for (perspective_hash, strong_id_hash_1) in &e1.perspective_strong_ids {
+        if let Some(strong_id_hash_2) = e2.perspective_strong_ids.get(perspective_hash) {
+            // Same perspective exists in both entries
+            // If strong ID hashes differ, there's a conflict
+            if strong_id_hash_1 != strong_id_hash_2 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
