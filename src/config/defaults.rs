@@ -146,6 +146,12 @@ pub const DEFAULT_CHANNEL_BUFFER: usize = 500;
 /// Default router shard list for local/dev setups.
 pub fn default_router_shards() -> Vec<String> {
     (0..DEFAULT_SHARD_COUNT)
-        .map(|idx| format!("{}:{}", DEFAULT_SHARD_HOST, DEFAULT_SHARD_BASE_PORT + idx as u16))
+        .map(|idx| {
+            format!(
+                "{}:{}",
+                DEFAULT_SHARD_HOST,
+                DEFAULT_SHARD_BASE_PORT + idx as u16
+            )
+        })
         .collect()
 }

@@ -181,10 +181,7 @@ fn generate_proto_batch(
     records
 }
 
-fn build_record_from_proto(
-    interner: &ConcurrentInterner,
-    input: &proto::RecordInput,
-) -> Record {
+fn build_record_from_proto(interner: &ConcurrentInterner, input: &proto::RecordInput) -> Record {
     let identity = input
         .identity
         .as_ref()
@@ -423,11 +420,9 @@ fn bench_shardnode_ingest(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let rt = Runtime::new().expect("runtime");
-                let shard = rt
-                    .block_on(async {
-                        ShardNode::new(0, config.clone(), StreamingTuning::default())
-                            .expect("shard")
-                    });
+                let shard = rt.block_on(async {
+                    ShardNode::new(0, config.clone(), StreamingTuning::default()).expect("shard")
+                });
                 let records = generate_proto_batch(1, count, overlap, 45);
                 (rt, shard, records)
             },
@@ -468,11 +463,9 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let rt = Runtime::new().expect("runtime");
-                let shard = rt
-                    .block_on(async {
-                        ShardNode::new(0, config.clone(), StreamingTuning::default())
-                            .expect("shard")
-                    });
+                let shard = rt.block_on(async {
+                    ShardNode::new(0, config.clone(), StreamingTuning::default()).expect("shard")
+                });
                 let records = generate_proto_batch(1, total, overlap, 46);
                 (rt, shard, records)
             },
@@ -524,7 +517,10 @@ fn bench_cluster_locality_index(c: &mut Criterion) {
             let email = interner.intern_attr("email");
             let name_val = interner.intern_value(&format!("Person_{i:09}"));
             let email_val = interner.intern_value(&format!("person_{i:09}@example.com"));
-            let key_values = vec![KeyValue::new(name, name_val), KeyValue::new(email, email_val)];
+            let key_values = vec![
+                KeyValue::new(name, name_val),
+                KeyValue::new(email, email_val),
+            ];
             IdentityKeySignature::from_key_values("person", &key_values)
         })
         .collect::<Vec<_>>();
@@ -595,7 +591,10 @@ fn bench_reconciliation(c: &mut Criterion) {
         .map(|i| {
             let name_val = interner.intern_value(&format!("Person_{i:06}"));
             let email_val = interner.intern_value(&format!("person_{i:06}@example.com"));
-            let key_values = vec![KeyValue::new(name, name_val), KeyValue::new(email, email_val)];
+            let key_values = vec![
+                KeyValue::new(name, name_val),
+                KeyValue::new(email, email_val),
+            ];
             IdentityKeySignature::from_key_values("person", &key_values)
         })
         .collect::<Vec<_>>();
@@ -615,19 +614,19 @@ fn bench_reconciliation(c: &mut Criterion) {
                     for sig in &signatures {
                         for entry_idx in 0..entries_per_key {
                             let shard = (idx + entry_idx) % shard_count;
-                            let cluster_id = GlobalClusterId::new(
-                                shard as u16,
-                                (idx + entry_idx) as u32,
-                                0,
-                            );
-                            let interval = Interval::new(0, 100 + entry_idx as i64)
-                                .expect("valid interval");
+                            let cluster_id =
+                                GlobalClusterId::new(shard as u16, (idx + entry_idx) as u32, 0);
+                            let interval =
+                                Interval::new(0, 100 + entry_idx as i64).expect("valid interval");
                             boundaries[shard].register_boundary_key(*sig, cluster_id, interval);
                         }
                         idx += 1;
                     }
 
-                    let key_set = signatures.iter().copied().collect::<std::collections::HashSet<_>>();
+                    let key_set = signatures
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>();
                     (boundaries, key_set)
                 },
                 |(boundaries, key_set)| {
