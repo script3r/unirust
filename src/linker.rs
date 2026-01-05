@@ -1437,9 +1437,9 @@ impl StreamingLinker {
 
             // Min-heap by end time: (Reverse(end), idx) - smallest end first
             let mut active_heap: BinaryHeap<Reverse<(crate::temporal::Instant, usize)>> =
-                BinaryHeap::new();
-            // Also keep a set of valid indices for O(1) lookup
-            let mut active_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                BinaryHeap::with_capacity(records.len().min(1024));
+            // Use FxHashSet for faster iteration (better cache locality)
+            let mut active_set: FxHashSet<usize> = FxHashSet::default();
 
             // Pre-allocate guard reason once per key (not per merge)
             let guard_reason = Self::GUARD_REASON_DEFERRED.to_string();
@@ -1609,16 +1609,20 @@ impl StreamingLinker {
     }
 }
 
+/// Strong ID summary for conflict detection between clusters.
+/// Tracks (perspective -> attr -> value -> intervals) for conflict checking.
 #[derive(Debug, Clone, Default)]
-struct StrongIdSummary {
-    by_perspective: HashMap<
+pub struct StrongIdSummary {
+    /// Per-perspective strong ID mappings: perspective -> attr -> value -> intervals
+    pub by_perspective: HashMap<
         String,
         HashMap<crate::model::AttrId, HashMap<crate::model::ValueId, Vec<Interval>>>,
     >,
 }
 
 impl StrongIdSummary {
-    fn merge(&mut self, other: StrongIdSummary) {
+    /// Merge another summary into this one, combining intervals by perspective/attr/value.
+    pub fn merge(&mut self, other: StrongIdSummary) {
         for (perspective, attrs) in other.by_perspective {
             let entry = self.by_perspective.entry(perspective).or_default();
             for (attr, values) in attrs {
@@ -1681,14 +1685,14 @@ impl StrongIdSummary {
     }
 }
 
-/// Internal identity key signature for linker deduplication.
+/// Identity key signature for linker deduplication.
 /// Distinct from sharding::IdentityKeySignature which uses a 32-byte hash.
 ///
 /// Uses precomputed hash for O(1) hash lookups instead of re-hashing on every access.
 /// This is critical for performance since LinkerKeySignature is used in hot-path
 /// FxHashSet/FxHashMap operations.
 #[derive(Debug, Clone)]
-struct LinkerKeySignature {
+pub struct LinkerKeySignature {
     entity_type: String,
     key_values: Vec<KeyValue>,
     /// Precomputed hash for fast lookups
@@ -1696,7 +1700,8 @@ struct LinkerKeySignature {
 }
 
 impl LinkerKeySignature {
-    fn new(entity_type: &str, key_values: &[KeyValue]) -> Self {
+    /// Create a new key signature with precomputed hash.
+    pub fn new(entity_type: &str, key_values: &[KeyValue]) -> Self {
         use rustc_hash::FxHasher;
         use std::hash::{Hash, Hasher};
 
@@ -1889,7 +1894,8 @@ fn get_strong_identifier_descriptor<'a>(
         .find(|descriptor| descriptor.attr == strong_id.attribute)
 }
 
-fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary {
+/// Build a strong ID summary for a record based on ontology strong identifiers.
+pub fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary {
     let _guard = crate::profile::profile_scope("build_record_summary");
     let strong_ids = ontology.strong_identifiers_for_type(&record.identity.entity_type);
     if strong_ids.is_empty() {

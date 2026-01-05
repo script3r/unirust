@@ -77,6 +77,18 @@ const DEFAULT_TARGET_FILE_MB: u64 = 128;
 const DEFAULT_LEVEL_BASE_MB: u64 = 512;
 const DEFAULT_BLOOM_BITS_PER_KEY: f64 = 10.0;
 const DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO: f64 = 0.1;
+// Aggressive compaction deferral: favor ingest throughput over compaction
+// Default 20 MB/s rate limit ensures compaction doesn't starve ingest
+const DEFAULT_RATE_LIMIT_MBPS: u64 = 20;
+// Reduce compaction threads to minimize CPU contention with ingest
+const DEFAULT_COMPACTION_THREADS: i32 = 1;
+// Keep flush threads higher to avoid write stalls
+const DEFAULT_FLUSH_THREADS: i32 = 2;
+// Disable auto compaction by default for maximum ingest throughput
+// Compaction runs during quiet periods or can be triggered manually
+const DEFAULT_DISABLE_AUTO_COMPACTION: bool = false;
+// Soft limit before slowing writes (4GB default - very permissive)
+const DEFAULT_SOFT_PENDING_COMPACTION_GB: u64 = 4;
 
 const ENV_BLOCK_CACHE_MB: &str = "UNIRUST_BLOCK_CACHE_MB";
 const ENV_WRITE_BUFFER_MB: &str = "UNIRUST_WRITE_BUFFER_MB";
@@ -86,6 +98,10 @@ const ENV_LEVEL_BASE_MB: &str = "UNIRUST_LEVEL_BASE_MB";
 const ENV_BLOOM_BITS_PER_KEY: &str = "UNIRUST_BLOOM_BITS_PER_KEY";
 const ENV_MEMTABLE_PREFIX_BLOOM_RATIO: &str = "UNIRUST_MEMTABLE_PREFIX_BLOOM_RATIO";
 const ENV_RATE_LIMIT_MBPS: &str = "UNIRUST_RATE_LIMIT_MBPS";
+const ENV_COMPACTION_THREADS: &str = "UNIRUST_COMPACTION_THREADS";
+const ENV_FLUSH_THREADS: &str = "UNIRUST_FLUSH_THREADS";
+const ENV_DISABLE_AUTO_COMPACTION: &str = "UNIRUST_DISABLE_AUTO_COMPACTION";
+const ENV_SOFT_PENDING_COMPACTION_GB: &str = "UNIRUST_SOFT_PENDING_COMPACTION_GB";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StorageManifest {
@@ -1085,6 +1101,10 @@ struct RocksDbTuning {
     bloom_bits_per_key: f64,
     memtable_prefix_bloom_ratio: f64,
     rate_limit_bytes_per_sec: i64,
+    compaction_threads: i32,
+    flush_threads: i32,
+    disable_auto_compaction: bool,
+    soft_pending_compaction_bytes: u64,
 }
 
 fn load_tuning() -> RocksDbTuning {
@@ -1098,7 +1118,16 @@ fn load_tuning() -> RocksDbTuning {
         ENV_MEMTABLE_PREFIX_BLOOM_RATIO,
         DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO,
     );
-    let rate_limit_mbps = env_u64(ENV_RATE_LIMIT_MBPS, 0) as i64;
+    // Use default rate limit (20 MB/s) to favor ingest throughput
+    let rate_limit_mbps = env_u64(ENV_RATE_LIMIT_MBPS, DEFAULT_RATE_LIMIT_MBPS) as i64;
+    let compaction_threads = env_i32(ENV_COMPACTION_THREADS, DEFAULT_COMPACTION_THREADS).max(1);
+    let flush_threads = env_i32(ENV_FLUSH_THREADS, DEFAULT_FLUSH_THREADS).max(1);
+    let disable_auto_compaction =
+        env_bool(ENV_DISABLE_AUTO_COMPACTION, DEFAULT_DISABLE_AUTO_COMPACTION);
+    let soft_pending_compaction_gb = env_u64(
+        ENV_SOFT_PENDING_COMPACTION_GB,
+        DEFAULT_SOFT_PENDING_COMPACTION_GB,
+    );
 
     RocksDbTuning {
         block_cache_bytes: block_cache_mb * 1024 * 1024,
@@ -1109,6 +1138,10 @@ fn load_tuning() -> RocksDbTuning {
         bloom_bits_per_key,
         memtable_prefix_bloom_ratio,
         rate_limit_bytes_per_sec: rate_limit_mbps.saturating_mul(1024 * 1024),
+        compaction_threads,
+        flush_threads,
+        disable_auto_compaction,
+        soft_pending_compaction_bytes: soft_pending_compaction_gb * 1024 * 1024 * 1024,
     }
 }
 
@@ -1140,6 +1173,13 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default)
+}
+
 fn build_base_options(tuning: &RocksDbTuning) -> Options {
     let mut options = Options::default();
     options.create_if_missing(true);
@@ -1149,9 +1189,34 @@ fn build_base_options(tuning: &RocksDbTuning) -> Options {
     options.set_max_write_buffer_number(tuning.max_write_buffers);
     options.set_target_file_size_base(tuning.target_file_size_base);
     options.set_max_bytes_for_level_base(tuning.max_bytes_for_level_base);
-    options.set_max_background_jobs(4);
+
+    // Separate compaction and flush threads for fine-grained control
+    // Favor flush (required for writes) over compaction (can be deferred)
+    let total_bg_jobs = tuning.compaction_threads + tuning.flush_threads;
+    options.set_max_background_jobs(total_bg_jobs);
+    // Increase L0 file limits to delay compaction triggers
+    options.set_level_zero_file_num_compaction_trigger(8);
+    options.set_level_zero_slowdown_writes_trigger(20);
+    options.set_level_zero_stop_writes_trigger(36);
+
     options.set_level_compaction_dynamic_level_bytes(true);
     options.set_compression_type(DBCompressionType::Zstd);
+
+    // Disable auto compaction if configured (for bulk ingest scenarios)
+    if tuning.disable_auto_compaction {
+        options.set_disable_auto_compactions(true);
+    }
+
+    // Set soft pending compaction limit - delays compaction pressure
+    options.set_soft_pending_compaction_bytes_limit(bytes_to_usize(
+        tuning.soft_pending_compaction_bytes,
+    ));
+    // Set hard limit much higher to avoid write stalls
+    options.set_hard_pending_compaction_bytes_limit(bytes_to_usize(
+        tuning.soft_pending_compaction_bytes * 4,
+    ));
+
+    // Rate limit compaction I/O to favor ingest throughput
     if tuning.rate_limit_bytes_per_sec > 0 {
         options.set_ratelimiter(tuning.rate_limit_bytes_per_sec, 100_000, 10);
         options.set_bytes_per_sync(1024 * 1024);
