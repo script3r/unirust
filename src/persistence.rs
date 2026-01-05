@@ -22,7 +22,7 @@ const CF_CONFLICT_SUMMARIES: &str = "conflict_summaries";
 const CF_CLUSTER_ASSIGNMENTS: &str = "cluster_assignments";
 
 thread_local! {
-    static RECORD_SER_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static RECORD_SER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_record_bytes<R, F>(record: &Record, f: F) -> Result<R>
