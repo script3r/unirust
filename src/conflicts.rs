@@ -537,8 +537,7 @@ impl ConflictDetector {
         attribute: AttrId,
         entity_id: RecordId,
     ) -> Result<Vec<DirectConflict>> {
-        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> =
-            FxHashMap::default();
+        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> = FxHashMap::default();
         descriptors_by_value.reserve(descriptors.len());
         for (value, interval) in descriptors {
             descriptors_by_value
@@ -561,8 +560,7 @@ impl ConflictDetector {
         descriptors: Vec<(RecordId, ValueId, Interval)>,
         attribute: AttrId,
     ) -> Result<Vec<DirectConflict>> {
-        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> =
-            FxHashMap::default();
+        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> = FxHashMap::default();
         descriptors_by_value.reserve(descriptors.len() / 4 + 1);
         for (record_id, value, interval) in descriptors {
             descriptors_by_value
