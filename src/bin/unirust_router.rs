@@ -42,7 +42,7 @@ ENVIRONMENT:
 CONFIG FILE (unirust.toml):
     [router]
     listen = "0.0.0.0:50060"
-    shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061"]
+    shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061", "shard-3:50061", "shard-4:50061"]
 "#
     );
 }

@@ -33,7 +33,8 @@ OPTIONS:
     -d, --data-dir <DIR>    Override data directory
     -o, --ontology <FILE>   Path to ontology config (JSON)
     -p, --profile <NAME>    Tuning profile: balanced, low-latency, high-throughput,
-                            bulk-ingest, memory-saver, billion-scale
+                            bulk-ingest, memory-saver, billion-scale,
+                            billion-scale-high-performance
         --repair            Run repair on startup
         --config-version    Config version for compatibility checking
     -h, --help              Print help
@@ -46,7 +47,7 @@ ENVIRONMENT:
     UNIRUST_SHARD_DATA_DIR  Data directory
 
 CONFIG FILE (unirust.toml):
-    profile = "high-throughput"
+    profile = "billion-scale-high-performance"
 
     [shard]
     listen = "0.0.0.0:50061"
@@ -64,6 +65,7 @@ fn parse_profile(value: &str) -> Option<Profile> {
         "bulk-ingest" => Some(Profile::BulkIngest),
         "memory-saver" => Some(Profile::MemorySaver),
         "billion-scale" => Some(Profile::BillionScale),
+        "billion-scale-high-performance" => Some(Profile::BillionScaleHighPerformance),
         _ => None,
     }
 }

@@ -30,9 +30,9 @@ pub struct CoalescerConfig {
 impl Default for CoalescerConfig {
     fn default() -> Self {
         Self {
-            capacity: 4096,
-            flush_interval: Duration::from_millis(5),
-            min_batch_size: 100,
+            capacity: 8192,
+            flush_interval: Duration::from_millis(10),
+            min_batch_size: 500,
         }
     }
 }

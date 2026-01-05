@@ -9,6 +9,15 @@
 /// Default shard listen address
 pub const DEFAULT_SHARD_ADDR: &str = "127.0.0.1:50061";
 
+/// Default shard host (router defaults)
+pub const DEFAULT_SHARD_HOST: &str = "127.0.0.1";
+
+/// Default shard base port (router defaults)
+pub const DEFAULT_SHARD_BASE_PORT: u16 = 50061;
+
+/// Default shard count for production deployments
+pub const DEFAULT_SHARD_COUNT: usize = 5;
+
 /// Default router listen address
 pub const DEFAULT_ROUTER_ADDR: &str = "127.0.0.1:50060";
 
@@ -18,24 +27,24 @@ pub const DEFAULT_ROUTER_ADDR: &str = "127.0.0.1:50060";
 
 /// Default block cache size in MB
 /// Larger values improve read performance for frequently accessed data.
-pub const DEFAULT_BLOCK_CACHE_MB: usize = 512;
+pub const DEFAULT_BLOCK_CACHE_MB: usize = 1024;
 
 /// Default write buffer size in MB
 /// Larger values batch more writes before flushing to disk.
-pub const DEFAULT_WRITE_BUFFER_MB: usize = 128;
+pub const DEFAULT_WRITE_BUFFER_MB: usize = 256;
 
 /// Default number of background compaction jobs
 /// Scale with available CPU cores for better compaction throughput.
-pub const DEFAULT_BACKGROUND_JOBS: usize = 4;
+pub const DEFAULT_BACKGROUND_JOBS: usize = 8;
 
 /// Default memtable size in bytes (64MB)
-pub const DEFAULT_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MEMTABLE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Default max write buffer number
-pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
+pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 6;
 
 /// Default level0 file number trigger for compaction
-pub const DEFAULT_LEVEL0_FILE_NUM_COMPACTION_TRIGGER: i32 = 4;
+pub const DEFAULT_LEVEL0_FILE_NUM_COMPACTION_TRIGGER: i32 = 8;
 
 // =============================================================================
 // Reconciliation Defaults
@@ -97,13 +106,13 @@ pub const DEFAULT_SAMPLING_TARGET: usize = 200;
 // =============================================================================
 
 /// Maximum delay before flushing partial WAL batch (microseconds)
-pub const DEFAULT_WAL_COALESCE_DELAY_US: u64 = 100;
+pub const DEFAULT_WAL_COALESCE_DELAY_US: u64 = 500;
 
 /// Maximum records to coalesce before WAL flush
-pub const DEFAULT_WAL_COALESCE_RECORDS: usize = 1000;
+pub const DEFAULT_WAL_COALESCE_RECORDS: usize = 5000;
 
 /// WAL channel capacity for backpressure
-pub const DEFAULT_WAL_CHANNEL_CAPACITY: usize = 1000;
+pub const DEFAULT_WAL_CHANNEL_CAPACITY: usize = 5000;
 
 // =============================================================================
 // Linker State Cache Defaults (for billion-scale)
@@ -129,7 +138,14 @@ pub const DEFAULT_DIRTY_BUFFER_SIZE: usize = 100_000;
 // =============================================================================
 
 /// Default batch size for record processing
-pub const DEFAULT_BATCH_SIZE: usize = 10_000;
+pub const DEFAULT_BATCH_SIZE: usize = 5000;
 
 /// Default channel buffer size for async processing
-pub const DEFAULT_CHANNEL_BUFFER: usize = 100;
+pub const DEFAULT_CHANNEL_BUFFER: usize = 500;
+
+/// Default router shard list for local/dev setups.
+pub fn default_router_shards() -> Vec<String> {
+    (0..DEFAULT_SHARD_COUNT)
+        .map(|idx| format!("{}:{}", DEFAULT_SHARD_HOST, DEFAULT_SHARD_BASE_PORT + idx as u16))
+        .collect()
+}

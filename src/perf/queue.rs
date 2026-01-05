@@ -13,10 +13,10 @@ use tokio::sync::oneshot;
 pub const QUEUE_CAPACITY: usize = 10_000;
 
 /// Maximum records per aggregated batch
-pub const MAX_BATCH_SIZE: usize = 1000;
+pub const MAX_BATCH_SIZE: usize = 5000;
 
 /// Maximum wait time before flushing partial batch
-pub const MAX_BATCH_WAIT: Duration = Duration::from_micros(500);
+pub const MAX_BATCH_WAIT: Duration = Duration::from_micros(2000);
 
 /// A job submitted to the ingest queue
 pub struct IngestJob {
@@ -260,8 +260,9 @@ mod tests {
     #[test]
     fn test_aggregator_flush_by_size() {
         let mut agg = BatchAggregator::new();
+        let jobs_needed = MAX_BATCH_SIZE / 100;
 
-        for i in 0..10 {
+        for i in 0..jobs_needed {
             let (tx, _rx) = oneshot::channel();
             agg.add(IngestJob {
                 records: Arc::new(vec![]),
@@ -271,11 +272,11 @@ mod tests {
                 submitted_at: Instant::now(),
             });
 
-            if i < 9 {
-                assert!(!agg.should_flush()); // < 1000 records
+            if i + 1 < jobs_needed {
+                assert!(!agg.should_flush()); // < MAX_BATCH_SIZE records
             }
         }
 
-        assert!(agg.should_flush()); // >= 1000 records
+        assert!(agg.should_flush()); // >= MAX_BATCH_SIZE records
     }
 }

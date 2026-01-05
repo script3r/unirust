@@ -10,7 +10,7 @@
 //!   --router http://127.0.0.1:50060 \
 //!   --shards "127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063" \
 //!   --streams 4 \
-//!   --batch 1000 \
+//!   --batch 5000 \
 //!   --overlap 0.1 \
 //!   --log /tmp/loadtest.log
 //! ```
@@ -72,7 +72,7 @@ impl Default for LoadTestConfig {
             router_addr: "http://127.0.0.1:50060".to_string(),
             shard_addrs: vec![],
             stream_count: 4,
-            batch_size: 1000,
+            batch_size: 5000,
             overlap_probability: 0.1,
             conflict_probability: 0.0,
             cross_shard_probability: 0.0,
@@ -163,7 +163,7 @@ OPTIONS:
     -r, --router <ADDR>   Router gRPC address (default: http://127.0.0.1:50060)
     -s, --shards <ADDRS>  Comma-separated shard addresses for direct metrics
     --streams <N>         Number of concurrent streams (default: 4)
-    --batch <N>           Batch size per request (default: 1000)
+    --batch <N>           Batch size per request (default: 5000)
     --overlap <F>         Overlap probability 0.0-1.0 (default: 0.1)
     --conflict <F>        Conflict probability 0.0-1.0 when overlapping (default: 0.0)
     --cross-shard <F>     Cross-shard merge probability 0.0-1.0 when overlapping (default: 0.0)
@@ -179,7 +179,7 @@ EXAMPLES:
     unirust_loadtest --count 100000 --router http://127.0.0.1:50060
 
     # Large scale with custom parallelism
-    unirust_loadtest -c 1000000 --streams 8 --batch 2000 --overlap 0.15
+    unirust_loadtest -c 1000000 --streams 8 --batch 5000 --overlap 0.15
 
     # Test with conflicts (10% overlap, 50% of overlaps have conflicts)
     unirust_loadtest -c 500000 --overlap 0.1 --conflict 0.5

@@ -104,6 +104,11 @@ harness = false
 name = "bench_diagnostic"
 harness = false
 
+# Distributed/sharded/streaming microbenchmarks (~2-4min)
+[[bench]]
+name = "bench_distributed"
+harness = false
+
 # Load test TUI binary
 [[bin]]
 name = "unirust_loadtest"

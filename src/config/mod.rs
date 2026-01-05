@@ -4,7 +4,7 @@
 //!
 //! # Example config file (unirust.toml)
 //! ```toml
-//! profile = "high-throughput"
+//! profile = "billion-scale-high-performance"
 //!
 //! [shard]
 //! listen = "0.0.0.0:50061"
@@ -13,7 +13,7 @@
 //!
 //! [router]
 //! listen = "0.0.0.0:50060"
-//! shards = ["shard-0:50061", "shard-1:50061"]
+//! shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061", "shard-3:50061", "shard-4:50061"]
 //! ```
 
 mod defaults;
@@ -86,8 +86,7 @@ pub enum Profile {
     Balanced,
     /// Optimized for low-latency responses
     LowLatency,
-    /// Optimized for maximum throughput (production default)
-    #[default]
+    /// Optimized for maximum throughput
     HighThroughput,
     /// Optimized for bulk data ingestion
     BulkIngest,
@@ -95,6 +94,9 @@ pub enum Profile {
     MemorySaver,
     /// For billion-scale datasets with persistent storage
     BillionScale,
+    /// For billion-scale datasets with larger caches (production default)
+    #[default]
+    BillionScaleHighPerformance,
 }
 
 impl Profile {
@@ -107,6 +109,7 @@ impl Profile {
             Profile::BulkIngest => TuningProfile::BulkIngest,
             Profile::MemorySaver => TuningProfile::MemorySaver,
             Profile::BillionScale => TuningProfile::BillionScale,
+            Profile::BillionScaleHighPerformance => TuningProfile::BillionScaleHighPerformance,
         }
     }
 }
@@ -162,7 +165,7 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             listen: DEFAULT_ROUTER_ADDR.parse().unwrap(),
-            shards: vec![DEFAULT_SHARD_ADDR.to_string()],
+            shards: default_router_shards(),
             shards_file: None,
             ontology: None,
             config_version: None,
@@ -298,7 +301,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = UniConfig::default();
-        assert_eq!(config.profile, Profile::HighThroughput);
+        assert_eq!(config.profile, Profile::BillionScaleHighPerformance);
         assert_eq!(config.shard.id, 0);
         assert_eq!(config.storage.block_cache_mb, DEFAULT_BLOCK_CACHE_MB);
     }
