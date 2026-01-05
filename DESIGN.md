@@ -119,12 +119,12 @@ Phase 2: Parallel Extraction (Rayon)
     │  Extract identity keys, strong ID summaries across all records
     ▼
 Phase 3: Sequential Linking
-    │  DSU merges with temporal guards (data dependencies require serialization)
+    │  DSU merges with temporal guards (serialized for correctness)
     ▼
 Result: Cluster assignments returned in original batch order
 ```
 
-This architecture achieves **4-5x throughput** over naive per-record processing by parallelizing the expensive extraction phase while keeping the DSU mutations sequential (required for correctness).
+Parallel extraction dominates compute time; DSU mutations are inherently sequential due to data dependencies but benefit from root caching.
 
 #### Phase 1: Key Extraction
 
@@ -687,12 +687,10 @@ Each partition runs independently with its own `Mutex<Partition>`. Rayon process
 
 | Workload | Records/sec | Notes |
 |----------|-------------|-------|
-| Pure ingest, no overlap | ~500K | Batch-parallel extraction dominates |
+| Pure ingest, no overlap | ~500K | Extraction-dominated |
 | 10% overlap probability | ~410K | Moderate DSU merge overhead |
 | 50% overlap probability | ~280K | Heavy merge workload |
 | With cross-shard reconciliation | ~380K | Periodic boundary sync |
-
-**Key optimization**: `process_batch_optimized()` uses `link_records_batch_parallel()` for parallel key extraction before sequential DSU updates.
 
 ### Memory Usage
 

@@ -218,8 +218,6 @@ Typical throughput on a 5-shard cluster (16 concurrent streams, batch size 5000)
 | 10% overlap | ~410K | 12ms |
 | With conflicts | ~300K | 16ms |
 
-The batch-parallel linker extracts identity keys in parallel (Rayon), then applies DSU merges sequentially. This architecture yields 4-5x throughput over naive per-record processing.
-
 ## Development
 
 ```bash
