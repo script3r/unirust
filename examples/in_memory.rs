@@ -43,10 +43,7 @@ fn main() -> anyhow::Result<()> {
 
     // Identity Key: Records with same (name + email) are candidates for merging
     // Using from_names() - no need to pre-intern attributes!
-    ontology.add_identity_key(IdentityKey::from_names(
-        vec!["name", "email"],
-        "name_email",
-    ));
+    ontology.add_identity_key(IdentityKey::from_names(vec!["name", "email"], "name_email"));
 
     // Strong Identifier: SSN uniquely identifies a person
     // If two records have different SSNs, they CANNOT be merged

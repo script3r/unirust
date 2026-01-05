@@ -240,7 +240,11 @@ impl Unirust {
     /// Any identity keys, strong identifiers, or constraints created with string-based
     /// APIs (e.g., `IdentityKey::from_names`) will have their attribute names automatically
     /// interned using the store's interner.
-    pub fn with_store_and_tuning<S>(mut ontology: Ontology, mut store: S, tuning: StreamingTuning) -> Self
+    pub fn with_store_and_tuning<S>(
+        mut ontology: Ontology,
+        mut store: S,
+        tuning: StreamingTuning,
+    ) -> Self
     where
         S: RecordStore + 'static,
     {

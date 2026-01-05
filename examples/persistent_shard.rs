@@ -81,10 +81,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut ontology = Ontology::new();
 
-    ontology.add_identity_key(IdentityKey::from_names(
-        vec!["name", "email"],
-        "name_email",
-    ));
+    ontology.add_identity_key(IdentityKey::from_names(vec!["name", "email"], "name_email"));
 
     ontology.add_strong_identifier(StrongIdentifier::from_name("ssn", "ssn_unique"));
 
