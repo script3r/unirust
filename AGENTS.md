@@ -11,8 +11,9 @@ Unirust is a distributed temporal entity resolution engine. The primary function
 ### Entity Resolution Must Always Happen
 
 Every ingested record MUST go through entity resolution. Never skip or bypass:
-- `linker.link_record()` - links a single record
-- `partitioned.ingest_batch()` - batch processing with entity resolution
+- `linker.link_records_batch_parallel()` - batch links with parallel extraction
+- `partitioned.process_batch_optimized()` - optimized partition processing
+- `partitioned.ingest_batch()` - distributed batch processing
 
 Any optimization that skips entity resolution is incorrect and breaks the core value proposition.
 
@@ -54,9 +55,10 @@ src/
 
 ### Ingest Flow
 1. `distributed.rs:ShardNode::ingest_records()` - gRPC entry
-2. `distributed.rs:dispatch_ingest_partitioned()` - dispatches to partitioned processing
-3. `partitioned.rs:ingest_batch()` - parallel partition processing
-4. `linker.rs:link_record()` - actual entity resolution
+2. `distributed.rs:dispatch_ingest_partitioned()` - routes to partitioned processing
+3. `partitioned.rs:ParallelPartitionedUnirust::ingest_batch_with_partitions()` - parallel partition dispatch
+4. `partitioned.rs:Partition::process_batch_optimized()` - **hot path**: batch insert → parallel extract → sequential link
+5. `linker.rs:link_records_batch_parallel()` - parallel key extraction, sequential DSU merges
 
 ### Query Flow
 1. `distributed.rs:RouterService::query_entities()` - gRPC entry
@@ -78,19 +80,20 @@ src/
 ### Load Testing
 - Use `unirust_loadtest` binary
 - Standard command: `./target/release/unirust_loadtest -r http://127.0.0.1:50060 -c 10000000 --streams 16 --batch 5000`
-- Baseline: ~550K rec/sec with 5 shards
+- Baseline with 5 shards, 10% overlap: **~410K rec/sec, ~12ms batch latency**
 
 ## Performance Considerations
 
 ### Do Not Regress
 After any change, verify performance with loadtest. Current baseline with 5 shards:
-- ~550K records/second
-- ~9ms batch latency
+- **~410K records/second** (10% overlap)
+- **~12ms batch latency**
 
 ### Hot Paths
-- `linker.rs:link_record()` - most CPU time
-- `dsu.rs:find_root()` - frequent path compression
-- `distributed.rs:dispatch_ingest_partitioned()` - batch processing
+- `partitioned.rs:process_batch_optimized()` - batch insert + parallel extract + sequential link
+- `linker.rs:link_records_batch_parallel()` - parallel extraction, sequential DSU
+- `linker.rs:link_extracted_record()` - DSU merges with temporal guards
+- `dsu.rs:find()` - path compression with root cache
 
 ### Avoid
 - Unnecessary cloning of large structures
@@ -131,13 +134,18 @@ cargo fmt                           # Format
 cargo bench --bench bench_quick     # Fast (~30s)
 cargo bench --bench bench_micro     # Component benchmarks
 
-# Load test (requires running cluster)
-./target/release/unirust_loadtest -r http://127.0.0.1:50060 -c 10000000 --streams 16 --batch 5000
+# Start cluster (recommended)
+SHARDS=5 ./scripts/cluster.sh start
 
-# Start cluster
-./target/release/unirust_router --port 50060 --shards 5
-./target/release/unirust_shard --port 50061 --shard-id 0 --data-dir /tmp/shard0
-# ... repeat for shards 1-4
+# Load test (requires running cluster)
+./target/release/unirust_loadtest \
+  --router http://127.0.0.1:50060 \
+  --count 10000000 \
+  --streams 16 \
+  --batch 5000
+
+# Stop cluster
+./scripts/cluster.sh stop
 ```
 
 ## Style Guidelines

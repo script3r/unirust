@@ -22,11 +22,11 @@ Unirust will:
 
 ## Features
 
-- **Temporal Awareness**: All data has validity intervals - merges and conflicts are evaluated per-time-period
+- **Temporal Awareness**: All data has validity intervals—merges and conflicts are evaluated per-time-period
 - **Conflict Detection**: Automatic detection of attribute conflicts within clusters
 - **Distributed**: Router + multi-shard architecture for horizontal scaling
 - **Persistent**: RocksDB storage with crash recovery
-- **High Performance**: Lock-free data structures, SIMD hashing, async WAL
+- **High Performance**: 400K+ records/sec via batch-parallel processing, lock-free DSU, SIMD hashing
 
 ## Quick Start
 
@@ -210,13 +210,15 @@ cargo run --example cluster
 
 ## Performance
 
-Typical throughput on a 5-shard cluster (modern hardware):
+Typical throughput on a 5-shard cluster (16 concurrent streams, batch size 5000):
 
-| Workload | Records/sec |
-|----------|-------------|
-| Pure ingest | ~500K |
-| 10% overlap | ~400K |
-| With conflicts | ~250K |
+| Workload | Records/sec | Batch Latency |
+|----------|-------------|---------------|
+| Pure ingest | ~500K | 8ms |
+| 10% overlap | ~410K | 12ms |
+| With conflicts | ~300K | 16ms |
+
+The batch-parallel linker extracts identity keys in parallel (Rayon), then applies DSU merges sequentially. This architecture yields 4-5x throughput over naive per-record processing.
 
 ## Development
 
@@ -227,11 +229,12 @@ cargo test
 # Run quick benchmarks (~30s)
 cargo bench --bench bench_quick
 
-# Run load test
+# Run load test (start cluster first: SHARDS=5 ./scripts/cluster.sh start)
 ./target/release/unirust_loadtest \
-  --endpoint http://127.0.0.1:50060 \
-  --count 1000000 \
-  --streams 16
+  --router http://127.0.0.1:50060 \
+  --count 10000000 \
+  --streams 16 \
+  --batch 5000
 
 # Format and lint
 cargo fmt

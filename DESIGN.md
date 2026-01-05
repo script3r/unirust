@@ -109,20 +109,22 @@ All data has temporal validity. An **Interval** `[start, end)` defines when a de
 
 ### Streaming Linker
 
-The core algorithm processes records in four phases:
+The core algorithm uses **batch-parallel processing** for high throughput. Within each partition, records are processed in three phases:
 
 ```
-Phase 1 (Parallel): Extract identity key values from records
-    │
+Phase 1: Batch Store Insertion
+    │  All records added to store, collecting (index, record_id) pairs
     ▼
-Phase 2 (Sequential): Query identity index for candidate clusters
-    │
+Phase 2: Parallel Extraction (Rayon)
+    │  Extract identity keys, strong ID summaries across all records
     ▼
-Phase 3 (Sequential): Merge clusters via DSU with temporal guards
-    │
+Phase 3: Sequential Linking
+    │  DSU merges with temporal guards (data dependencies require serialization)
     ▼
-Phase 4 (Parallel): Finalize cluster assignments
+Result: Cluster assignments returned in original batch order
 ```
+
+This architecture achieves **4-5x throughput** over naive per-record processing by parallelizing the expensive extraction phase while keeping the DSU mutations sequential (required for correctness).
 
 #### Phase 1: Key Extraction
 
@@ -579,28 +581,38 @@ fn wal_writer_loop(rx: Receiver<WalEntry>, config: WalConfig) {
 
 ### Partitioned Processing
 
-For maximum throughput, records are partitioned for parallel processing:
+For maximum throughput, records are partitioned by identity key hash for parallel processing. Each partition uses `process_batch_optimized()`:
 
 ```
                     ┌──────────────────────┐
                     │   Incoming Records   │
                     └──────────┬───────────┘
                                │
+                    ┌──────────▼───────────┐
+                    │  Partition by Hash   │  (identity_key_hash % partition_count)
+                    └──────────┬───────────┘
+                               │
           ┌────────────────────┼────────────────────┐
           │                    │                    │
    ┌──────▼──────┐     ┌──────▼──────┐     ┌──────▼──────┐
    │ Partition 0 │     │ Partition 1 │     │ Partition N │
-   │ Local DSU   │     │ Local DSU   │     │ Local DSU   │
-   │ Local Index │     │ Local Index │     │ Local Index │
+   │             │     │             │     │             │
+   │ 1. Batch    │     │ 1. Batch    │     │ 1. Batch    │
+   │    Insert   │     │    Insert   │     │    Insert   │
+   │ 2. Parallel │     │ 2. Parallel │     │ 2. Parallel │
+   │    Extract  │     │    Extract  │     │    Extract  │
+   │ 3. Seq Link │     │ 3. Seq Link │     │ 3. Seq Link │
    └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
           │                    │                    │
           └────────────────────┼────────────────────┘
                                │
                     ┌──────────▼───────────┐
-                    │ Cross-Partition      │
-                    │ Merge Queue          │
+                    │  Merge & Sort by     │
+                    │  Original Index      │
                     └──────────────────────┘
 ```
+
+Each partition runs independently with its own `Mutex<Partition>`. Rayon processes all partitions in parallel—no global lock contention.
 
 ---
 
@@ -609,18 +621,19 @@ For maximum throughput, records are partitioned for parallel processing:
 ### Ingest Path
 
 ```
-1. Client sends RecordInput via gRPC
-2. Router hashes identity key → target shard
-3. Shard receives record batch
-4. Store stages records (dedup check by identity)
-5. For each record:
-   a. Extract identity key values
-   b. Query identity index for candidates
-   c. For each candidate: attempt DSU merge with temporal guards
-   d. Update identity index with new record
-6. Flush staged records to RocksDB
-7. Update boundary index for cross-shard tracking
-8. Return cluster assignments
+1. Client sends RecordInput batch via gRPC
+2. Router hashes identity keys → partition records to shards
+3. Each shard receives its partition of the batch
+4. dispatch_ingest_partitioned() routes to ParallelPartitionedUnirust
+5. Records partitioned again by identity_key_hash % partition_count
+6. Each partition (in parallel via Rayon):
+   a. Batch insert all records to store
+   b. Parallel extract: identity keys + strong ID summaries (Rayon)
+   c. Sequential link: DSU merges with temporal guards
+   d. Update identity index
+7. Merge partition results, sort by original index
+8. Update boundary index for cross-shard tracking
+9. Return cluster assignments
 ```
 
 ### Query Path
@@ -670,14 +683,16 @@ For maximum throughput, records are partitioned for parallel processing:
 
 ## Appendix: Performance Characteristics
 
-### Throughput (5-shard cluster)
+### Throughput (5-shard cluster, 16 streams, batch size 5000)
 
-| Workload | Records/sec |
-|----------|-------------|
-| Pure ingest, no conflicts | ~500K |
-| 10% overlap probability | ~400K |
-| 50% overlap probability | ~250K |
-| With reconciliation enabled | ~350K |
+| Workload | Records/sec | Notes |
+|----------|-------------|-------|
+| Pure ingest, no overlap | ~500K | Batch-parallel extraction dominates |
+| 10% overlap probability | ~410K | Moderate DSU merge overhead |
+| 50% overlap probability | ~280K | Heavy merge workload |
+| With cross-shard reconciliation | ~380K | Periodic boundary sync |
+
+**Key optimization**: `process_batch_optimized()` uses `link_records_batch_parallel()` for parallel key extraction before sequential DSU updates.
 
 ### Memory Usage
 

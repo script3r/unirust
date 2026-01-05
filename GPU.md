@@ -845,4 +845,4 @@ detect_cross_shard_conflicts<<<grid, block, 0, stream>>>(args...);
 ---
 
 *Document generated: 2025-01-04*
-*Last updated: Initial version*
+*Last updated: 2025-01-05 (baseline updated to 410K rec/sec after batch-parallel optimization)*
