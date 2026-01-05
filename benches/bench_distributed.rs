@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tonic::Request;
+use unirust_rs::distributed::proto::shard_service_server::ShardService;
 use unirust_rs::distributed::{
     proto, ClusterLocalityIndex, ConstraintConfig, ConstraintKind, DistributedOntologyConfig,
     IdentityKeyConfig, ShardNode,
