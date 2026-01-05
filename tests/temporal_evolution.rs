@@ -977,7 +977,8 @@ async fn same_cluster_regardless_of_insertion_order() -> anyhow::Result<()> {
         vec![1, 2, 0], // B, C, A
     ];
 
-    let records = [record_input(
+    let records = [
+        record_input(
             0,
             "person",
             "crm",
@@ -997,7 +998,8 @@ async fn same_cluster_regardless_of_insertion_order() -> anyhow::Result<()> {
             "hr",
             "rec_C",
             vec![("email", "shared@example.com", 0, 100)],
-        )];
+        ),
+    ];
 
     let mut all_record_clusters: Vec<Vec<u32>> = Vec::new();
 
