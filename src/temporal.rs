@@ -238,19 +238,16 @@ pub fn allen_relation(a: &Interval, b: &Interval) -> AllenRelation {
 }
 
 /// Check if two intervals are adjacent (meet)
+#[inline]
 pub fn is_adjacent(a: &Interval, b: &Interval) -> bool {
-    allen_relation(a, b) == AllenRelation::Meets || allen_relation(a, b) == AllenRelation::MetBy
+    a.end == b.start || b.end == a.start
 }
 
 /// Check if two intervals overlap
+#[inline]
 pub fn is_overlapping(a: &Interval, b: &Interval) -> bool {
-    !matches!(
-        allen_relation(a, b),
-        AllenRelation::Precedes
-            | AllenRelation::PrecededBy
-            | AllenRelation::Meets
-            | AllenRelation::MetBy
-    )
+    // Half-open intervals overlap unless one ends at or before the other's start.
+    a.start < b.end && b.start < a.end
 }
 
 /// Compute the intersection of two intervals
