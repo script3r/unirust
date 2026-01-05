@@ -6,6 +6,7 @@ use rocksdb::{
     checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +20,21 @@ const CF_INDEX_TEMPORAL_BUCKET: &str = "index_temporal_bucket";
 const CF_INDEX_IDENTITY: &str = "index_identity";
 const CF_CONFLICT_SUMMARIES: &str = "conflict_summaries";
 const CF_CLUSTER_ASSIGNMENTS: &str = "cluster_assignments";
+
+thread_local! {
+    static RECORD_SER_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+}
+
+fn with_record_bytes<R, F>(record: &Record, f: F) -> Result<R>
+where
+    F: FnOnce(&[u8]) -> Result<R>,
+{
+    RECORD_SER_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        record.encode_into(&mut buf).map_err(|err| anyhow!(err))?;
+        f(&buf)
+    })
+}
 
 // DSU persistence column families
 const CF_DSU_PARENT: &str = "dsu_parent";
@@ -229,8 +245,10 @@ impl PersistentStore {
             .cf_handle(CF_RECORDS)
             .ok_or_else(|| anyhow!("missing records column family"))?;
         let key = record.id.0.to_be_bytes();
-        let bytes = bincode::serialize(record)?;
-        self.db.put_cf(records_cf, key, bytes)?;
+        with_record_bytes(record, |bytes| {
+            self.db.put_cf(records_cf, key, bytes)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -348,8 +366,10 @@ impl PersistentStore {
 
         for record in &records {
             let key = record.id.0.to_be_bytes();
-            let bytes = bincode::serialize(record)?;
-            batch.put_cf(records_cf, key, bytes);
+            with_record_bytes(record, |bytes| {
+                batch.put_cf(records_cf, key, bytes);
+                Ok(())
+            })?;
             self.index_record_with_batch(record, &mut batch)?;
         }
 
@@ -401,8 +421,10 @@ impl RecordStore for PersistentStore {
             .cf_handle(CF_RECORDS)
             .ok_or_else(|| anyhow!("missing records column family"))?;
         let key = record_id.0.to_be_bytes();
-        let bytes = bincode::serialize(&record)?;
-        batch.put_cf(records_cf, key, bytes);
+        with_record_bytes(&record, |bytes| {
+            batch.put_cf(records_cf, key, bytes);
+            Ok(())
+        })?;
         self.index_record_with_batch(&record, &mut batch)?;
         self.persist_interner(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
@@ -431,8 +453,10 @@ impl RecordStore for PersistentStore {
         for mut record in records {
             let record_id = self.inner.prepare_record(&mut record)?;
             let key = record_id.0.to_be_bytes();
-            let bytes = bincode::serialize(&record)?;
-            batch.put_cf(records_cf, key, bytes);
+            with_record_bytes(&record, |bytes| {
+                batch.put_cf(records_cf, key, bytes);
+                Ok(())
+            })?;
             prepared_records.push(record);
         }
 
@@ -507,8 +531,10 @@ impl RecordStore for PersistentStore {
         for mut record in new_records {
             let record_id = self.inner.prepare_record(&mut record)?;
             let key = record_id.0.to_be_bytes();
-            let bytes = bincode::serialize(&record)?;
-            batch.put_cf(records_cf, key, bytes);
+            with_record_bytes(&record, |bytes| {
+                batch.put_cf(records_cf, key, bytes);
+                Ok(())
+            })?;
             assigned_ids.push(record_id);
             prepared_records.push(record);
         }

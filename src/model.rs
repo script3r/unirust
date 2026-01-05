@@ -230,6 +230,12 @@ impl Record {
         }
     }
 
+    /// Serialize into a reusable buffer to avoid per-record allocations.
+    pub fn encode_into(&self, buffer: &mut Vec<u8>) -> bincode::Result<()> {
+        buffer.clear();
+        bincode::serialize_into(buffer, self)
+    }
+
     /// Get descriptors for a specific attribute
     pub fn descriptors_for_attr(&self, attr: AttrId) -> Vec<&Descriptor> {
         self.descriptors.iter().filter(|d| d.attr == attr).collect()

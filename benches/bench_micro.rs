@@ -730,9 +730,10 @@ fn bench_record_serde(c: &mut Criterion) {
                 },
                 |records| {
                     let mut total_bytes = 0usize;
+                    let mut buffer: Vec<u8> = Vec::new();
                     for record in &records {
-                        let bytes = bincode::serialize(record).unwrap();
-                        total_bytes += bytes.len();
+                        record.encode_into(&mut buffer).unwrap();
+                        total_bytes += buffer.len();
                     }
                     black_box(total_bytes)
                 },
