@@ -10,6 +10,7 @@ use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
 use hashbrown::HashMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 // use std::collections::HashSet;
 
@@ -84,7 +85,7 @@ struct IntervalEvent {
     time: i64,
     kind: EventKind,
     value: ValueId,
-    participants: Participants,
+    participants: Option<Participants>,
 }
 
 impl IntervalEvent {
@@ -93,7 +94,7 @@ impl IntervalEvent {
             time,
             kind: EventKind::Start,
             value,
-            participants,
+            participants: Some(participants),
         }
     }
 
@@ -102,7 +103,7 @@ impl IntervalEvent {
             time,
             kind: EventKind::End,
             value,
-            participants: Participants::Many(Vec::new()),
+            participants: None,
         }
     }
 }
@@ -536,8 +537,9 @@ impl ConflictDetector {
         attribute: AttrId,
         entity_id: RecordId,
     ) -> Result<Vec<DirectConflict>> {
-        let mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>> =
-            HashMap::with_capacity(descriptors.len());
+        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> =
+            FxHashMap::default();
+        descriptors_by_value.reserve(descriptors.len());
         for (value, interval) in descriptors {
             descriptors_by_value
                 .entry(value)
@@ -559,8 +561,9 @@ impl ConflictDetector {
         descriptors: Vec<(RecordId, ValueId, Interval)>,
         attribute: AttrId,
     ) -> Result<Vec<DirectConflict>> {
-        let mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>> =
-            HashMap::with_capacity(descriptors.len() / 4 + 1);
+        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> =
+            FxHashMap::default();
+        descriptors_by_value.reserve(descriptors.len() / 4 + 1);
         for (record_id, value, interval) in descriptors {
             descriptors_by_value
                 .entry(value)
@@ -605,7 +608,7 @@ impl ConflictDetector {
 
     fn detect_conflicts_from_value_intervals(
         attribute: AttrId,
-        mut descriptors_by_value: HashMap<ValueId, Vec<ValueInterval>>,
+        mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>>,
     ) -> Vec<DirectConflict> {
         let mut conflicts = Vec::new();
 
@@ -617,6 +620,8 @@ impl ConflictDetector {
         // Calculate total event count for pre-allocation
         let event_count: usize = descriptors_by_value.values().map(|v| v.len() * 2).sum();
         let mut events = Vec::with_capacity(event_count);
+
+        let active_capacity = descriptors_by_value.len();
 
         // Consume the HashMap to avoid cloning participants
         for (value, intervals) in descriptors_by_value {
@@ -632,7 +637,8 @@ impl ConflictDetector {
 
         events.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| a.kind.cmp(&b.kind)));
 
-        let mut active: HashMap<ValueId, Participants> = HashMap::new();
+        let mut active: FxHashMap<ValueId, Participants> = FxHashMap::default();
+        active.reserve(active_capacity);
         let mut last_time: Option<i64> = None;
 
         for event in events {
@@ -659,7 +665,9 @@ impl ConflictDetector {
                 }
                 EventKind::Start => {
                     // Participants already sorted/deduped by merge_value_intervals
-                    active.insert(event.value, event.participants);
+                    if let Some(participants) = event.participants {
+                        active.insert(event.value, participants);
+                    }
                 }
             }
 
@@ -731,7 +739,7 @@ impl ConflictDetector {
 
         // For each atomic interval, find which values are active
         for atom in &atoms {
-            let mut active_values: HashMap<ValueId, Vec<RecordId>> = HashMap::new();
+            let mut active_values: FxHashMap<ValueId, Vec<RecordId>> = FxHashMap::default();
 
             for (record_id, value, interval) in &descriptors {
                 if crate::temporal::encloses(interval, atom) {
