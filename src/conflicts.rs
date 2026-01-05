@@ -741,10 +741,7 @@ impl ConflictDetector {
 
             for (record_id, value, interval) in &descriptors {
                 if crate::temporal::encloses(interval, atom) {
-                    active_values
-                        .entry(*value)
-                        .or_insert_with(Vec::new)
-                        .push(*record_id);
+                    active_values.entry(*value).or_default().push(*record_id);
                 }
             }
 
