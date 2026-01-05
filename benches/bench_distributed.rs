@@ -557,7 +557,7 @@ fn bench_cluster_locality_index(c: &mut Criterion) {
 
     group.bench_function("lookup_misses", |b| {
         b.iter_batched(
-            || ClusterLocalityIndex::new(),
+            ClusterLocalityIndex::new,
             |mut index| {
                 let mut misses = 0usize;
                 for sig in &signatures {
@@ -611,8 +611,7 @@ fn bench_reconciliation(c: &mut Criterion) {
                         boundaries.push(ClusterBoundaryIndex::new_small(shard as u16));
                     }
 
-                    let mut idx = 0usize;
-                    for sig in &signatures {
+                    for (idx, sig) in signatures.iter().enumerate() {
                         for entry_idx in 0..entries_per_key {
                             let shard = (idx + entry_idx) % shard_count;
                             let cluster_id =
@@ -621,7 +620,6 @@ fn bench_reconciliation(c: &mut Criterion) {
                                 Interval::new(0, 100 + entry_idx as i64).expect("valid interval");
                             boundaries[shard].register_boundary_key(*sig, cluster_id, interval);
                         }
-                        idx += 1;
                     }
 
                     let key_set = signatures
