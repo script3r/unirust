@@ -179,8 +179,8 @@ pub mod advanced {
     pub use crate::persistence::LinkerStatePersistence;
     pub use crate::query::{QueryConflict, QueryDescriptorOverlap};
     pub use crate::sharding::{
-        BloomFilter, BoundaryEntry, BoundaryMetadata, ClusterBoundaryIndex, IdentityKeySignature,
-        IncrementalReconciler, ReconciliationResult,
+        BloomFilter, BoundaryEntry, BoundaryMetadata, ClusterBoundaryIndex, CrossShardConflict,
+        IdentityKeySignature, IncrementalReconciler, ReconciliationResult,
     };
     pub use crate::store::StoreMetrics;
 }

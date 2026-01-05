@@ -379,6 +379,10 @@ message ClusterBoundaryEntry {
   int64 interval_start = 2;
   int64 interval_end = 3;
   uint32 shard_id = 4;
+  // Strong ID hashes per perspective for cross-shard conflict detection.
+  // Key: perspective name hash, Value: hash of strong ID values.
+  // Two clusters conflict if they share a perspective but have different values.
+  map<uint64, uint64> perspective_strong_ids = 5;
 }
 
 message BoundaryMetadata {
@@ -449,6 +453,30 @@ message ApplyMergeResponse {
   string error = 3;
 }
 
+// --- Cross-Shard Conflict Propagation ---
+
+// A cross-shard conflict detected during reconciliation.
+// This is an indirect conflict where clusters share an identity key
+// but have conflicting strong identifiers in the same perspective.
+message CrossShardConflict {
+  IdentityKeySignature identity_key_signature = 1;
+  GlobalClusterId cluster1 = 2;
+  GlobalClusterId cluster2 = 3;
+  int64 interval_start = 4;
+  int64 interval_end = 5;
+  uint64 perspective_hash = 6;
+  uint64 strong_id_hash1 = 7;
+  uint64 strong_id_hash2 = 8;
+}
+
+message StoreCrossShardConflictsRequest {
+  repeated CrossShardConflict conflicts = 1;
+}
+
+message StoreCrossShardConflictsResponse {
+  uint32 stored_count = 1;
+}
+
 // --- Streaming Ingest ---
 
 message IngestRecordsChunk {
@@ -493,4 +521,7 @@ service ShardService {
   rpc ApplyMerge(ApplyMergeRequest) returns (ApplyMergeResponse);
   rpc GetDirtyBoundaryKeys(GetDirtyBoundaryKeysRequest) returns (GetDirtyBoundaryKeysResponse);
   rpc ClearDirtyKeys(ClearDirtyKeysRequest) returns (ClearDirtyKeysResponse);
+
+  // Cross-shard conflict propagation
+  rpc StoreCrossShardConflicts(StoreCrossShardConflictsRequest) returns (StoreCrossShardConflictsResponse);
 }

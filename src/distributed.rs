@@ -678,6 +678,10 @@ pub struct ShardNode {
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     config_version: String,
     metrics: Arc<PerfMetrics>,
+    /// Cross-shard conflicts detected during reconciliation.
+    /// These are indirect conflicts where clusters on different shards share
+    /// an identity key but have conflicting strong identifiers.
+    cross_shard_conflicts: Arc<parking_lot::RwLock<Vec<crate::sharding::CrossShardConflict>>>,
 }
 
 const INGEST_QUEUE_CAPACITY: usize = 1024; // Increased from 128 for high-throughput
@@ -739,10 +743,23 @@ impl ShardNode {
         repair_on_start: bool,
         config_version: Option<String>,
     ) -> AnyResult<Self> {
-        // Set shard_id in tuning and enable boundary tracking for cross-shard reconciliation
+        // Set shard_id in tuning and enable boundary tracking for cross-shard reconciliation.
+        // Boundary tracking is REQUIRED for distributed mode - it enables cross-shard conflict
+        // detection. Without it, conflicts between records on different shards go undetected.
         let tuning = tuning
             .with_shard_id(shard_id as u16)
             .with_boundary_tracking(true);
+
+        // Defensive check: fail fast if boundary tracking is somehow disabled.
+        // This should never happen since we just enabled it, but guards against
+        // future refactoring that might accidentally break this invariant.
+        if !tuning.enable_boundary_tracking {
+            anyhow::bail!(
+                "ShardNode requires enable_boundary_tracking=true for cross-shard conflict detection. \
+                 Distributed mode cannot safely operate without boundary tracking enabled."
+            );
+        }
+
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         let worker_count = ingest_worker_count();
         let use_partitioned = is_partitioned_enabled();
@@ -791,6 +808,7 @@ impl ShardNode {
                 ingest_txs,
                 config_version,
                 metrics: Arc::new(PerfMetrics::new()),
+                cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
             });
         }
 
@@ -843,6 +861,7 @@ impl ShardNode {
             ingest_txs,
             config_version,
             metrics: Arc::new(PerfMetrics::new()),
+            cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -1933,6 +1952,34 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
             summaries.retain(|summary| crate::temporal::is_overlapping(&summary.interval, &filter));
         }
+
+        // Add cross-shard conflicts (indirect conflicts from reconciliation)
+        let cross_shard_conflicts = self.cross_shard_conflicts.read();
+        for conflict in cross_shard_conflicts.iter() {
+            // Apply same filters
+            if request.end > request.start {
+                let filter = Interval::new(request.start, request.end)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+                if !crate::temporal::is_overlapping(&conflict.interval, &filter) {
+                    continue;
+                }
+            }
+
+            // Convert to ConflictSummary
+            summaries.push(ConflictSummary {
+                kind: "indirect_cross_shard".to_string(),
+                attribute: None, // We only have hash, not the actual attribute name
+                interval: conflict.interval,
+                records: vec![],
+                cause: Some(format!(
+                    "Cross-shard conflict: clusters {}:{} and {}:{} share identity key but have different strong IDs in same perspective",
+                    conflict.cluster1.shard_id, conflict.cluster1.local_id,
+                    conflict.cluster2.shard_id, conflict.cluster2.local_id
+                )),
+            });
+        }
+        drop(cross_shard_conflicts);
+
         let response = proto::ListConflictsResponse {
             conflicts: summaries
                 .into_iter()
@@ -2015,6 +2062,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                                         interval_start: e.interval.start,
                                         interval_end: e.interval.end,
                                         shard_id: e.shard_id as u32,
+                                        perspective_strong_ids: e.perspective_strong_ids.clone(),
                                     })
                                     .collect(),
                             })
@@ -2128,6 +2176,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                             interval_start: e.interval.start,
                             interval_end: e.interval.end,
                             shard_id: e.shard_id as u32,
+                            perspective_strong_ids: e.perspective_strong_ids.clone(),
                         })
                         .collect();
 
@@ -2179,6 +2228,73 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         Ok(Response::new(proto::ClearDirtyKeysResponse {
             keys_cleared,
+        }))
+    }
+
+    async fn store_cross_shard_conflicts(
+        &self,
+        request: Request<proto::StoreCrossShardConflictsRequest>,
+    ) -> Result<Response<proto::StoreCrossShardConflictsResponse>, Status> {
+        let req = request.into_inner();
+        let conflicts: Vec<crate::sharding::CrossShardConflict> = req
+            .conflicts
+            .into_iter()
+            .filter_map(|c| {
+                let sig = c.identity_key_signature.as_ref()?;
+                if sig.signature.len() != 32 {
+                    return None;
+                }
+                let mut sig_bytes = [0u8; 32];
+                sig_bytes.copy_from_slice(&sig.signature);
+
+                let cluster1 = c.cluster1.as_ref()?;
+                let cluster2 = c.cluster2.as_ref()?;
+
+                let interval = Interval::new(c.interval_start, c.interval_end).ok()?;
+
+                Some(crate::sharding::CrossShardConflict {
+                    identity_key_signature: crate::sharding::IdentityKeySignature::from_bytes(
+                        sig_bytes,
+                    ),
+                    cluster1: GlobalClusterId::new(
+                        cluster1.shard_id as u16,
+                        cluster1.local_id,
+                        cluster1.version as u16,
+                    ),
+                    cluster2: GlobalClusterId::new(
+                        cluster2.shard_id as u16,
+                        cluster2.local_id,
+                        cluster2.version as u16,
+                    ),
+                    interval,
+                    perspective_hash: c.perspective_hash,
+                    strong_id_hash1: c.strong_id_hash1,
+                    strong_id_hash2: c.strong_id_hash2,
+                })
+            })
+            .collect();
+
+        let stored_count = conflicts.len() as u32;
+
+        // Store conflicts - keep only those relevant to this shard
+        let shard_id = self.shard_id as u16;
+        let mut conflict_storage = self.cross_shard_conflicts.write();
+        for conflict in conflicts {
+            // Store if either cluster belongs to this shard
+            if conflict.cluster1.shard_id == shard_id || conflict.cluster2.shard_id == shard_id {
+                // Avoid duplicates - check if already stored
+                if !conflict_storage.iter().any(|c| {
+                    c.cluster1 == conflict.cluster1
+                        && c.cluster2 == conflict.cluster2
+                        && c.interval == conflict.interval
+                }) {
+                    conflict_storage.push(conflict);
+                }
+            }
+        }
+
+        Ok(Response::new(proto::StoreCrossShardConflictsResponse {
+            stored_count,
         }))
     }
 }
@@ -2577,7 +2693,12 @@ impl RouterNode {
                                 entry.interval_start,
                                 entry.interval_end,
                             ) {
-                                boundary.register_boundary_key(*sig, cluster_id, interval);
+                                boundary.register_boundary_key_with_strong_ids(
+                                    *sig,
+                                    cluster_id,
+                                    interval,
+                                    entry.perspective_strong_ids.clone(),
+                                );
                             }
                         }
                     }
@@ -2630,6 +2751,61 @@ impl RouterNode {
                                 version: secondary.version as u32,
                             }),
                         }))
+                        .await;
+                }
+            }
+        }
+
+        // Propagate detected conflicts to affected shards
+        if !result.detected_conflicts.is_empty() {
+            // Group conflicts by shard
+            let mut conflicts_by_shard: std::collections::HashMap<
+                u16,
+                Vec<proto::CrossShardConflict>,
+            > = std::collections::HashMap::new();
+
+            for conflict in &result.detected_conflicts {
+                let proto_conflict = proto::CrossShardConflict {
+                    identity_key_signature: Some(proto::IdentityKeySignature {
+                        signature: conflict.identity_key_signature.to_bytes().to_vec(),
+                    }),
+                    cluster1: Some(proto::GlobalClusterId {
+                        shard_id: conflict.cluster1.shard_id as u32,
+                        local_id: conflict.cluster1.local_id,
+                        version: conflict.cluster1.version as u32,
+                    }),
+                    cluster2: Some(proto::GlobalClusterId {
+                        shard_id: conflict.cluster2.shard_id as u32,
+                        local_id: conflict.cluster2.local_id,
+                        version: conflict.cluster2.version as u32,
+                    }),
+                    interval_start: conflict.interval.start,
+                    interval_end: conflict.interval.end,
+                    perspective_hash: conflict.perspective_hash,
+                    strong_id_hash1: conflict.strong_id_hash1,
+                    strong_id_hash2: conflict.strong_id_hash2,
+                };
+
+                // Send to both shards involved
+                conflicts_by_shard
+                    .entry(conflict.cluster1.shard_id)
+                    .or_default()
+                    .push(proto_conflict.clone());
+                if conflict.cluster2.shard_id != conflict.cluster1.shard_id {
+                    conflicts_by_shard
+                        .entry(conflict.cluster2.shard_id)
+                        .or_default()
+                        .push(proto_conflict);
+                }
+            }
+
+            // Send conflicts to each shard
+            for (shard_id, conflicts) in conflicts_by_shard {
+                if let Ok(mut client) = self.shard_client(shard_id as u32) {
+                    let _ = client
+                        .store_cross_shard_conflicts(Request::new(
+                            proto::StoreCrossShardConflictsRequest { conflicts },
+                        ))
                         .await;
                 }
             }
@@ -3243,7 +3419,12 @@ impl proto::router_service_server::RouterService for RouterNode {
                                     entry.interval_start,
                                     entry.interval_end,
                                 ) {
-                                    boundary_index.register_boundary_key(sig, cluster_id, interval);
+                                    boundary_index.register_boundary_key_with_strong_ids(
+                                        sig,
+                                        cluster_id,
+                                        interval,
+                                        entry.perspective_strong_ids.clone(),
+                                    );
                                 }
                             }
                         }
@@ -3304,6 +3485,61 @@ impl proto::router_service_server::RouterService for RouterNode {
                         }))
                         .await
                         .map(|resp| total_records_updated += resp.into_inner().records_updated);
+                }
+            }
+        }
+
+        // Propagate detected conflicts to affected shards
+        if !result.detected_conflicts.is_empty() {
+            // Group conflicts by shard
+            let mut conflicts_by_shard: std::collections::HashMap<
+                u16,
+                Vec<proto::CrossShardConflict>,
+            > = std::collections::HashMap::new();
+
+            for conflict in &result.detected_conflicts {
+                let proto_conflict = proto::CrossShardConflict {
+                    identity_key_signature: Some(proto::IdentityKeySignature {
+                        signature: conflict.identity_key_signature.to_bytes().to_vec(),
+                    }),
+                    cluster1: Some(proto::GlobalClusterId {
+                        shard_id: conflict.cluster1.shard_id as u32,
+                        local_id: conflict.cluster1.local_id,
+                        version: conflict.cluster1.version as u32,
+                    }),
+                    cluster2: Some(proto::GlobalClusterId {
+                        shard_id: conflict.cluster2.shard_id as u32,
+                        local_id: conflict.cluster2.local_id,
+                        version: conflict.cluster2.version as u32,
+                    }),
+                    interval_start: conflict.interval.start,
+                    interval_end: conflict.interval.end,
+                    perspective_hash: conflict.perspective_hash,
+                    strong_id_hash1: conflict.strong_id_hash1,
+                    strong_id_hash2: conflict.strong_id_hash2,
+                };
+
+                // Send to both shards involved
+                conflicts_by_shard
+                    .entry(conflict.cluster1.shard_id)
+                    .or_default()
+                    .push(proto_conflict.clone());
+                if conflict.cluster2.shard_id != conflict.cluster1.shard_id {
+                    conflicts_by_shard
+                        .entry(conflict.cluster2.shard_id)
+                        .or_default()
+                        .push(proto_conflict);
+                }
+            }
+
+            // Send conflicts to each shard
+            for (shard_id, conflicts) in conflicts_by_shard {
+                if let Ok(mut client) = self.shard_client(shard_id as u32) {
+                    let _ = client
+                        .store_cross_shard_conflicts(Request::new(
+                            proto::StoreCrossShardConflictsRequest { conflicts },
+                        ))
+                        .await;
                 }
             }
         }

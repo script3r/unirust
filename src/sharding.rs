@@ -148,6 +148,29 @@ pub struct BoundaryEntry {
     pub perspective_strong_ids: HashMap<u64, u64>,
 }
 
+/// A cross-shard conflict detected during reconciliation.
+///
+/// This represents an indirect conflict where two clusters on different shards
+/// share an identity key but have conflicting strong identifiers within the
+/// same perspective - meaning they cannot be merged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossShardConflict {
+    /// The identity key signature that links the conflicting clusters.
+    pub identity_key_signature: IdentityKeySignature,
+    /// The first cluster involved in the conflict.
+    pub cluster1: GlobalClusterId,
+    /// The second cluster involved in the conflict.
+    pub cluster2: GlobalClusterId,
+    /// The time interval where the conflict occurs.
+    pub interval: Interval,
+    /// Hash of the perspective where the conflict was detected.
+    pub perspective_hash: u64,
+    /// Strong ID hash from cluster1.
+    pub strong_id_hash1: u64,
+    /// Strong ID hash from cluster2.
+    pub strong_id_hash2: u64,
+}
+
 /// Index tracking identity keys at shard boundaries.
 ///
 /// This enables incremental reconciliation by tracking which clusters
@@ -386,6 +409,10 @@ pub struct ReconciliationResult {
     pub merge_candidates: usize,
     /// Number of merges blocked due to cross-shard conflicts.
     pub conflicts_blocked: usize,
+    /// Detected cross-shard conflicts (indirect conflicts).
+    /// These are conflicts where clusters share an identity key but have
+    /// conflicting strong identifiers, preventing merge.
+    pub detected_conflicts: Vec<CrossShardConflict>,
 }
 
 /// Incremental reconciler for cross-shard cluster merges.
@@ -421,13 +448,19 @@ impl IncrementalReconciler {
     }
 
     /// Find clusters that need to be merged, returning stats about the process.
-    /// Returns (merges, merge_candidates, conflicts_blocked).
+    /// Returns (merges, merge_candidates, conflicts_blocked, detected_conflicts).
     pub fn find_cross_shard_merges_with_stats(
         &self,
-    ) -> (Vec<(GlobalClusterId, GlobalClusterId)>, usize, usize) {
+    ) -> (
+        Vec<(GlobalClusterId, GlobalClusterId)>,
+        usize,
+        usize,
+        Vec<CrossShardConflict>,
+    ) {
         let mut merges = Vec::new();
         let mut merge_candidates = 0;
         let mut conflicts_blocked = 0;
+        let mut detected_conflicts = Vec::new();
 
         // Build a map of all signatures to their entries across all shards
         let mut all_entries: HashMap<IdentityKeySignature, Vec<&BoundaryEntry>> = HashMap::new();
@@ -439,7 +472,7 @@ impl IncrementalReconciler {
         }
 
         // Find signatures that appear in multiple shards
-        for (_sig, entries) in all_entries {
+        for (sig, entries) in all_entries {
             if entries.len() < 2 {
                 continue;
             }
@@ -464,9 +497,26 @@ impl IncrementalReconciler {
                             merge_candidates += 1;
 
                             // Check for same-perspective conflicts before proposing merge
-                            if has_cross_shard_conflict(e1, e2) {
-                                // Skip this merge - clusters conflict on strong IDs
+                            if let Some(conflict_detail) = detect_cross_shard_conflict(e1, e2) {
+                                // Record the conflict and skip this merge
                                 conflicts_blocked += 1;
+
+                                // Compute the overlapping interval
+                                let overlap_start = e1.interval.start.max(e2.interval.start);
+                                let overlap_end = e1.interval.end.min(e2.interval.end);
+                                if let Ok(overlap_interval) =
+                                    Interval::new(overlap_start, overlap_end)
+                                {
+                                    detected_conflicts.push(CrossShardConflict {
+                                        identity_key_signature: sig,
+                                        cluster1: e1.cluster_id,
+                                        cluster2: e2.cluster_id,
+                                        interval: overlap_interval,
+                                        perspective_hash: conflict_detail.perspective_hash,
+                                        strong_id_hash1: conflict_detail.strong_id_hash1,
+                                        strong_id_hash2: conflict_detail.strong_id_hash2,
+                                    });
+                                }
                                 continue;
                             }
 
@@ -483,14 +533,19 @@ impl IncrementalReconciler {
             }
         }
 
-        (merges, merge_candidates, conflicts_blocked)
+        (
+            merges,
+            merge_candidates,
+            conflicts_blocked,
+            detected_conflicts,
+        )
     }
 
     /// Perform incremental reconciliation.
     ///
     /// Returns the reconciliation result without loading full records.
     pub fn reconcile(&mut self) -> ReconciliationResult {
-        let (merges, merge_candidates, conflicts_blocked) =
+        let (merges, merge_candidates, conflicts_blocked, detected_conflicts) =
             self.find_cross_shard_merges_with_stats();
 
         let mut result = ReconciliationResult {
@@ -504,6 +559,7 @@ impl IncrementalReconciler {
             keys_matched: 0,
             merge_candidates,
             conflicts_blocked,
+            detected_conflicts,
         };
 
         // Count matched keys
@@ -544,6 +600,7 @@ impl IncrementalReconciler {
         let mut merge_candidates = 0;
         let mut conflicts_blocked = 0;
         let mut keys_matched = 0;
+        let mut detected_conflicts = Vec::new();
 
         // For each dirty key, collect entries from all shards
         for sig in keys {
@@ -576,8 +633,25 @@ impl IncrementalReconciler {
                         merge_candidates += 1;
 
                         // Check for same-perspective conflicts before proposing merge
-                        if has_cross_shard_conflict(e1, e2) {
+                        if let Some(conflict_detail) = detect_cross_shard_conflict(e1, e2) {
+                            // Record the conflict and skip this merge
                             conflicts_blocked += 1;
+
+                            // Compute the overlapping interval
+                            let overlap_start = e1.interval.start.max(e2.interval.start);
+                            let overlap_end = e1.interval.end.min(e2.interval.end);
+                            if let Ok(overlap_interval) = Interval::new(overlap_start, overlap_end)
+                            {
+                                detected_conflicts.push(CrossShardConflict {
+                                    identity_key_signature: *sig,
+                                    cluster1: e1.cluster_id,
+                                    cluster2: e2.cluster_id,
+                                    interval: overlap_interval,
+                                    perspective_hash: conflict_detail.perspective_hash,
+                                    strong_id_hash1: conflict_detail.strong_id_hash1,
+                                    strong_id_hash2: conflict_detail.strong_id_hash2,
+                                });
+                            }
                             continue;
                         }
 
@@ -602,6 +676,7 @@ impl IncrementalReconciler {
             keys_matched,
             merge_candidates,
             conflicts_blocked,
+            detected_conflicts,
         }
     }
 
@@ -621,24 +696,37 @@ impl Default for IncrementalReconciler {
     }
 }
 
+/// Details of a detected cross-shard conflict between two boundary entries.
+struct ConflictDetail {
+    perspective_hash: u64,
+    strong_id_hash1: u64,
+    strong_id_hash2: u64,
+}
+
 /// Check if two boundary entries have conflicting strong IDs.
 ///
 /// Two entries conflict if they share a perspective (same key in perspective_strong_ids)
 /// but have different strong ID hashes (different values). This indicates the clusters
 /// have the same perspective but different strong identifiers, which would create a
 /// conflict if merged.
-fn has_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> bool {
+///
+/// Returns `Some(ConflictDetail)` if a conflict is found, `None` otherwise.
+fn detect_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> Option<ConflictDetail> {
     // Check each perspective in e1 against e2
     for (perspective_hash, strong_id_hash_1) in &e1.perspective_strong_ids {
         if let Some(strong_id_hash_2) = e2.perspective_strong_ids.get(perspective_hash) {
             // Same perspective exists in both entries
             // If strong ID hashes differ, there's a conflict
             if strong_id_hash_1 != strong_id_hash_2 {
-                return true;
+                return Some(ConflictDetail {
+                    perspective_hash: *perspective_hash,
+                    strong_id_hash1: *strong_id_hash_1,
+                    strong_id_hash2: *strong_id_hash_2,
+                });
             }
         }
     }
-    false
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1205,5 +1293,220 @@ mod tests {
         let boundaries = index2.get_boundaries(&sig).unwrap();
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].cluster_id, cluster_id);
+    }
+
+    /// Test that cross-shard conflicts are detected and blocked.
+    ///
+    /// This simulates the "indirect conflict" scenario from dominus:
+    /// - Three records share the same identity key (e.g., ISIN="I", country="C")
+    /// - Record 1 (shard 0, perspective "msci"): ts_code="TS1"
+    /// - Record 2 (shard 1, perspective "msci"): ts_code="TS2" (CONFLICT with Record 1)
+    /// - Record 3 (shard 1, perspective "axioma"): axioma_id="AI1" (no conflict)
+    ///
+    /// The merge between clusters containing Records 1 and 2 should be blocked
+    /// because they have conflicting strong IDs within the same perspective.
+    #[test]
+    fn test_cross_shard_conflict_detection() {
+        use crate::model::{AttrId, ValueId};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut reconciler = IncrementalReconciler::new();
+
+        // Create two shard boundaries with shared identity key
+        let mut shard0 = ClusterBoundaryIndex::new_small(0);
+        let mut shard1 = ClusterBoundaryIndex::new_small(1);
+
+        // Shared identity key signature (simulating ISIN="I", country="C")
+        let kv = vec![
+            KeyValue::new(AttrId(1), ValueId(100)), // isin
+            KeyValue::new(AttrId(2), ValueId(200)), // country
+        ];
+        let sig = IdentityKeySignature::from_key_values("instrument_region", &kv);
+
+        // Helper to hash perspective name
+        fn hash_perspective(perspective: &str) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            perspective.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // Helper to hash strong ID values
+        fn hash_strong_id(values: &[(AttrId, ValueId)]) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            values.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let msci_perspective = hash_perspective("msci");
+        let axioma_perspective = hash_perspective("axioma");
+
+        // Record 1 on shard 0: msci perspective, ts_code="TS1"
+        let cluster0 = GlobalClusterId::new(0, 100, 0);
+        let interval = Interval::new(0, 100).unwrap();
+        let mut entry0 = BoundaryEntry {
+            cluster_id: cluster0,
+            interval,
+            shard_id: 0,
+            perspective_strong_ids: HashMap::new(),
+        };
+        // Strong ID: ts_code="TS1" (represented by hash)
+        entry0.perspective_strong_ids.insert(
+            msci_perspective,
+            hash_strong_id(&[(AttrId(10), ValueId(1))]), // ts_code=TS1
+        );
+        shard0.boundary_keys.entry(sig).or_default().push(entry0);
+        shard0.key_bloom.insert(&sig);
+
+        // Record 2 on shard 1: msci perspective, ts_code="TS2" (CONFLICT!)
+        let cluster1_a = GlobalClusterId::new(1, 200, 0);
+        let mut entry1_a = BoundaryEntry {
+            cluster_id: cluster1_a,
+            interval,
+            shard_id: 1,
+            perspective_strong_ids: HashMap::new(),
+        };
+        // Strong ID: ts_code="TS2" (DIFFERENT from Record 1!)
+        entry1_a.perspective_strong_ids.insert(
+            msci_perspective,
+            hash_strong_id(&[(AttrId(10), ValueId(2))]), // ts_code=TS2
+        );
+        shard1.boundary_keys.entry(sig).or_default().push(entry1_a);
+        shard1.key_bloom.insert(&sig);
+
+        // Record 3 on shard 1: axioma perspective, axioma_id="AI1" (no conflict)
+        let cluster1_b = GlobalClusterId::new(1, 300, 0);
+        let mut entry1_b = BoundaryEntry {
+            cluster_id: cluster1_b,
+            interval,
+            shard_id: 1,
+            perspective_strong_ids: HashMap::new(),
+        };
+        // Strong ID: axioma_id="AI1" (different perspective, no conflict)
+        entry1_b.perspective_strong_ids.insert(
+            axioma_perspective,
+            hash_strong_id(&[(AttrId(20), ValueId(1))]), // axioma_id=AI1
+        );
+        shard1.boundary_keys.get_mut(&sig).unwrap().push(entry1_b);
+
+        reconciler.add_shard_boundary(shard0);
+        reconciler.add_shard_boundary(shard1);
+
+        // Reconcile should detect the conflict
+        let result = reconciler.reconcile();
+
+        // The merge between cluster0 (shard0) and cluster1_a (shard1) should be BLOCKED
+        // because they have conflicting ts_code values in the same "msci" perspective
+        assert!(
+            result.conflicts_blocked > 0,
+            "Expected at least one conflict to be blocked"
+        );
+
+        // The detected conflicts should include the conflicting clusters
+        assert!(
+            !result.detected_conflicts.is_empty(),
+            "Expected detected_conflicts to be populated"
+        );
+
+        // Find the conflict between cluster0 and cluster1_a
+        let conflict = result.detected_conflicts.iter().find(|c| {
+            (c.cluster1 == cluster0 && c.cluster2 == cluster1_a)
+                || (c.cluster1 == cluster1_a && c.cluster2 == cluster0)
+        });
+
+        assert!(
+            conflict.is_some(),
+            "Expected to find conflict between cluster0 and cluster1_a"
+        );
+
+        let conflict = conflict.unwrap();
+        assert_eq!(
+            conflict.perspective_hash, msci_perspective,
+            "Conflict should be in msci perspective"
+        );
+        assert_eq!(
+            conflict.identity_key_signature, sig,
+            "Conflict should have the shared identity key"
+        );
+
+        // The merge between clusters without conflicts can still happen
+        // (e.g., cluster0 with cluster1_b if they don't conflict)
+        // Note: cluster0 and cluster1_b don't share a perspective, so no conflict
+    }
+
+    /// Test that non-conflicting cross-shard merges proceed normally
+    #[test]
+    fn test_cross_shard_merge_without_conflict() {
+        use crate::model::{AttrId, ValueId};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut reconciler = IncrementalReconciler::new();
+
+        let mut shard0 = ClusterBoundaryIndex::new_small(0);
+        let mut shard1 = ClusterBoundaryIndex::new_small(1);
+
+        let kv = vec![KeyValue::new(AttrId(1), ValueId(100))];
+        let sig = IdentityKeySignature::from_key_values("person", &kv);
+
+        fn hash_perspective(perspective: &str) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            perspective.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        fn hash_strong_id(values: &[(AttrId, ValueId)]) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            values.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let crm_perspective = hash_perspective("crm");
+        let erp_perspective = hash_perspective("erp");
+
+        // Cluster on shard 0 with CRM perspective
+        let cluster0 = GlobalClusterId::new(0, 100, 0);
+        let interval = Interval::new(0, 100).unwrap();
+        let mut entry0 = BoundaryEntry {
+            cluster_id: cluster0,
+            interval,
+            shard_id: 0,
+            perspective_strong_ids: HashMap::new(),
+        };
+        entry0
+            .perspective_strong_ids
+            .insert(crm_perspective, hash_strong_id(&[(AttrId(10), ValueId(1))]));
+        shard0.boundary_keys.entry(sig).or_default().push(entry0);
+        shard0.key_bloom.insert(&sig);
+
+        // Cluster on shard 1 with ERP perspective (different perspective = no conflict)
+        let cluster1 = GlobalClusterId::new(1, 200, 0);
+        let mut entry1 = BoundaryEntry {
+            cluster_id: cluster1,
+            interval,
+            shard_id: 1,
+            perspective_strong_ids: HashMap::new(),
+        };
+        entry1
+            .perspective_strong_ids
+            .insert(erp_perspective, hash_strong_id(&[(AttrId(20), ValueId(2))]));
+        shard1.boundary_keys.entry(sig).or_default().push(entry1);
+        shard1.key_bloom.insert(&sig);
+
+        reconciler.add_shard_boundary(shard0);
+        reconciler.add_shard_boundary(shard1);
+
+        let result = reconciler.reconcile();
+
+        // No conflicts because perspectives are different
+        assert_eq!(result.conflicts_blocked, 0, "Expected no conflicts");
+        assert!(
+            result.detected_conflicts.is_empty(),
+            "Expected no detected conflicts"
+        );
+
+        // Merge should proceed
+        assert_eq!(result.merges_performed, 1, "Expected one merge");
+        assert_eq!(result.keys_matched, 1);
     }
 }

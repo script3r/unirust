@@ -869,7 +869,7 @@ impl StreamingLinker {
                 }
                 // Track boundary signature for merges (borrows now released)
                 if let Some(new_root) = boundary_to_track {
-                    self.track_merge_boundary(entity_type, key_values, new_root, interval);
+                    self.track_merge_boundary(store, entity_type, key_values, new_root, interval);
                 }
             }
         }
@@ -1251,6 +1251,7 @@ impl StreamingLinker {
     #[inline]
     fn track_merge_boundary(
         &mut self,
+        store: &dyn RecordStore,
         entity_type: &str,
         key_values: &[KeyValue],
         new_root: RecordId,
@@ -1264,6 +1265,15 @@ impl StreamingLinker {
         let sharding_sig = key_signature.to_sharding_signature();
         let key = (sharding_sig, global_id);
 
+        // Compute perspective_strong_ids from the cluster's summary
+        // Uses actual string values (via interner) for cross-shard consistency
+        let interner = store.interner();
+        let perspective_strong_ids = self
+            .strong_id_summaries
+            .peek(&new_root)
+            .map(|summary| summary.compute_perspective_strong_ids(interner))
+            .unwrap_or_default();
+
         // Merge intervals for the same (signature, cluster) combination
         self.boundary_signatures
             .entry(key)
@@ -1273,10 +1283,14 @@ impl StreamingLinker {
                 if let Ok(merged) = Interval::new(new_start, new_end) {
                     existing.interval = merged;
                 }
+                // Also merge perspective_strong_ids from the updated cluster
+                for (k, v) in &perspective_strong_ids {
+                    existing.perspective_strong_ids.entry(*k).or_insert(*v);
+                }
             })
             .or_insert_with(|| BoundaryData {
                 interval,
-                perspective_strong_ids: HashMap::new(),
+                perspective_strong_ids,
             });
 
         // Mark this key as dirty for adaptive reconciliation
@@ -1615,6 +1629,55 @@ impl StrongIdSummary {
                 coalesce_value_intervals(value_entry);
             }
         }
+    }
+
+    /// Compute perspective -> strong_id_hash for cross-shard conflict detection.
+    /// Returns a map from hashed perspective name to hashed strong ID values.
+    ///
+    /// IMPORTANT: This hashes the actual string values, not internal IDs.
+    /// Different shards may assign different internal IDs to the same strings,
+    /// so we must hash the actual strings to get consistent results across shards.
+    fn compute_perspective_strong_ids(
+        &self,
+        interner: &crate::model::StringInterner,
+    ) -> HashMap<u64, u64> {
+        use rustc_hash::FxHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut result = HashMap::new();
+        for (perspective, attrs) in &self.by_perspective {
+            // Hash the perspective name
+            let mut p_hasher = FxHasher::default();
+            perspective.hash(&mut p_hasher);
+            let perspective_hash = p_hasher.finish();
+
+            // Collect (attr_string, value_string) pairs and sort for deterministic hashing
+            // We must use the actual strings, not IDs, to be consistent across shards
+            let mut values: Vec<(&str, &str)> = attrs
+                .iter()
+                .flat_map(|(attr_id, values)| {
+                    let attr_str = interner.get_attr(*attr_id);
+                    values.keys().filter_map(move |value_id| {
+                        let value_str = interner.get_value(*value_id);
+                        match (attr_str, value_str) {
+                            (Some(a), Some(v)) => Some((a.as_str(), v.as_str())),
+                            _ => None,
+                        }
+                    })
+                })
+                .collect();
+            values.sort();
+
+            let mut v_hasher = FxHasher::default();
+            for (attr, value) in &values {
+                attr.hash(&mut v_hasher);
+                value.hash(&mut v_hasher);
+            }
+            let values_hash = v_hasher.finish();
+
+            result.insert(perspective_hash, values_hash);
+        }
+        result
     }
 }
 
