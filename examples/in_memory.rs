@@ -40,36 +40,24 @@ fn main() -> anyhow::Result<()> {
     // and strong identifiers as "these records are DEFINITELY different if this differs"
 
     let mut ontology = Ontology::new();
-    let mut engine = Unirust::new(ontology.clone());
-
-    // Create attribute IDs (interned strings for efficiency)
-    let name_attr = engine.intern_attr("name");
-    let email_attr = engine.intern_attr("email");
-    let _phone_attr = engine.intern_attr("phone");
-    let ssn_attr = engine.intern_attr("ssn");
 
     // Identity Key: Records with same (name + email) are candidates for merging
-    ontology.add_identity_key(IdentityKey::new(
-        vec![name_attr, email_attr],
-        "name_email".to_string(),
+    // Using from_names() - no need to pre-intern attributes!
+    ontology.add_identity_key(IdentityKey::from_names(
+        vec!["name", "email"],
+        "name_email",
     ));
 
     // Strong Identifier: SSN uniquely identifies a person
     // If two records have different SSNs, they CANNOT be merged
-    ontology.add_strong_identifier(StrongIdentifier::new(ssn_attr, "ssn_unique".to_string()));
+    ontology.add_strong_identifier(StrongIdentifier::from_name("ssn", "ssn_unique"));
 
     println!("Ontology configured:");
     println!("  - Identity Key: name + email (records match if both are equal)");
     println!("  - Strong ID: SSN (prevents merging if different)\n");
 
-    // Recreate engine with the configured ontology
+    // Create the engine - ontology attributes are automatically interned
     let mut engine = Unirust::new(ontology);
-
-    // Re-intern attributes (required after creating new engine)
-    let name_attr = engine.intern_attr("name");
-    let email_attr = engine.intern_attr("email");
-    let phone_attr = engine.intern_attr("phone"); // Used in records below
-    let ssn_attr = engine.intern_attr("ssn");
 
     // =========================================================================
     // Step 2: Create Records from Multiple Source Systems
@@ -81,7 +69,12 @@ fn main() -> anyhow::Result<()> {
     // - RecordIdentity: Source system info (entity_type, perspective, uid)
     // - Descriptors: Attribute values with temporal validity intervals
 
-    // Intern the values we'll use
+    // Intern attributes and values for use in records
+    let name_attr = engine.intern_attr("name");
+    let email_attr = engine.intern_attr("email");
+    let phone_attr = engine.intern_attr("phone");
+    let ssn_attr = engine.intern_attr("ssn");
+
     let john_name = engine.intern_value("John Doe");
     let john_email = engine.intern_value("john@example.com");
     let ssn_123 = engine.intern_value("123-45-6789");

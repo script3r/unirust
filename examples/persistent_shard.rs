@@ -73,46 +73,37 @@ fn main() -> anyhow::Result<()> {
     println!("Using tuning profile: {:?}\n", profile);
 
     // =========================================================================
-    // Step 3: Create Engine with Store
+    // Step 3: Configure Ontology
     // =========================================================================
     //
-    // Start with empty ontology - we'll configure it after interning attrs
+    // Using from_names() - no need to pre-intern attributes!
+    // The engine will automatically intern them when created.
 
-    let ontology = Ontology::new();
-    let mut engine = Unirust::with_store_and_tuning(ontology, store, tuning.clone());
-
-    // =========================================================================
-    // Step 4: Configure Ontology
-    // =========================================================================
-    //
-    // Intern attribute IDs through the engine (which owns the store)
-    let name_attr = engine.intern_attr("name");
-    let email_attr = engine.intern_attr("email");
-    let _phone_attr = engine.intern_attr("phone");
-    let ssn_attr = engine.intern_attr("ssn");
-    let _dept_attr = engine.intern_attr("department");
-
-    // Create ontology with interned attributes
     let mut ontology = Ontology::new();
-    ontology.add_identity_key(IdentityKey::new(
-        vec![name_attr, email_attr],
-        "name_email".to_string(),
-    ));
-    ontology.add_strong_identifier(StrongIdentifier::new(ssn_attr, "ssn_unique".to_string()));
 
-    // Recreate engine with configured ontology
-    // Note: Attributes are persisted, so they'll get the same IDs
-    let store = PersistentStore::open(&data_dir)?;
+    ontology.add_identity_key(IdentityKey::from_names(
+        vec!["name", "email"],
+        "name_email",
+    ));
+
+    ontology.add_strong_identifier(StrongIdentifier::from_name("ssn", "ssn_unique"));
+
+    println!("Ontology configured with identity key (name+email) and strong ID (ssn)\n");
+
+    // =========================================================================
+    // Step 4: Create Engine with Store and Ontology
+    // =========================================================================
+    //
+    // The engine automatically interns the ontology's attribute names.
+
     let mut engine = Unirust::with_store_and_tuning(ontology, store, tuning);
 
-    // Re-intern attrs (will get same IDs from persisted interner)
+    // Intern attributes for use in records
     let name_attr = engine.intern_attr("name");
     let email_attr = engine.intern_attr("email");
     let phone_attr = engine.intern_attr("phone");
     let ssn_attr = engine.intern_attr("ssn");
     let dept_attr = engine.intern_attr("department");
-
-    println!("Ontology configured with identity key (name+email) and strong ID (ssn)\n");
 
     // =========================================================================
     // Step 5: Generate and Ingest Records
@@ -239,12 +230,6 @@ fn main() -> anyhow::Result<()> {
     println!("  2. Restart your application");
     println!("  3. Re-open with PersistentStore::open()");
     println!("  4. All data would be recovered automatically");
-
-    // To actually demonstrate recovery:
-    // drop(engine);
-    // let store = PersistentStore::open(&data_dir)?;
-    // let engine = Unirust::with_store_and_tuning(ontology, store, tuning);
-    // println!("Recovered {} records", engine.stats().record_count);
 
     println!("\n✓ Example completed successfully!");
     println!("\nNext steps:");

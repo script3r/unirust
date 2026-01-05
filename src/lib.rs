@@ -212,10 +212,17 @@ impl Unirust {
     }
 
     /// Create a new Unirust instance with a custom store implementation.
-    pub fn with_store<S>(ontology: Ontology, store: S) -> Self
+    ///
+    /// Any identity keys, strong identifiers, or constraints created with string-based
+    /// APIs (e.g., `IdentityKey::from_names`) will have their attribute names automatically
+    /// interned using the store's interner.
+    pub fn with_store<S>(mut ontology: Ontology, mut store: S) -> Self
     where
         S: RecordStore + 'static,
     {
+        // Intern any pending attribute names in the ontology
+        ontology.intern_attributes(|name| store.intern_attr(name));
+
         Self {
             store: Box::new(store),
             ontology,
@@ -228,10 +235,18 @@ impl Unirust {
         }
     }
 
-    pub fn with_store_and_tuning<S>(ontology: Ontology, store: S, tuning: StreamingTuning) -> Self
+    /// Create a new Unirust instance with a custom store and tuning configuration.
+    ///
+    /// Any identity keys, strong identifiers, or constraints created with string-based
+    /// APIs (e.g., `IdentityKey::from_names`) will have their attribute names automatically
+    /// interned using the store's interner.
+    pub fn with_store_and_tuning<S>(mut ontology: Ontology, mut store: S, tuning: StreamingTuning) -> Self
     where
         S: RecordStore + 'static,
     {
+        // Intern any pending attribute names in the ontology
+        ontology.intern_attributes(|name| store.intern_attr(name));
+
         Self {
             store: Box::new(store),
             ontology,

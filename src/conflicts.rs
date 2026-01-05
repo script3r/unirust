@@ -1119,7 +1119,7 @@ impl ConflictDetector {
         // Check constraints across clusters (for unique constraints)
         for constraint in &ontology.constraints {
             match constraint {
-                Constraint::Unique { attribute, name } => {
+                Constraint::Unique { attribute, name, .. } => {
                     let cross_cluster_violations = Self::check_unique_constraint_across_clusters(
                         store, clusters, *attribute, name,
                     )?;
@@ -1262,12 +1262,12 @@ impl ConflictDetector {
         let mut violations = Vec::new();
 
         match constraint {
-            Constraint::Unique { attribute, name } => {
+            Constraint::Unique { attribute, name, .. } => {
                 let violations_for_attr =
                     Self::check_unique_constraint(store, cluster, *attribute, name)?;
                 violations.extend(violations_for_attr);
             }
-            Constraint::UniqueWithinPerspective { attribute, name } => {
+            Constraint::UniqueWithinPerspective { attribute, name, .. } => {
                 let violations_for_attr = Self::check_unique_within_perspective_constraint(
                     store, cluster, *attribute, name,
                 )?;

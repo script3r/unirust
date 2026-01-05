@@ -21,16 +21,35 @@ pub struct IdentityKey {
 }
 
 impl IdentityKey {
-    /// Create a new identity key
+    /// Create a new identity key from interned attribute IDs
     pub fn new(attributes: Vec<AttrId>, name: String) -> Self {
         Self {
             attributes,
-            attribute_names: Vec::new(), // Will be populated when needed
+            attribute_names: Vec::new(),
             name,
         }
     }
 
-    /// Create a new identity key with attribute names (for partitioning support)
+    /// Create a new identity key from attribute names (preferred API)
+    ///
+    /// The attribute names will be interned when the ontology is applied to an engine.
+    /// This is the recommended way to create identity keys as it doesn't require
+    /// pre-interning attributes.
+    ///
+    /// # Example
+    /// ```
+    /// use unirust_rs::ontology::IdentityKey;
+    /// let key = IdentityKey::from_names(vec!["name", "email"], "name_email");
+    /// ```
+    pub fn from_names<S: Into<String>>(attribute_names: Vec<&str>, name: S) -> Self {
+        Self {
+            attributes: Vec::new(), // Will be populated when ontology is applied
+            attribute_names: attribute_names.into_iter().map(String::from).collect(),
+            name: name.into(),
+        }
+    }
+
+    /// Create a new identity key with both IDs and names (for partitioning support)
     pub fn with_attribute_names(
         attributes: Vec<AttrId>,
         attribute_names: Vec<String>,
@@ -41,6 +60,11 @@ impl IdentityKey {
             attribute_names,
             name,
         }
+    }
+
+    /// Check if this identity key needs interning (has names but no IDs)
+    pub fn needs_interning(&self) -> bool {
+        self.attributes.is_empty() && !self.attribute_names.is_empty()
     }
 
     /// Check if this identity key matches another over an overlapping interval
@@ -65,14 +89,43 @@ impl IdentityKey {
 pub struct StrongIdentifier {
     /// The attribute that serves as a strong identifier
     pub attribute: AttrId,
+    /// The attribute name as a string (for deferred interning)
+    #[serde(default)]
+    pub attribute_name: Option<String>,
     /// Human-readable name for this strong identifier
     pub name: String,
 }
 
 impl StrongIdentifier {
-    /// Create a new strong identifier
+    /// Create a new strong identifier from an interned attribute ID
     pub fn new(attribute: AttrId, name: String) -> Self {
-        Self { attribute, name }
+        Self {
+            attribute,
+            attribute_name: None,
+            name,
+        }
+    }
+
+    /// Create a new strong identifier from an attribute name (preferred API)
+    ///
+    /// The attribute name will be interned when the ontology is applied to an engine.
+    ///
+    /// # Example
+    /// ```
+    /// use unirust_rs::ontology::StrongIdentifier;
+    /// let strong_id = StrongIdentifier::from_name("ssn", "ssn_unique");
+    /// ```
+    pub fn from_name<S: Into<String>>(attribute_name: &str, name: S) -> Self {
+        Self {
+            attribute: AttrId(0), // Will be populated when ontology is applied
+            attribute_name: Some(attribute_name.to_string()),
+            name: name.into(),
+        }
+    }
+
+    /// Check if this strong identifier needs interning
+    pub fn needs_interning(&self) -> bool {
+        self.attribute_name.is_some() && self.attribute.0 == 0
     }
 }
 
@@ -107,21 +160,66 @@ impl Crosswalk {
 pub enum Constraint {
     /// Unique constraint: no two records can have different values for this attribute
     /// within the same cluster over overlapping time intervals
-    Unique { attribute: AttrId, name: String },
+    Unique {
+        attribute: AttrId,
+        #[serde(default)]
+        attribute_name: Option<String>,
+        name: String,
+    },
     /// Unique within perspective: no two records from the same perspective can have
     /// different values for this attribute over overlapping time intervals
-    UniqueWithinPerspective { attribute: AttrId, name: String },
+    UniqueWithinPerspective {
+        attribute: AttrId,
+        #[serde(default)]
+        attribute_name: Option<String>,
+        name: String,
+    },
 }
 
 impl Constraint {
-    /// Create a unique constraint
+    /// Create a unique constraint from an interned attribute ID
     pub fn unique(attribute: AttrId, name: String) -> Self {
-        Self::Unique { attribute, name }
+        Self::Unique {
+            attribute,
+            attribute_name: None,
+            name,
+        }
     }
 
-    /// Create a unique within perspective constraint
+    /// Create a unique constraint from an attribute name (preferred API)
+    ///
+    /// # Example
+    /// ```
+    /// use unirust_rs::ontology::Constraint;
+    /// let constraint = Constraint::unique_from_name("email", "unique_email");
+    /// ```
+    pub fn unique_from_name<S: Into<String>>(attribute_name: &str, name: S) -> Self {
+        Self::Unique {
+            attribute: AttrId(0),
+            attribute_name: Some(attribute_name.to_string()),
+            name: name.into(),
+        }
+    }
+
+    /// Create a unique within perspective constraint from an interned attribute ID
     pub fn unique_within_perspective(attribute: AttrId, name: String) -> Self {
-        Self::UniqueWithinPerspective { attribute, name }
+        Self::UniqueWithinPerspective {
+            attribute,
+            attribute_name: None,
+            name,
+        }
+    }
+
+    /// Create a unique within perspective constraint from an attribute name (preferred API)
+    pub fn unique_within_perspective_from_name<S: Into<String>>(
+        attribute_name: &str,
+        name: S,
+    ) -> Self {
+        Self::UniqueWithinPerspective {
+            attribute: AttrId(0),
+            attribute_name: Some(attribute_name.to_string()),
+            name: name.into(),
+        }
     }
 
     /// Get the attribute this constraint applies to
@@ -132,11 +230,35 @@ impl Constraint {
         }
     }
 
+    /// Get the attribute name if available
+    pub fn attribute_name(&self) -> Option<&str> {
+        match self {
+            Self::Unique { attribute_name, .. } => attribute_name.as_deref(),
+            Self::UniqueWithinPerspective { attribute_name, .. } => attribute_name.as_deref(),
+        }
+    }
+
     /// Get the name of this constraint
     pub fn name(&self) -> &str {
         match self {
             Self::Unique { name, .. } => name,
             Self::UniqueWithinPerspective { name, .. } => name,
+        }
+    }
+
+    /// Check if this constraint needs interning
+    pub fn needs_interning(&self) -> bool {
+        match self {
+            Self::Unique {
+                attribute,
+                attribute_name,
+                ..
+            } => attribute_name.is_some() && attribute.0 == 0,
+            Self::UniqueWithinPerspective {
+                attribute,
+                attribute_name,
+                ..
+            } => attribute_name.is_some() && attribute.0 == 0,
         }
     }
 }
@@ -192,6 +314,63 @@ impl Ontology {
     /// Add a constraint
     pub fn add_constraint(&mut self, constraint: Constraint) {
         self.constraints.push(constraint);
+    }
+
+    /// Intern all pending attribute names using the provided function
+    ///
+    /// This resolves any identity keys, strong identifiers, or constraints that were
+    /// created with string-based APIs (e.g., `IdentityKey::from_names`).
+    ///
+    /// Called automatically when the ontology is applied to an engine.
+    pub fn intern_attributes<F>(&mut self, mut intern_fn: F)
+    where
+        F: FnMut(&str) -> AttrId,
+    {
+        // Intern identity key attributes
+        for key in &mut self.identity_keys {
+            if key.needs_interning() {
+                key.attributes = key
+                    .attribute_names
+                    .iter()
+                    .map(|name| intern_fn(name))
+                    .collect();
+            }
+        }
+
+        // Intern strong identifier attributes
+        for strong_id in &mut self.strong_identifiers {
+            if strong_id.needs_interning() {
+                if let Some(ref name) = strong_id.attribute_name {
+                    strong_id.attribute = intern_fn(name);
+                }
+            }
+        }
+
+        // Intern constraint attributes
+        for constraint in &mut self.constraints {
+            if constraint.needs_interning() {
+                match constraint {
+                    Constraint::Unique {
+                        attribute,
+                        attribute_name,
+                        ..
+                    } => {
+                        if let Some(ref name) = attribute_name {
+                            *attribute = intern_fn(name);
+                        }
+                    }
+                    Constraint::UniqueWithinPerspective {
+                        attribute,
+                        attribute_name,
+                        ..
+                    } => {
+                        if let Some(ref name) = attribute_name {
+                            *attribute = intern_fn(name);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Add an entity type
