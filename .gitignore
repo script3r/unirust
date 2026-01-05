@@ -26,3 +26,4 @@ Thumbs.db
 cluster_data/
 cluster_logs/
 .cluster/
+.research/

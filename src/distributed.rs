@@ -675,6 +675,7 @@ pub struct ShardNode {
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
+    ingest_wal_lock: Arc<Mutex<()>>,
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     config_version: String,
     metrics: Arc<PerfMetrics>,
@@ -805,6 +806,7 @@ impl ShardNode {
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
                 ingest_wal,
+                ingest_wal_lock: Arc::new(Mutex::new(())),
                 ingest_txs,
                 config_version,
                 metrics: Arc::new(PerfMetrics::new()),
@@ -858,6 +860,7 @@ impl ShardNode {
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
             ingest_wal,
+            ingest_wal_lock: Arc::new(Mutex::new(())),
             ingest_txs,
             config_version,
             metrics: Arc::new(PerfMetrics::new()),
@@ -1399,6 +1402,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let start = Instant::now();
         let records = request.into_inner().records;
         let record_count = records.len();
+        let _wal_guard = if self.ingest_wal.is_some() {
+            Some(self.ingest_wal_lock.lock().await)
+        } else {
+            None
+        };
 
         // Use partitioned processing for large batches (high-throughput mode)
         // Small batches use sequential path for correctness (query support)
@@ -1441,6 +1449,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             record_count += chunk.records.len();
+            let _wal_guard = if self.ingest_wal.is_some() {
+                Some(self.ingest_wal_lock.lock().await)
+            } else {
+                None
+            };
 
             // Use partitioned processing for large batches (high-throughput mode)
             // Small batches use sequential path for correctness
