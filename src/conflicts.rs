@@ -818,20 +818,20 @@ impl ConflictDetector {
             let start = window[0];
             let end = window[1];
 
-        while event_idx < events.len() && events[event_idx].time == start {
-            let event = &mut events[event_idx];
-            match event.kind {
-                EventKind::End => {
-                    active.remove(&event.value);
-                }
-                EventKind::Start => {
-                    if let Some(participants) = event.participants.take() {
-                        active.insert(event.value, participants);
+            while event_idx < events.len() && events[event_idx].time == start {
+                let event = &mut events[event_idx];
+                match event.kind {
+                    EventKind::End => {
+                        active.remove(&event.value);
+                    }
+                    EventKind::Start => {
+                        if let Some(participants) = event.participants.take() {
+                            active.insert(event.value, participants);
+                        }
                     }
                 }
+                event_idx += 1;
             }
-            event_idx += 1;
-        }
 
             if start < end && active.len() > 1 {
                 if let Ok(interval) = Interval::new(start, end) {
