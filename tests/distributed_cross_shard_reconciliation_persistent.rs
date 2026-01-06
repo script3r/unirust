@@ -132,10 +132,8 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
         spawn_router(vec![shard0.addr, shard1.addr], empty_config.clone()).await?;
 
     let mut router_client = RouterServiceClient::connect(format!("http://{}", router_addr)).await?;
-    let mut shard0_client =
-        ShardServiceClient::connect(format!("http://{}", shard0.addr)).await?;
-    let mut shard1_client =
-        ShardServiceClient::connect(format!("http://{}", shard1.addr)).await?;
+    let mut shard0_client = ShardServiceClient::connect(format!("http://{}", shard0.addr)).await?;
+    let mut shard1_client = ShardServiceClient::connect(format!("http://{}", shard1.addr)).await?;
 
     router_client
         .set_ontology(ApplyOntologyRequest {
@@ -150,14 +148,20 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
         "person",
         "hr",
         "hr_001",
-        vec![("email", "alice@example.com", 0, 100), ("ssn", "1234", 0, 100)],
+        vec![
+            ("email", "alice@example.com", 0, 100),
+            ("ssn", "1234", 0, 100),
+        ],
     );
     let shard0_rec2 = record_input(
         1,
         "person",
         "hr",
         "hr_001b",
-        vec![("email", "alice@example.com", 0, 100), ("ssn", "1234", 0, 100)],
+        vec![
+            ("email", "alice@example.com", 0, 100),
+            ("ssn", "1234", 0, 100),
+        ],
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
@@ -170,14 +174,20 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
         "person",
         "hr",
         "hr_002",
-        vec![("email", "alice@example.com", 0, 100), ("ssn", "1234", 0, 100)],
+        vec![
+            ("email", "alice@example.com", 0, 100),
+            ("ssn", "1234", 0, 100),
+        ],
     );
     let shard1_rec2 = record_input(
         3,
         "person",
         "hr",
         "hr_002b",
-        vec![("email", "alice@example.com", 0, 100), ("ssn", "1234", 0, 100)],
+        vec![
+            ("email", "alice@example.com", 0, 100),
+            ("ssn", "1234", 0, 100),
+        ],
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {

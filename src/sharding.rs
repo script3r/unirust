@@ -2,8 +2,8 @@
 
 use crate::linker::StreamingLinker;
 use crate::model::ClusterId;
-use crate::model::{InternerLookup, StringInterner};
 use crate::model::{Descriptor, GlobalClusterId, KeyValue, Record, RecordId};
+use crate::model::{InternerLookup, StringInterner};
 use crate::ontology::Ontology;
 use crate::store::Store;
 use crate::temporal::{is_overlapping, Interval};
@@ -1564,9 +1564,8 @@ mod tests {
         let attr2 = concurrent.intern_attr("email");
         let value2 = concurrent.intern_value("alice@example.com");
         let kv2 = vec![KeyValue::new(attr2, value2)];
-        let sig2 =
-            IdentityKeySignature::from_key_values_with_interner("person", &kv2, &concurrent)
-                .expect("signature");
+        let sig2 = IdentityKeySignature::from_key_values_with_interner("person", &kv2, &concurrent)
+            .expect("signature");
 
         assert_eq!(sig, sig2);
     }

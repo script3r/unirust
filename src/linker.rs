@@ -1695,10 +1695,7 @@ impl StrongIdSummary {
     /// IMPORTANT: This hashes the actual string values, not internal IDs.
     /// Different shards may assign different internal IDs to the same strings,
     /// so we must hash the actual strings to get consistent results across shards.
-    fn compute_perspective_strong_ids(
-        &self,
-        interner: &dyn InternerLookup,
-    ) -> HashMap<u64, u64> {
+    fn compute_perspective_strong_ids(&self, interner: &dyn InternerLookup) -> HashMap<u64, u64> {
         use rustc_hash::FxHasher;
         use std::hash::{Hash, Hasher};
 
@@ -1752,10 +1749,7 @@ mod tests {
         let mut ontology = Ontology::new();
 
         let email_attr = store.intern_attr("email");
-        ontology.add_identity_key(IdentityKey::new(
-            vec![email_attr],
-            "email_key".to_string(),
-        ));
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
 
         let mut tuning = crate::StreamingTuning::default();
         tuning.enable_boundary_tracking = true;
@@ -1838,7 +1832,6 @@ impl LinkerKeySignature {
     fn key_values(&self) -> &[KeyValue] {
         &self.key_values
     }
-
 }
 
 impl PartialEq for LinkerKeySignature {

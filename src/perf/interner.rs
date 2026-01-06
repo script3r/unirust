@@ -49,10 +49,13 @@ impl ConcurrentInterner {
         // Slow path: insert new entry
         // Use entry API to avoid TOCTOU race
         let attr_string = attr.to_string();
-        let id = *self.attr_to_id.entry(attr_string.clone()).or_insert_with(|| {
-            let id = self.next_attr_id.fetch_add(1, Ordering::Relaxed);
-            AttrId(id)
-        });
+        let id = *self
+            .attr_to_id
+            .entry(attr_string.clone())
+            .or_insert_with(|| {
+                let id = self.next_attr_id.fetch_add(1, Ordering::Relaxed);
+                AttrId(id)
+            });
         self.id_to_attr.entry(id).or_insert(attr_string);
         id
     }
