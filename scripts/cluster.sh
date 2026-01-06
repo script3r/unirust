@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
 ACTION="${1:-start}"
 
-SHARDS="${SHARDS:-5}"
+SHARDS="${SHARDS:-3}"
 ROUTER_PORT="${ROUTER_PORT:-50060}"
 SHARD_PORT_BASE="${SHARD_PORT_BASE:-50061}"
 DATA_DIR="${DATA_DIR:-$ROOT_DIR/cluster_data}"
@@ -23,7 +23,7 @@ usage() {
 Usage: $0 [start|stop|status|build]
 
 Environment:
-  SHARDS=5
+  SHARDS=3
   ROUTER_PORT=50060
   SHARD_PORT_BASE=50061
   DATA_DIR=$ROOT_DIR/cluster_data
