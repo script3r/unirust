@@ -1486,6 +1486,40 @@ pub fn detect_attribute_conflicts(
     descriptors: Vec<(RecordId, ValueId, Interval)>,
     algorithm: ConflictAlgorithm,
 ) -> Vec<DirectConflict> {
+    if descriptors.is_empty() {
+        return Vec::new();
+    }
+
+    let first_interval = descriptors[0].2;
+    let mut all_same_interval = true;
+    for (_, _, interval) in descriptors.iter().skip(1) {
+        if *interval != first_interval {
+            all_same_interval = false;
+            break;
+        }
+    }
+
+    if all_same_interval {
+        let mut values_map: FxHashMap<ValueId, Vec<RecordId>> = FxHashMap::default();
+        values_map.reserve(descriptors.len());
+        for (record_id, value, _) in descriptors {
+            values_map.entry(value).or_default().push(record_id);
+        }
+        if values_map.len() <= 1 {
+            return Vec::new();
+        }
+        let values: Vec<ConflictValue> = values_map
+            .into_iter()
+            .map(|(value, participants)| ConflictValue::new(value, participants))
+            .collect();
+        return vec![DirectConflict::new(
+            "direct".to_string(),
+            attribute,
+            first_interval,
+            values,
+        )];
+    }
+
     match algorithm {
         ConflictAlgorithm::SweepLine => {
             ConflictDetector::detect_conflicts_for_attribute_fast(descriptors, attribute)

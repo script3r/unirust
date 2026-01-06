@@ -68,10 +68,10 @@ pub struct LoadTestConfig {
 impl Default for LoadTestConfig {
     fn default() -> Self {
         Self {
-            count: 100_000,
+            count: 20_000_000,
             router_addr: "http://127.0.0.1:50060".to_string(),
             shard_addrs: vec![],
-            stream_count: 4,
+            stream_count: 32,
             batch_size: 5000,
             overlap_probability: 0.1,
             conflict_probability: 0.0,
@@ -159,10 +159,10 @@ USAGE:
     unirust_loadtest [OPTIONS]
 
 OPTIONS:
-    -c, --count <N>       Total entities to generate (default: 100000)
+    -c, --count <N>       Total entities to generate (default: 20000000)
     -r, --router <ADDR>   Router gRPC address (default: http://127.0.0.1:50060)
     -s, --shards <ADDRS>  Comma-separated shard addresses for direct metrics
-    --streams <N>         Number of concurrent streams (default: 4)
+    --streams <N>         Number of concurrent streams (default: 32)
     --batch <N>           Batch size per request (default: 5000)
     --overlap <F>         Overlap probability 0.0-1.0 (default: 0.1)
     --conflict <F>        Conflict probability 0.0-1.0 when overlapping (default: 0.0)
