@@ -724,44 +724,131 @@ impl ConflictDetector {
             return Vec::new();
         }
 
-        // Collect all intervals for atomic interval computation
-        let intervals: Vec<Interval> = descriptors.iter().map(|(_, _, i)| *i).collect();
-
-        // Get atomic intervals
-        let atoms = crate::temporal::atomic_intervals(&intervals);
-        if atoms.is_empty() {
+        let descriptor_count = descriptors.len();
+        let mut boundary_points: Vec<i64> = Vec::with_capacity(descriptor_count * 2);
+        for (_, _, interval) in &descriptors {
+            boundary_points.push(interval.start);
+            boundary_points.push(interval.end);
+        }
+        boundary_points.sort_unstable();
+        boundary_points.dedup();
+        if boundary_points.len() < 2 {
             return Vec::new();
         }
 
-        let mut conflicts = Vec::new();
-
-        // For each atomic interval, find which values are active
-        for atom in &atoms {
-            let mut active_values: FxHashMap<ValueId, Vec<RecordId>> = FxHashMap::default();
-
-            for (record_id, value, interval) in &descriptors {
-                if crate::temporal::encloses(interval, atom) {
-                    active_values.entry(*value).or_default().push(*record_id);
+        let atom_count = boundary_points.len() - 1;
+        // When atom count is tiny relative to descriptors, a direct scan is cheaper.
+        if atom_count * 4 <= descriptor_count {
+            let mut conflicts = Vec::new();
+            for window in boundary_points.windows(2) {
+                let Ok(atom) = Interval::new(window[0], window[1]) else {
+                    continue;
+                };
+                let mut active_values: FxHashMap<ValueId, Vec<RecordId>> = FxHashMap::default();
+                for (record_id, value, interval) in &descriptors {
+                    if crate::temporal::encloses(interval, &atom) {
+                        active_values.entry(*value).or_default().push(*record_id);
+                    }
+                }
+                if active_values.len() > 1 {
+                    let values: Vec<ConflictValue> = active_values
+                        .into_iter()
+                        .map(|(value, participants)| ConflictValue::new(value, participants))
+                        .collect();
+                    conflicts.push(DirectConflict::new(
+                        "direct".to_string(),
+                        attribute,
+                        atom,
+                        values,
+                    ));
                 }
             }
+            return Self::merge_adjacent_conflicts(conflicts);
+        }
 
-            // If multiple values are active in this atomic interval, it's a conflict
-            if active_values.len() > 1 {
-                let values: Vec<ConflictValue> = active_values
-                    .into_iter()
-                    .map(|(value, participants)| ConflictValue::new(value, participants))
-                    .collect();
+        // Build value -> intervals map and merge per value to avoid overlapping duplicates.
+        let mut descriptors_by_value: FxHashMap<ValueId, Vec<ValueInterval>> = FxHashMap::default();
+        descriptors_by_value.reserve(descriptors.len() / 4 + 1);
+        for (record_id, value, interval) in descriptors {
+            descriptors_by_value
+                .entry(value)
+                .or_insert_with(|| Vec::with_capacity(4))
+                .push(ValueInterval {
+                    interval,
+                    participants: Participants::one(record_id),
+                });
+        }
 
-                conflicts.push(DirectConflict::new(
-                    "direct".to_string(),
-                    attribute,
-                    *atom,
-                    values,
+        for intervals in descriptors_by_value.values_mut() {
+            *intervals = Self::merge_value_intervals(std::mem::take(intervals));
+        }
+
+        // Collect boundary points and events once, then sweep through atoms.
+        let mut points: Vec<i64> = Vec::with_capacity(descriptors_by_value.len() * 4);
+        let event_count: usize = descriptors_by_value.values().map(|v| v.len() * 2).sum();
+        let mut events = Vec::with_capacity(event_count);
+
+        for (value, intervals) in descriptors_by_value {
+            for entry in intervals {
+                points.push(entry.interval.start);
+                points.push(entry.interval.end);
+                events.push(IntervalEvent::start(
+                    entry.interval.start,
+                    value,
+                    entry.participants,
                 ));
+                events.push(IntervalEvent::end(entry.interval.end, value));
             }
         }
 
-        // Merge adjacent conflicts with the same values
+        points.sort_unstable();
+        points.dedup();
+        if points.len() < 2 {
+            return Vec::new();
+        }
+
+        events.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| a.kind.cmp(&b.kind)));
+
+        let mut conflicts = Vec::new();
+        let mut active: FxHashMap<ValueId, Participants> = FxHashMap::default();
+        active.reserve(points.len().min(64));
+
+        let mut event_idx = 0usize;
+        for window in points.windows(2) {
+            let start = window[0];
+            let end = window[1];
+
+        while event_idx < events.len() && events[event_idx].time == start {
+            let event = &mut events[event_idx];
+            match event.kind {
+                EventKind::End => {
+                    active.remove(&event.value);
+                }
+                EventKind::Start => {
+                    if let Some(participants) = event.participants.take() {
+                        active.insert(event.value, participants);
+                    }
+                }
+            }
+            event_idx += 1;
+        }
+
+            if start < end && active.len() > 1 {
+                if let Ok(interval) = Interval::new(start, end) {
+                    let mut values = Vec::with_capacity(active.len());
+                    for (value, participants) in &active {
+                        values.push(ConflictValue::new(*value, participants.to_vec()));
+                    }
+                    conflicts.push(DirectConflict::new(
+                        "direct".to_string(),
+                        attribute,
+                        interval,
+                        values,
+                    ));
+                }
+            }
+        }
+
         Self::merge_adjacent_conflicts(conflicts)
     }
 
