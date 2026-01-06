@@ -2,7 +2,7 @@
 
 use crate::linker::StreamingLinker;
 use crate::model::ClusterId;
-use crate::model::StringInterner;
+use crate::model::{InternerLookup, StringInterner};
 use crate::model::{Descriptor, GlobalClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
 use crate::store::Store;
@@ -51,6 +51,44 @@ impl IdentityKeySignature {
         }
 
         Self(bytes)
+    }
+
+    /// Create a signature from identity key values using the interner's string values.
+    /// This ensures signatures are stable across shards that do not share ValueId mappings.
+    pub fn from_key_values_with_interner(
+        entity_type: &str,
+        key_values: &[KeyValue],
+        interner: &dyn InternerLookup,
+    ) -> Option<Self> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher1 = DefaultHasher::new();
+        let mut hasher2 = DefaultHasher::new();
+
+        entity_type.hash(&mut hasher1);
+        entity_type.hash(&mut hasher2);
+
+        for (i, kv) in key_values.iter().enumerate() {
+            let attr = interner.get_attr_string(kv.attr)?;
+            let value = interner.get_value_string(kv.value)?;
+            attr.hash(&mut hasher1);
+            value.hash(&mut hasher1);
+            ((attr, value), i).hash(&mut hasher2);
+        }
+
+        let h1 = hasher1.finish().to_le_bytes();
+        let h2 = hasher2.finish().to_le_bytes();
+
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&h1);
+        bytes[8..16].copy_from_slice(&h2);
+        for i in 0..8 {
+            bytes[16 + i] = h1[i] ^ h2[7 - i];
+            bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
+        }
+
+        Some(Self(bytes))
     }
 
     /// Convert to bytes for storage.
@@ -980,6 +1018,7 @@ fn seed_store_interner_from(store: &mut Store, interner: &StringInterner) {
 mod tests {
     use super::*;
     use crate::model::{Descriptor, RecordIdentity};
+    use crate::perf::ConcurrentInterner;
     use crate::Interval;
 
     #[test]
@@ -1508,5 +1547,27 @@ mod tests {
         // Merge should proceed
         assert_eq!(result.merges_performed, 1, "Expected one merge");
         assert_eq!(result.keys_matched, 1);
+    }
+
+    #[test]
+    fn identity_signature_stable_across_interners() {
+        let mut interner = StringInterner::new();
+        let attr = interner.intern_attr("email");
+        let value = interner.intern_value("alice@example.com");
+        let kv = vec![KeyValue::new(attr, value)];
+        let sig = IdentityKeySignature::from_key_values_with_interner("person", &kv, &interner)
+            .expect("signature");
+
+        let concurrent = ConcurrentInterner::new();
+        concurrent.intern_attr("padding_attr");
+        concurrent.intern_value("padding_value");
+        let attr2 = concurrent.intern_attr("email");
+        let value2 = concurrent.intern_value("alice@example.com");
+        let kv2 = vec![KeyValue::new(attr2, value2)];
+        let sig2 =
+            IdentityKeySignature::from_key_values_with_interner("person", &kv2, &concurrent)
+                .expect("signature");
+
+        assert_eq!(sig, sig2);
     }
 }

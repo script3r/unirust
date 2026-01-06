@@ -27,6 +27,7 @@ use crate::linker::StreamingLinker;
 use crate::model::{ClusterId, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
 use crate::perf::bigtable_opts::PartitionOptimizations;
+use crate::perf::ConcurrentInterner;
 use crate::sharding::IdentityKeySignature;
 use crate::store::Store;
 use crate::temporal::Interval;
@@ -115,6 +116,8 @@ pub struct Partition {
     linker: StreamingLinker,
     /// Local record store for this partition
     store: Store,
+    /// Interner used to resolve record IDs back to strings for boundary tracking
+    interner: Arc<ConcurrentInterner>,
     /// Inbound merge requests from other partitions
     merge_rx: Receiver<CrossPartitionMerge>,
     /// Sender for merge requests (cloned to other partitions)
@@ -133,6 +136,7 @@ impl Partition {
         id: usize,
         tuning: &StreamingTuning,
         ontology: &Ontology,
+        interner: Arc<ConcurrentInterner>,
         merge_queue_capacity: usize,
     ) -> Result<Self> {
         let store = Store::new();
@@ -155,6 +159,7 @@ impl Partition {
             id,
             linker,
             store,
+            interner,
             merge_rx,
             merge_tx,
             records_processed: AtomicU64::new(0),
@@ -219,7 +224,12 @@ impl Partition {
                     .metrics()
                     .merges_performed
                     .load(Ordering::Relaxed);
-                let cluster_id = match self.linker.link_record(&self.store, ontology, record_id) {
+                let cluster_id = match self.linker.link_record_with_interner(
+                    &self.store,
+                    self.interner.as_ref(),
+                    ontology,
+                    record_id,
+                ) {
                     Ok(id) => id,
                     Err(e) => {
                         warn!("Failed to link record {:?}: {}", record_id, e);
@@ -339,10 +349,11 @@ impl Partition {
 
         // Use batch parallel linking if we have records to link
         let cluster_ids: Vec<ClusterId> = if !records_to_link.is_empty() {
-            match self
-                .linker
-                .link_records_batch_parallel(&records_to_link, ontology)
-            {
+            match self.linker.link_records_batch_parallel_with_interner(
+                &records_to_link,
+                ontology,
+                self.interner.as_ref(),
+            ) {
                 Ok(ids) => ids,
                 Err(e) => {
                     warn!("Failed to batch link records: {}", e);
@@ -625,10 +636,27 @@ impl PartitionedUnirust {
         ontology: Arc<Ontology>,
         tuning: StreamingTuning,
     ) -> Result<Self> {
+        let interner = Arc::new(ConcurrentInterner::new());
+        Self::new_with_interner(config, ontology, tuning, interner)
+    }
+
+    /// Create a new partitioned Unirust instance with a shared interner.
+    pub fn new_with_interner(
+        config: PartitionConfig,
+        ontology: Arc<Ontology>,
+        tuning: StreamingTuning,
+        interner: Arc<ConcurrentInterner>,
+    ) -> Result<Self> {
         let mut partitions = Vec::with_capacity(config.partition_count);
 
         for id in 0..config.partition_count {
-            let partition = Partition::new(id, &tuning, &ontology, config.merge_queue_capacity)?;
+            let partition = Partition::new(
+                id,
+                &tuning,
+                &ontology,
+                interner.clone(),
+                config.merge_queue_capacity,
+            )?;
             partitions.push(partition);
         }
 
@@ -867,10 +895,27 @@ impl ParallelPartitionedUnirust {
         ontology: Arc<Ontology>,
         tuning: StreamingTuning,
     ) -> Result<Self> {
+        let interner = Arc::new(ConcurrentInterner::new());
+        Self::new_with_interner(config, ontology, tuning, interner)
+    }
+
+    /// Create a new parallel partitioned Unirust instance with a shared interner.
+    pub fn new_with_interner(
+        config: PartitionConfig,
+        ontology: Arc<Ontology>,
+        tuning: StreamingTuning,
+        interner: Arc<ConcurrentInterner>,
+    ) -> Result<Self> {
         let mut partitions = Vec::with_capacity(config.partition_count);
 
         for id in 0..config.partition_count {
-            let partition = Partition::new(id, &tuning, &ontology, config.merge_queue_capacity)?;
+            let partition = Partition::new(
+                id,
+                &tuning,
+                &ontology,
+                interner.clone(),
+                config.merge_queue_capacity,
+            )?;
             partitions.push(parking_lot::Mutex::new(partition));
         }
 

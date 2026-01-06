@@ -261,6 +261,12 @@ pub struct StringInterner {
     next_value_id: u32,
 }
 
+/// Lightweight lookup for resolving interned IDs back to strings.
+pub trait InternerLookup {
+    fn get_attr_string(&self, id: AttrId) -> Option<String>;
+    fn get_value_string(&self, id: ValueId) -> Option<String>;
+}
+
 impl StringInterner {
     /// Create a new string interner
     pub fn new() -> Self {
@@ -362,6 +368,16 @@ impl StringInterner {
     /// Get all value IDs
     pub fn value_ids(&self) -> impl Iterator<Item = ValueId> + '_ {
         self.id_to_value.keys().copied()
+    }
+}
+
+impl InternerLookup for StringInterner {
+    fn get_attr_string(&self, id: AttrId) -> Option<String> {
+        self.get_attr(id).cloned()
+    }
+
+    fn get_value_string(&self, id: ValueId) -> Option<String> {
+        self.get_value(id).cloned()
     }
 }
 

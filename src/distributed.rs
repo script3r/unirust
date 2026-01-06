@@ -770,6 +770,9 @@ impl ShardNode {
             tracing::info!(shard_id, num_partitions, "Partitioned processing enabled");
         }
 
+        // Create concurrent interner FIRST - used for both ontology and records
+        let concurrent_interner = Arc::new(ConcurrentInterner::new());
+
         if let Some(path) = data_dir.clone() {
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
@@ -786,10 +789,11 @@ impl ShardNode {
             // ParallelPartitionedUnirust has per-partition Mutexes for true parallelism
             let partitioned = if use_partitioned {
                 let partition_config = PartitionConfig::for_cores(num_partitions);
-                let partitioned_unirust = ParallelPartitionedUnirust::new(
+                let partitioned_unirust = ParallelPartitionedUnirust::new_with_interner(
                     partition_config,
                     Arc::new(ontology),
                     tuning.clone(),
+                    concurrent_interner.clone(),
                 )?;
                 Some(Arc::new(partitioned_unirust))
             } else {
@@ -801,7 +805,7 @@ impl ShardNode {
                 shard_id,
                 unirust,
                 partitioned: Arc::new(parking_lot::RwLock::new(partitioned)),
-                concurrent_interner: Arc::new(ConcurrentInterner::new()),
+                concurrent_interner,
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
@@ -813,9 +817,6 @@ impl ShardNode {
                 cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
             });
         }
-
-        // Create concurrent interner FIRST - used for both ontology and records
-        let concurrent_interner = Arc::new(ConcurrentInterner::new());
 
         // Build ontology using the concurrent interner for partitioned mode
         // This ensures AttrIds match between ontology and records
@@ -840,10 +841,11 @@ impl ShardNode {
         // ParallelPartitionedUnirust has per-partition Mutexes for true parallelism
         let partitioned = if use_partitioned {
             let partition_config = PartitionConfig::for_cores(num_partitions);
-            let partitioned_unirust = ParallelPartitionedUnirust::new(
+            let partitioned_unirust = ParallelPartitionedUnirust::new_with_interner(
                 partition_config,
                 Arc::new(ontology),
                 tuning.clone(),
+                concurrent_interner.clone(),
             )?;
             Some(Arc::new(partitioned_unirust))
         } else {
@@ -1380,10 +1382,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
             let partition_config = PartitionConfig::for_cores(num_partitions);
             // Build ontology using concurrent interner to ensure AttrIds match records
             let ontology = config.build_ontology_with_interner(&self.concurrent_interner);
-            let new_partitioned = ParallelPartitionedUnirust::new(
+            let new_partitioned = ParallelPartitionedUnirust::new_with_interner(
                 partition_config,
                 Arc::new(ontology),
                 self.tuning.clone(),
+                self.concurrent_interner.clone(),
             )
             .map_err(|err| Status::internal(err.to_string()))?;
 

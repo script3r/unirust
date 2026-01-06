@@ -12,7 +12,7 @@
 use crate::dsu::TemporalGuard;
 use crate::dsu::{Clusters, DsuBackend, MergeResult, TemporalDSU};
 use crate::index::IndexBackend;
-use crate::model::{ClusterId, GlobalClusterId, KeyValue, Record, RecordId};
+use crate::model::{ClusterId, GlobalClusterId, InternerLookup, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
 use crate::perf::bigtable_opts::PartitionOptimizations;
 use crate::sharding::IdentityKeySignature as ShardingKeySignature;
@@ -540,6 +540,18 @@ impl StreamingLinker {
         ontology: &Ontology,
         record_id: RecordId,
     ) -> Result<ClusterId> {
+        self.link_record_with_interner(store, store.interner(), ontology, record_id)
+    }
+
+    /// Link a newly added record with an explicit interner for boundary tracking.
+    #[instrument(skip(self, store, interner, ontology), level = "debug", fields(record = ?record_id))]
+    pub fn link_record_with_interner(
+        &mut self,
+        store: &dyn RecordStore,
+        interner: &dyn InternerLookup,
+        ontology: &Ontology,
+        record_id: RecordId,
+    ) -> Result<ClusterId> {
         let _guard = crate::profile::profile_scope("link_record");
         if !self.dsu.has_record(record_id)? {
             self.dsu.add_record(record_id)?;
@@ -869,7 +881,13 @@ impl StreamingLinker {
                 }
                 // Track boundary signature for merges (borrows now released)
                 if let Some(new_root) = boundary_to_track {
-                    self.track_merge_boundary(store, entity_type, key_values, new_root, interval);
+                    self.track_merge_boundary(
+                        interner,
+                        entity_type,
+                        key_values,
+                        new_root,
+                        interval,
+                    );
                 }
             }
         }
@@ -914,6 +932,26 @@ impl StreamingLinker {
         records: &[&Record],
         ontology: &Ontology,
     ) -> Result<Vec<ClusterId>> {
+        self.link_records_batch_parallel_internal(records, ontology, None)
+    }
+
+    /// Link a batch of records using parallel extraction, with access to the store.
+    /// This enables boundary tracking for cross-shard reconciliation.
+    pub fn link_records_batch_parallel_with_interner(
+        &mut self,
+        records: &[&Record],
+        ontology: &Ontology,
+        interner: &dyn InternerLookup,
+    ) -> Result<Vec<ClusterId>> {
+        self.link_records_batch_parallel_internal(records, ontology, Some(interner))
+    }
+
+    fn link_records_batch_parallel_internal(
+        &mut self,
+        records: &[&Record],
+        ontology: &Ontology,
+        interner: Option<&dyn InternerLookup>,
+    ) -> Result<Vec<ClusterId>> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -928,7 +966,8 @@ impl StreamingLinker {
         // Phase 2: Sequential linking (DSU mutations require exclusive access)
         let mut cluster_ids = Vec::with_capacity(records.len());
         for (record, extraction) in records.iter().zip(extractions) {
-            let cluster_id = self.link_extracted_record(ontology, extraction)?;
+            let cluster_id =
+                self.link_extracted_record_with_interner(ontology, extraction, interner)?;
             cluster_ids.push(cluster_id);
 
             // Phase 3: Add to index (requires record reference)
@@ -980,10 +1019,11 @@ impl StreamingLinker {
     }
 
     /// Link an extracted record (sequential, mutates DSU).
-    fn link_extracted_record(
+    fn link_extracted_record_with_interner(
         &mut self,
         _ontology: &Ontology,
         extraction: ParallelExtractionResult,
+        interner: Option<&dyn InternerLookup>,
     ) -> Result<ClusterId> {
         let record_id = extraction.record_id;
         let entity_type = &extraction.entity_type;
@@ -1095,6 +1135,15 @@ impl StreamingLinker {
                         new_root,
                     );
                     root_a = new_root;
+                    if let Some(interner) = interner {
+                        self.track_merge_boundary(
+                            interner,
+                            entity_type,
+                            &key_values,
+                            new_root,
+                            interval,
+                        );
+                    }
                 }
             }
         }
@@ -1251,7 +1300,7 @@ impl StreamingLinker {
     #[inline]
     fn track_merge_boundary(
         &mut self,
-        store: &dyn RecordStore,
+        interner: &dyn InternerLookup,
         entity_type: &str,
         key_values: &[KeyValue],
         new_root: RecordId,
@@ -1260,14 +1309,19 @@ impl StreamingLinker {
         if !self.tuning.enable_boundary_tracking {
             return;
         }
-        let key_signature = LinkerKeySignature::new(entity_type, key_values);
         let global_id = self.get_or_assign_global_cluster_id(new_root);
-        let sharding_sig = key_signature.to_sharding_signature();
+        let sharding_sig = match ShardingKeySignature::from_key_values_with_interner(
+            entity_type,
+            key_values,
+            interner,
+        ) {
+            Some(sig) => sig,
+            None => return,
+        };
         let key = (sharding_sig, global_id);
 
         // Compute perspective_strong_ids from the cluster's summary
         // Uses actual string values (via interner) for cross-shard consistency
-        let interner = store.interner();
         let perspective_strong_ids = self
             .strong_id_summaries
             .peek(&new_root)
@@ -1643,7 +1697,7 @@ impl StrongIdSummary {
     /// so we must hash the actual strings to get consistent results across shards.
     fn compute_perspective_strong_ids(
         &self,
-        interner: &crate::model::StringInterner,
+        interner: &dyn InternerLookup,
     ) -> HashMap<u64, u64> {
         use rustc_hash::FxHasher;
         use std::hash::{Hash, Hasher};
@@ -1657,14 +1711,14 @@ impl StrongIdSummary {
 
             // Collect (attr_string, value_string) pairs and sort for deterministic hashing
             // We must use the actual strings, not IDs, to be consistent across shards
-            let mut values: Vec<(&str, &str)> = attrs
+            let mut values: Vec<(String, String)> = attrs
                 .iter()
                 .flat_map(|(attr_id, values)| {
-                    let attr_str = interner.get_attr(*attr_id);
+                    let attr_str = interner.get_attr_string(*attr_id);
                     values.keys().filter_map(move |value_id| {
-                        let value_str = interner.get_value(*value_id);
-                        match (attr_str, value_str) {
-                            (Some(a), Some(v)) => Some((a.as_str(), v.as_str())),
+                        let value_str = interner.get_value_string(*value_id);
+                        match (attr_str.clone(), value_str) {
+                            (Some(a), Some(v)) => Some((a, v)),
                             _ => None,
                         }
                     })
@@ -1682,6 +1736,65 @@ impl StrongIdSummary {
             result.insert(perspective_hash, values_hash);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Descriptor, RecordIdentity};
+    use crate::ontology::IdentityKey;
+    use crate::store::Store;
+
+    #[test]
+    fn parallel_link_tracks_boundary_keys() {
+        let mut store = Store::new();
+        let mut ontology = Ontology::new();
+
+        let email_attr = store.intern_attr("email");
+        ontology.add_identity_key(IdentityKey::new(
+            vec![email_attr],
+            "email_key".to_string(),
+        ));
+
+        let mut tuning = crate::StreamingTuning::default();
+        tuning.enable_boundary_tracking = true;
+
+        let mut linker = StreamingLinker::new(&store, &ontology, &tuning).expect("linker");
+
+        let interval = Interval::new(0, 10).expect("interval");
+        let email_value = store.intern_value("alice@example.com");
+
+        let record1 = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "hr".to_string(), "u1".to_string()),
+            vec![Descriptor::new(email_attr, email_value, interval)],
+        );
+        let record2 = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "hr".to_string(), "u2".to_string()),
+            vec![Descriptor::new(email_attr, email_value, interval)],
+        );
+
+        let id1 = store.add_record(record1).expect("record1");
+        let id2 = store.add_record(record2).expect("record2");
+
+        let records_to_link: Vec<&Record> = [id1, id2]
+            .iter()
+            .filter_map(|id| store.get_record_ref(*id))
+            .collect();
+
+        let cluster_ids = linker
+            .link_records_batch_parallel_with_interner(
+                &records_to_link,
+                &ontology,
+                store.interner(),
+            )
+            .expect("link");
+
+        assert_eq!(cluster_ids.len(), 2);
+        assert!(linker.boundary_count() > 0);
+        assert!(linker.dirty_boundary_key_count() > 0);
     }
 }
 
@@ -1726,10 +1839,6 @@ impl LinkerKeySignature {
         &self.key_values
     }
 
-    /// Convert to a sharding IdentityKeySignature for cross-shard boundary tracking.
-    fn to_sharding_signature(&self) -> ShardingKeySignature {
-        ShardingKeySignature::from_key_values(&self.entity_type, &self.key_values)
-    }
 }
 
 impl PartialEq for LinkerKeySignature {

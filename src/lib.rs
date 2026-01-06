@@ -352,8 +352,11 @@ impl Unirust {
 
             // Use parallel batch linking for large batches (>= 100 records)
             if records_to_link.len() >= 100 {
-                let cluster_ids =
-                    streaming.link_records_batch_parallel(&records_to_link, &self.ontology)?;
+                let cluster_ids = streaming.link_records_batch_parallel_with_interner(
+                    &records_to_link,
+                    &self.ontology,
+                    self.store.interner(),
+                )?;
                 let mut cluster_id_iter = cluster_ids.into_iter();
 
                 for (record_id, inserted) in &staged_info {
@@ -716,7 +719,11 @@ impl Unirust {
             // Use parallel batch linking for large batches (>= 100 records)
             if records_to_link.len() >= 100 {
                 let cluster_ids =
-                    streaming.link_records_batch_parallel(&records_to_link, &self.ontology)?;
+                    streaming.link_records_batch_parallel_with_interner(
+                        &records_to_link,
+                        &self.ontology,
+                        self.store.interner(),
+                    )?;
                 let mut cluster_id_iter = cluster_ids.into_iter();
 
                 for (record_id, inserted) in &staged_info {
