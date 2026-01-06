@@ -1751,8 +1751,10 @@ mod tests {
         let email_attr = store.intern_attr("email");
         ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
 
-        let mut tuning = crate::StreamingTuning::default();
-        tuning.enable_boundary_tracking = true;
+        let tuning = crate::StreamingTuning {
+            enable_boundary_tracking: true,
+            ..Default::default()
+        };
 
         let mut linker = StreamingLinker::new(&store, &ontology, &tuning).expect("linker");
 
