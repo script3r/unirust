@@ -680,7 +680,7 @@ impl ConflictDetector {
             return intervals;
         }
 
-        intervals.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+        intervals.sort_by_key(|value| value.interval.start);
         let mut merged: Vec<ValueInterval> = Vec::with_capacity(intervals.len());
 
         for current in intervals {
@@ -858,7 +858,7 @@ impl ConflictDetector {
             return conflicts;
         }
 
-        conflicts.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+        conflicts.sort_by_key(|conflict| conflict.interval.start);
         let mut merged: Vec<DirectConflict> = Vec::with_capacity(conflicts.len());
 
         for current in conflicts {

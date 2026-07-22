@@ -1893,9 +1893,11 @@ async fn poll_metrics_task(
                                 if let Some(latency) = m.ingest_latency {
                                     shard.ingest_latency_total.store(latency.total_micros, Ordering::Relaxed);
                                     shard.ingest_latency_max.store(latency.max_micros, Ordering::Relaxed);
-                                    if latency.count > 0 {
+                                    if let Some(average) =
+                                        latency.total_micros.checked_div(latency.count)
+                                    {
                                         shard.ingest_latency_avg.store(
-                                            latency.total_micros / latency.count,
+                                            average,
                                             Ordering::Relaxed,
                                         );
                                     }

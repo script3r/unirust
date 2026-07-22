@@ -2883,7 +2883,7 @@ impl RouterNode {
             };
         }
 
-        matches.sort_by(|a, b| a.start.cmp(&b.start));
+        matches.sort_by_key(|query_match| query_match.start);
 
         for window in matches.windows(2) {
             let current = &window[0];

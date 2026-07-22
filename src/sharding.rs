@@ -857,7 +857,7 @@ impl ShardedStreamEngine {
         let shard_count = self.shards.len();
         let shards = std::mem::take(&mut self.shards);
         let mut handles = Vec::with_capacity(shard_count);
-        for ((idx, shard), bucket) in shards.into_iter().enumerate().zip(buckets.into_iter()) {
+        for ((idx, shard), bucket) in shards.into_iter().enumerate().zip(buckets) {
             handles.push(std::thread::spawn(
                 move || -> Result<(usize, ShardState, Vec<ShardedClusterAssignment>)> {
                     let mut shard = shard;

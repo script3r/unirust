@@ -59,7 +59,7 @@ pub fn print_report() {
         .map(|(name, (count, total))| (*name, *count, *total))
         .collect();
 
-    entries.sort_by(|a, b| b.2.cmp(&a.2));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
 
     println!("\nProfiling report:");
     for (name, count, total) in entries {

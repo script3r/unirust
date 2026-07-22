@@ -374,7 +374,7 @@ fn coalesce_matches_per_cluster(matches: Vec<RawMatch>) -> Vec<RawMatch> {
         }
     }
 
-    result.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+    result.sort_by_key(|query_match| query_match.interval.start);
     result
 }
 
@@ -389,7 +389,7 @@ fn find_overlap_conflict(
     }
 
     let mut sorted = matches.to_vec();
-    sorted.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+    sorted.sort_by_key(|query_match| query_match.interval.start);
 
     for window in sorted.windows(2) {
         let current = &window[0];
