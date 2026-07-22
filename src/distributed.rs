@@ -763,11 +763,19 @@ impl ShardNode {
 
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         let worker_count = ingest_worker_count();
-        let use_partitioned = is_partitioned_enabled();
+        let partitioned_requested = is_partitioned_enabled();
+        // Partition stores are currently in-memory. Persistent shards must keep every
+        // ingest on the PersistentStore path until partitions have a durable backend.
+        let use_partitioned = partitioned_requested && data_dir.is_none();
         let num_partitions = partition_count();
 
         if use_partitioned {
             tracing::info!(shard_id, num_partitions, "Partitioned processing enabled");
+        } else if partitioned_requested && data_dir.is_some() {
+            tracing::info!(
+                shard_id,
+                "Partitioned processing disabled for persistent shard"
+            );
         }
 
         // Create concurrent interner FIRST - used for both ontology and records
@@ -1206,20 +1214,13 @@ async fn dispatch_ingest_partitioned(
     let indexed_records: Vec<(usize, u32, Record)> = if records.len() > 500 {
         records
             .par_iter()
-            .filter_map(|record| {
-                ShardNode::build_record_concurrent(interner, record)
-                    .ok()
-                    .map(|r| {
-                        let partition_id = compute_partition_id_for_record(
-                            &r,
-                            ontology,
-                            interner,
-                            partition_count,
-                        );
-                        (partition_id, record.index, r)
-                    })
+            .map(|record| {
+                let built = ShardNode::build_record_concurrent(interner, record)?;
+                let partition_id =
+                    compute_partition_id_for_record(&built, ontology, interner, partition_count);
+                Ok((partition_id, record.index, built))
             })
-            .collect()
+            .collect::<Result<Vec<_>, Status>>()?
     } else {
         let mut indexed_records = Vec::with_capacity(records.len());
         for record in &records {
@@ -1232,7 +1233,9 @@ async fn dispatch_ingest_partitioned(
     };
 
     // Phase 2: REAL entity resolution via partitioned processing with pre-computed partition IDs
-    let partition_results = partitioned.ingest_batch_with_partitions(indexed_records);
+    let partition_results = partitioned
+        .ingest_batch_with_partitions(indexed_records)
+        .map_err(|err| Status::internal(err.to_string()))?;
 
     // Phase 3: Convert to proto assignments
     let mut assignments = Vec::with_capacity(partition_results.len());
@@ -1377,7 +1380,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         // Rebuild partitioned processor with the new ontology if enabled
         // CRITICAL: The partitioned processor needs the ontology with strong identifiers
         // for conflict detection to work!
-        if is_partitioned_enabled() {
+        if is_partitioned_enabled() && self.data_dir.is_none() {
             let num_partitions = partition_count();
             let partition_config = PartitionConfig::for_cores(num_partitions);
             // Build ontology using concurrent interner to ensure AttrIds match records
@@ -1393,6 +1396,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             let mut partitioned_guard = self.partitioned.write();
             *partitioned_guard = Some(Arc::new(new_partitioned));
             tracing::info!("Partitioned processor rebuilt with updated ontology");
+        } else {
+            *self.partitioned.write() = None;
         }
 
         Ok(Response::new(proto::ApplyOntologyResponse {}))
@@ -2011,6 +2016,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::Empty>, Status> {
         let config = self.ontology_config.lock().await.clone();
         if let Some(path) = &self.data_dir {
+            let mut guard = write_unirust!(self);
+            let old = std::mem::replace(
+                &mut *guard,
+                Unirust::with_store_and_tuning(
+                    crate::Ontology::new(),
+                    crate::Store::new(),
+                    self.tuning.clone(),
+                ),
+            );
+            drop(old);
+
             let mut store =
                 PersistentStore::open(path).map_err(|err| Status::internal(err.to_string()))?;
             store
@@ -2025,7 +2041,6 @@ impl proto::shard_service_server::ShardService for ShardNode {
             store
                 .persist_state()
                 .map_err(|err| Status::internal(err.to_string()))?;
-            let mut guard = write_unirust!(self);
             *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
         } else {
             let mut store = crate::Store::new();

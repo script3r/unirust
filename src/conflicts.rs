@@ -35,7 +35,7 @@ impl Participants {
                 Participants::One(a) => {
                     *self = Participants::Many(vec![*a, b]);
                 }
-                Participants::Many(ref mut v) => {
+                Participants::Many(v) => {
                     v.push(b);
                 }
             },
@@ -44,7 +44,7 @@ impl Participants {
                     other_v.push(*a);
                     *self = Participants::Many(other_v);
                 }
-                Participants::Many(ref mut v) => {
+                Participants::Many(v) => {
                     v.append(&mut other_v);
                 }
             },
@@ -53,7 +53,7 @@ impl Participants {
 
     #[inline]
     fn sort_dedup(&mut self) {
-        if let Participants::Many(ref mut v) = self {
+        if let Participants::Many(v) = self {
             v.sort();
             v.dedup();
         }
@@ -2677,7 +2677,11 @@ mod tests {
 
                 // With the optimized linker, records with strong identifier conflicts are kept separate
                 // so there should be no indirect conflicts detected
-                assert_eq!(indirect_conflicts.len(), 0, "No indirect conflicts should be detected when records are kept separate due to strong identifier conflicts");
+                assert_eq!(
+                    indirect_conflicts.len(),
+                    0,
+                    "No indirect conflicts should be detected when records are kept separate due to strong identifier conflicts"
+                );
 
                 // Verify conflict details
                 for conflict in &indirect_conflicts {
@@ -3296,7 +3300,11 @@ mod tests {
             records,
             |_, clusters, observations| {
                 // Should have 2 separate clusters (entities should NOT be merged)
-                assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities with same email but different UIDs should not be merged");
+                assert_eq!(
+                    clusters.clusters.len(),
+                    2,
+                    "Should have 2 separate clusters - entities with same email but different UIDs should not be merged"
+                );
 
                 // Verify that the clusters contain the correct records
                 let mut found_entity1 = false;
@@ -3412,10 +3420,18 @@ mod tests {
             records,
             |_, clusters, observations| {
                 // Should have 2 separate clusters (entities should NOT be merged)
-                assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities from different perspectives should not be merged");
+                assert_eq!(
+                    clusters.clusters.len(),
+                    2,
+                    "Should have 2 separate clusters - entities from different perspectives should not be merged"
+                );
 
                 // Should have NO conflict observations (different perspectives can have same unique values)
-                assert_eq!(observations.len(), 0, "Should have no conflict observations - entities from different perspectives can have the same unique identifier");
+                assert_eq!(
+                    observations.len(),
+                    0,
+                    "Should have no conflict observations - entities from different perspectives can have the same unique identifier"
+                );
             },
         );
     }

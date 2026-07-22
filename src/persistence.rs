@@ -7,6 +7,7 @@ use rocksdb::{
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -114,6 +115,7 @@ pub struct PersistentStore {
     db: Arc<DB>,
     cache: Mutex<LruCache<RecordId, Record>>,
     staged_records: Mutex<Vec<Record>>,
+    staged_identities: Mutex<HashMap<RecordIdentity, RecordId>>,
     persisted_attr_id: u32,
     persisted_value_id: u32,
     record_count: u64,
@@ -166,6 +168,7 @@ impl PersistentStore {
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("cache capacity"),
             )),
             staged_records: Mutex::new(Vec::new()),
+            staged_identities: Mutex::new(HashMap::new()),
             persisted_attr_id,
             persisted_value_id,
             record_count,
@@ -187,7 +190,7 @@ impl PersistentStore {
         &mut self.inner
     }
 
-    pub fn persist_interner(&mut self, batch: &mut WriteBatch) -> Result<()> {
+    fn append_interner_to_batch(&self, batch: &mut WriteBatch) -> Result<(u32, u32)> {
         let interner_cf = self
             .db
             .cf_handle(CF_INTERNER)
@@ -216,8 +219,6 @@ impl PersistentStore {
             }
         }
 
-        self.persisted_attr_id = next_attr;
-        self.persisted_value_id = next_value;
         batch.put_cf(
             self.db
                 .cf_handle(CF_METADATA)
@@ -232,7 +233,12 @@ impl PersistentStore {
             KEY_NEXT_VALUE_ID,
             bincode::serialize(&next_value)?,
         );
-        Ok(())
+        Ok((next_attr, next_value))
+    }
+
+    fn commit_interner_watermark(&mut self, watermark: (u32, u32)) {
+        self.persisted_attr_id = watermark.0;
+        self.persisted_value_id = watermark.1;
     }
 
     pub fn persist_metadata(&self, batch: &mut WriteBatch) -> Result<()> {
@@ -310,10 +316,23 @@ impl PersistentStore {
         self.record_count = 0;
         self.cluster_count = 0;
         self.conflict_summary_count = 0;
+        self.staged_records
+            .get_mut()
+            .map_err(|_| anyhow!("staged records lock poisoned"))?
+            .clear();
+        self.staged_identities
+            .get_mut()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .clear();
+        self.cache
+            .get_mut()
+            .map_err(|_| anyhow!("record cache lock poisoned"))?
+            .clear();
         let mut batch = WriteBatch::default();
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata(&mut batch)?;
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         Ok(())
     }
 
@@ -330,9 +349,10 @@ impl PersistentStore {
 
     pub fn persist_state(&mut self) -> Result<()> {
         let mut batch = WriteBatch::default();
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata(&mut batch)?;
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         Ok(())
     }
 
@@ -343,17 +363,34 @@ impl PersistentStore {
             return Ok((existing, false));
         }
 
+        if let Some(existing) = self
+            .staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .get(&record.identity)
+            .copied()
+        {
+            return Ok((existing, false));
+        }
+
         let record_id = self.inner.prepare_record(&mut record)?;
+        let identity = record.identity.clone();
 
         // Add to cache immediately so it's readable
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(record_id, record.clone());
-        }
+        self.cache
+            .lock()
+            .map_err(|_| anyhow!("record cache lock poisoned"))?
+            .put(record_id, record.clone());
 
         // Stage for later batch write
-        if let Ok(mut staged) = self.staged_records.lock() {
-            staged.push(record);
-        }
+        self.staged_records
+            .lock()
+            .map_err(|_| anyhow!("staged records lock poisoned"))?
+            .push(record);
+        self.staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .insert(identity, record_id);
 
         Ok((record_id, true))
     }
@@ -364,7 +401,7 @@ impl PersistentStore {
             let mut staged = self
                 .staged_records
                 .lock()
-                .map_err(|_| anyhow!("lock error"))?;
+                .map_err(|_| anyhow!("staged records lock poisoned"))?;
             std::mem::take(&mut *staged)
         };
 
@@ -373,28 +410,43 @@ impl PersistentStore {
         }
 
         let count = records.len();
-        let records_cf = self
-            .db
-            .cf_handle(CF_RECORDS)
-            .ok_or_else(|| anyhow!("missing records column family"))?;
-
-        let mut batch = WriteBatch::default();
-
-        for record in &records {
-            let key = record.id.0.to_be_bytes();
-            with_record_bytes(record, |bytes| {
-                batch.put_cf(records_cf, key, bytes);
-                Ok(())
-            })?;
-            self.index_record_with_batch(record, &mut batch)?;
-        }
-
         let next_count = self.record_count.saturating_add(count as u64);
-        self.persist_interner(&mut batch)?;
-        self.persist_metadata_with_count(&mut batch, next_count)?;
+        let write_result = (|| -> Result<(u32, u32)> {
+            let mut batch = WriteBatch::default();
+            let watermark = self.append_interner_to_batch(&mut batch)?;
+            self.persist_metadata_with_count(&mut batch, next_count)?;
+            let records_cf = self
+                .db
+                .cf_handle(CF_RECORDS)
+                .ok_or_else(|| anyhow!("missing records column family"))?;
+            for record in &records {
+                let key = record.id.0.to_be_bytes();
+                with_record_bytes(record, |bytes| {
+                    batch.put_cf(records_cf, key, bytes);
+                    Ok(())
+                })?;
+                self.index_record_with_batch(record, &mut batch)?;
+            }
+            self.db.write_opt(batch, &fast_write_opts())?;
+            Ok(watermark)
+        })();
 
-        self.db.write_opt(batch, &fast_write_opts())?;
+        let watermark = match write_result {
+            Ok(watermark) => watermark,
+            Err(error) => {
+                *self
+                    .staged_records
+                    .lock()
+                    .map_err(|_| anyhow!("staged records lock poisoned"))? = records;
+                return Err(error);
+            }
+        };
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
+        self.staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .clear();
 
         Ok(count)
     }
@@ -442,9 +494,10 @@ impl RecordStore for PersistentStore {
             Ok(())
         })?;
         self.index_record_with_batch(&record, &mut batch)?;
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
         if let Ok(mut cache) = self.cache.lock() {
             cache.put(record_id, record);
@@ -485,11 +538,12 @@ impl RecordStore for PersistentStore {
         let next_count = self
             .record_count
             .saturating_add(prepared_records.len() as u64);
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 
         // Single write for all records
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
 
         // Update cache
@@ -519,13 +573,19 @@ impl RecordStore for PersistentStore {
         let mut results = Vec::with_capacity(records.len());
         let mut new_records = Vec::new();
         let mut new_record_indices = Vec::new();
+        let mut pending_identities = HashMap::new();
+        let mut pending_duplicates = Vec::new();
 
         for (idx, record) in records.into_iter().enumerate() {
             if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
                 results.push((existing, false));
+            } else if let Some(&new_record_index) = pending_identities.get(&record.identity) {
+                results.push((RecordId(0), false));
+                pending_duplicates.push((idx, new_record_index));
             } else {
                 results.push((RecordId(0), true)); // Placeholder, will be filled in
                 new_record_indices.push(idx);
+                pending_identities.insert(record.identity.clone(), new_records.len());
                 new_records.push(record);
             }
         }
@@ -564,16 +624,20 @@ impl RecordStore for PersistentStore {
         let next_count = self
             .record_count
             .saturating_add(prepared_records.len() as u64);
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 
         // Single write for all new records
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
 
         // Update results with actual record IDs
         for (i, idx) in new_record_indices.into_iter().enumerate() {
             results[idx].0 = assigned_ids[i];
+        }
+        for (idx, new_record_index) in pending_duplicates {
+            results[idx].0 = assigned_ids[new_record_index];
         }
 
         // Update cache
@@ -2287,6 +2351,79 @@ mod tests {
         let loaded = store.get_record(record_id).unwrap();
         assert_eq!(loaded.identity.uid, "1");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn staged_batch_deduplicates_source_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let attr = store.interner_mut().intern_attr("email");
+        let value = store.interner_mut().intern_value("alice@example.com");
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "alice-1".to_string(),
+        );
+        let make_record = || {
+            Record::new(
+                RecordId(0),
+                identity.clone(),
+                vec![Descriptor::new(attr, value, Interval::new(0, 10).unwrap())],
+            )
+        };
+
+        let first = store.stage_record_if_absent(make_record()).unwrap();
+        let second = store.stage_record_if_absent(make_record()).unwrap();
+
+        assert!(first.1);
+        assert!(!second.1);
+        assert_eq!(first.0, second.0);
+        assert_eq!(store.flush_staged_records().unwrap(), 1);
+        drop(store);
+
+        let store = PersistentStore::open(path).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get_record_id_by_identity(&identity), Some(first.0));
+    }
+
+    #[test]
+    fn batch_insert_deduplicates_source_identity() {
+        let dir = tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "alice-1".to_string(),
+        );
+        let make_record = || Record::new(RecordId(0), identity.clone(), Vec::new());
+
+        let results = store
+            .add_records_if_absent(vec![make_record(), make_record()])
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1);
+        assert!(!results[1].1);
+        assert_eq!(results[0].0, results[1].0);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn interner_watermark_advances_only_after_commit() {
+        let dir = tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        store.interner_mut().intern_attr("email");
+
+        let mut batch = WriteBatch::default();
+        let watermark = store.append_interner_to_batch(&mut batch).unwrap();
+
+        assert_eq!(store.persisted_attr_id, 0);
+        assert_eq!(watermark.0, 1);
+        store.db.write(batch).unwrap();
+        store.commit_interner_watermark(watermark);
+        assert_eq!(store.persisted_attr_id, 1);
     }
 
     #[test]

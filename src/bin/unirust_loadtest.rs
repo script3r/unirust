@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -80,6 +80,27 @@ impl Default for LoadTestConfig {
             seed: 42,
             headless: false,
         }
+    }
+}
+
+impl LoadTestConfig {
+    fn validate(&self) -> Result<()> {
+        if self.stream_count == 0 {
+            bail!("--streams must be greater than zero");
+        }
+        if self.batch_size == 0 {
+            bail!("--batch must be greater than zero");
+        }
+        for (name, value) in [
+            ("--overlap", self.overlap_probability),
+            ("--conflict", self.conflict_probability),
+            ("--cross-shard", self.cross_shard_probability),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                bail!("{name} must be between 0.0 and 1.0");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -159,7 +180,7 @@ USAGE:
     unirust_loadtest [OPTIONS]
 
 OPTIONS:
-    -c, --count <N>       Total entities to generate (default: 20000000)
+    -c, --count <N>       Total records to generate (default: 20000000)
     -r, --router <ADDR>   Router gRPC address (default: http://127.0.0.1:50060)
     -s, --shards <ADDRS>  Comma-separated shard addresses for direct metrics
     --streams <N>         Number of concurrent streams (default: 32)
@@ -175,7 +196,7 @@ OPTIONS:
     -h, --help            Print help
 
 EXAMPLES:
-    # Basic test with 100K entities
+    # Basic test with 100K records
     unirust_loadtest --count 100000 --router http://127.0.0.1:50060
 
     # Large scale with custom parallelism
@@ -443,7 +464,7 @@ impl CyberEntityGenerator {
     ) -> Self {
         let total_weight: u32 = EntityType::all().iter().map(|e| e.weight()).sum();
         // Pool size determines cluster density: smaller pool = denser clusters
-        // For ~10 entities per cluster with 10% overlap, use pool_size ~= total_entities / 100
+        // For ~10 records per cluster with 10% overlap, use pool_size ~= total_records / 100
         let pool_size = 10_000; // Supports up to 1M entities with ~10 per cluster at 10% overlap
 
         Self {
@@ -1288,6 +1309,8 @@ pub struct StreamStats {
     pub records_sent: AtomicU64,
     pub records_acked: AtomicU64,
     pub last_latency_micros: AtomicU64,
+    pub latency_total_micros: AtomicU64,
+    pub successful_batches: AtomicU64,
     pub errors: AtomicU64,
 }
 
@@ -1311,9 +1334,9 @@ pub struct ShardStats {
 
 pub struct LoadTestMetrics {
     pub start_time: Instant,
-    pub total_entities: u64,
-    pub entities_sent: AtomicU64,
-    pub entities_acked: AtomicU64,
+    pub total_records: u64,
+    pub records_sent: AtomicU64,
+    pub records_acked: AtomicU64,
     pub cluster_count: AtomicU64,
     pub conflicts_detected: AtomicU64,
     pub merges_performed: AtomicU64,
@@ -1328,7 +1351,7 @@ pub struct LoadTestMetrics {
 }
 
 impl LoadTestMetrics {
-    pub fn new(stream_count: usize, shard_count: usize, total_entities: u64) -> Self {
+    pub fn new(stream_count: usize, shard_count: usize, total_records: u64) -> Self {
         let stream_stats = (0..stream_count).map(|_| StreamStats::default()).collect();
         let shard_stats = (0..shard_count)
             .map(|i| ShardStats {
@@ -1339,9 +1362,9 @@ impl LoadTestMetrics {
 
         Self {
             start_time: Instant::now(),
-            total_entities,
-            entities_sent: AtomicU64::new(0),
-            entities_acked: AtomicU64::new(0),
+            total_records,
+            records_sent: AtomicU64::new(0),
+            records_acked: AtomicU64::new(0),
             cluster_count: AtomicU64::new(0),
             conflicts_detected: AtomicU64::new(0),
             merges_performed: AtomicU64::new(0),
@@ -1360,16 +1383,16 @@ impl LoadTestMetrics {
     }
 
     pub fn progress(&self) -> f64 {
-        let acked = self.entities_acked.load(Ordering::Relaxed);
-        if self.total_entities == 0 {
+        let acked = self.records_acked.load(Ordering::Relaxed);
+        if self.total_records == 0 {
             1.0
         } else {
-            acked as f64 / self.total_entities as f64
+            acked as f64 / self.total_records as f64
         }
     }
 
     pub fn throughput(&self) -> f64 {
-        let acked = self.entities_acked.load(Ordering::Relaxed);
+        let acked = self.records_acked.load(Ordering::Relaxed);
         let elapsed = self.elapsed().as_secs_f64();
         if elapsed > 0.0 {
             acked as f64 / elapsed
@@ -1379,8 +1402,8 @@ impl LoadTestMetrics {
     }
 
     pub fn eta(&self) -> Option<Duration> {
-        let acked = self.entities_acked.load(Ordering::Relaxed);
-        let remaining = self.total_entities.saturating_sub(acked);
+        let acked = self.records_acked.load(Ordering::Relaxed);
+        let remaining = self.total_records.saturating_sub(acked);
         let throughput = self.throughput();
         if throughput > 0.0 && remaining > 0 {
             Some(Duration::from_secs_f64(remaining as f64 / throughput))
@@ -1389,12 +1412,40 @@ impl LoadTestMetrics {
         }
     }
 
+    fn successful_batches(&self) -> u64 {
+        self.stream_stats
+            .iter()
+            .map(|stream| stream.successful_batches.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn average_request_latency_millis(&self) -> f64 {
+        let total_micros: u64 = self
+            .stream_stats
+            .iter()
+            .map(|stream| stream.latency_total_micros.load(Ordering::Relaxed))
+            .sum();
+        let batches = self.successful_batches();
+        if batches == 0 {
+            0.0
+        } else {
+            total_micros as f64 / batches as f64 / 1000.0
+        }
+    }
+
+    fn request_errors(&self) -> u64 {
+        self.stream_stats
+            .iter()
+            .map(|stream| stream.errors.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Generate a detailed report for analysis
     pub fn generate_report(&self, config: &LoadTestConfig) -> String {
         let elapsed = self.elapsed();
         let elapsed_secs = elapsed.as_secs_f64();
-        let entities_sent = self.entities_sent.load(Ordering::Relaxed);
-        let entities_acked = self.entities_acked.load(Ordering::Relaxed);
+        let records_sent = self.records_sent.load(Ordering::Relaxed);
+        let records_acked = self.records_acked.load(Ordering::Relaxed);
         let cluster_count = self.cluster_count.load(Ordering::Relaxed);
         let conflicts = self.conflicts_detected.load(Ordering::Relaxed);
         let throughput = self.throughput();
@@ -1441,18 +1492,14 @@ impl LoadTestMetrics {
 
         // Summary
         report.push_str("## Summary\n");
-        report.push_str(&format!("  Entities sent:    {}\n", entities_sent));
-        report.push_str(&format!("  Entities acked:   {}\n", entities_acked));
+        report.push_str(&format!("  Records sent:     {}\n", records_sent));
+        report.push_str(&format!("  Records acked:    {}\n", records_acked));
         report.push_str(&format!("  Clusters:         {}\n", cluster_count));
         report.push_str(&format!("  Conflicts:        {}\n", conflicts));
         report.push_str(&format!("  Throughput:       {:.2} rec/sec\n", throughput));
         report.push_str(&format!(
-            "  Avg latency:      {:.2} ms/batch\n\n",
-            if throughput > 0.0 {
-                (config.batch_size as f64 / throughput) * 1000.0
-            } else {
-                0.0
-            }
+            "  Avg RPC latency:  {:.2} ms/request\n\n",
+            self.average_request_latency_millis()
         ));
 
         // Cross-shard reconciliation stats
@@ -1572,20 +1619,16 @@ impl LoadTestMetrics {
 
         // Performance metrics
         report.push_str("## Performance Analysis\n");
-        let entities_per_stream = entities_acked as f64 / config.stream_count as f64;
-        let batches_total = entities_acked as f64 / config.batch_size as f64;
-        let batch_latency_avg = if batches_total > 0.0 {
-            elapsed_secs * 1000.0 / batches_total
-        } else {
-            0.0
-        };
-        report.push_str(&format!("  Total batches:      {:.0}\n", batches_total));
+        let records_per_stream = records_acked as f64 / config.stream_count as f64;
+        let batches_total = self.successful_batches();
+        let batch_latency_avg = self.average_request_latency_millis();
+        report.push_str(&format!("  Successful batches: {}\n", batches_total));
         report.push_str(&format!(
-            "  Entities/stream:    {:.0}\n",
-            entities_per_stream
+            "  Records/stream:     {:.0}\n",
+            records_per_stream
         ));
         report.push_str(&format!(
-            "  Batch latency avg:  {:.2} ms\n",
+            "  RPC latency avg:    {:.2} ms\n",
             batch_latency_avg
         ));
         report.push_str(&format!(
@@ -1602,7 +1645,7 @@ impl LoadTestMetrics {
             report.push_str("    - Check disk I/O with iostat\n");
         }
         if batch_latency_avg > 500.0 {
-            report.push_str("  ⚠ Batch latency > 500ms - processing bottleneck\n");
+            report.push_str("  ⚠ RPC latency > 500ms - processing bottleneck\n");
             report.push_str("    - Check conflict detection overhead\n");
             report.push_str("    - Consider profiling with UNIRUST_PROFILE=1\n");
         }
@@ -1663,7 +1706,6 @@ async fn run_parallel_streams(
 
     // Generator task
     let gen_config = config.clone();
-    let gen_metrics = metrics.clone();
     let gen_tx = tx.clone();
     let generator_handle = tokio::spawn(async move {
         let mut generator = CyberEntityGenerator::new(
@@ -1678,10 +1720,6 @@ async fn run_parallel_streams(
             let batch_size = gen_config.batch_size.min(remaining as usize);
             let batch = generator.generate_batch(batch_size);
             remaining -= batch_size as u64;
-            gen_metrics
-                .entities_sent
-                .fetch_add(batch_size as u64, Ordering::Relaxed);
-
             if gen_tx.send(batch).await.is_err() {
                 break; // Channel closed
             }
@@ -1712,7 +1750,7 @@ async fn run_parallel_streams(
                     metrics.stream_stats[i]
                         .records_sent
                         .fetch_add(batch_len as u64, Ordering::Relaxed);
-                    metrics.entities_sent.fetch_add(batch_len as u64, Ordering::Relaxed);
+                    metrics.records_sent.fetch_add(batch_len as u64, Ordering::Relaxed);
                     let start = Instant::now();
 
                     // Retry with exponential backoff
@@ -1736,15 +1774,31 @@ async fn run_parallel_streams(
                         {
                             Ok(response) => {
                                 let count = response.into_inner().assignments.len();
+                                if count != batch_len {
+                                    tracing::error!(
+                                        stream = i,
+                                        expected = batch_len,
+                                        acknowledged = count,
+                                        "Ingest returned an incomplete assignment set"
+                                    );
+                                    metrics.stream_stats[i]
+                                        .errors
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 metrics.stream_stats[i]
                                     .records_acked
                                     .fetch_add(count as u64, Ordering::Relaxed);
-                                metrics
-                                    .entities_acked
-                                    .fetch_add(count as u64, Ordering::Relaxed);
+                                metrics.records_acked.fetch_add(count as u64, Ordering::Relaxed);
+                                let latency_micros = start.elapsed().as_micros() as u64;
                                 metrics.stream_stats[i]
                                     .last_latency_micros
-                                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                    .store(latency_micros, Ordering::Relaxed);
+                                metrics.stream_stats[i]
+                                    .latency_total_micros
+                                    .fetch_add(latency_micros, Ordering::Relaxed);
+                                metrics.stream_stats[i]
+                                    .successful_batches
+                                    .fetch_add(1, Ordering::Relaxed);
                                 success = true;
                                 break;
                             }
@@ -1761,15 +1815,15 @@ async fn run_parallel_streams(
                         metrics.stream_stats[i]
                             .errors
                             .fetch_add(1, Ordering::Relaxed);
-                        // Still count for progress tracking
-                        metrics
-                            .entities_acked
-                            .fetch_add(batch_len as u64, Ordering::Relaxed);
                     }
                 }
             })
         })
         .collect();
+
+    // If every connection fails, dropping the original receiver lets the
+    // generator observe the closed channel instead of blocking forever.
+    drop(rx);
 
     // Wait for generator to finish
     let _ = generator_handle.await;
@@ -1828,7 +1882,7 @@ async fn poll_metrics_task(
 
                 // Poll individual shards for detailed metrics
                 for (i, client_opt) in shard_clients.iter_mut().enumerate() {
-                    if let Some(ref mut client) = client_opt {
+                    if let Some(client) = client_opt {
                         if let Ok(response) = client.get_metrics(MetricsRequest {}).await {
                             let m = response.into_inner();
                             if i < metrics.shard_stats.len() {
@@ -1970,7 +2024,7 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
 
     // Progress
     let progress = metrics.progress();
-    let acked = metrics.entities_acked.load(Ordering::Relaxed);
+    let acked = metrics.records_acked.load(Ordering::Relaxed);
     let eta_str = metrics
         .eta()
         .map(|d| format!("ETA: {}", format_duration(d)))
@@ -1996,17 +2050,10 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
         .split(chunks[3]);
 
     let throughput = metrics.throughput();
-    let avg_latency: u64 = metrics
-        .stream_stats
-        .iter()
-        .map(|s| s.last_latency_micros.load(Ordering::Relaxed))
-        .sum::<u64>()
-        / metrics.stream_stats.len().max(1) as u64;
-
     let throughput_text = format!(
         "Records/sec: {:.0}\nAvg Latency: {:.2} ms",
         throughput,
-        avg_latency as f64 / 1000.0
+        metrics.average_request_latency_millis()
     );
     let throughput_para = Paragraph::new(throughput_text)
         .style(Style::default().fg(Color::Green))
@@ -2038,13 +2085,14 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let sent = s.records_sent.load(Ordering::Relaxed);
             let acked = s.records_acked.load(Ordering::Relaxed);
             let latency = s.last_latency_micros.load(Ordering::Relaxed);
             let errors = s.errors.load(Ordering::Relaxed);
 
             Row::new(vec![
                 format!("#{}", i),
-                format!("{} sent", format_number(acked)),
+                format!("{} sent", format_number(sent)),
                 format!("{} ack", format_number(acked)),
                 format!("{:.1}ms", latency as f64 / 1000.0),
                 if errors > 0 {
@@ -2167,7 +2215,7 @@ async fn run_headless(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     println!(
-        "Running in headless mode - streaming {} entities...",
+        "Running in headless mode - streaming {} records...",
         config.count
     );
     let start = Instant::now();
@@ -2178,8 +2226,8 @@ async fn run_headless(
 
         // Print progress every 5 seconds
         if last_print.elapsed() >= Duration::from_secs(5) {
-            let sent = metrics.entities_sent.load(Ordering::Relaxed);
-            let acked = metrics.entities_acked.load(Ordering::Relaxed);
+            let sent = metrics.records_sent.load(Ordering::Relaxed);
+            let acked = metrics.records_acked.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
                 acked as f64 / elapsed
@@ -2214,6 +2262,7 @@ async fn run_headless(
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = parse_args();
+    config.validate()?;
 
     // Setup file logging if specified
     if let Some(log_path) = &config.log_file {
@@ -2251,6 +2300,7 @@ async fn main() -> Result<()> {
         if let Err(e) = run_parallel_streams(&stream_config, stream_metrics.clone()).await {
             tracing::error!(error = %e, "Streaming failed");
             *stream_metrics.error_message.write().await = Some(e.to_string());
+            stream_metrics.completed.store(true, Ordering::Relaxed);
         }
     });
 
@@ -2274,8 +2324,71 @@ async fn main() -> Result<()> {
     let _ = streaming_handle.await;
     let _ = metrics_handle.await;
 
-    // Generate and save report
-    write_report(&config, &metrics)?;
+    // Always preserve the diagnostic report, even when the run is incomplete.
+    let report_path = write_report(&config, &metrics)?;
+    if let Some(error) = metrics.error_message.read().await.clone() {
+        bail!(
+            "load test failed: {error}; report: {}",
+            report_path.display()
+        );
+    }
+
+    let sent = metrics.records_sent.load(Ordering::Relaxed);
+    let acked = metrics.records_acked.load(Ordering::Relaxed);
+    let errors = metrics.request_errors();
+    if errors > 0 || sent != config.count || acked != config.count {
+        bail!(
+            "load test incomplete: sent {sent}/{}, acknowledged {acked}/{}, request errors {errors}; report: {}",
+            config.count,
+            config.count,
+            report_path.display()
+        );
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_uses_single_record_counters_and_measured_rpc_latency() {
+        let config = LoadTestConfig {
+            count: 100,
+            stream_count: 1,
+            batch_size: 50,
+            ..LoadTestConfig::default()
+        };
+        let metrics = LoadTestMetrics::new(1, 0, config.count);
+        metrics.records_sent.store(100, Ordering::Relaxed);
+        metrics.records_acked.store(90, Ordering::Relaxed);
+        metrics.stream_stats[0]
+            .successful_batches
+            .store(2, Ordering::Relaxed);
+        metrics.stream_stats[0]
+            .latency_total_micros
+            .store(5_000, Ordering::Relaxed);
+
+        let report = metrics.generate_report(&config);
+
+        assert!(report.contains("Records sent:     100"));
+        assert!(report.contains("Records acked:    90"));
+        assert!(report.contains("Avg RPC latency:  2.50 ms/request"));
+        assert!(report.contains("Successful batches: 2"));
+        assert_eq!(metrics.progress(), 0.9);
+    }
+
+    #[test]
+    fn config_rejects_values_that_cannot_make_progress() {
+        let mut config = LoadTestConfig {
+            batch_size: 0,
+            ..LoadTestConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.batch_size = 5_000;
+        config.overlap_probability = 1.1;
+        assert!(config.validate().is_err());
+    }
 }

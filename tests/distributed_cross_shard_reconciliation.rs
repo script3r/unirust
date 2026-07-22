@@ -10,6 +10,7 @@
 
 use std::net::SocketAddr;
 
+use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -26,18 +27,27 @@ use unirust_rs::distributed::{
 };
 use unirust_rs::{StreamingTuning, TuningProfile};
 
+// Each scenario opens several RocksDB instances. Serialize this integration file
+// so the test process does not exceed its file-descriptor limit.
+static PERSISTENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn spawn_shard(
     shard_id: u32,
     config: DistributedOntologyConfig,
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -159,6 +169,7 @@ fn build_instrument_config() -> DistributedOntologyConfig {
 /// key to trigger a merge, which activates boundary tracking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_shard_conflict_detected_via_reconcile() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -300,6 +311,7 @@ async fn cross_shard_conflict_detected_via_reconcile() -> anyhow::Result<()> {
 /// We ingest directly to shards to force cross-shard scenario.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -420,6 +432,7 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
 /// We ingest directly to shards to force cross-shard scenario.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -548,6 +561,7 @@ async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
 /// This directly tests the serialization fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -629,6 +643,7 @@ async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<(
 /// Test dirty boundary keys also include perspective_strong_ids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -747,6 +762,7 @@ fn build_multi_key_config() -> DistributedOntologyConfig {
 /// This tests whether reconciliation can detect conflicts through transitive relationships.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_multi_key_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -927,6 +943,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
 /// Sharded: Each shard thinks its entity legitimately owns the identifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peic_many_entities_claim_same_identifier_across_shards() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     // Use UNIQUE constraint (not UniqueWithinPerspective) for global uniqueness
     let config = DistributedOntologyConfig {
         identity_keys: vec![IdentityKeyConfig {
@@ -1064,6 +1081,7 @@ async fn peic_many_entities_claim_same_identifier_across_shards() -> anyhow::Res
 /// Sharded: Each shard only knows about its own time ranges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temporal_overlap_conflict_across_shards() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -1185,6 +1203,7 @@ async fn temporal_overlap_conflict_across_shards() -> anyhow::Result<()> {
 /// Sharded: Requires re-reconciliation to detect the new conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_arriving_data_triggers_conflict() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -1323,6 +1342,7 @@ async fn late_arriving_data_triggers_conflict() -> anyhow::Result<()> {
 /// Sharded: Requires multiple reconciliation rounds to propagate the chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     // Ontology with 3 identity keys for the chain
     let config = DistributedOntologyConfig {
         identity_keys: vec![
@@ -1534,6 +1554,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
 /// have different values for the same attribute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn different_perspectives_no_false_positive_conflict() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_instrument_config(); // Uses UniqueWithinPerspective
     let empty_config = DistributedOntologyConfig::empty();
 

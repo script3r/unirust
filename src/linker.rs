@@ -657,7 +657,7 @@ impl StreamingLinker {
                             );
                         let candidates: CandidateVec = candidates_slice.iter().copied().collect();
                         // Cache the result for future lookups
-                        if let Some(ref opts) = partition_opts {
+                        if let Some(opts) = partition_opts {
                             opts.cache_candidates(&identity_sig, candidates.to_vec());
                         }
                         (candidates, is_hot)
@@ -862,7 +862,7 @@ impl StreamingLinker {
                             new_root,
                         );
                         // Invalidate cache on merge - candidates changed
-                        if let Some(ref opts) = partition_opts {
+                        if let Some(opts) = partition_opts {
                             opts.on_cluster_merge(root_a, root_b);
                         }
                         root_a = new_root;

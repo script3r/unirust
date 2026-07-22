@@ -581,7 +581,8 @@ fn wal_writer_loop(rx: Receiver<WalEntry>, config: WalConfig) {
 
 ### Partitioned Processing
 
-For maximum throughput, records are partitioned by identity key hash for parallel processing. Each partition uses `process_batch_optimized()`:
+For non-persistent shards, records can be partitioned by identity key hash for
+parallel processing. Each partition uses `process_batch_optimized()`:
 
 ```
                     ┌──────────────────────┐
@@ -614,6 +615,13 @@ For maximum throughput, records are partitioned by identity key hash for paralle
 
 Each partition runs independently with its own `Mutex<Partition>`. Rayon processes all partitions in parallel—no global lock contention.
 
+Partition stores are currently in-memory. A shard configured with `data_dir`
+therefore does not use this path: it routes every batch through the shard's
+`PersistentStore`, where records, indexes, and cluster assignments are durable
+and immediately available to queries. Enabling durable partition-local stores
+requires an explicit on-disk layout and recovery protocol; routing persistent
+traffic to in-memory partitions is not a valid optimization.
+
 ---
 
 ## Data Flow
@@ -624,16 +632,17 @@ Each partition runs independently with its own `Mutex<Partition>`. Rayon process
 1. Client sends RecordInput batch via gRPC
 2. Router hashes identity keys → partition records to shards
 3. Each shard receives its partition of the batch
-4. dispatch_ingest_partitioned() routes to ParallelPartitionedUnirust
-5. Records partitioned again by identity_key_hash % partition_count
+4. Non-persistent shards may route large batches to ParallelPartitionedUnirust
+5. On that path, records are partitioned again by identity_key_hash % partition_count
 6. Each partition (in parallel via Rayon):
    a. Batch insert all records to store
    b. Parallel extract: identity keys + strong ID summaries (Rayon)
    c. Sequential link: DSU merges with temporal guards
    d. Update identity index
-7. Merge partition results, sort by original index
-8. Update boundary index for cross-shard tracking
-9. Return cluster assignments
+7. Persistent shards instead resolve through Unirust backed by PersistentStore
+8. Persist records and cluster assignments before acknowledging the request
+9. Update boundary indexes for cross-shard tracking
+10. Return cluster assignments
 ```
 
 ### Query Path
@@ -675,7 +684,7 @@ Each partition runs independently with its own `Mutex<Partition>`. Rayon process
 | Balanced | 2,000 | 50,000 | General purpose |
 | LowLatency | 1,000 | 20,000 | Fast responses |
 | HighThroughput | 4,000 | 100,000 | Batch processing |
-| BulkIngest | 500 | 10,000 | Maximum speed |
+| BulkIngest | 500 | 10,000 | Large loads; full resolution with lower candidate caps |
 | MemorySaver | 500 | 5,000 | Reduced memory |
 | BillionScale | 2,000 + persistent DSU | 100,000 | Huge datasets |
 
@@ -683,14 +692,16 @@ Each partition runs independently with its own `Mutex<Partition>`. Rayon process
 
 ## Appendix: Performance Characteristics
 
-### Throughput (5-shard cluster, 16 streams, batch size 5000)
+### Verified Throughput (5-shard persistent cluster)
 
-| Workload | Records/sec | Notes |
-|----------|-------------|-------|
-| Pure ingest, no overlap | ~500K | Extraction-dominated |
-| 10% overlap probability | ~410K | Moderate DSU merge overhead |
-| 50% overlap probability | ~280K | Heavy merge workload |
-| With cross-shard reconciliation | ~380K | Periodic boundary sync |
+The release audit on 2026-07-22 measured 70,539 records/sec for 10,000,000
+records, 16 streams, 5,000-record batches, and 10% overlap on an Apple M5 with
+32 GB RAM. All 10,000,000 records were acknowledged with zero stream errors.
+
+Earlier 280K-500K figures measured an in-memory partition path that did not
+persist or expose its records through the shard's primary store. They are not
+valid production baselines. Performance work must preserve full entity
+resolution and acknowledge records only after durable storage.
 
 ### Memory Usage
 

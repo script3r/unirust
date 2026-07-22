@@ -30,12 +30,17 @@ async fn spawn_shard(
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -143,29 +148,26 @@ async fn shard_recovery_after_restart() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Ingest records
-    let records = vec![
-        record_input(
-            0,
-            "person",
-            "crm",
-            "persist-1",
-            vec![("email", "persist@example.com", 0, 10)],
-        ),
-        record_input(
-            1,
-            "person",
-            "crm",
-            "persist-2",
-            vec![("email", "persist2@example.com", 0, 10)],
-        ),
-    ];
+    // Cross the partitioned-dispatch threshold. Persistent shards must still route
+    // these records through the durable store and perform entity resolution.
+    let records: Vec<_> = (0..128)
+        .map(|index| {
+            record_input(
+                index,
+                "person",
+                "crm",
+                &format!("persist-{index}"),
+                vec![("email", &format!("entity-{}@example.com", index / 2), 0, 10)],
+            )
+        })
+        .collect();
     client
         .ingest_records(proto::IngestRecordsRequest { records })
         .await?;
 
     let stats = client.get_stats(StatsRequest {}).await?.into_inner();
-    assert_eq!(stats.record_count, 2);
+    assert_eq!(stats.record_count, 128);
+    assert_eq!(stats.cluster_count, 64);
 
     // Stop shard
     shard_handle.abort();
@@ -181,8 +183,12 @@ async fn shard_recovery_after_restart() -> anyhow::Result<()> {
     let stats = client.get_stats(StatsRequest {}).await?.into_inner();
 
     assert_eq!(
-        stats.record_count, 2,
+        stats.record_count, 128,
         "Records should persist after restart"
+    );
+    assert_eq!(
+        stats.cluster_count, 64,
+        "Entity-resolution assignments should persist after restart"
     );
 
     Ok(())

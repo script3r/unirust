@@ -295,10 +295,10 @@ impl Partition {
         &mut self,
         records: Vec<(u32, Record)>,
         ontology: &Ontology,
-    ) -> Vec<PartitionIngestResult> {
+    ) -> Result<Vec<PartitionIngestResult>> {
         let count = records.len();
         if count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Phase 1: Batch add all records to store, collect metadata
@@ -309,13 +309,7 @@ impl Partition {
             // Compute identity key signature BEFORE moving record to store
             let identity_sig = self.compute_identity_signature(&record, ontology);
 
-            let (record_id, inserted) = match self.store.add_record_if_absent_raw(record) {
-                Ok((id, ins)) => (id, ins),
-                Err(e) => {
-                    warn!("Failed to add record: {}", e);
-                    continue;
-                }
-            };
+            let (record_id, inserted) = self.store.add_record_if_absent_raw(record)?;
 
             // Update bloom filter
             if let Some(ref sig) = identity_sig {
@@ -349,21 +343,22 @@ impl Partition {
 
         // Use batch parallel linking if we have records to link
         let cluster_ids: Vec<ClusterId> = if !records_to_link.is_empty() {
-            match self.linker.link_records_batch_parallel_with_interner(
+            self.linker.link_records_batch_parallel_with_interner(
                 &records_to_link,
                 ontology,
                 self.interner.as_ref(),
-            ) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!("Failed to batch link records: {}", e);
-                    // Fall back to returning empty cluster IDs
-                    vec![ClusterId(0); records_to_link.len()]
-                }
-            }
+            )?
         } else {
             Vec::new()
         };
+
+        if cluster_ids.len() != inserted_info.len() {
+            anyhow::bail!(
+                "entity resolution returned {} assignments for {} inserted records",
+                cluster_ids.len(),
+                inserted_info.len()
+            );
+        }
 
         let conflicts_after = self
             .linker
@@ -412,43 +407,7 @@ impl Partition {
         // Process any pending cross-partition merges
         self.drain_merge_queue(ontology);
 
-        results
-    }
-
-    /// ULTRA-FAST batch processing - skips entity resolution AND storage.
-    /// Uses UID hash as cluster ID for maximum throughput.
-    /// For pure ingest acknowledgment - real storage/resolution done async.
-    #[inline]
-    pub fn process_batch_ultra_fast(
-        &mut self,
-        records: Vec<(u32, Record)>,
-    ) -> Vec<PartitionIngestResult> {
-        let count = records.len();
-        let mut results = Vec::with_capacity(count);
-
-        for (index, record) in records {
-            // Compute cluster ID from UID hash - deterministic, no linking needed
-            let cluster_id = {
-                let mut hasher = FxHasher::default();
-                record.identity.uid.hash(&mut hasher);
-                ClusterId(hasher.finish() as u32)
-            };
-
-            // Skip storage entirely for max throughput
-            // Records can be reconstructed from source or stored async
-            let _ = &record; // Keep record for future async storage
-
-            results.push(PartitionIngestResult {
-                index,
-                cluster_id,
-                merges: 0,
-                had_conflicts: false,
-            });
-        }
-
-        self.records_processed
-            .fetch_add(count as u64, Ordering::Relaxed);
-        results
+        Ok(results)
     }
 
     /// Drain and apply pending cross-partition merges
@@ -1035,9 +994,9 @@ impl ParallelPartitionedUnirust {
     /// Ingest a batch of records using TRUE parallel partition processing.
     /// Each partition is processed independently with its own lock - no global contention!
     #[instrument(skip(self, records), level = "debug")]
-    pub fn ingest_batch(&self, records: Vec<(u32, Record)>) -> Vec<PartitionIngestResult> {
+    pub fn ingest_batch(&self, records: Vec<(u32, Record)>) -> Result<Vec<PartitionIngestResult>> {
         if records.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let record_count = records.len();
@@ -1051,7 +1010,7 @@ impl ParallelPartitionedUnirust {
         // Each partition has its own Mutex, so no global lock contention!
         let ontology = &self.ontology;
 
-        let all_results: Vec<Vec<PartitionIngestResult>> = partitioned
+        let all_results: Result<Vec<Vec<PartitionIngestResult>>> = partitioned
             .into_par_iter()
             .enumerate()
             .filter(|(_, batch)| !batch.is_empty())
@@ -1064,9 +1023,9 @@ impl ParallelPartitionedUnirust {
             .collect();
 
         // Phase 3: Flatten and sort results by original index
-        let mut results: Vec<PartitionIngestResult> = all_results.into_iter().flatten().collect();
+        let mut results: Vec<PartitionIngestResult> = all_results?.into_iter().flatten().collect();
         results.sort_by_key(|r| r.index);
-        results
+        Ok(results)
     }
 
     /// Ingest a batch of records with pre-computed partition IDs.
@@ -1077,9 +1036,9 @@ impl ParallelPartitionedUnirust {
     pub fn ingest_batch_with_partitions(
         &self,
         records: Vec<(usize, u32, Record)>,
-    ) -> Vec<PartitionIngestResult> {
+    ) -> Result<Vec<PartitionIngestResult>> {
         if records.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let record_count = records.len();
@@ -1097,7 +1056,7 @@ impl ParallelPartitionedUnirust {
         // Phase 2: Process ALL partitions in PARALLEL using rayon
         let ontology = &self.ontology;
 
-        let all_results: Vec<Vec<PartitionIngestResult>> = partitioned
+        let all_results: Result<Vec<Vec<PartitionIngestResult>>> = partitioned
             .into_par_iter()
             .enumerate()
             .filter(|(_, batch)| !batch.is_empty())
@@ -1109,45 +1068,9 @@ impl ParallelPartitionedUnirust {
             .collect();
 
         // Phase 3: Flatten and sort results by original index
-        let mut results: Vec<PartitionIngestResult> = all_results.into_iter().flatten().collect();
+        let mut results: Vec<PartitionIngestResult> = all_results?.into_iter().flatten().collect();
         results.sort_by_key(|r| r.index);
-        results
-    }
-
-    /// ULTRA-FAST ingest - skips entity resolution for maximum throughput.
-    /// Uses UID hash as cluster ID. Entity resolution done lazily at query time.
-    /// This is the fastest possible ingest path.
-    #[inline]
-    pub fn ingest_batch_ultra_fast(
-        &self,
-        records: Vec<(u32, Record)>,
-    ) -> Vec<PartitionIngestResult> {
-        if records.is_empty() {
-            return Vec::new();
-        }
-
-        let record_count = records.len();
-        self.total_records
-            .fetch_add(record_count as u64, Ordering::Relaxed);
-
-        // Phase 1: Partition records by primary key (parallel for large batches)
-        let partitioned = self.partition_records(records);
-
-        // Phase 2: Process ALL partitions in PARALLEL - ULTRA FAST mode
-        let all_results: Vec<Vec<PartitionIngestResult>> = partitioned
-            .into_par_iter()
-            .enumerate()
-            .filter(|(_, batch)| !batch.is_empty())
-            .map(|(partition_id, batch)| {
-                let mut partition = self.partitions[partition_id].lock();
-                partition.process_batch_ultra_fast(batch)
-            })
-            .collect();
-
-        // Phase 3: Flatten and sort results by original index
-        let mut results: Vec<PartitionIngestResult> = all_results.into_iter().flatten().collect();
-        results.sort_by_key(|r| r.index);
-        results
+        Ok(results)
     }
 
     /// Get the total number of clusters across all partitions

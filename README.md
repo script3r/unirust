@@ -26,7 +26,7 @@ Unirust will:
 - **Conflict Detection**: Automatic detection of attribute conflicts within clusters
 - **Distributed**: Router + multi-shard architecture for horizontal scaling
 - **Persistent**: RocksDB storage with crash recovery
-- **High Performance**: 400K+ records/sec via batch-parallel processing, lock-free DSU, SIMD hashing
+- **Measured Performance**: Release baselines use persistent shards and include full entity resolution; see the benchmark below
 
 ## Quick Start
 
@@ -141,7 +141,7 @@ write_buffer_mb = 256
 | `balanced` | General purpose (default for library) |
 | `low-latency` | Interactive queries, fast responses |
 | `high-throughput` | Batch processing (default for binaries) |
-| `bulk-ingest` | Maximum ingest speed, reduced matching |
+| `bulk-ingest` | Large initial loads with lower candidate caps; entity resolution remains enabled |
 | `memory-saver` | Constrained environments |
 | `billion-scale` | Persistent DSU for huge datasets |
 
@@ -187,22 +187,14 @@ See [DESIGN.md](DESIGN.md) for detailed architecture documentation, including:
 
 ## Examples
 
-The `examples/` directory contains comprehensive examples:
+The `examples/` directory demonstrates the supported sharded deployment model:
 
-- `in_memory.rs` - In-memory entity resolution, perfect for learning
-- `persistent_shard.rs` - Single-shard with RocksDB persistence
 - `cluster.rs` - Full 3-shard distributed cluster with router
-- `unirust.toml` - Example configuration file
+- `unirust.toml` - Persistent router and shard configuration
 
 Run examples:
 ```bash
-# Simple in-memory example
-cargo run --example in_memory
-
-# Persistent storage with single shard
-cargo run --example persistent_shard
-
-# Distributed cluster (requires cluster running first)
+# Distributed cluster (requires the persistent cluster running first)
 SHARDS=3 ./scripts/cluster.sh start
 cargo run --example cluster
 ./scripts/cluster.sh stop
@@ -210,19 +202,27 @@ cargo run --example cluster
 
 ## Performance
 
-Typical throughput on a 5-shard cluster (16 concurrent streams, batch size 5000):
+Release verification on an Apple M5 with 32 GB RAM, five persistent shards,
+16 concurrent streams, 5,000-record batches, and 10% overlap:
 
-| Workload | Records/sec | Batch Latency |
-|----------|-------------|---------------|
-| Pure ingest | ~500K | 8ms |
-| 10% overlap | ~410K | 12ms |
-| With conflicts | ~300K | 16ms |
+| Records | Records/sec | Stream Errors |
+|---------|-------------|---------------|
+| 10,000,000 | 70,539 | 0 |
+
+This is an end-to-end durability-correct measurement: records and cluster
+assignments are persisted before acknowledgement, and every record goes through
+entity resolution. Results depend on storage hardware and ontology complexity;
+rerun the command below on the release target rather than treating this number
+as a service-level guarantee.
 
 ## Development
 
 ```bash
-# Run tests
+# Fast correctness gate (unit and integration tests)
 cargo test
+
+# Compile examples, binaries, and benchmarks without executing benchmarks
+cargo check --all-targets --all-features
 
 # Run quick benchmarks (~30s)
 cargo bench --bench bench_quick
@@ -236,8 +236,24 @@ cargo bench --bench bench_quick
 
 # Format and lint
 cargo fmt
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+`cargo test --all-targets` executes Criterion benchmark binaries on some Cargo
+versions and is intentionally not the default correctness gate. Run benchmarks
+explicitly with `cargo bench --bench <name>`.
+
+### Test Strategy
+
+- Unit tests cover temporal algebra, matching, DSU behavior, indexes, and focused
+  persistence failure modes.
+- Integration tests exercise router and shard RPCs with temporary
+  `PersistentStore` databases, including restart, WAL, reconciliation, streaming,
+  reset, and rebalance behavior.
+- `cargo check --all-targets --all-features` compiles examples and benchmarks
+  without mixing performance workloads into the correctness suite.
+- `bench_quick` is the local performance smoke test. The distributed load test is
+  the release benchmark and must be run against persistent shards.
 
 ## Container Deployment
 

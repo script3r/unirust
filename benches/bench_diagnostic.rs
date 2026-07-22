@@ -87,7 +87,9 @@ fn diagnose_dsu_scaling() {
 /// Test index via full pipeline at different scales
 fn diagnose_index_scaling() {
     println!("--- Index Scaling via Pipeline Diagnostic ---");
-    println!("  (Index performance is measured via full pipeline - see diagnose_full_pipeline for details)");
+    println!(
+        "  (Index performance is measured via full pipeline - see diagnose_full_pipeline for details)"
+    );
     println!();
 }
 
