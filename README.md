@@ -265,6 +265,10 @@ Never expose a shard port directly to an untrusted network. Destructive RPCs
 remain disabled by default, but ingest, query, export, reconciliation, and other
 administrative surfaces are otherwise unauthenticated.
 
+The shard binary requires a persistent `--data-dir`. An in-memory shard can only
+be started with the explicit `--ephemeral` flag and loses all records when the
+process exits.
+
 ## Performance
 
 Release verification on an Apple M5 with 32 GB RAM, five persistent shards,

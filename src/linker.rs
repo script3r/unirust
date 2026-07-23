@@ -757,20 +757,22 @@ impl StreamingLinker {
                     None
                 };
 
-                // Track if we should record boundary after the loop
-                let mut boundary_to_track: Option<RecordId> = None;
-
                 // Use destructuring for separate mutable borrows in candidate processing
                 let StreamingLinker {
                     dsu,
                     identity_index,
                     cluster_ids,
                     next_cluster_id,
+                    global_cluster_ids,
                     strong_id_summaries,
                     tainted_identity_keys,
                     record_perspectives,
+                    boundary_signatures,
+                    dirty_boundary_keys,
+                    cross_shard_merges,
                     metrics,
                     partition_opts,
+                    shard_id,
                     ..
                 } = self;
 
@@ -852,6 +854,16 @@ impl StreamingLinker {
                             root_b,
                             new_root,
                         );
+                        reconcile_global_cluster_ids(
+                            global_cluster_ids,
+                            cross_shard_merges,
+                            boundary_signatures,
+                            dirty_boundary_keys,
+                            *shard_id,
+                            root_a,
+                            root_b,
+                            new_root,
+                        );
                         reconcile_cluster_summaries(strong_id_summaries, root_a, root_b, new_root);
                         identity_index.merge_key_clusters(
                             entity_type,
@@ -865,9 +877,6 @@ impl StreamingLinker {
                             opts.on_cluster_merge(root_a, root_b);
                         }
                         root_a = new_root;
-
-                        // Mark for boundary tracking after borrows are released
-                        boundary_to_track = Some(new_root);
                     }
                 }
                 // Record stats after candidates loop (borrows dropped)
@@ -878,22 +887,17 @@ impl StreamingLinker {
                         .or_default()
                         .record(candidate_len, actual_cap);
                 }
-                // Track boundary signature for merges (borrows now released)
-                if let Some(new_root) = boundary_to_track {
-                    self.track_merge_boundary(
-                        interner,
-                        entity_type,
-                        key_values,
-                        new_root,
-                        interval,
-                    );
-                }
             }
         }
 
         // Add the record to the index after matching to avoid self-matches.
         let _add_guard = crate::profile::profile_scope("add_to_index");
         let root = self.dsu.find(record_id).unwrap_or(record_id);
+        for (_, key_values_with_intervals) in &cached_keys {
+            for (key_values, interval) in key_values_with_intervals {
+                self.track_merge_boundary(interner, entity_type, key_values, root, *interval);
+            }
+        }
 
         self.identity_index
             .add_record_with_cached_keys(record_id, root, entity_type, cached_keys);
@@ -970,7 +974,7 @@ impl StreamingLinker {
             cluster_ids.push(cluster_id);
 
             // Phase 3: Add to index (requires record reference)
-            self.add_to_index_after_parallel_link(record, ontology)?;
+            self.add_to_index_after_parallel_link(record, ontology, interner)?;
         }
 
         Ok(cluster_ids)
@@ -1022,7 +1026,7 @@ impl StreamingLinker {
         &mut self,
         _ontology: &Ontology,
         extraction: ParallelExtractionResult,
-        interner: Option<&dyn InternerLookup>,
+        _interner: Option<&dyn InternerLookup>,
     ) -> Result<ClusterId> {
         let record_id = extraction.record_id;
         let entity_type = &extraction.entity_type;
@@ -1120,6 +1124,16 @@ impl StreamingLinker {
                         root_b,
                         new_root,
                     );
+                    reconcile_global_cluster_ids(
+                        &mut self.global_cluster_ids,
+                        &mut self.cross_shard_merges,
+                        &mut self.boundary_signatures,
+                        &mut self.dirty_boundary_keys,
+                        self.shard_id,
+                        root_a,
+                        root_b,
+                        new_root,
+                    );
                     reconcile_cluster_summaries(
                         &mut self.strong_id_summaries,
                         root_a,
@@ -1134,15 +1148,6 @@ impl StreamingLinker {
                         new_root,
                     );
                     root_a = new_root;
-                    if let Some(interner) = interner {
-                        self.track_merge_boundary(
-                            interner,
-                            entity_type,
-                            &key_values,
-                            new_root,
-                            interval,
-                        );
-                    }
                 }
             }
         }
@@ -1161,6 +1166,7 @@ impl StreamingLinker {
         &mut self,
         record: &Record,
         ontology: &Ontology,
+        interner: Option<&dyn InternerLookup>,
     ) -> Result<()> {
         let root = self.dsu.find(record.id).unwrap_or(record.id);
         let entity_type = &record.identity.entity_type;
@@ -1174,6 +1180,14 @@ impl StreamingLinker {
                 crate::index::extract_key_values_from_record(record, identity_key)
             {
                 cached_keys.push((identity_key, key_values_with_intervals));
+            }
+        }
+
+        if let Some(interner) = interner {
+            for (_, key_values_with_intervals) in &cached_keys {
+                for (key_values, interval) in key_values_with_intervals {
+                    self.track_merge_boundary(interner, entity_type, key_values, root, *interval);
+                }
             }
         }
 
@@ -1292,10 +1306,7 @@ impl StreamingLinker {
             .collect()
     }
 
-    /// Track boundary signature when a merge happens.
-    /// This is the optimized path - we only track boundaries when clusters actually merge,
-    /// not on every record. This significantly reduces overhead while still capturing
-    /// the important cross-shard boundary information.
+    /// Track an identity-key observation for distributed reconciliation.
     #[inline]
     fn track_merge_boundary(
         &mut self,
@@ -1810,6 +1821,81 @@ mod tests {
         assert!(linker.boundary_count() > 0);
         assert!(linker.dirty_boundary_key_count() > 0);
     }
+
+    #[test]
+    fn local_merge_canonicalizes_previously_exposed_global_ids() {
+        let mut store = Store::new();
+        let mut ontology = Ontology::new();
+        let email_attr = store.intern_attr("email");
+        let phone_attr = store.intern_attr("phone");
+        ontology.add_identity_key(IdentityKey::new(vec![email_attr], "email_key".to_string()));
+        ontology.add_identity_key(IdentityKey::new(vec![phone_attr], "phone_key".to_string()));
+        let tuning = crate::StreamingTuning {
+            shard_id: 1,
+            enable_boundary_tracking: true,
+            ..Default::default()
+        };
+        let mut linker = StreamingLinker::new(&store, &ontology, &tuning).expect("linker");
+        let interval = Interval::new(0, 10).expect("interval");
+        let email_value = store.intern_value("alice@example.com");
+        let phone_value = store.intern_value("+15550001");
+
+        let records = [
+            Record::new(
+                RecordId(0),
+                RecordIdentity::new("person".to_string(), "crm".to_string(), "email".to_string()),
+                vec![Descriptor::new(email_attr, email_value, interval)],
+            ),
+            Record::new(
+                RecordId(0),
+                RecordIdentity::new("person".to_string(), "crm".to_string(), "phone".to_string()),
+                vec![Descriptor::new(phone_attr, phone_value, interval)],
+            ),
+            Record::new(
+                RecordId(0),
+                RecordIdentity::new(
+                    "person".to_string(),
+                    "crm".to_string(),
+                    "bridge".to_string(),
+                ),
+                vec![
+                    Descriptor::new(email_attr, email_value, interval),
+                    Descriptor::new(phone_attr, phone_value, interval),
+                ],
+            ),
+        ];
+
+        for record in records {
+            let record_id = store.add_record(record).expect("record");
+            linker
+                .link_record(&store, &ontology, record_id)
+                .expect("link");
+        }
+
+        let boundary = linker.export_boundary_index();
+        let mut global_ids = [email_attr, phone_attr]
+            .into_iter()
+            .zip([email_value, phone_value])
+            .flat_map(|(attr, value)| {
+                let signature = ShardingKeySignature::from_key_values_with_interner(
+                    "person",
+                    &[KeyValue::new(attr, value)],
+                    store.interner(),
+                )
+                .expect("signature");
+                boundary
+                    .get_boundaries(&signature)
+                    .expect("boundary")
+                    .iter()
+                    .map(|entry| entry.cluster_id)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        global_ids.sort_by_key(GlobalClusterId::to_u64);
+        global_ids.dedup();
+        assert_eq!(global_ids.len(), 1);
+        assert_eq!(linker.cross_shard_merge_count(), 1);
+    }
 }
 
 /// Identity key signature for linker deduplication.
@@ -1934,6 +2020,96 @@ fn reconcile_cluster_ids(
         cluster_ids.remove(&root_b);
     }
     cluster_ids.insert(new_root, chosen);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_global_cluster_ids(
+    global_cluster_ids: &mut LinkerState<RecordId, GlobalClusterId>,
+    cross_shard_merges: &mut HashMap<GlobalClusterId, GlobalClusterId>,
+    boundary_signatures: &mut HashMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
+    dirty_boundary_keys: &mut HashSet<ShardingKeySignature>,
+    shard_id: u16,
+    root_a: RecordId,
+    root_b: RecordId,
+    new_root: RecordId,
+) {
+    fn resolve(
+        redirects: &HashMap<GlobalClusterId, GlobalClusterId>,
+        id: GlobalClusterId,
+    ) -> GlobalClusterId {
+        let mut current = id;
+        let mut seen = HashSet::new();
+        while let Some(next) = redirects.get(&current).copied() {
+            if !seen.insert(current) {
+                break;
+            }
+            current = next;
+        }
+        current
+    }
+
+    let id_a = global_cluster_ids.get_copy(&root_a);
+    let id_b = global_cluster_ids.get_copy(&root_b);
+    if id_a.is_none() && id_b.is_none() {
+        return;
+    }
+    if root_a != new_root {
+        global_cluster_ids.remove(&root_a);
+    }
+    if root_b != new_root {
+        global_cluster_ids.remove(&root_b);
+    }
+
+    let mut ids = [id_a, id_b]
+        .into_iter()
+        .flatten()
+        .flat_map(|id| [id, resolve(cross_shard_merges, id)])
+        .collect::<Vec<_>>();
+    ids.sort_by_key(GlobalClusterId::to_u64);
+    ids.dedup();
+    let canonical = ids
+        .first()
+        .copied()
+        .unwrap_or_else(|| GlobalClusterId::from_local(shard_id, ClusterId(new_root.0)));
+
+    for id in &ids {
+        if *id == canonical {
+            cross_shard_merges.remove(id);
+        } else {
+            cross_shard_merges.insert(*id, canonical);
+        }
+    }
+    for (_, global_id) in global_cluster_ids.iter_mut() {
+        if ids.contains(global_id) {
+            *global_id = canonical;
+        }
+    }
+    global_cluster_ids.insert(new_root, canonical);
+
+    let keys_to_update = boundary_signatures
+        .keys()
+        .filter(|(_, global_id)| ids.contains(global_id) && *global_id != canonical)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (signature, old_id) in keys_to_update {
+        if let Some(data) = boundary_signatures.remove(&(signature, old_id)) {
+            boundary_signatures
+                .entry((signature, canonical))
+                .and_modify(|existing| {
+                    if let Ok(interval) = Interval::new(
+                        existing.interval.start.min(data.interval.start),
+                        existing.interval.end.max(data.interval.end),
+                    ) {
+                        existing.interval = interval;
+                    }
+                    existing
+                        .perspective_strong_ids
+                        .extend(data.perspective_strong_ids.clone());
+                })
+                .or_insert(data);
+            dirty_boundary_keys.insert(signature);
+        }
+    }
 }
 
 fn reconcile_cluster_summaries(

@@ -330,6 +330,23 @@ impl Unirust {
     /// }
     /// ```
     pub fn ingest(&mut self, records: Vec<Record>) -> anyhow::Result<IngestResult> {
+        self.ingest_internal(records, false)
+    }
+
+    /// Ingest snapshots while preserving their explicit record IDs.
+    #[doc(hidden)]
+    pub fn ingest_with_explicit_ids(
+        &mut self,
+        records: Vec<Record>,
+    ) -> anyhow::Result<IngestResult> {
+        self.ingest_internal(records, true)
+    }
+
+    fn ingest_internal(
+        &mut self,
+        records: Vec<Record>,
+        preserve_record_ids: bool,
+    ) -> anyhow::Result<IngestResult> {
         self.clear_conflict_cache();
         self.clear_query_stats();
         if self.streaming.is_none() {
@@ -339,7 +356,11 @@ impl Unirust {
         // Stage all records and collect their IDs
         let mut staged_info: Vec<(RecordId, bool)> = Vec::with_capacity(records.len());
         for record in records {
-            let (record_id, inserted) = self.store.stage_record_if_absent(record)?;
+            let (record_id, inserted) = if preserve_record_ids {
+                self.store.stage_record_with_explicit_id_if_absent(record)?
+            } else {
+                self.store.stage_record_if_absent(record)?
+            };
             staged_info.push((record_id, inserted));
         }
 
@@ -1114,8 +1135,12 @@ impl Unirust {
         self.conflict_cache.lock().unwrap().clone()
     }
 
-    pub fn load_conflict_summaries(&self) -> Option<Vec<conflicts::ConflictSummary>> {
-        self.store.load_conflict_summaries()
+    pub fn load_conflict_summaries(
+        &self,
+    ) -> anyhow::Result<Option<Vec<conflicts::ConflictSummary>>> {
+        let summaries = self.store.load_conflict_summaries();
+        self.store.ensure_healthy()?;
+        Ok(summaries)
     }
 
     /// Persist the durable cross-shard conflict set.
@@ -1140,11 +1165,15 @@ impl Unirust {
             .or_else(|| self.store.conflict_summary_count())
     }
 
-    pub fn set_conflict_cache(&mut self, summaries: Vec<conflicts::ConflictSummary>) {
-        if let Err(err) = self.store.set_conflict_summaries(&summaries) {
-            eprintln!("Failed to persist conflict summaries: {err}");
-        }
+    pub fn set_conflict_cache(
+        &mut self,
+        summaries: Vec<conflicts::ConflictSummary>,
+    ) -> anyhow::Result<()> {
+        self.store.ensure_healthy()?;
+        self.store.set_conflict_summaries(&summaries)?;
+        self.store.sync()?;
         *self.conflict_cache.lock().unwrap() = Some(summaries);
+        Ok(())
     }
 
     fn clear_conflict_cache(&self) {
@@ -1216,6 +1245,26 @@ impl Unirust {
             self.streaming = Some(self.create_streaming_linker()?);
         }
 
+        let (primary, secondary) = {
+            let streaming = self.streaming.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
+            })?;
+            (
+                streaming.resolve_global_cluster_id(primary),
+                streaming.resolve_global_cluster_id(secondary),
+            )
+        };
+        if primary == secondary {
+            return Ok(0);
+        }
+        if primary.to_u64() >= secondary.to_u64() {
+            anyhow::bail!(
+                "cross-shard merge must redirect cluster {} to lower canonical cluster {}",
+                secondary.to_u64(),
+                primary.to_u64()
+            );
+        }
+
         if let Some(db) = self.store.shared_db() {
             let persistence = LinkerStatePersistence::new(&db);
             persistence.save_cross_shard_merge(secondary, primary)?;
@@ -1225,6 +1274,28 @@ impl Unirust {
             anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
         })?;
         Ok(streaming.apply_cross_shard_merge(primary, secondary))
+    }
+
+    /// Resolve a global cluster ID through durable cross-shard redirects.
+    pub fn resolve_global_cluster_id(&self, id: GlobalClusterId) -> Option<GlobalClusterId> {
+        self.streaming
+            .as_ref()
+            .map(|streaming| streaming.resolve_global_cluster_id(id))
+    }
+
+    /// Return the canonical global cluster ID for a record.
+    pub fn global_cluster_id_for_record(
+        &mut self,
+        record_id: RecordId,
+    ) -> anyhow::Result<GlobalClusterId> {
+        if self.streaming.is_none() {
+            self.streaming = Some(self.create_streaming_linker()?);
+        }
+        let streaming = self.streaming.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
+        })?;
+        let global_id = streaming.global_cluster_id_for(record_id);
+        Ok(streaming.resolve_global_cluster_id(global_id))
     }
 
     /// Get the number of cross-shard merge mappings tracked.

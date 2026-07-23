@@ -242,6 +242,16 @@ pub trait RecordStore: Send + Sync {
         self.add_record_if_absent(record)
     }
 
+    /// Stage a record while preserving its explicit ID.
+    fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        _record: Record,
+    ) -> Result<(RecordId, bool)> {
+        Err(anyhow::anyhow!(
+            "explicit record ID staging is not supported by this store"
+        ))
+    }
+
     /// Flush all staged records to the database. Returns count of flushed records.
     /// Default implementation returns 0 (no staging support).
     fn flush_staged_records(&mut self) -> Result<usize> {
@@ -332,6 +342,13 @@ impl Store {
             self.next_record_id = self.next_record_id.max(record.id.0 + 1);
         }
 
+        Ok(record.id)
+    }
+
+    /// Prepare a record without treating ID zero as an allocation sentinel.
+    pub fn prepare_record_with_explicit_id(&mut self, record: &mut Record) -> Result<RecordId> {
+        self.intern_record(record);
+        self.next_record_id = self.next_record_id.max(record.id.0.saturating_add(1));
         Ok(record.id)
     }
 
@@ -665,6 +682,20 @@ impl RecordStore for Store {
 
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         Store::add_record_if_absent(self, record)
+    }
+
+    fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        record: Record,
+    ) -> Result<(RecordId, bool)> {
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            return Ok((existing, false));
+        }
+        if self.records.contains_key(&record.id) {
+            anyhow::bail!("record ID {} already exists", record.id.0);
+        }
+        let id = self.insert_record(record)?;
+        Ok((id, true))
     }
 }
 

@@ -497,7 +497,7 @@ impl IncrementalReconciler {
     ) {
         let mut merges = Vec::new();
         let mut merge_candidates = 0;
-        let mut conflicts_blocked = 0;
+        let mut conflicts_blocked = 0usize;
         let mut detected_conflicts = Vec::new();
 
         // Build a map of all signatures to their entries across all shards
@@ -571,10 +571,12 @@ impl IncrementalReconciler {
             }
         }
 
+        let (merges, component_conflicts_blocked) =
+            canonicalize_merges(merges, &detected_conflicts);
         (
             merges,
             merge_candidates,
-            conflicts_blocked,
+            conflicts_blocked.saturating_add(component_conflicts_blocked),
             detected_conflicts,
         )
     }
@@ -636,7 +638,7 @@ impl IncrementalReconciler {
 
         let mut merges = Vec::new();
         let mut merge_candidates = 0;
-        let mut conflicts_blocked = 0;
+        let mut conflicts_blocked = 0usize;
         let mut keys_matched = 0;
         let mut detected_conflicts = Vec::new();
 
@@ -705,6 +707,9 @@ impl IncrementalReconciler {
             }
         }
 
+        let (merges, component_conflicts_blocked) =
+            canonicalize_merges(merges, &detected_conflicts);
+        conflicts_blocked = conflicts_blocked.saturating_add(component_conflicts_blocked);
         self.pending_merges = merges.clone();
 
         ReconciliationResult {
@@ -726,6 +731,112 @@ impl IncrementalReconciler {
         }
         all_dirty
     }
+}
+
+fn canonicalize_merges(
+    merges: Vec<(GlobalClusterId, GlobalClusterId)>,
+    conflicts: &[CrossShardConflict],
+) -> (Vec<(GlobalClusterId, GlobalClusterId)>, usize) {
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+
+    let mut edges = merges
+        .into_iter()
+        .filter(|(left, right)| left != right)
+        .map(|(left, right)| {
+            if left.to_u64() <= right.to_u64() {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by_key(|(left, right)| (left.to_u64(), right.to_u64()));
+    edges.dedup();
+
+    let mut nodes = edges
+        .iter()
+        .flat_map(|(left, right)| [*left, *right])
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(GlobalClusterId::to_u64);
+    nodes.dedup();
+    let node_index = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (*node, index))
+        .collect::<HashMap<_, _>>();
+
+    let mut blocked_by_node: HashMap<GlobalClusterId, HashSet<GlobalClusterId>> = HashMap::new();
+    for conflict in conflicts {
+        if conflict.cluster1 == conflict.cluster2 {
+            continue;
+        }
+        blocked_by_node
+            .entry(conflict.cluster1)
+            .or_default()
+            .insert(conflict.cluster2);
+        blocked_by_node
+            .entry(conflict.cluster2)
+            .or_default()
+            .insert(conflict.cluster1);
+    }
+
+    let mut parent = (0..nodes.len()).collect::<Vec<_>>();
+    let mut members = nodes
+        .iter()
+        .map(|node| HashSet::from([*node]))
+        .collect::<Vec<_>>();
+    let mut blocked = nodes
+        .iter()
+        .map(|node| blocked_by_node.remove(node).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let mut component_conflicts_blocked = 0usize;
+
+    for (left, right) in edges {
+        let mut left_root = find(&mut parent, node_index[&left]);
+        let mut right_root = find(&mut parent, node_index[&right]);
+        if left_root == right_root {
+            continue;
+        }
+        if !blocked[left_root].is_disjoint(&members[right_root])
+            || !blocked[right_root].is_disjoint(&members[left_root])
+        {
+            component_conflicts_blocked = component_conflicts_blocked.saturating_add(1);
+            continue;
+        }
+        if nodes[left_root].to_u64() > nodes[right_root].to_u64() {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+        parent[right_root] = left_root;
+        let right_members = std::mem::take(&mut members[right_root]);
+        members[left_root].extend(right_members);
+        let right_blocked = std::mem::take(&mut blocked[right_root]);
+        blocked[left_root].extend(right_blocked);
+    }
+
+    let mut canonical = Vec::new();
+    for (index, component_members) in members.iter().enumerate() {
+        if find(&mut parent, index) != index {
+            continue;
+        }
+        let mut component = component_members.iter().copied().collect::<Vec<_>>();
+        component.sort_by_key(GlobalClusterId::to_u64);
+        if let Some(primary) = component.first().copied() {
+            canonical.extend(
+                component
+                    .into_iter()
+                    .skip(1)
+                    .map(|secondary| (primary, secondary)),
+            );
+        }
+    }
+    canonical.sort_by_key(|(primary, secondary)| (primary.to_u64(), secondary.to_u64()));
+    (canonical, component_conflicts_blocked)
 }
 
 impl Default for IncrementalReconciler {
@@ -1303,6 +1414,62 @@ mod tests {
         let (primary, secondary) = result.merged_clusters[0];
         assert_eq!(primary.shard_id, 0);
         assert_eq!(secondary.shard_id, 1);
+    }
+
+    #[test]
+    fn reconciler_redirects_every_component_member_to_one_primary() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut reconciler = IncrementalReconciler::new();
+        let signature = IdentityKeySignature::from_key_values(
+            "person",
+            &[KeyValue::new(AttrId(1), ValueId(2))],
+        );
+        let interval = Interval::new(0, 100).unwrap();
+        let clusters = [
+            GlobalClusterId::new(0, 10, 0),
+            GlobalClusterId::new(1, 20, 0),
+            GlobalClusterId::new(2, 30, 0),
+        ];
+
+        for (shard_id, cluster_id) in clusters.into_iter().enumerate() {
+            let mut boundary = ClusterBoundaryIndex::new_small(shard_id as u16);
+            boundary.register_boundary_key(signature, cluster_id, interval);
+            reconciler.add_shard_boundary(boundary);
+        }
+
+        let result = reconciler.reconcile();
+        assert_eq!(
+            result.merged_clusters,
+            vec![(clusters[0], clusters[1]), (clusters[0], clusters[2])]
+        );
+        assert_eq!(result.merges_performed, 2);
+        assert_eq!(result.merge_candidates, 3);
+    }
+
+    #[test]
+    fn component_merge_does_not_bridge_a_cannot_link_pair() {
+        use crate::model::{AttrId, ValueId};
+
+        let a = GlobalClusterId::new(0, 10, 0);
+        let b = GlobalClusterId::new(1, 20, 0);
+        let c = GlobalClusterId::new(2, 30, 0);
+        let conflict = CrossShardConflict {
+            identity_key_signature: IdentityKeySignature::from_key_values(
+                "person",
+                &[KeyValue::new(AttrId(1), ValueId(2))],
+            ),
+            cluster1: a,
+            cluster2: c,
+            interval: Interval::new(0, 100).unwrap(),
+            perspective_hash: 1,
+            strong_id_hash1: 2,
+            strong_id_hash2: 3,
+        };
+
+        let (merges, blocked) = canonicalize_merges(vec![(a, b), (b, c)], &[conflict]);
+        assert_eq!(merges, vec![(a, b)]);
+        assert_eq!(blocked, 1);
     }
 
     #[test]

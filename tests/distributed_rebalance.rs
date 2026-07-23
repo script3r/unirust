@@ -186,5 +186,26 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
         assert!(exported_ids.contains(&record_id));
     }
 
+    let original = exported.records[0].clone();
+    let mut collision = original.clone();
+    collision.identity.as_mut().expect("exported identity").uid = "different-record".to_string();
+    let error = shard1
+        .import_records(ImportRecordsRequest {
+            records: vec![collision],
+        })
+        .await
+        .expect_err("import must not overwrite an existing numeric record ID");
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+    let after_collision = shard1
+        .export_records(ExportRecordsRequest {
+            start_id: original.record_id,
+            end_id: original.record_id.saturating_add(1),
+            limit: 1,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(after_collision.records, vec![original]);
+
     Ok(())
 }

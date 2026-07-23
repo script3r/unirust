@@ -388,9 +388,11 @@ impl PersistentStore {
     /// Stage a record for later batch write. Returns (record_id, inserted).
     /// The record is added to cache immediately so it's readable, but not yet persisted to DB.
     pub fn stage_record_if_absent(&mut self, mut record: Record) -> Result<(RecordId, bool)> {
+        <Self as RecordStore>::ensure_healthy(self)?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
             return Ok((existing, false));
         }
+        <Self as RecordStore>::ensure_healthy(self)?;
 
         if let Some(existing) = self
             .staged_identities
@@ -424,8 +426,49 @@ impl PersistentStore {
         Ok((record_id, true))
     }
 
+    pub fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        mut record: Record,
+    ) -> Result<(RecordId, bool)> {
+        <Self as RecordStore>::ensure_healthy(self)?;
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            return Ok((existing, false));
+        }
+        <Self as RecordStore>::ensure_healthy(self)?;
+        if let Some(existing) = self
+            .staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .get(&record.identity)
+            .copied()
+        {
+            return Ok((existing, false));
+        }
+        if self.get_record(record.id).is_some() {
+            anyhow::bail!("record ID {} already exists", record.id.0);
+        }
+        <Self as RecordStore>::ensure_healthy(self)?;
+
+        let record_id = self.inner.prepare_record_with_explicit_id(&mut record)?;
+        let identity = record.identity.clone();
+        self.cache
+            .lock()
+            .map_err(|_| anyhow!("record cache lock poisoned"))?
+            .put(record_id, record.clone());
+        self.staged_records
+            .lock()
+            .map_err(|_| anyhow!("staged records lock poisoned"))?
+            .push(record);
+        self.staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .insert(identity, record_id);
+        Ok((record_id, true))
+    }
+
     /// Flush all staged records to the database in a single batch write.
     pub fn flush_staged_records(&mut self) -> Result<usize> {
+        <Self as RecordStore>::ensure_healthy(self)?;
         let records = {
             let mut staged = self
                 .staged_records
@@ -555,6 +598,7 @@ impl RecordStore for PersistentStore {
     }
 
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
+        self.ensure_healthy()?;
         let mut record = record;
         let record_id = self.inner.prepare_record(&mut record)?;
         let next_count = self.record_count.saturating_add(1);
@@ -581,6 +625,7 @@ impl RecordStore for PersistentStore {
     }
 
     fn add_records(&mut self, records: Vec<Record>) -> Result<()> {
+        self.ensure_healthy()?;
         if records.is_empty() {
             return Ok(());
         }
@@ -632,14 +677,17 @@ impl RecordStore for PersistentStore {
     }
 
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        self.ensure_healthy()?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
             return Ok((existing, false));
         }
+        self.ensure_healthy()?;
         let record_id = self.add_record(record)?;
         Ok((record_id, true))
     }
 
     fn add_records_if_absent(&mut self, records: Vec<Record>) -> Result<Vec<(RecordId, bool)>> {
+        self.ensure_healthy()?;
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -664,6 +712,7 @@ impl RecordStore for PersistentStore {
                 new_records.push(record);
             }
         }
+        self.ensure_healthy()?;
 
         if new_records.is_empty() {
             return Ok(results);
@@ -727,6 +776,13 @@ impl RecordStore for PersistentStore {
 
     fn stage_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         PersistentStore::stage_record_if_absent(self, record)
+    }
+
+    fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        record: Record,
+    ) -> Result<(RecordId, bool)> {
+        PersistentStore::stage_record_with_explicit_id_if_absent(self, record)
     }
 
     fn flush_staged_records(&mut self) -> Result<usize> {

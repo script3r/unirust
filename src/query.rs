@@ -73,6 +73,7 @@ impl QuerySelectivityStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryMatch {
     pub cluster_id: ClusterId,
+    pub root_record_id: RecordId,
     pub interval: Interval,
     pub golden: Vec<GoldenDescriptor>,
     pub cluster_key: Option<String>,
@@ -202,24 +203,31 @@ pub fn query_master_entities_with_cache(
     }
     let matches = matches
         .into_iter()
-        .map(|entry| QueryMatch {
-            cluster_id: entry.cluster_id,
-            interval: entry.interval,
-            golden: filter_golden_for_interval(
-                golden_cache
+        .map(|entry| {
+            let root_record_id = clusters
+                .get_cluster(entry.cluster_id)
+                .map(|cluster| cluster.root)
+                .ok_or_else(|| anyhow::anyhow!("query cluster has no DSU root"))?;
+            Ok(QueryMatch {
+                cluster_id: entry.cluster_id,
+                root_record_id,
+                interval: entry.interval,
+                golden: filter_golden_for_interval(
+                    golden_cache
+                        .get(&entry.cluster_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    entry.interval,
+                ),
+                cluster_key: cluster_key_cache
                     .get(&entry.cluster_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                entry.interval,
-            ),
-            cluster_key: cluster_key_cache
-                .get(&entry.cluster_id)
-                .map(|key| key.value.clone()),
-            cluster_key_identity: cluster_key_cache
-                .get(&entry.cluster_id)
-                .map(|key| key.identity_key.clone()),
+                    .map(|key| key.value.clone()),
+                cluster_key_identity: cluster_key_cache
+                    .get(&entry.cluster_id)
+                    .map(|key| key.identity_key.clone()),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(QueryOutcome::Matches(matches))
 }
 
@@ -303,24 +311,31 @@ pub fn query_master_entities_with_cache_selective(
     }
     let matches = matches
         .into_iter()
-        .map(|entry| QueryMatch {
-            cluster_id: entry.cluster_id,
-            interval: entry.interval,
-            golden: filter_golden_for_interval(
-                golden_cache
+        .map(|entry| {
+            let root_record_id = clusters
+                .get_cluster(entry.cluster_id)
+                .map(|cluster| cluster.root)
+                .ok_or_else(|| anyhow::anyhow!("query cluster has no DSU root"))?;
+            Ok(QueryMatch {
+                cluster_id: entry.cluster_id,
+                root_record_id,
+                interval: entry.interval,
+                golden: filter_golden_for_interval(
+                    golden_cache
+                        .get(&entry.cluster_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    entry.interval,
+                ),
+                cluster_key: cluster_key_cache
                     .get(&entry.cluster_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                entry.interval,
-            ),
-            cluster_key: cluster_key_cache
-                .get(&entry.cluster_id)
-                .map(|key| key.value.clone()),
-            cluster_key_identity: cluster_key_cache
-                .get(&entry.cluster_id)
-                .map(|key| key.identity_key.clone()),
+                    .map(|key| key.value.clone()),
+                cluster_key_identity: cluster_key_cache
+                    .get(&entry.cluster_id)
+                    .map(|key| key.identity_key.clone()),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(QueryOutcome::Matches(matches))
 }
 

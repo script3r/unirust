@@ -57,6 +57,34 @@ async fn spawn_shard_persistent(
     })
 }
 
+async fn spawn_shard_at(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+    data_path: PathBuf,
+) -> anyhow::Result<(SocketAddr, ShardNode, JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_path),
+        false,
+        None,
+    )?;
+    let service_shard = shard.clone();
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(proto::shard_service_server::ShardServiceServer::new(
+                service_shard,
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, shard, handle))
+}
+
 async fn spawn_router(
     shard_addrs: Vec<SocketAddr>,
     config: DistributedOntologyConfig,
@@ -209,4 +237,107 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_shard_singleton_merge_survives_full_restart() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let data_paths = (0..3)
+        .map(|shard_id| root.path().join(format!("shard-{shard_id}")))
+        .collect::<Vec<_>>();
+    for path in &data_paths {
+        std::fs::create_dir_all(path)?;
+    }
+
+    let mut shard_addrs = Vec::new();
+    let mut shard_nodes = Vec::new();
+    let mut shard_handles = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) =
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?;
+        shard_addrs.push(addr);
+        shard_nodes.push(shard);
+        shard_handles.push(handle);
+    }
+    let (router_addr, router_handle) = spawn_router(shard_addrs.clone(), config.clone()).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    for (shard_id, shard_addr) in shard_addrs.iter().enumerate() {
+        let mut shard_client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+        shard_client
+            .ingest_records(IngestRecordsRequest {
+                records: vec![record_input(
+                    shard_id as u32,
+                    "person",
+                    "hr",
+                    &format!("person-{shard_id}"),
+                    vec![
+                        ("email", "restart@example.com", 0, 100),
+                        ("ssn", "1234", 0, 100),
+                    ],
+                )],
+            })
+            .await?;
+    }
+
+    let reconciliation = router_client
+        .reconcile(proto::ReconcileRequest {
+            shard_metadata: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(reconciliation.merges_performed, 2);
+    assert_eq!(query_match_count(&mut router_client).await?, 1);
+
+    drop(router_client);
+    router_handle.abort();
+    let _ = router_handle.await;
+    for shard in &shard_nodes {
+        shard.shutdown().await?;
+    }
+    for handle in shard_handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(shard_nodes);
+    sleep(Duration::from_millis(100)).await;
+
+    let mut restarted_addrs = Vec::new();
+    let mut _restarted_nodes = Vec::new();
+    let mut _restarted_handles = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) =
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?;
+        restarted_addrs.push(addr);
+        _restarted_nodes.push(shard);
+        _restarted_handles.push(handle);
+    }
+    let (router_addr, _router_handle) = spawn_router(restarted_addrs, config).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+    assert_eq!(query_match_count(&mut router_client).await?, 1);
+
+    Ok(())
+}
+
+async fn query_match_count(
+    client: &mut RouterServiceClient<tonic::transport::Channel>,
+) -> anyhow::Result<usize> {
+    let response = client
+        .query_entities(proto::QueryEntitiesRequest {
+            descriptors: vec![proto::QueryDescriptor {
+                attr: "email".to_string(),
+                value: "restart@example.com".to_string(),
+            }],
+            start: 0,
+            end: 100,
+        })
+        .await?
+        .into_inner();
+    match response.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            Ok(matches.matches.len())
+        }
+        other => anyhow::bail!("expected reconciled query matches, got {other:?}"),
+    }
 }

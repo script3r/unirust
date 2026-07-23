@@ -318,6 +318,34 @@ fn cross_shard_merge_mapping_survives_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn cross_shard_merge_chain_is_persisted_as_direct_canonical_redirects() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join("store");
+    std::fs::create_dir_all(&data_dir)?;
+    let primary = GlobalClusterId::new(0, 10, 0);
+    let middle = GlobalClusterId::new(1, 20, 0);
+    let secondary = GlobalClusterId::new(2, 30, 0);
+
+    {
+        let store = PersistentStore::open(&data_dir)?;
+        let mut unirust = Unirust::with_store(default_ontology_for_empty_store(), store);
+        unirust.stream_records(Vec::new())?;
+        unirust.apply_cross_shard_merge(primary, middle)?;
+        unirust.apply_cross_shard_merge(middle, secondary)?;
+        assert_eq!(unirust.resolve_global_cluster_id(secondary), Some(primary));
+    }
+
+    {
+        let store = PersistentStore::open(&data_dir)?;
+        let mut unirust = Unirust::with_store(default_ontology_for_empty_store(), store);
+        unirust.stream_records(Vec::new())?;
+        assert_eq!(unirust.resolve_global_cluster_id(secondary), Some(primary));
+    }
+
+    Ok(())
+}
+
 fn default_ontology_for_empty_store() -> unirust_rs::Ontology {
     unirust_rs::Ontology::new()
 }

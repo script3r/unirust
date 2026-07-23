@@ -36,6 +36,7 @@ OPTIONS:
                             bulk-ingest, memory-saver, billion-scale,
                             billion-scale-high-performance
         --repair            Run repair on startup
+        --ephemeral         Allow an in-memory shard; all data is lost on process exit
         --allow-destructive-admin
                             Enable destructive admin RPCs such as Reset
         --config-version    Config version for compatibility checking
@@ -156,6 +157,12 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| parse_arg("-c"))
         .or_else(|| std::env::var("UNIRUST_CONFIG").ok());
     let config = UniConfig::load(config_path.as_deref(), overrides)?;
+    if config.shard.data_dir.is_none() && !has_flag("--ephemeral") {
+        anyhow::bail!(
+            "persistent shard storage is required; configure --data-dir (or use --ephemeral \
+             explicitly for disposable development data)"
+        );
+    }
 
     // Get tuning from profile
     let profile = config.profile.to_tuning_profile();

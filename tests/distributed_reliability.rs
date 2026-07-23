@@ -380,6 +380,59 @@ async fn reconciliation_fails_when_boundary_metadata_is_incomplete() -> anyhow::
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_rejects_caller_supplied_boundary_metadata() -> anyhow::Result<()> {
+    let config = support::build_iam_config();
+    let (shard_addr, _shard_handle) = spawn_shard(0, config.clone()).await?;
+    let (router_addr, _router_handle) = spawn_router(vec![shard_addr], config).await?;
+    let mut client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    let error = client
+        .reconcile(proto::ReconcileRequest {
+            shard_metadata: vec![proto::BoundaryMetadata::default()],
+        })
+        .await
+        .expect_err("reconciliation must only use metadata fetched from configured shards");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_rejects_misordered_shard_endpoints() -> anyhow::Result<()> {
+    let config = support::build_iam_config();
+    let (shard_addr, _shard_handle) = spawn_shard(1, config.clone()).await?;
+
+    let error = match RouterNode::connect(vec![format!("http://{shard_addr}")], config).await {
+        Ok(_) => anyhow::bail!("router accepted shard 1 at endpoint index 0"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_requires_at_least_one_shard() -> anyhow::Result<()> {
+    let error = match RouterNode::connect(Vec::new(), support::build_iam_config()).await {
+        Ok(_) => anyhow::bail!("router accepted an empty shard list"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[test]
+fn shard_id_must_fit_global_cluster_id() {
+    let result = ShardNode::new(
+        u32::from(u16::MAX) + 1,
+        support::build_iam_config(),
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+    );
+    assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destructive_reset_is_disabled_and_preserves_records_by_default() -> anyhow::Result<()> {
     let config = support::build_iam_config();
     let (shard_addr, _shard_handle) = spawn_shard(0, config).await?;

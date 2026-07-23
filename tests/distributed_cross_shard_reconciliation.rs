@@ -332,7 +332,7 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
 
     sleep(Duration::from_millis(100)).await;
 
-    // Shard 0: Two records with same identity key, from "msci" perspective
+    // A singleton on each shard must still participate in distributed resolution.
     let shard0_rec1 = record_input(
         0,
         "instrument",
@@ -344,25 +344,13 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
             ("ts_code", "TS_MSCI", 0, 100),
         ],
     );
-    let shard0_rec2 = record_input(
-        1,
-        "instrument",
-        "msci",
-        "msci_001b",
-        vec![
-            ("isin", "ISIN002", 0, 100),
-            ("country", "UK", 0, 100),
-            ("ts_code", "TS_MSCI", 0, 100),
-        ],
-    );
-
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            records: vec![shard0_rec1, shard0_rec2],
+            records: vec![shard0_rec1],
         })
         .await?;
 
-    // Shard 1: Two records with same identity key, from "axioma" perspective
+    // Shard 1: Same identity key from a different perspective.
     // Different perspective means no strong ID conflict
     let shard1_rec1 = record_input(
         2,
@@ -375,21 +363,9 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
             ("axioma_id", "AX001", 0, 100),
         ],
     );
-    let shard1_rec2 = record_input(
-        3,
-        "instrument",
-        "axioma",
-        "axioma_001b",
-        vec![
-            ("isin", "ISIN002", 0, 100),
-            ("country", "UK", 0, 100),
-            ("axioma_id", "AX001", 0, 100),
-        ],
-    );
-
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            records: vec![shard1_rec1, shard1_rec2],
+            records: vec![shard1_rec1],
         })
         .await?;
 
@@ -424,6 +400,30 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
         reconcile_response.merges_performed,
         reconcile_response.conflicts_blocked
     );
+
+    let query = router_client
+        .query_entities(proto::QueryEntitiesRequest {
+            descriptors: vec![
+                proto::QueryDescriptor {
+                    attr: "isin".to_string(),
+                    value: "ISIN002".to_string(),
+                },
+                proto::QueryDescriptor {
+                    attr: "country".to_string(),
+                    value: "UK".to_string(),
+                },
+            ],
+            start: 0,
+            end: 100,
+        })
+        .await?
+        .into_inner();
+    let matches = match query.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => matches.matches,
+        other => anyhow::bail!("expected one reconciled global entity, got {other:?}"),
+    };
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].shard_id, 0);
 
     Ok(())
 }
