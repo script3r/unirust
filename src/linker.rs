@@ -448,23 +448,21 @@ impl StreamingLinker {
         dsu: DsuBackend,
         identity_index: IndexBackend,
     ) -> Result<Self> {
-        // Create LinkerState instances based on config (LRU-bounded or HashMap)
-        let (cluster_ids, global_cluster_ids, strong_id_summaries, record_perspectives) =
-            if let Some(config) = &tuning.linker_state_config {
-                (
-                    LinkerState::bounded(config.cluster_ids_capacity),
-                    LinkerState::bounded(config.global_ids_capacity),
-                    LinkerState::bounded(config.summaries_capacity),
-                    LinkerState::bounded(config.perspectives_capacity),
-                )
-            } else {
-                (
-                    LinkerState::unbounded(),
-                    LinkerState::unbounded(),
-                    LinkerState::unbounded(),
-                    LinkerState::unbounded(),
-                )
-            };
+        // These mappings and summaries affect resolution correctness. The bounded
+        // backend cannot be enabled until evictions have a durable spill/read-through
+        // path; silently dropping an old entry can split clusters after enough ingest.
+        if tuning.linker_state_config.is_some() {
+            tracing::warn!(
+                "bounded linker state requested but durable spill is unavailable; \
+                 using correctness-preserving unbounded state"
+            );
+        }
+        let (cluster_ids, global_cluster_ids, strong_id_summaries, record_perspectives) = (
+            LinkerState::unbounded(),
+            LinkerState::unbounded(),
+            LinkerState::unbounded(),
+            LinkerState::unbounded(),
+        );
 
         let mut streamer = Self {
             dsu,
@@ -498,6 +496,7 @@ impl StreamingLinker {
             }
         }
 
+        store.ensure_healthy()?;
         Ok(streamer)
     }
 

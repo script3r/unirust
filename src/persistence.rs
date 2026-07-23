@@ -9,6 +9,7 @@ use rocksdb::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const CF_RECORDS: &str = "records";
@@ -143,6 +144,7 @@ pub struct PersistentStore {
     record_count: u64,
     cluster_count: u64,
     conflict_summary_count: u64,
+    read_fault: AtomicBool,
 }
 
 /// Create WriteOptions for grouped writes. A high-level ingest calls
@@ -197,6 +199,7 @@ impl PersistentStore {
             record_count,
             cluster_count,
             conflict_summary_count,
+            read_fault: AtomicBool::new(false),
         };
         instance.rebuild_indexes_if_needed()?;
         if should_persist_count {
@@ -211,6 +214,10 @@ impl PersistentStore {
 
     pub fn inner_mut(&mut self) -> &mut Store {
         &mut self.inner
+    }
+
+    fn mark_read_fault(&self) {
+        self.read_fault.store(true, Ordering::Release);
     }
 
     fn append_interner_to_batch(&self, batch: &mut WriteBatch) -> Result<(u32, u32)> {
@@ -284,20 +291,7 @@ impl PersistentStore {
         Ok(())
     }
 
-    pub fn persist_record(&self, record: &Record) -> Result<()> {
-        let records_cf = self
-            .db
-            .cf_handle(CF_RECORDS)
-            .ok_or_else(|| anyhow!("missing records column family"))?;
-        let key = record.id.0.to_be_bytes();
-        with_record_bytes(record, |bytes| {
-            self.db.put_cf(records_cf, key, bytes)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    pub fn index_record(&self, record: &Record) -> Result<()> {
+    fn index_record(&self, record: &Record) -> Result<()> {
         let mut batch = WriteBatch::default();
         self.index_record_with_batch(record, &mut batch)?;
         self.db.write(batch)?;
@@ -322,12 +316,37 @@ impl PersistentStore {
     }
 
     pub fn reset_data(&mut self) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for &cf_name in RESET_DATA_CFS {
+            clear_cf_in_batch(&self.db, cf_name, &mut batch)?;
+        }
+        let metadata_cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        batch.delete_cf(metadata_cf, KEY_INDEX_VERSION);
+        batch.delete_cf(metadata_cf, KEY_CROSS_SHARD_CONFLICTS);
+        batch.put_cf(metadata_cf, KEY_NEXT_RECORD_ID, bincode::serialize(&0u32)?);
+        batch.put_cf(metadata_cf, KEY_RECORD_COUNT, bincode::serialize(&0u64)?);
+        batch.put_cf(metadata_cf, KEY_CLUSTER_COUNT, bincode::serialize(&0u64)?);
+        batch.put_cf(
+            metadata_cf,
+            KEY_CONFLICT_SUMMARY_COUNT,
+            bincode::serialize(&0u64)?,
+        );
+        batch.put_cf(metadata_cf, KEY_NEXT_ATTR_ID, bincode::serialize(&0u32)?);
+        batch.put_cf(metadata_cf, KEY_NEXT_VALUE_ID, bincode::serialize(&0u32)?);
+        self.db.write(batch)?;
+        self.db.flush_wal(true)?;
+
+        // Only publish the empty live view after the durable reset commits.
         self.inner = Store::new();
         self.persisted_attr_id = 0;
         self.persisted_value_id = 0;
         self.record_count = 0;
         self.cluster_count = 0;
         self.conflict_summary_count = 0;
+        self.read_fault.store(false, Ordering::Release);
         self.staged_records
             .get_mut()
             .map_err(|_| anyhow!("staged records lock poisoned"))?
@@ -340,22 +359,6 @@ impl PersistentStore {
             .get_mut()
             .map_err(|_| anyhow!("record cache lock poisoned"))?
             .clear();
-
-        let mut batch = WriteBatch::default();
-        for &cf_name in RESET_DATA_CFS {
-            clear_cf_in_batch(&self.db, cf_name, &mut batch)?;
-        }
-        let metadata_cf = self
-            .db
-            .cf_handle(CF_METADATA)
-            .ok_or_else(|| anyhow!("missing metadata column family"))?;
-        batch.delete_cf(metadata_cf, KEY_INDEX_VERSION);
-        batch.delete_cf(metadata_cf, KEY_CROSS_SHARD_CONFLICTS);
-        let watermark = self.append_interner_to_batch(&mut batch)?;
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        self.db.flush_wal(true)?;
-        self.commit_interner_watermark(watermark);
         Ok(())
     }
 
@@ -485,10 +488,24 @@ impl PersistentStore {
     }
 
     fn lookup_interner_id(&self, prefix: u8, value: &str) -> Option<u32> {
-        let interner_cf = self.db.cf_handle(CF_INTERNER)?;
+        let interner_cf = match self.db.cf_handle(CF_INTERNER) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let key = encode_interner_lookup_key(prefix, value);
-        let bytes = self.db.get_cf(interner_cf, key).ok()??;
+        let bytes = match self.db.get_cf(interner_cf, key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         if bytes.len() != 4 {
+            self.mark_read_fault();
             return None;
         }
         let mut buf = [0u8; 4];
@@ -497,14 +514,46 @@ impl PersistentStore {
     }
 
     fn lookup_interner_value(&self, prefix: u8, id: u32) -> Option<String> {
-        let interner_cf = self.db.cf_handle(CF_INTERNER)?;
+        let interner_cf = match self.db.cf_handle(CF_INTERNER) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let key = encode_interner_key(prefix, id);
-        let bytes = self.db.get_cf(interner_cf, key).ok()??;
-        String::from_utf8(bytes).ok()
+        let bytes = match self.db.get_cf(interner_cf, key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        match String::from_utf8(bytes) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.mark_read_fault();
+                None
+            }
+        }
     }
 }
 
 impl RecordStore for PersistentStore {
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.read_fault.load(Ordering::Acquire) {
+            anyhow::bail!(
+                "persistent store observed an I/O or decode failure; restart before continuing"
+            );
+        }
+        Ok(())
+    }
+
+    fn reset_data(&mut self) -> Result<()> {
+        PersistentStore::reset_data(self)
+    }
+
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
         let mut record = record;
         let record_id = self.inner.prepare_record(&mut record)?;
@@ -685,6 +734,7 @@ impl RecordStore for PersistentStore {
     }
 
     fn sync(&self) -> Result<()> {
+        self.ensure_healthy()?;
         self.db.flush_wal(true)?;
         Ok(())
     }
@@ -696,10 +746,29 @@ impl RecordStore for PersistentStore {
             }
         }
 
-        let records_cf = self.db.cf_handle(CF_RECORDS)?;
+        let records_cf = match self.db.cf_handle(CF_RECORDS) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let key = id.0.to_be_bytes();
-        let bytes = self.db.get_cf(records_cf, key).ok()??;
-        let record: Record = bincode::deserialize(&bytes).ok()?;
+        let bytes = match self.db.get_cf(records_cf, key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        let record: Record = match bincode::deserialize(&bytes) {
+            Ok(record) => record,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         if let Ok(mut cache) = self.cache.lock() {
             cache.put(id, record.clone());
         }
@@ -709,23 +778,56 @@ impl RecordStore for PersistentStore {
     fn get_all_records(&self) -> Vec<Record> {
         let records_cf = match self.db.cf_handle(CF_RECORDS) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
-        self.db
-            .iterator_cf(records_cf, IteratorMode::Start)
-            .filter_map(|entry| {
-                entry
-                    .ok()
-                    .and_then(|(_, value)| bincode::deserialize(&value).ok())
-            })
-            .collect()
+        let mut records = Vec::new();
+        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
+            let (_, value) = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            };
+            match bincode::deserialize(&value) {
+                Ok(record) => records.push(record),
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            }
+        }
+        records
     }
 
     fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
-        let identity_cf = self.db.cf_handle(CF_INDEX_IDENTITY)?;
-        let key = encode_identity_index(identity).ok()?;
-        let value = self.db.get_cf(identity_cf, key).ok()??;
+        let identity_cf = match self.db.cf_handle(CF_INDEX_IDENTITY) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        let key = match encode_identity_index(identity) {
+            Ok(key) => key,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        let value = match self.db.get_cf(identity_cf, key) {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         if value.len() != 4 {
+            self.mark_read_fault();
             return None;
         }
         let mut bytes = [0u8; 4];
@@ -736,15 +838,25 @@ impl RecordStore for PersistentStore {
     fn for_each_record(&self, f: &mut dyn FnMut(Record)) {
         let records_cf = match self.db.cf_handle(CF_RECORDS) {
             Some(cf) => cf,
-            None => return,
+            None => {
+                self.mark_read_fault();
+                return;
+            }
         };
-        for (_key, value) in self
-            .db
-            .iterator_cf(records_cf, IteratorMode::Start)
-            .flatten()
-        {
-            if let Ok(record) = bincode::deserialize(&value) {
-                f(record);
+        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
+            let (_key, value) = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            };
+            match bincode::deserialize(&value) {
+                Ok(record) => f(record),
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             }
         }
     }
@@ -752,7 +864,10 @@ impl RecordStore for PersistentStore {
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_ENTITY_TYPE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_string_prefix(entity_type);
         let iter = self
@@ -763,7 +878,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -772,8 +890,14 @@ impl RecordStore for PersistentStore {
                 if seen.insert(record_id) {
                     if let Some(record) = self.get_record(RecordId(record_id)) {
                         records.push(record);
+                    } else {
+                        self.mark_read_fault();
+                        break;
                     }
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -782,7 +906,10 @@ impl RecordStore for PersistentStore {
     fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_PERSPECTIVE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_string_prefix(perspective);
         let iter = self
@@ -793,7 +920,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -802,8 +932,14 @@ impl RecordStore for PersistentStore {
                 if seen.insert(record_id) {
                     if let Some(record) = self.get_record(RecordId(record_id)) {
                         records.push(record);
+                    } else {
+                        self.mark_read_fault();
+                        break;
                     }
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -812,7 +948,10 @@ impl RecordStore for PersistentStore {
     fn get_records_with_attribute(&self, attr: crate::model::AttrId) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_ATTR_VALUE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_attr_prefix(attr.0);
         let iter = self
@@ -823,7 +962,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -832,8 +974,14 @@ impl RecordStore for PersistentStore {
                 if seen.insert(record_id) {
                     if let Some(record) = self.get_record(RecordId(record_id)) {
                         records.push(record);
+                    } else {
+                        self.mark_read_fault();
+                        break;
                     }
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -842,7 +990,10 @@ impl RecordStore for PersistentStore {
     fn get_records_in_interval(&self, interval: crate::temporal::Interval) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_TEMPORAL_BUCKET) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let mut candidates = std::collections::HashSet::new();
         for bucket in buckets_for_interval(interval.start, interval.end) {
@@ -853,13 +1004,19 @@ impl RecordStore for PersistentStore {
             for entry in iter {
                 let (key, _) = match entry {
                     Ok(pair) => pair,
-                    Err(_) => break,
+                    Err(_) => {
+                        self.mark_read_fault();
+                        break;
+                    }
                 };
                 if !key.starts_with(&prefix) {
                     break;
                 }
                 if let Some(record_id) = decode_temporal_record_id(&key) {
                     candidates.insert(record_id);
+                } else {
+                    self.mark_read_fault();
+                    break;
                 }
             }
         }
@@ -871,6 +1028,9 @@ impl RecordStore for PersistentStore {
                 }) {
                     records.push(record);
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -884,7 +1044,10 @@ impl RecordStore for PersistentStore {
     ) -> Vec<(RecordId, crate::temporal::Interval)> {
         let cf = match self.db.cf_handle(CF_INDEX_ATTR_VALUE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_attr_value_prefix(attr.0, value.0);
         let iter = self
@@ -894,7 +1057,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -903,6 +1069,9 @@ impl RecordStore for PersistentStore {
                 if let Some(overlap) = crate::temporal::intersect(&record_interval, &interval) {
                     matches.push((RecordId(record_id), overlap));
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         matches
@@ -959,11 +1128,18 @@ impl RecordStore for PersistentStore {
     }
 
     fn set_cluster_count(&mut self, count: usize) -> Result<()> {
+        let previous = self.cluster_count;
         self.cluster_count = count as u64;
-        let mut batch = WriteBatch::default();
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        Ok(())
+        let result = (|| {
+            let mut batch = WriteBatch::default();
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.cluster_count = previous;
+        }
+        result
     }
 
     fn cluster_count(&self) -> Option<usize> {
@@ -981,10 +1157,17 @@ impl RecordStore for PersistentStore {
         let bytes = bincode::serialize(summaries)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, b"latest", bytes);
+        let previous = self.conflict_summary_count;
         self.conflict_summary_count = summaries.len() as u64;
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        Ok(())
+        let result = (|| {
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.conflict_summary_count = previous;
+        }
+        result
     }
 
     fn set_cluster_conflict_summaries(
@@ -997,14 +1180,13 @@ impl RecordStore for PersistentStore {
             .cf_handle(CF_CONFLICT_SUMMARIES)
             .ok_or_else(|| anyhow!("missing conflict summaries column family"))?;
         let key = cluster_id.0.to_be_bytes();
-        let existing = self.db.get_cf(cf, key).ok().flatten();
-        let existing_len = existing
-            .as_ref()
-            .and_then(|bytes| {
-                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(bytes).ok()
-            })
-            .map(|summaries| summaries.len())
-            .unwrap_or(0);
+        let existing = self.db.get_cf(cf, key)?;
+        let existing_len = match existing {
+            Some(bytes) => {
+                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&bytes)?.len()
+            }
+            None => 0,
+        };
         let new_len = summaries.len();
         let total = self
             .conflict_summary_count
@@ -1013,23 +1195,45 @@ impl RecordStore for PersistentStore {
         let bytes = bincode::serialize(summaries)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, key, bytes);
+        let previous = self.conflict_summary_count;
         self.conflict_summary_count = total;
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        Ok(())
+        let result = (|| {
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.conflict_summary_count = previous;
+        }
+        result
     }
 
     fn load_conflict_summaries(&self) -> Option<Vec<crate::conflicts::ConflictSummary>> {
-        let cf = self.db.cf_handle(CF_CONFLICT_SUMMARIES)?;
+        let cf = match self.db.cf_handle(CF_CONFLICT_SUMMARIES) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let mut summaries = Vec::new();
-        for (key, value) in self.db.iterator_cf(cf, IteratorMode::Start).flatten() {
+        for entry in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, value) = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            };
             if key.as_ref() == b"latest" {
                 continue;
             }
-            if let Ok(mut parsed) =
-                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&value)
-            {
-                summaries.append(&mut parsed);
+            match bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&value) {
+                Ok(mut parsed) => summaries.append(&mut parsed),
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             }
         }
         if summaries.is_empty() {
@@ -1112,7 +1316,10 @@ impl RecordStore for PersistentStore {
     ) -> Vec<Record> {
         let records_cf = match self.db.cf_handle(CF_RECORDS) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let mut records = Vec::new();
         let start_key = start.0.to_be_bytes();
@@ -1123,18 +1330,30 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, value) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             let record_id = match decode_record_id_key(&key) {
                 Some(id) => id,
-                None => continue,
+                None => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if record_id >= end.0 {
                 break;
             }
-            if let Ok(record) = bincode::deserialize::<Record>(&value) {
-                records.push(record);
-                if max_results > 0 && records.len() >= max_results {
+            match bincode::deserialize::<Record>(&value) {
+                Ok(record) => {
+                    records.push(record);
+                    if max_results > 0 && records.len() >= max_results {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    self.mark_read_fault();
                     break;
                 }
             }
@@ -1143,20 +1362,44 @@ impl RecordStore for PersistentStore {
     }
 
     fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
-        let records_cf = self.db.cf_handle(CF_RECORDS)?;
+        let records_cf = match self.db.cf_handle(CF_RECORDS) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let mut start_iter = self.db.iterator_cf(records_cf, IteratorMode::Start);
-        let min_id = start_iter
-            .next()
-            .and_then(|entry| entry.ok())
-            .and_then(|(key, _)| decode_record_id_key(&key))
-            .map(RecordId)?;
+        let min_id = match start_iter.next() {
+            Some(Ok((key, _))) => match decode_record_id_key(&key) {
+                Some(id) => RecordId(id),
+                None => {
+                    self.mark_read_fault();
+                    return None;
+                }
+            },
+            Some(Err(_)) => {
+                self.mark_read_fault();
+                return None;
+            }
+            None => return None,
+        };
 
         let mut end_iter = self.db.iterator_cf(records_cf, IteratorMode::End);
-        let max_id = end_iter
-            .next()
-            .and_then(|entry| entry.ok())
-            .and_then(|(key, _)| decode_record_id_key(&key))
-            .map(RecordId)?;
+        let max_id = match end_iter.next() {
+            Some(Ok((key, _))) => match decode_record_id_key(&key) {
+                Some(id) => RecordId(id),
+                None => {
+                    self.mark_read_fault();
+                    return None;
+                }
+            },
+            Some(Err(_)) => {
+                self.mark_read_fault();
+                return None;
+            }
+            None => return None,
+        };
 
         Some((min_id, max_id))
     }
@@ -1880,6 +2123,30 @@ fn clear_cf(db: &DB, cf_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clear linker structures that can be reconstructed from durable records.
+///
+/// A crash can leave an older, internally consistent DSU snapshot alongside newer
+/// acknowledged records. Reusing that mixed-generation state during a record scan
+/// skips merges that are required to rebuild summaries and boundary metadata. Start
+/// recovery from an empty derived state instead; records and their persisted
+/// assignments remain untouched.
+pub(crate) fn clear_rebuildable_linker_state(db: &DB) -> Result<()> {
+    let mut batch = WriteBatch::default();
+    for cf_name in [
+        CF_DSU_PARENT,
+        CF_DSU_RANK,
+        CF_DSU_GUARDS,
+        CF_DSU_METADATA,
+        CF_INDEX_IDENTITY_KEYS,
+        CF_INDEX_KEY_STATS,
+    ] {
+        clear_cf_in_batch(db, cf_name, &mut batch)?;
+    }
+    db.write(batch)?;
+    db.flush_wal(true)?;
+    Ok(())
+}
+
 // ============================================================================
 // DSU Persistence Support
 // ============================================================================
@@ -2459,6 +2726,43 @@ mod tests {
         let loaded = store.get_record(record_id).unwrap();
         assert_eq!(loaded.identity.uid, "1");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn corrupt_record_read_poison_store_fail_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+        let record_id;
+        {
+            let mut store = PersistentStore::open(path).unwrap();
+            let attr = store.interner_mut().intern_attr("email");
+            let value = store.interner_mut().intern_value("corrupt@example.com");
+            record_id = store
+                .add_record(Record::new(
+                    RecordId(0),
+                    RecordIdentity::new(
+                        "person".to_string(),
+                        "crm".to_string(),
+                        "corrupt".to_string(),
+                    ),
+                    vec![Descriptor::new(attr, value, Interval::new(0, 10).unwrap())],
+                ))
+                .unwrap();
+        }
+
+        let store = PersistentStore::open(path).unwrap();
+        let records_cf = store.db.cf_handle(CF_RECORDS).unwrap();
+        store
+            .db
+            .put_cf(records_cf, record_id.0.to_be_bytes(), b"not-a-record")
+            .unwrap();
+
+        assert!(store.get_record(record_id).is_none());
+        assert!(store.ensure_healthy().is_err());
+        assert!(
+            store.sync().is_err(),
+            "an ingest acknowledgement must fail after an incomplete read"
+        );
     }
 
     #[test]

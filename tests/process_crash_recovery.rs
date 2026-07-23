@@ -49,6 +49,26 @@ impl ShardProcess {
         let _ = self.child.wait()?;
         Ok(())
     }
+
+    #[cfg(unix)]
+    async fn terminate_and_wait(&mut self) -> anyhow::Result<()> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("failed to send SIGTERM to shard process");
+        }
+        for _ in 0..100 {
+            if self.child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("shard did not exit after SIGTERM");
+    }
 }
 
 impl Drop for ShardProcess {
@@ -185,6 +205,36 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
     let stats = client.get_stats(StatsRequest {}).await?.into_inner();
     assert_eq!(stats.record_count, 129);
     assert_eq!(stats.cluster_count, 64);
+
+    #[cfg(unix)]
+    {
+        drop(client);
+        restarted.terminate_and_wait().await?;
+
+        let third_addr = available_addr()?;
+        let mut restarted_after_shutdown =
+            ShardProcess::spawn(third_addr, &data_dir, &ontology_path)?;
+        let mut client = wait_for_shard(third_addr, &mut restarted_after_shutdown).await?;
+        let stats = client.get_stats(StatsRequest {}).await?.into_inner();
+        assert_eq!(stats.record_count, 129);
+        assert_eq!(stats.cluster_count, 64);
+
+        let linked_after_shutdown = client
+            .ingest_records(IngestRecordsRequest {
+                records: vec![record(
+                    129,
+                    "graceful-shutdown-after-restart".to_string(),
+                    "entity-0@example.com".to_string(),
+                )],
+            })
+            .await?
+            .into_inner();
+        assert_eq!(linked_after_shutdown.assignments.len(), 1);
+        assert_eq!(
+            linked_after_shutdown.assignments[0].cluster_id, original_cluster,
+            "a graceful restart must preserve entity-resolution identity"
+        );
+    }
 
     Ok(())
 }

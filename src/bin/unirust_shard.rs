@@ -185,9 +185,12 @@ async fn main() -> anyhow::Result<()> {
         config.shard.id, config.shard.listen
     );
     Server::builder()
-        .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
+        .add_service(proto::shard_service_server::ShardServiceServer::new(
+            shard.clone(),
+        ))
         .serve_with_shutdown(config.shard.listen, shutdown_signal())
         .await?;
+    shard.shutdown().await?;
 
     Ok(())
 }

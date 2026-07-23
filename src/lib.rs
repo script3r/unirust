@@ -275,6 +275,9 @@ impl Unirust {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("persistent linker backend requires a database"))?
                 .clone();
+            if !self.store.is_empty() {
+                persistence::clear_rebuildable_linker_state(&db)?;
+            }
             let dsu = if use_persistent_dsu {
                 let dsu_config = self.tuning.dsu_config.clone().unwrap_or_default();
                 dsu::DsuBackend::persistent(db.clone(), dsu_config)?
@@ -482,11 +485,13 @@ impl Unirust {
 
     /// Get all cluster assignments.
     pub fn clusters(&mut self) -> anyhow::Result<Clusters> {
-        if let Some(streaming) = &mut self.streaming {
-            Ok(streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?)
+        let clusters = if let Some(streaming) = &mut self.streaming {
+            streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?
         } else {
-            linker::build_clusters(self.store.as_ref(), &self.ontology)
-        }
+            linker::build_clusters(self.store.as_ref(), &self.ontology)?
+        };
+        self.store.ensure_healthy()?;
+        Ok(clusters)
     }
 
     /// Export the knowledge graph.
@@ -494,12 +499,14 @@ impl Unirust {
         let clusters = self.clusters()?;
         let observations =
             conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
-        graph::export_graph(
+        let graph = graph::export_graph(
             self.store.as_ref(),
             &clusters,
             &observations,
             &self.ontology,
-        )
+        )?;
+        self.store.ensure_healthy()?;
+        Ok(graph)
     }
 
     /// Persist all state to disk (for persistent stores).
@@ -635,11 +642,42 @@ impl Unirust {
         self.store.len()
     }
 
+    #[doc(hidden)]
+    pub fn ensure_store_healthy(&self) -> anyhow::Result<()> {
+        self.store.ensure_healthy()
+    }
+
+    /// Durably clear the store and install a fresh ontology on the same handle.
+    #[doc(hidden)]
+    pub fn reset_with_ontology(&mut self, mut ontology: Ontology) -> anyhow::Result<()> {
+        self.store.reset_data()?;
+        ontology.intern_attributes(|name| self.store.intern_attr(name));
+        self.ontology = ontology;
+        self.streaming = None;
+        self.graph_state = None;
+        self.query_cache = std::sync::Mutex::new(None);
+        self.conflict_cache = std::sync::Mutex::new(None);
+        self.query_stats = std::sync::Mutex::new(query::QuerySelectivityStats::default());
+        Ok(())
+    }
+
     pub fn streaming_cluster_count(&self) -> Option<usize> {
         self.streaming
             .as_ref()
             .map(|streaming| streaming.cluster_count())
             .or_else(|| self.store.cluster_count())
+    }
+
+    /// Reconstruct the streaming linker before accepting live traffic.
+    ///
+    /// Persistent shards call this during startup so recovery cost and failures are
+    /// surfaced before the gRPC listener becomes ready.
+    #[doc(hidden)]
+    pub fn initialize_streaming(&mut self) -> anyhow::Result<()> {
+        if self.streaming.is_none() {
+            self.streaming = Some(self.create_streaming_linker()?);
+        }
+        Ok(())
     }
 
     /// Get the number of conflicts detected by the streaming linker
@@ -1044,7 +1082,7 @@ impl Unirust {
         }
         let cache = cache_guard.as_ref().expect("cache");
         let mut stats_guard = self.query_stats.lock().expect("query stats lock");
-        query::query_master_entities_with_cache_selective(
+        let outcome = query::query_master_entities_with_cache_selective(
             self.store.as_ref(),
             &cache.clusters,
             descriptors,
@@ -1053,7 +1091,9 @@ impl Unirust {
             &cache.cluster_keys,
             &cache.record_to_cluster,
             &mut stats_guard,
-        )
+        )?;
+        self.store.ensure_healthy()?;
+        Ok(outcome)
     }
 
     fn invalidate_query_cache(&self) {
@@ -1256,7 +1296,18 @@ impl Unirust {
     /// This is a convenience method that flushes linker state and ensures
     /// all data is synced to disk. Call before shutdown for complete recovery.
     pub fn checkpoint_linker_state(&mut self) -> anyhow::Result<()> {
-        self.flush_linker_state()?;
+        self.initialize_streaming()?;
+        let db = self
+            .store
+            .shared_db()
+            .ok_or_else(|| anyhow::anyhow!("Persistence not available - use PersistentStore"))?;
+        let streaming = self
+            .streaming
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming initialization failed"))?;
+        streaming.flush_dsu()?;
+        let persistence = LinkerStatePersistence::new(&db);
+        streaming.flush_state(&persistence)?;
 
         // Also flush the underlying store to ensure staged records are persisted
         if let Err(e) = self.store.flush_staged_records() {
@@ -1267,6 +1318,22 @@ impl Unirust {
         self.store.sync()?;
 
         Ok(())
+    }
+
+    /// Flush the bounded amount of dirty state required for graceful process exit.
+    ///
+    /// Full linker-map snapshots grow with total record count and are not needed by
+    /// the authoritative record-scan recovery path.
+    #[doc(hidden)]
+    pub fn checkpoint_for_shutdown(&mut self) -> anyhow::Result<()> {
+        self.initialize_streaming()?;
+        let streaming = self
+            .streaming
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming initialization failed"))?;
+        streaming.flush_dsu()?;
+        self.store.flush_staged_records()?;
+        self.store.sync()
     }
 }
 

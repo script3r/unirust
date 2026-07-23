@@ -1,6 +1,6 @@
 use crate::conflicts::ConflictSummary;
 use crate::graph::GoldenDescriptor;
-use crate::model::{AttrId, GlobalClusterId, Record, RecordId, RecordIdentity};
+use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::partitioned::{ParallelPartitionedUnirust, PartitionConfig};
 use crate::perf::ConcurrentInterner;
@@ -148,13 +148,18 @@ impl IngestWal {
 
     fn write_batch(&self, records: &[proto::RecordInput]) -> Result<(), Status> {
         if records.is_empty() {
-            return self.clear();
+            return Ok(());
         }
         let inputs: Vec<WalRecordInput> = records
             .iter()
             .map(wal_from_proto_input)
             .collect::<Result<_, Status>>()?;
         let payload = encode_wal_batch(&inputs)?;
+        if self.path.exists() || self.temp_path.exists() {
+            return Err(Status::failed_precondition(
+                "an earlier ingest WAL is still pending; restart the shard to replay it",
+            ));
+        }
         let mut file =
             fs::File::create(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
         file.write_all(&payload)
@@ -195,6 +200,10 @@ impl IngestWal {
         };
         let records = inputs.into_iter().map(proto_from_wal_input).collect();
         Ok(Some(records))
+    }
+
+    fn has_pending(&self) -> bool {
+        self.path.exists() || self.temp_path.exists()
     }
 
     fn replay(&self, unirust: &mut Unirust, shard_id: u32) -> Result<(), Status> {
@@ -514,35 +523,31 @@ impl DistributedOntologyConfig {
         }
     }
 
-    pub fn build_ontology(&self, store: &mut crate::Store) -> Ontology {
+    fn ontology_template(&self) -> Ontology {
         let mut ontology = Ontology::new();
 
         for key in &self.identity_keys {
-            let attrs: Vec<AttrId> = key
-                .attributes
-                .iter()
-                .map(|attr| store.interner_mut().intern_attr(attr))
-                .collect();
-            // Store both AttrIds and string names for partitioning support
-            ontology.add_identity_key(IdentityKey::with_attribute_names(
-                attrs,
-                key.attributes.clone(),
+            ontology.add_identity_key(IdentityKey::from_names(
+                key.attributes.iter().map(String::as_str).collect(),
                 key.name.clone(),
             ));
         }
 
         for attr in &self.strong_identifiers {
-            let attr_id = store.interner_mut().intern_attr(attr);
             ontology
-                .add_strong_identifier(StrongIdentifier::new(attr_id, format!("{attr}_strong")));
+                .add_strong_identifier(StrongIdentifier::from_name(attr, format!("{attr}_strong")));
         }
 
         for constraint in &self.constraints {
-            let attr_id = store.interner_mut().intern_attr(&constraint.attribute);
             let constraint = match constraint.kind {
-                ConstraintKind::Unique => Constraint::unique(attr_id, constraint.name.clone()),
+                ConstraintKind::Unique => {
+                    Constraint::unique_from_name(&constraint.attribute, constraint.name.clone())
+                }
                 ConstraintKind::UniqueWithinPerspective => {
-                    Constraint::unique_within_perspective(attr_id, constraint.name.clone())
+                    Constraint::unique_within_perspective_from_name(
+                        &constraint.attribute,
+                        constraint.name.clone(),
+                    )
                 }
             };
             ontology.add_constraint(constraint);
@@ -551,42 +556,17 @@ impl DistributedOntologyConfig {
         ontology
     }
 
+    pub fn build_ontology(&self, store: &mut crate::Store) -> Ontology {
+        let mut ontology = self.ontology_template();
+        ontology.intern_attributes(|name| store.interner_mut().intern_attr(name));
+        ontology
+    }
+
     /// Build ontology using a ConcurrentInterner for partitioned mode.
     /// This ensures AttrIds match between ontology and records built with the same interner.
     pub fn build_ontology_with_interner(&self, interner: &ConcurrentInterner) -> Ontology {
-        let mut ontology = Ontology::new();
-
-        for key in &self.identity_keys {
-            let attrs: Vec<AttrId> = key
-                .attributes
-                .iter()
-                .map(|attr| interner.intern_attr(attr))
-                .collect();
-            // Store both AttrIds and string names for partitioning support
-            ontology.add_identity_key(IdentityKey::with_attribute_names(
-                attrs,
-                key.attributes.clone(),
-                key.name.clone(),
-            ));
-        }
-
-        for attr in &self.strong_identifiers {
-            let attr_id = interner.intern_attr(attr);
-            ontology
-                .add_strong_identifier(StrongIdentifier::new(attr_id, format!("{attr}_strong")));
-        }
-
-        for constraint in &self.constraints {
-            let attr_id = interner.intern_attr(&constraint.attribute);
-            let constraint = match constraint.kind {
-                ConstraintKind::Unique => Constraint::unique(attr_id, constraint.name.clone()),
-                ConstraintKind::UniqueWithinPerspective => {
-                    Constraint::unique_within_perspective(attr_id, constraint.name.clone())
-                }
-            };
-            ontology.add_constraint(constraint);
-        }
-
+        let mut ontology = self.ontology_template();
+        ontology.intern_attributes(|name| interner.intern_attr(name));
         ontology
     }
 }
@@ -980,10 +960,18 @@ impl ShardNode {
             let ingest_wal = Some(Arc::new(IngestWal::new(&path)));
             let mut unirust =
                 Unirust::with_store_and_tuning(ontology.clone(), store, tuning.clone());
+            let recovery_started = Instant::now();
+            unirust.initialize_streaming()?;
             if let Some(wal) = ingest_wal.as_ref() {
                 wal.replay(&mut unirust, shard_id)
                     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
             }
+            tracing::info!(
+                shard_id,
+                records = unirust.record_count(),
+                elapsed_ms = recovery_started.elapsed().as_millis(),
+                "persistent linker recovery completed"
+            );
             let recovered_cross_shard_conflicts = unirust.load_cross_shard_conflicts()?;
             let unirust = Arc::new(parking_lot::RwLock::new(unirust));
 
@@ -1085,6 +1073,79 @@ impl ShardNode {
     pub fn with_destructive_admin(mut self, allow: bool) -> Self {
         self.allow_destructive_admin = allow;
         self
+    }
+
+    /// Drain mutations and durably flush derived state before process exit.
+    pub async fn shutdown(&self) -> AnyResult<()> {
+        let _mutation_guard = self.mutation_gate.write().await;
+        let _wal_guard = self.ingest_wal_lock.lock().await;
+        if self.data_dir.is_none() {
+            return Ok(());
+        }
+
+        let mut unirust = write_unirust!(self);
+        unirust.checkpoint_for_shutdown()?;
+        if self
+            .ingest_wal
+            .as_ref()
+            .is_some_and(|wal| wal.has_pending())
+        {
+            tracing::warn!(
+                shard_id = self.shard_id,
+                "shutdown completed with a pending ingest WAL; it will replay on restart"
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_no_pending_ingest(&self) -> Result<(), Status> {
+        if self
+            .ingest_wal
+            .as_ref()
+            .is_some_and(|wal| wal.has_pending())
+        {
+            return if self.ingest_wal_lock.try_lock().is_ok() {
+                Err(Status::failed_precondition(
+                    "ingest recovery is pending; restart the shard before serving more traffic",
+                ))
+            } else {
+                Err(Status::unavailable("an ingest commit is in progress"))
+            };
+        }
+        let unirust = read_unirust!(self);
+        unirust.ensure_store_healthy().map_err(|err| {
+            Status::failed_precondition(format!(
+                "persistent store is unhealthy; restart the shard: {err}"
+            ))
+        })
+    }
+
+    fn ensure_recovery_healthy(&self) -> Result<(), Status> {
+        if self
+            .ingest_wal
+            .as_ref()
+            .is_some_and(|wal| wal.has_pending())
+            && self.ingest_wal_lock.try_lock().is_ok()
+        {
+            return Err(Status::failed_precondition(
+                "ingest recovery is pending; restart the shard",
+            ));
+        }
+        let unirust = read_unirust!(self);
+        unirust.ensure_store_healthy().map_err(|err| {
+            Status::failed_precondition(format!(
+                "persistent store is unhealthy; restart the shard: {err}"
+            ))
+        })
+    }
+
+    fn ensure_store_healthy(&self) -> Result<(), Status> {
+        let unirust = read_unirust!(self);
+        unirust.ensure_store_healthy().map_err(|err| {
+            Status::failed_precondition(format!(
+                "persistent store is unhealthy; restart the shard: {err}"
+            ))
+        })
     }
 
     /// Build a record using the concurrent interner - NO LOCK REQUIRED!
@@ -1551,6 +1612,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::ApplyOntologyRequest>,
     ) -> Result<Response<proto::ApplyOntologyResponse>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
+        self.ensure_no_pending_ingest()?;
         let config = request
             .into_inner()
             .config
@@ -1652,6 +1714,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         } else {
             None
         };
+        self.ensure_store_healthy()?;
 
         // Use partitioned processing for large batches (high-throughput mode)
         // Small batches use sequential path for correctness (query support)
@@ -1700,6 +1763,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             } else {
                 None
             };
+            self.ensure_store_healthy()?;
 
             // Use partitioned processing for large batches (high-throughput mode)
             // Small batches use sequential path for correctness
@@ -1741,6 +1805,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::QueryEntitiesRequest>,
     ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let start = Instant::now();
         let mut unirust = write_unirust!(self);
         let request = request.into_inner();
@@ -1835,6 +1900,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let unirust = read_unirust!(self);
         let partitioned_guard = self.partitioned.read();
 
@@ -1895,6 +1961,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
+        self.ensure_recovery_healthy()?;
         Ok(Response::new(proto::HealthCheckResponse {
             status: "ok".to_string(),
         }))
@@ -1937,6 +2004,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::CheckpointRequest>,
     ) -> Result<Response<proto::CheckpointResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let data_dir = self
             .data_dir
             .as_ref()
@@ -1961,6 +2029,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::RecordIdRangeRequest>,
     ) -> Result<Response<proto::RecordIdRangeResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let unirust = read_unirust!(self);
         let record_count = unirust.record_count() as u64;
         let response = match unirust.record_id_bounds() {
@@ -1984,6 +2054,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ExportRecordsRequest>,
     ) -> Result<Response<proto::ExportRecordsResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
         let limit = if request.limit == 0 {
             EXPORT_DEFAULT_LIMIT
@@ -2029,6 +2101,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ExportRecordsRequest>,
     ) -> Result<Response<Self::ExportRecordsStreamStream>, Status> {
+        let mutation_guard = self.mutation_gate.clone().read_owned().await;
+        self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
         let limit = if request.limit == 0 {
             EXPORT_DEFAULT_LIMIT
@@ -2078,6 +2152,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         };
 
         tokio::spawn(async move {
+            let _mutation_guard = mutation_guard;
             loop {
                 let (records, has_more, next_start_id) =
                     read_records(unirust.clone(), start_id, end_id, limit).await;
@@ -2116,6 +2191,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::ImportRecordsRequest>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
         if request.records.is_empty() {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
@@ -2147,6 +2223,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<tonic::Streaming<proto::ImportRecordsChunk>>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let mut stream = request.into_inner();
         let mut imported = 0u64;
         while let Some(chunk) = stream
@@ -2184,6 +2261,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::ListConflictsRequest>,
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
         let mut summaries = if let Some(cache) = {
             let guard = read_unirust!(self);
@@ -2267,39 +2345,28 @@ impl proto::shard_service_server::ShardService for ShardNode {
             ));
         }
         let _mutation_guard = self.mutation_gate.write().await;
+        self.ensure_no_pending_ingest()?;
         let config = self.ontology_config.lock().await.clone();
-        if let Some(path) = &self.data_dir {
+        {
             let mut guard = write_unirust!(self);
-            let old = std::mem::replace(
-                &mut *guard,
-                Unirust::with_store_and_tuning(
-                    crate::Ontology::new(),
-                    crate::Store::new(),
-                    self.tuning.clone(),
-                ),
-            );
-            drop(old);
+            guard
+                .reset_with_ontology(config.ontology_template())
+                .map_err(|err| Status::internal(err.to_string()))?;
+        }
 
-            let mut store =
-                PersistentStore::open(path).map_err(|err| Status::internal(err.to_string()))?;
-            store
-                .reset_data()
-                .map_err(|err| Status::internal(err.to_string()))?;
-            store
-                .save_ontology_config(&bincode::serialize(&config).map_err(|err| {
-                    Status::internal(format!("failed to encode ontology config: {err}"))
-                })?)
-                .map_err(|err| Status::internal(err.to_string()))?;
-            let ontology = config.build_ontology(store.inner_mut());
-            store
-                .persist_state()
-                .map_err(|err| Status::internal(err.to_string()))?;
-            *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+        if is_partitioned_enabled() && self.data_dir.is_none() {
+            let partition_config = PartitionConfig::for_cores(partition_count());
+            let ontology = config.build_ontology_with_interner(&self.concurrent_interner);
+            let partitioned = ParallelPartitionedUnirust::new_with_interner(
+                partition_config,
+                Arc::new(ontology),
+                self.tuning.clone(),
+                self.concurrent_interner.clone(),
+            )
+            .map_err(|err| Status::internal(err.to_string()))?;
+            *self.partitioned.write() = Some(Arc::new(partitioned));
         } else {
-            let mut store = crate::Store::new();
-            let ontology = config.build_ontology(&mut store);
-            let mut guard = write_unirust!(self);
-            *guard = Unirust::with_store_and_tuning(ontology, store, self.tuning.clone());
+            *self.partitioned.write() = None;
         }
         self.cross_shard_conflicts.write().clear();
         Ok(Response::new(proto::Empty {}))
@@ -2309,6 +2376,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::GetBoundaryMetadataRequest>,
     ) -> Result<Response<proto::GetBoundaryMetadataResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let since_version = request.into_inner().since_version;
 
         // Export boundary metadata from the streaming linker
@@ -2372,6 +2441,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::ApplyMergeRequest>,
     ) -> Result<Response<proto::ApplyMergeResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
 
         let primary = req
@@ -2429,6 +2499,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::GetDirtyBoundaryKeysRequest>,
     ) -> Result<Response<proto::GetDirtyBoundaryKeysResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let unirust = read_unirust!(self);
         let partitioned_guard = self.partitioned.read();
 
@@ -2486,6 +2558,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ClearDirtyKeysRequest>,
     ) -> Result<Response<proto::ClearDirtyKeysResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
         let mut unirust = write_unirust!(self);
         let partitioned_guard = self.partitioned.read();
@@ -2522,6 +2596,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::StoreCrossShardConflictsRequest>,
     ) -> Result<Response<proto::StoreCrossShardConflictsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
+        self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
         let conflicts: Vec<crate::sharding::CrossShardConflict> = req
             .conflicts
@@ -4030,5 +4105,68 @@ mod wal_tests {
         let decoded = decode_wal_batch(&encoded).expect("decode legacy WAL");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].index, 7);
+    }
+
+    #[test]
+    fn pending_wal_cannot_be_overwritten() {
+        let temp_dir = tempfile::tempdir().expect("temporary WAL directory");
+        let wal = IngestWal::new(temp_dir.path());
+        let first = proto_from_wal_input(sample_wal_record());
+        wal.write_batch(std::slice::from_ref(&first))
+            .expect("write first WAL");
+
+        let mut second = first;
+        second.index = 99;
+        second.identity.as_mut().expect("identity").uid = "replacement".to_string();
+        let error = wal
+            .write_batch(&[second])
+            .expect_err("pending WAL must block replacement");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let recovered = wal
+            .load_batch()
+            .expect("load pending WAL")
+            .expect("pending batch");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].index, 7);
+        assert_eq!(
+            recovered[0].identity.as_ref().expect("identity").uid,
+            "wal-checksum"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_wal_fails_health_and_reads_closed() {
+        use proto::shard_service_server::ShardService;
+
+        let temp_dir = tempfile::tempdir().expect("temporary shard directory");
+        let shard = ShardNode::new_with_data_dir(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+            Some(temp_dir.path().to_path_buf()),
+            false,
+            None,
+        )
+        .expect("persistent shard");
+        let wal = shard.ingest_wal.as_ref().expect("ingest WAL");
+        wal.write_batch(&[proto_from_wal_input(sample_wal_record())])
+            .expect("write pending WAL");
+
+        let health_error =
+            ShardService::health_check(&shard, Request::new(proto::HealthCheckRequest {}))
+                .await
+                .expect_err("pending recovery must fail health");
+        assert_eq!(health_error.code(), tonic::Code::FailedPrecondition);
+
+        let stats_error = ShardService::get_stats(&shard, Request::new(proto::StatsRequest {}))
+            .await
+            .expect_err("pending recovery must block state reads");
+        assert_eq!(stats_error.code(), tonic::Code::FailedPrecondition);
+
+        wal.clear().expect("clear test WAL");
+        ShardService::health_check(&shard, Request::new(proto::HealthCheckRequest {}))
+            .await
+            .expect("health recovers after WAL clears");
     }
 }

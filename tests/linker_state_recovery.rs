@@ -6,9 +6,12 @@
 use std::collections::HashMap;
 use tempfile::tempdir;
 use unirust_rs::advanced::{ClusterId, GlobalClusterId, LinkerStateConfig};
+use unirust_rs::model::{Descriptor, Record, RecordIdentity};
+use unirust_rs::ontology::{IdentityKey, StrongIdentifier};
 use unirust_rs::persistence::linker_encoding;
+use unirust_rs::temporal::Interval;
 use unirust_rs::test_support::{default_ontology, generate_dataset};
-use unirust_rs::{PersistentStore, RecordId, StreamingTuning, Unirust};
+use unirust_rs::{Ontology, PersistentStore, RecordId, StreamingTuning, Unirust};
 
 #[test]
 fn linker_state_persists_across_restart() -> anyhow::Result<()> {
@@ -161,6 +164,129 @@ fn linker_state_with_lru_config_persists() -> anyhow::Result<()> {
 
         let next_cluster_id_after = unirust.next_cluster_id().unwrap_or(0);
         assert_eq!(next_cluster_id_after, next_cluster_id_before);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn bounded_linker_configuration_does_not_evict_resolution_state() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let store = PersistentStore::open(dir.path())?;
+    let mut ontology = Ontology::new();
+    ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+
+    let mut tuning = StreamingTuning::balanced();
+    tuning.linker_state_config = Some(LinkerStateConfig {
+        cluster_ids_capacity: 1,
+        global_ids_capacity: 1,
+        summaries_capacity: 1,
+        perspectives_capacity: 1,
+        dirty_buffer_size: 1,
+    });
+    let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning);
+
+    fn record(unirust: &mut Unirust, uid: &str, email: &str) -> Record {
+        let attr = unirust.intern_attr("email");
+        let value = unirust.intern_value(email);
+        Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), uid.to_string()),
+            vec![Descriptor::new(
+                attr,
+                value,
+                Interval::new(0, 10).expect("valid interval"),
+            )],
+        )
+    }
+
+    let first_record = record(&mut unirust, "first", "shared@example.com");
+    let first = unirust.stream_records(vec![first_record])?[0].cluster_id;
+    let unrelated_record = record(&mut unirust, "unrelated", "other@example.com");
+    unirust.stream_records(vec![unrelated_record])?;
+    let related_record = record(&mut unirust, "related", "shared@example.com");
+    let related = unirust.stream_records(vec![related_record])?[0].cluster_id;
+
+    assert_eq!(
+        related, first,
+        "a cache capacity must never change entity-resolution results"
+    );
+    Ok(())
+}
+
+#[test]
+fn persistent_dsu_restart_rebuilds_cluster_summaries() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join("persistent-dsu");
+    std::fs::create_dir_all(&data_dir)?;
+
+    fn ontology() -> Ontology {
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+        ontology.add_strong_identifier(StrongIdentifier::from_name("ssn", "ssn"));
+        ontology
+    }
+
+    fn record(unirust: &mut Unirust, uid: &str, ssn: Option<&str>) -> Record {
+        let email_attr = unirust.intern_attr("email");
+        let email_value = unirust.intern_value("shared@example.com");
+        let mut descriptors = vec![Descriptor::new(
+            email_attr,
+            email_value,
+            Interval::new(0, 10).expect("valid interval"),
+        )];
+        if let Some(ssn) = ssn {
+            let ssn_attr = unirust.intern_attr("ssn");
+            let ssn_value = unirust.intern_value(ssn);
+            descriptors.push(Descriptor::new(
+                ssn_attr,
+                ssn_value,
+                Interval::new(0, 10).expect("valid interval"),
+            ));
+        }
+        Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), uid.to_string()),
+            descriptors,
+        )
+    }
+
+    let original_cluster;
+    {
+        let store = PersistentStore::open(&data_dir)?;
+        let mut tuning = StreamingTuning::billion_scale();
+        tuning
+            .dsu_config
+            .as_mut()
+            .expect("persistent DSU config")
+            .dirty_buffer_size = 1;
+        let mut unirust = Unirust::with_store_and_tuning(ontology(), store, tuning);
+        let first = record(&mut unirust, "first", None);
+        original_cluster = unirust.stream_records(vec![first])?[0].cluster_id;
+        let second = record(&mut unirust, "second", Some("111-11-1111"));
+        let second_cluster = unirust.stream_records(vec![second])?[0].cluster_id;
+        assert_eq!(second_cluster, original_cluster);
+        unirust.checkpoint_linker_state()?;
+    }
+
+    {
+        let store = PersistentStore::open(&data_dir)?;
+        let mut tuning = StreamingTuning::billion_scale();
+        tuning
+            .dsu_config
+            .as_mut()
+            .expect("persistent DSU config")
+            .dirty_buffer_size = 1;
+        let mut unirust = Unirust::with_store_and_tuning(ontology(), store, tuning);
+        unirust.initialize_streaming()?;
+
+        let conflicting = record(&mut unirust, "conflicting", Some("222-22-2222"));
+        let conflicting_cluster = unirust.stream_records(vec![conflicting])?[0].cluster_id;
+        assert_ne!(
+            conflicting_cluster, original_cluster,
+            "restart recovery must retain strong-ID conflict guards"
+        );
+        assert_eq!(unirust.streaming_cluster_count(), Some(2));
     }
 
     Ok(())

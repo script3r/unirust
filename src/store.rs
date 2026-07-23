@@ -22,6 +22,16 @@ pub struct StoreMetrics {
 
 /// Persistence abstraction for records and metadata.
 pub trait RecordStore: Send + Sync {
+    /// Fail if the store observed an I/O or decode error that made a prior read incomplete.
+    fn ensure_healthy(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove all records and derived state while keeping the store usable.
+    fn reset_data(&mut self) -> Result<()> {
+        anyhow::bail!("reset is not supported by this record store")
+    }
+
     /// Add a single record and return its assigned ID.
     fn add_record(&mut self, record: Record) -> Result<RecordId>;
 
@@ -560,6 +570,11 @@ impl Default for Store {
 }
 
 impl RecordStore for Store {
+    fn reset_data(&mut self) -> Result<()> {
+        *self = Store::new();
+        Ok(())
+    }
+
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
         Store::add_record(self, record)
     }

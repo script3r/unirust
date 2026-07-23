@@ -302,7 +302,10 @@ impl StreamingTuning {
             use_tiered_index: true,
             shard_id: 0,
             enable_boundary_tracking: false,
-            linker_state_config: Some(LinkerStateConfig::default()),
+            // LinkerState's bounded LRU backend has no durable spill path yet.
+            // Evicting cluster summaries or ID mappings changes resolution results,
+            // so persistent profiles must remain unbounded until spill is implemented.
+            linker_state_config: None,
         }
     }
 
@@ -326,7 +329,8 @@ impl StreamingTuning {
             use_tiered_index: true,
             shard_id: 0,
             enable_boundary_tracking: false,
-            linker_state_config: Some(LinkerStateConfig::high_performance()),
+            // Correctness-critical linker state cannot be evicted without durable spill.
+            linker_state_config: None,
         }
     }
 
@@ -343,8 +347,11 @@ impl StreamingTuning {
     }
 }
 
-/// Configuration for linker state memory management.
-/// Controls LRU cache sizes for cluster IDs, summaries, and perspectives.
+/// Reserved configuration for linker-state memory management.
+///
+/// Capacities are currently not enforced because correctness-critical evictions
+/// require a durable spill/read-through backend. Supplying this configuration
+/// retains unbounded state and emits a warning.
 #[derive(Debug, Clone)]
 pub struct LinkerStateConfig {
     /// Maximum number of cluster ID mappings to keep in memory.

@@ -149,7 +149,7 @@ write_buffer_mb = 256
 | `high-throughput` | Batch processing (default for binaries) |
 | `bulk-ingest` | Large initial loads with lower candidate caps; entity resolution remains enabled |
 | `memory-saver` | Constrained environments |
-| `billion-scale` | Persistent DSU for huge datasets |
+| `billion-scale` | Disk-backed DSU/index; see the recovery and memory limits below |
 
 ## API Reference
 
@@ -217,11 +217,27 @@ Persistent shards use two recovery layers for every ingest request:
 3. Only after that sync succeeds is the ingest WAL removed and the request
    acknowledged. Its directory is synced again after removal.
 
-On restart, a remaining ingest WAL is replayed idempotently. A truncated or
-corrupt WAL is preserved with a `.corrupt.*` suffix and shard startup fails with
-a data-loss error instead of accepting traffic with an unknown recovery gap.
-Cross-shard merge redirects are also persisted before acknowledgement and
-reloaded when the streaming linker is reconstructed.
+On restart, a remaining ingest WAL is replayed idempotently. A pending WAL is
+never overwritten by a later request; a failed ingest therefore requires shard
+restart and replay before more traffic is accepted. A truncated or corrupt WAL
+is preserved with a `.corrupt.*` suffix and shard startup fails with a data-loss
+error instead of accepting traffic with an unknown recovery gap. Cross-shard
+merge redirects are also persisted before acknowledgement and reloaded when the
+streaming linker is reconstructed.
+
+The shard reconstructs all derived linker state before opening its gRPC
+listener. Recovery currently scans all persisted records, so recovery time is
+O(record count). This is a correctness-first crash-recovery path, not a bounded
+recovery-time guarantee. Measure restart time at the intended dataset size and
+set orchestration startup probes accordingly.
+
+`LinkerStateConfig` cache capacities are not enforced because the current LRU
+backend has no durable spill/read-through path. Evicting cluster IDs, strong-ID
+summaries, or record perspectives would change entity-resolution results.
+Persistent profiles therefore retain this correctness-critical working set in
+memory even though their DSU and identity index are disk-backed. The
+`billion-scale` profile must not be treated as proof that a billion-record
+deployment fits a given memory or recovery-time budget.
 
 `scripts/cluster.sh start` and `restart` preserve `DATA_DIR`. Only the explicit
 `reset` action deletes shard data, and it requires `UNIRUST_CONFIRM_RESET=1`.
@@ -235,9 +251,19 @@ multi-shard reset cannot be atomic. The supported production reset is the
 confirmed offline script action. Test or isolated admin deployments can opt in
 with the shard flag `--allow-destructive-admin`.
 
-The shard and router binaries handle SIGINT/SIGTERM with graceful gRPC shutdown;
-acknowledged ingests are additionally covered by an executable-level process
-kill and restart integration test.
+The shard and router binaries handle SIGINT/SIGTERM with graceful gRPC shutdown.
+The shard drains active mutations and flushes dirty DSU and authoritative store
+state before exit. Acknowledged ingests are additionally covered by an
+executable-level SIGKILL, restart, SIGTERM, and second-restart integration test.
+
+## Deployment Security
+
+The gRPC services do not currently terminate TLS or authenticate callers.
+Production deployments must place the router and every shard on private
+networks and enforce authenticated TLS with a service mesh or reverse proxy.
+Never expose a shard port directly to an untrusted network. Destructive RPCs
+remain disabled by default, but ingest, query, export, reconciliation, and other
+administrative surfaces are otherwise unauthenticated.
 
 ## Performance
 
