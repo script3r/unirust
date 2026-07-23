@@ -61,7 +61,8 @@ async fn spawn_shard(
         Some(data_dir.path().to_path_buf()),
         false,
         None,
-    )?;
+    )?
+    .with_destructive_admin(true);
     let handle = tokio::spawn(async move {
         let _data_dir = data_dir;
         Server::builder()

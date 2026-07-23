@@ -22,7 +22,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
@@ -622,6 +622,34 @@ fn map_proto_config(config: &proto::OntologyConfig) -> DistributedOntologyConfig
     }
 }
 
+fn to_proto_config(config: &DistributedOntologyConfig) -> proto::OntologyConfig {
+    proto::OntologyConfig {
+        identity_keys: config
+            .identity_keys
+            .iter()
+            .map(|entry| proto::IdentityKeyConfig {
+                name: entry.name.clone(),
+                attributes: entry.attributes.clone(),
+            })
+            .collect(),
+        strong_identifiers: config.strong_identifiers.clone(),
+        constraints: config
+            .constraints
+            .iter()
+            .map(|entry| proto::ConstraintConfig {
+                name: entry.name.clone(),
+                attribute: entry.attribute.clone(),
+                kind: match entry.kind {
+                    ConstraintKind::Unique => proto::ConstraintKind::Unique.into(),
+                    ConstraintKind::UniqueWithinPerspective => {
+                        proto::ConstraintKind::UniqueWithinPerspective.into()
+                    }
+                },
+            })
+            .collect(),
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn wal_from_proto_input(input: &proto::RecordInput) -> Result<WalRecordInput, Status> {
     let identity = input
@@ -842,6 +870,8 @@ pub struct ShardNode {
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     config_version: String,
     metrics: Arc<PerfMetrics>,
+    /// Destructive RPCs are disabled unless explicitly enabled by the embedding process.
+    allow_destructive_admin: bool,
     /// Cross-shard conflicts detected during reconciliation.
     /// These are indirect conflicts where clusters on different shards share
     /// an identity key but have conflicting strong identifiers.
@@ -987,6 +1017,7 @@ impl ShardNode {
                 ingest_txs,
                 config_version,
                 metrics: Arc::new(PerfMetrics::new()),
+                allow_destructive_admin: false,
                 cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(
                     recovered_cross_shard_conflicts,
                 )),
@@ -1042,8 +1073,18 @@ impl ShardNode {
             ingest_txs,
             config_version,
             metrics: Arc::new(PerfMetrics::new()),
+            allow_destructive_admin: false,
             cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
+    }
+
+    /// Explicitly enable destructive admin RPCs such as `Reset`.
+    ///
+    /// Production binaries leave these disabled by default. Prefer an offline
+    /// reset of stopped shard data directories whenever possible.
+    pub fn with_destructive_admin(mut self, allow: bool) -> Self {
+        self.allow_destructive_admin = allow;
+        self
     }
 
     /// Build a record using the concurrent interner - NO LOCK REQUIRED!
@@ -1190,19 +1231,30 @@ impl ShardNode {
 
 #[allow(clippy::result_large_err)]
 fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, Status> {
+    let checkpoint_root = data_dir.join("checkpoints");
     if requested.is_empty() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|err| Status::internal(err.to_string()))?
-            .as_secs();
-        return Ok(data_dir.join("checkpoints").join(format!("{timestamp}")));
+            .as_nanos();
+        return Ok(checkpoint_root.join(format!("{timestamp}")));
     }
     let candidate = PathBuf::from(requested);
-    if candidate.is_absolute() {
-        Ok(candidate)
-    } else {
-        Ok(data_dir.join(candidate))
+    if candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Status::invalid_argument(
+            "checkpoint path must be relative and remain within the shard checkpoint directory",
+        ));
     }
+    Ok(checkpoint_root.join(candidate))
 }
 
 fn ingest_worker_count() -> usize {
@@ -1852,8 +1904,10 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::ConfigVersionRequest>,
     ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        let ontology_config = self.ontology_config.lock().await;
         Ok(Response::new(proto::ConfigVersionResponse {
             version: self.config_version.clone(),
+            ontology_config: Some(to_proto_config(&ontology_config)),
         }))
     }
 
@@ -2206,6 +2260,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         _request: Request<proto::Empty>,
     ) -> Result<Response<proto::Empty>, Status> {
+        if !self.allow_destructive_admin {
+            return Err(Status::permission_denied(
+                "destructive reset RPC is disabled; stop the cluster and use the confirmed \
+                 offline reset procedure",
+            ));
+        }
         let _mutation_guard = self.mutation_gate.write().await;
         let config = self.ontology_config.lock().await.clone();
         if let Some(path) = &self.data_dir {
@@ -2681,6 +2741,8 @@ pub struct RouterNode {
     reconciliation_coordinator: Arc<tokio::sync::Mutex<ReconciliationCoordinator>>,
     /// Serializes destructive cluster changes against router-mediated mutations.
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Latches closed if a distributed ontology mutation cannot be rolled back.
+    cluster_consistent: Arc<AtomicBool>,
 }
 
 impl RouterNode {
@@ -2707,17 +2769,25 @@ impl RouterNode {
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
         for client in &shard_clients {
             let mut client = client.clone();
-            let version = client
+            let response = client
                 .get_config_version(Request::new(proto::ConfigVersionRequest {}))
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?
-                .into_inner()
-                .version;
-            if version != config_version {
+                .into_inner();
+            if response.version != config_version {
                 return Err(Status::failed_precondition(format!(
                     "config version mismatch: router {}, shard {}",
-                    config_version, version
+                    config_version, response.version
                 )));
+            }
+            let shard_ontology = response.ontology_config.ok_or_else(|| {
+                Status::failed_precondition("shard did not report its ontology configuration")
+            })?;
+            if map_proto_config(&shard_ontology) != ontology_config {
+                return Err(Status::failed_precondition(
+                    "ontology mismatch between router and shard; restart the router with the \
+                     same ontology used by every shard",
+                ));
             }
         }
         let router = Arc::new(Self {
@@ -2730,6 +2800,7 @@ impl RouterNode {
                 ReconciliationCoordinator::new(AdaptiveReconciliationConfig::default()),
             )),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            cluster_consistent: Arc::new(AtomicBool::new(true)),
         });
 
         // Start adaptive reconciliation background task automatically
@@ -2781,6 +2852,18 @@ impl RouterNode {
             )));
         }
         Ok(self.shard_clients[idx].clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn ensure_cluster_consistent(&self) -> Result<(), Status> {
+        if self.cluster_consistent.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "cluster is blocked after an incomplete ontology change; retry SetOntology with \
+                 the intended configuration or recover the shard configurations offline",
+            ))
+        }
     }
 
     async fn fetch_boundary_metadata(&self) -> Result<Vec<proto::BoundaryMetadata>, Status> {
@@ -2918,6 +3001,9 @@ impl RouterNode {
         loop {
             interval.tick().await;
             let _mutation_guard = self.mutation_gate.read().await;
+            if self.ensure_cluster_consistent().is_err() {
+                continue;
+            }
 
             // 1. Poll all shards for dirty boundary keys
             let mut poll_complete = true;
@@ -3142,7 +3228,8 @@ impl proto::router_service_server::RouterService for RouterNode {
             .clone()
             .ok_or_else(|| Status::invalid_argument("ontology config is required"))?;
         let mapped = map_proto_config(&config);
-        if *self.ontology_config.read().await != mapped {
+        let previous = self.ontology_config.read().await.clone();
+        if previous != mapped {
             for client in &self.shard_clients {
                 let mut client = client.clone();
                 let stats = client
@@ -3161,9 +3248,33 @@ impl proto::router_service_server::RouterService for RouterNode {
 
         for client in &self.shard_clients {
             let mut client = client.clone();
-            client.set_ontology(Request::new(payload.clone())).await?;
+            if let Err(apply_error) = client.set_ontology(Request::new(payload.clone())).await {
+                let rollback = proto::ApplyOntologyRequest {
+                    config: Some(to_proto_config(&previous)),
+                };
+                let mut rollback_complete = true;
+                for rollback_client in &self.shard_clients {
+                    let mut rollback_client = rollback_client.clone();
+                    if rollback_client
+                        .set_ontology(Request::new(rollback.clone()))
+                        .await
+                        .is_err()
+                    {
+                        rollback_complete = false;
+                    }
+                }
+                if !rollback_complete {
+                    self.cluster_consistent.store(false, Ordering::Release);
+                    return Err(Status::aborted(format!(
+                        "ontology update failed and rollback was incomplete; cluster is blocked: \
+                         {apply_error}"
+                    )));
+                }
+                return Err(apply_error);
+            }
         }
         *self.ontology_config.write().await = mapped;
+        self.cluster_consistent.store(true, Ordering::Release);
 
         Ok(Response::new(proto::ApplyOntologyResponse {}))
     }
@@ -3173,6 +3284,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_cluster_consistent()?;
         let start = Instant::now();
         let batch = request.into_inner();
         let record_count = batch.records.len();
@@ -3248,6 +3360,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<proto::QueryEntitiesRequest>,
     ) -> Result<Response<proto::QueryEntitiesResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_cluster_consistent()?;
         let start = Instant::now();
         let request = request.into_inner();
         let mut responses = Vec::with_capacity(self.shard_clients.len());
@@ -3309,6 +3422,8 @@ impl proto::router_service_server::RouterService for RouterNode {
         &self,
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_cluster_consistent()?;
         for client in &self.shard_clients {
             let mut client = client.clone();
             client
@@ -3326,8 +3441,10 @@ impl proto::router_service_server::RouterService for RouterNode {
         &self,
         _request: Request<proto::ConfigVersionRequest>,
     ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        let ontology_config = self.ontology_config.read().await;
         Ok(Response::new(proto::ConfigVersionResponse {
             version: self.config_version.clone(),
+            ontology_config: Some(to_proto_config(&ontology_config)),
         }))
     }
 
@@ -3453,6 +3570,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<proto::RouterImportRecordsRequest>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_cluster_consistent()?;
         let request = request.into_inner();
         let mut client = self.shard_client(request.shard_id)?;
         let response = client
@@ -3470,6 +3588,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<tonic::Streaming<proto::RouterImportRecordsRequest>>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_cluster_consistent()?;
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -3611,10 +3730,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         let _mutation_guard = self.mutation_gate.write().await;
         for client in &self.shard_clients {
             let mut client = client.clone();
-            client
-                .reset(Request::new(proto::Empty {}))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?;
+            client.reset(Request::new(proto::Empty {})).await?;
         }
         Ok(Response::new(proto::Empty {}))
     }
@@ -3624,6 +3740,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<proto::ReconcileRequest>,
     ) -> Result<Response<proto::ReconcileResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_cluster_consistent()?;
         let req = request.into_inner();
 
         let shard_metadata = if req.shard_metadata.is_empty() {

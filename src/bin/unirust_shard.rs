@@ -36,6 +36,8 @@ OPTIONS:
                             bulk-ingest, memory-saver, billion-scale,
                             billion-scale-high-performance
         --repair            Run repair on startup
+        --allow-destructive-admin
+                            Enable destructive admin RPCs such as Reset
         --config-version    Config version for compatibility checking
     -h, --help              Print help
 
@@ -77,6 +79,24 @@ fn load_ontology(path: Option<&std::path::Path>) -> anyhow::Result<DistributedOn
         Ok(config)
     } else {
         Ok(DistributedOntologyConfig::empty())
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -157,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
         config.shard.data_dir.clone(),
         config.shard.repair,
         config_version,
-    )?;
+    )?
+    .with_destructive_admin(has_flag("--allow-destructive-admin"));
 
     println!(
         "Unirust shard {} listening on {}",
@@ -165,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     );
     Server::builder()
         .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
-        .serve(config.shard.listen)
+        .serve_with_shutdown(config.shard.listen, shutdown_signal())
         .await?;
 
     Ok(())

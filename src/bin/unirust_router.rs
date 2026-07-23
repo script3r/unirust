@@ -57,6 +57,24 @@ fn load_ontology(path: Option<&std::path::Path>) -> anyhow::Result<DistributedOn
     }
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if has_flag("-h") || has_flag("--help") {
@@ -126,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(proto::router_service_server::RouterServiceServer::new(
             router,
         ))
-        .serve(config.router.listen)
+        .serve_with_shutdown(config.router.listen, shutdown_signal())
         .await?;
 
     Ok(())

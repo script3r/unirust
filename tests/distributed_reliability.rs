@@ -7,12 +7,16 @@
 //! - Entity resolution consistency after failures
 
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::codegen::{http, Service};
+use tonic::server::NamedService;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
@@ -23,6 +27,53 @@ use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
 use unirust_rs::{StreamingTuning, TuningProfile};
 
 mod support;
+
+#[derive(Clone)]
+struct FailSetOntology<S> {
+    inner: S,
+}
+
+impl<S> FailSetOntology<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S, B> Service<http::Request<B>> for FailSetOntology<S>
+where
+    S: Service<
+            http::Request<B>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + Send,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/unirust.ShardService/SetOntology" {
+            return Box::pin(async {
+                Ok(tonic::Status::unavailable("injected SetOntology failure").into_http())
+            });
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
+impl<S> NamedService for FailSetOntology<S>
+where
+    S: NamedService,
+{
+    const NAME: &'static str = S::NAME;
+}
 
 async fn spawn_shard(
     shard_id: u32,
@@ -43,6 +94,33 @@ async fn spawn_shard(
         let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, handle))
+}
+
+async fn spawn_set_ontology_failing_shard(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
+    )?;
+    let service = proto::shard_service_server::ShardServiceServer::new(shard);
+    let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
+        Server::builder()
+            .add_service(FailSetOntology::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("shard server");
@@ -297,6 +375,101 @@ async fn reconciliation_fails_when_boundary_metadata_is_incomplete() -> anyhow::
         .await
         .expect_err("reconciliation must not succeed with a missing shard");
     assert_eq!(error.code(), tonic::Code::Unavailable);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destructive_reset_is_disabled_and_preserves_records_by_default() -> anyhow::Result<()> {
+    let config = support::build_iam_config();
+    let (shard_addr, _shard_handle) = spawn_shard(0, config).await?;
+    let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+
+    client
+        .ingest_records(IngestRecordsRequest {
+            records: vec![record_input(
+                0,
+                "person",
+                "crm",
+                "reset-guard",
+                vec![("email", "reset-guard@example.com", 0, 10)],
+            )],
+        })
+        .await?;
+
+    let error = client
+        .reset(proto::Empty {})
+        .await
+        .expect_err("destructive reset must require explicit server opt-in");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
+    assert_eq!(stats.record_count, 1);
+    assert_eq!(stats.cluster_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_paths_cannot_escape_the_shard_data_directory() -> anyhow::Result<()> {
+    let (shard_addr, _shard_handle) = spawn_shard(0, support::build_iam_config()).await?;
+    let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+
+    for unsafe_path in ["/tmp/unirust-checkpoint", "../outside"] {
+        let error = client
+            .checkpoint(proto::CheckpointRequest {
+                path: unsafe_path.to_string(),
+            })
+            .await
+            .expect_err("unsafe checkpoint path must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    let response = client
+        .checkpoint(proto::CheckpointRequest {
+            path: "operator-snapshot".to_string(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.paths.len(), 1);
+    let checkpoint = std::path::Path::new(&response.paths[0]);
+    assert!(checkpoint.ends_with("checkpoints/operator-snapshot"));
+    assert!(checkpoint.is_dir());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<()> {
+    let empty = DistributedOntologyConfig::empty();
+    let (shard0_addr, _shard0_handle) = spawn_shard(0, empty.clone()).await?;
+    let (shard1_addr, _shard1_handle) = spawn_set_ontology_failing_shard(1, empty.clone()).await?;
+    let (router_addr, _router_handle) = spawn_router(vec![shard0_addr, shard1_addr], empty).await?;
+    let mut client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    let update_error = client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(support::to_proto_config(&support::build_iam_config())),
+        })
+        .await
+        .expect_err("ontology update must fail when a shard is unavailable");
+    assert_eq!(update_error.code(), tonic::Code::Aborted);
+    assert!(update_error.message().contains("cluster is blocked"));
+
+    let ingest_error = client
+        .ingest_records(IngestRecordsRequest {
+            records: vec![record_input(
+                0,
+                "person",
+                "crm",
+                "blocked-ingest",
+                vec![("email", "blocked@example.com", 0, 10)],
+            )],
+        })
+        .await
+        .expect_err("traffic must remain blocked after an incomplete rollback");
+    assert_eq!(ingest_error.code(), tonic::Code::FailedPrecondition);
+    assert!(ingest_error.message().contains("cluster is blocked"));
 
     Ok(())
 }

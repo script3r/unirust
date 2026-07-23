@@ -52,7 +52,13 @@ cargo build --release
 
 ```bash
 # Use the cluster script
-SHARDS=5 ./scripts/cluster.sh start
+SHARDS=5 ONTOLOGY=/etc/unirust/ontology.json ./scripts/cluster.sh start
+
+# Restart the same persistent cluster without deleting records
+SHARDS=5 ONTOLOGY=/etc/unirust/ontology.json ./scripts/cluster.sh restart
+
+# Destructive reset is separate and requires explicit confirmation
+UNIRUST_CONFIRM_RESET=1 ./scripts/cluster.sh reset
 
 # Or start manually:
 ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0
@@ -217,6 +223,22 @@ a data-loss error instead of accepting traffic with an unknown recovery gap.
 Cross-shard merge redirects are also persisted before acknowledgement and
 reloaded when the streaming linker is reconstructed.
 
+`scripts/cluster.sh start` and `restart` preserve `DATA_DIR`. Only the explicit
+`reset` action deletes shard data, and it requires `UNIRUST_CONFIRM_RESET=1`.
+The script defaults to `examples/loadtest-ontology.json`; set `ONTOLOGY` to the
+same immutable configuration on every shard and router for another deployment.
+Router startup compares the complete ontology reported by every shard and fails
+closed on a mismatch.
+
+The destructive gRPC `Reset` method is disabled by default because a sequential
+multi-shard reset cannot be atomic. The supported production reset is the
+confirmed offline script action. Test or isolated admin deployments can opt in
+with the shard flag `--allow-destructive-admin`.
+
+The shard and router binaries handle SIGINT/SIGTERM with graceful gRPC shutdown;
+acknowledged ingests are additionally covered by an executable-level process
+kill and restart integration test.
+
 ## Performance
 
 Release verification on an Apple M5 with 32 GB RAM, five persistent shards,
@@ -302,6 +324,9 @@ podman-compose logs -f router
 podman-compose run --rm loadtest
 
 # Stop and clean up
+podman-compose down
+
+# Explicitly delete all persistent shard volumes
 podman-compose down -v
 ```
 

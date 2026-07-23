@@ -174,3 +174,21 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_rejects_a_shard_with_a_different_restored_ontology() -> anyhow::Result<()> {
+    let (shard_addr, _shard_handle) = spawn_shard(0, support::build_iam_config()).await?;
+    let error = match RouterNode::connect(
+        vec![format!("http://{shard_addr}")],
+        DistributedOntologyConfig::empty(),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("router unexpectedly accepted a mismatched shard ontology"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("ontology mismatch"));
+    Ok(())
+}

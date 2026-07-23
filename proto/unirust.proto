@@ -258,6 +258,7 @@ message ConfigVersionRequest {}
 
 message ConfigVersionResponse {
   string version = 1;
+  OntologyConfig ontology_config = 2;
 }
 
 // --- Checkpoint ---

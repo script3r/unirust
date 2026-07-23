@@ -5,13 +5,13 @@
 #   podman-compose up -d
 #   podman-compose logs -f router
 #
-# Scale to more shards:
-#   SHARDS=5 podman-compose up -d --scale shard=5
-#
 # Run loadtest:
-#   podman-compose run --rm loadtest --endpoint http://router:50060 --count 100000
+#   podman-compose run --rm loadtest --router http://router:50060 --count 100000
 #
-# Stop cluster:
+# Stop cluster while preserving data:
+#   podman-compose down
+#
+# Explicitly delete all shard data:
 #   podman-compose down -v
 
 services:
@@ -21,15 +21,17 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    command: ["shard", "--shard-id", "0", "--data-dir", "/data"]
     volumes:
       - shard-0-data:/data
+      - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
+    command:
+      ["shard", "--shard-id", "0", "--data-dir", "/data", "--ontology", "/etc/unirust/ontology.json"]
     environment:
       UNIRUST_PROFILE: high-throughput
     networks:
       - unirust-net
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50061 || exit 1"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -40,15 +42,17 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    command: ["shard", "--shard-id", "1", "--data-dir", "/data"]
+    command:
+      ["shard", "--shard-id", "1", "--data-dir", "/data", "--ontology", "/etc/unirust/ontology.json"]
     volumes:
       - shard-1-data:/data
+      - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     environment:
       UNIRUST_PROFILE: high-throughput
     networks:
       - unirust-net
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50061 || exit 1"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -59,15 +63,17 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    command: ["shard", "--shard-id", "2", "--data-dir", "/data"]
+    command:
+      ["shard", "--shard-id", "2", "--data-dir", "/data", "--ontology", "/etc/unirust/ontology.json"]
     volumes:
       - shard-2-data:/data
+      - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     environment:
       UNIRUST_PROFILE: high-throughput
     networks:
       - unirust-net
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50061 || exit 1"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -79,7 +85,16 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    command: ["router", "--shards", "shard-0:50061,shard-1:50061,shard-2:50061"]
+    command:
+      [
+        "router",
+        "--shards",
+        "shard-0:50061,shard-1:50061,shard-2:50061",
+        "--ontology",
+        "/etc/unirust/ontology.json",
+      ]
+    volumes:
+      - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     ports:
       - "50060:50060"
     depends_on:
@@ -92,7 +107,7 @@ services:
     networks:
       - unirust-net
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/50060 || exit 1"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50060"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -104,7 +119,8 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    command: ["loadtest", "--endpoint", "http://router:50060", "--count", "100000", "--streams", "8"]
+    command:
+      ["loadtest", "--router", "http://router:50060", "--count", "100000", "--streams", "8", "--headless"]
     depends_on:
       router:
         condition: service_healthy

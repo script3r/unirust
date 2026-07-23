@@ -2393,4 +2393,25 @@ mod tests {
         config.overlap_probability = 1.1;
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn deployment_ontology_matches_loadtest_ontology() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/loadtest-ontology.json");
+        let deployed: unirust_rs::distributed::DistributedOntologyConfig =
+            serde_json::from_slice(&std::fs::read(path).expect("deployment ontology"))
+                .expect("valid deployment ontology");
+        let generated = build_ontology_config();
+
+        assert_eq!(deployed.identity_keys.len(), generated.identity_keys.len());
+        for (deployed_key, generated_key) in
+            deployed.identity_keys.iter().zip(&generated.identity_keys)
+        {
+            assert_eq!(deployed_key.name, generated_key.name);
+            assert_eq!(deployed_key.attributes, generated_key.attributes);
+        }
+        assert_eq!(deployed.strong_identifiers, generated.strong_identifiers);
+        assert!(deployed.constraints.is_empty());
+        assert!(generated.constraints.is_empty());
+    }
 }

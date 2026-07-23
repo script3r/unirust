@@ -1176,16 +1176,15 @@ impl Unirust {
             self.streaming = Some(self.create_streaming_linker()?);
         }
 
-        let streaming = self.streaming.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
-        })?;
-        let updated = streaming.apply_cross_shard_merge(primary, secondary);
         if let Some(db) = self.store.shared_db() {
             let persistence = LinkerStatePersistence::new(&db);
             persistence.save_cross_shard_merge(secondary, primary)?;
             self.store.sync()?;
         }
-        Ok(updated)
+        let streaming = self.streaming.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
+        })?;
+        Ok(streaming.apply_cross_shard_merge(primary, secondary))
     }
 
     /// Get the number of cross-shard merge mappings tracked.

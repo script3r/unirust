@@ -4,12 +4,12 @@
 #
 # Usage:
 #   podman build -t unirust -f Containerfile .
-#   podman run --rm -p 50061:50061 unirust shard
+#   podman run --rm -p 50061:50061 -v unirust-data:/data unirust shard
 #   podman run --rm -p 50060:50060 unirust router --shards shard-0:50061
 #
 # Or use with compose.yaml for full cluster deployment
 
-FROM rust:1.82 AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
@@ -27,9 +27,10 @@ COPY src ./src
 COPY benches ./benches
 
 # Build release binaries
-RUN cargo build --release --no-default-features \
+RUN cargo build --release --locked --features test-support \
     --bin unirust_shard \
     --bin unirust_router \
+    --bin unirust_client \
     --bin unirust_loadtest
 
 # Production image
@@ -38,6 +39,7 @@ FROM debian:bookworm-slim
 # Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -46,6 +48,7 @@ RUN useradd -m -u 1000 unirust
 # Copy binaries
 COPY --from=builder /app/target/release/unirust_shard /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_router /usr/local/bin/
+COPY --from=builder /app/target/release/unirust_client /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_loadtest /usr/local/bin/
 
 # Create data directory
