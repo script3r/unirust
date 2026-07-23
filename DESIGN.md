@@ -640,10 +640,19 @@ traffic to in-memory partitions is not a valid optimization.
    c. Sequential link: DSU merges with temporal guards
    d. Update identity index
 7. Persistent shards instead resolve through Unirust backed by PersistentStore
-8. Persist records and cluster assignments before acknowledging the request
-9. Update boundary indexes for cross-shard tracking
-10. Return cluster assignments
+8. Before resolution, write and fsync a versioned, checksummed binary ingest WAL
+9. Persist records, indexes, cluster assignments, and request metadata
+10. Sync the RocksDB WAL to stable storage
+11. Remove the ingest WAL and fsync its parent directory
+12. Update boundary indexes for cross-shard tracking
+13. Return cluster assignments
 ```
+
+If a shard stops before step 11, restart replays the ingest WAL using source
+identity idempotency. If framing, length, or checksum validation fails, startup
+fails closed and preserves the corrupt file for operator recovery. Cross-shard
+merge redirects use the linker metadata column family and receive the same
+stable-storage barrier before their RPC reports success.
 
 ### Query Path
 
@@ -694,9 +703,11 @@ traffic to in-memory partitions is not a valid optimization.
 
 ### Verified Throughput (5-shard persistent cluster)
 
-The release audit on 2026-07-22 measured 70,539 records/sec for 10,000,000
+The release audit on 2026-07-22 measured 50,598 records/sec for 10,000,000
 records, 16 streams, 5,000-record batches, and 10% overlap on an Apple M5 with
 32 GB RAM. All 10,000,000 records were acknowledged with zero stream errors.
+The measurement includes an `fsync` of the RocksDB WAL before each successful
+batch acknowledgement.
 
 Earlier 280K-500K figures measured an in-memory partition path that did not
 persist or expose its records through the shard's primary store. They are not

@@ -200,6 +200,23 @@ cargo run --example cluster
 ./scripts/cluster.sh stop
 ```
 
+## Durability
+
+Persistent shards use two recovery layers for every ingest request:
+
+1. The request is written to a versioned, checksummed binary ingest WAL. The
+   file and its parent directory are synced before entity resolution begins.
+2. Records, indexes, cluster assignments, and all other state produced by the
+   request are written to RocksDB, then its WAL is synced to stable storage.
+3. Only after that sync succeeds is the ingest WAL removed and the request
+   acknowledged. Its directory is synced again after removal.
+
+On restart, a remaining ingest WAL is replayed idempotently. A truncated or
+corrupt WAL is preserved with a `.corrupt.*` suffix and shard startup fails with
+a data-loss error instead of accepting traffic with an unknown recovery gap.
+Cross-shard merge redirects are also persisted before acknowledgement and
+reloaded when the streaming linker is reconstructed.
+
 ## Performance
 
 Release verification on an Apple M5 with 32 GB RAM, five persistent shards,
@@ -207,13 +224,13 @@ Release verification on an Apple M5 with 32 GB RAM, five persistent shards,
 
 | Records | Records/sec | Stream Errors |
 |---------|-------------|---------------|
-| 10,000,000 | 70,539 | 0 |
+| 10,000,000 | 50,598 | 0 |
 
-This is an end-to-end durability-correct measurement: records and cluster
-assignments are persisted before acknowledgement, and every record goes through
-entity resolution. Results depend on storage hardware and ontology complexity;
-rerun the command below on the release target rather than treating this number
-as a service-level guarantee.
+This is an end-to-end power-loss-durability measurement: records and cluster
+assignments are persisted and the RocksDB WAL is synchronously flushed before
+acknowledgement, and every record goes through entity resolution. Results depend
+on storage hardware and ontology complexity; rerun the command below on the
+release target rather than treating this number as a service-level guarantee.
 
 ## Development
 

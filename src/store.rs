@@ -225,6 +225,14 @@ pub trait RecordStore: Send + Sync {
         Ok(0)
     }
 
+    /// Make all completed writes durable on stable storage.
+    ///
+    /// In-memory stores have nothing to synchronize. Persistent implementations
+    /// must not return until their recovery log is synced.
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Optional store-level metrics.
     fn metrics(&self) -> Option<StoreMetrics> {
         None

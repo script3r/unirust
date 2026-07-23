@@ -1,4 +1,4 @@
-use crate::model::{Record, RecordId, RecordIdentity, StringInterner};
+use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity, StringInterner};
 use crate::store::{RecordStore, Store, StoreMetrics};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
@@ -51,6 +51,27 @@ const CF_INDEX_KEY_STATS: &str = "index_key_stats"; // Access statistics
 const CF_LINKER_CLUSTER_IDS: &str = "linker_cluster_ids";
 const CF_LINKER_GLOBAL_IDS: &str = "linker_global_ids";
 const CF_LINKER_METADATA: &str = "linker_metadata";
+
+const RESET_DATA_CFS: &[&str] = &[
+    CF_RECORDS,
+    CF_INTERNER,
+    CF_INDEX_ATTR_VALUE,
+    CF_INDEX_ENTITY_TYPE,
+    CF_INDEX_PERSPECTIVE,
+    CF_INDEX_TEMPORAL_BUCKET,
+    CF_INDEX_IDENTITY,
+    CF_CONFLICT_SUMMARIES,
+    CF_CLUSTER_ASSIGNMENTS,
+    CF_DSU_PARENT,
+    CF_DSU_RANK,
+    CF_DSU_GUARDS,
+    CF_DSU_METADATA,
+    CF_INDEX_IDENTITY_KEYS,
+    CF_INDEX_KEY_STATS,
+    CF_LINKER_CLUSTER_IDS,
+    CF_LINKER_GLOBAL_IDS,
+    CF_LINKER_METADATA,
+];
 
 const KEY_NEXT_RECORD_ID: &[u8] = b"next_record_id";
 const KEY_INTERNER: &[u8] = b"interner";
@@ -123,7 +144,8 @@ pub struct PersistentStore {
     conflict_summary_count: u64,
 }
 
-/// Create WriteOptions for fast async writes (no WAL sync)
+/// Create WriteOptions for grouped writes. A high-level ingest calls
+/// `RecordStore::sync` once after all related batches have been written.
 fn fast_write_opts() -> WriteOptions {
     let mut opts = WriteOptions::default();
     opts.set_sync(false);
@@ -299,17 +321,6 @@ impl PersistentStore {
     }
 
     pub fn reset_data(&mut self) -> Result<()> {
-        clear_cf(&self.db, CF_RECORDS)?;
-        clear_cf(&self.db, CF_INTERNER)?;
-        clear_cf(&self.db, CF_INDEX_ATTR_VALUE)?;
-        clear_cf(&self.db, CF_INDEX_ENTITY_TYPE)?;
-        clear_cf(&self.db, CF_INDEX_PERSPECTIVE)?;
-        clear_cf(&self.db, CF_INDEX_TEMPORAL_BUCKET)?;
-        clear_cf(&self.db, CF_INDEX_IDENTITY)?;
-        clear_cf(&self.db, CF_CONFLICT_SUMMARIES)?;
-        clear_cf(&self.db, CF_CLUSTER_ASSIGNMENTS)?;
-        remove_metadata_key(&self.db, KEY_NEXT_RECORD_ID)?;
-        remove_metadata_key(&self.db, KEY_INDEX_VERSION)?;
         self.inner = Store::new();
         self.persisted_attr_id = 0;
         self.persisted_value_id = 0;
@@ -328,20 +339,32 @@ impl PersistentStore {
             .get_mut()
             .map_err(|_| anyhow!("record cache lock poisoned"))?
             .clear();
+
         let mut batch = WriteBatch::default();
+        for &cf_name in RESET_DATA_CFS {
+            clear_cf_in_batch(&self.db, cf_name, &mut batch)?;
+        }
+        let metadata_cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        batch.delete_cf(metadata_cf, KEY_INDEX_VERSION);
         let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata(&mut batch)?;
         self.db.write(batch)?;
+        self.db.flush_wal(true)?;
         self.commit_interner_watermark(watermark);
         Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
         self.db.flush()?;
         Ok(())
     }
 
     pub fn checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.db.flush_wal(true)?;
         let checkpoint = Checkpoint::new(&self.db)?;
         checkpoint.create_checkpoint(path)?;
         Ok(())
@@ -352,6 +375,7 @@ impl PersistentStore {
         let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata(&mut batch)?;
         self.db.write(batch)?;
+        self.db.flush_wal(true)?;
         self.commit_interner_watermark(watermark);
         Ok(())
     }
@@ -656,6 +680,11 @@ impl RecordStore for PersistentStore {
 
     fn flush_staged_records(&mut self) -> Result<usize> {
         PersistentStore::flush_staged_records(self)
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
+        Ok(())
     }
 
     fn get_record(&self, id: RecordId) -> Option<Record> {
@@ -1804,30 +1833,21 @@ fn load_metadata<T: serde::de::DeserializeOwned>(db: &DB, key: &[u8]) -> Result<
     }
 }
 
-fn clear_cf(db: &DB, cf_name: &str) -> Result<()> {
+fn clear_cf_in_batch(db: &DB, cf_name: &str, batch: &mut WriteBatch) -> Result<()> {
     let cf = db
         .cf_handle(cf_name)
         .ok_or_else(|| anyhow!("missing column family {cf_name}"))?;
-    let keys: Vec<Vec<u8>> = db
-        .iterator_cf(cf, IteratorMode::Start)
-        .map(|entry| entry.map(|(key, _)| key.to_vec()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let mut batch = WriteBatch::default();
-    for key in keys {
-        batch.delete_cf(cf, key);
-    }
-    db.write(batch)?;
+    // Keys are either fixed-width (under 64 bytes) or begin with a discriminator
+    // below 0xff, so this exclusive bound covers their complete encoded keyspace.
+    // A range tombstone avoids materializing millions of keys.
+    batch.delete_range_cf(cf, &[][..], &[u8::MAX; 64][..]);
     Ok(())
 }
 
-fn remove_metadata_key(db: &DB, key: &[u8]) -> Result<()> {
-    let metadata_cf = db
-        .cf_handle(CF_METADATA)
-        .ok_or_else(|| anyhow!("missing metadata column family"))?;
-    db.delete_cf(metadata_cf, key)?;
+fn clear_cf(db: &DB, cf_name: &str) -> Result<()> {
+    let mut batch = WriteBatch::default();
+    clear_cf_in_batch(db, cf_name, &mut batch)?;
+    db.write(batch)?;
     Ok(())
 }
 
@@ -2193,6 +2213,24 @@ pub mod linker_encoding {
 
     /// The metadata key for next_cluster_id
     pub const KEY_NEXT_CLUSTER_ID: &[u8] = b"linker_next_cluster_id";
+
+    /// Prefix for durable cross-shard merge mappings.
+    pub const CROSS_SHARD_MERGE_PREFIX: &[u8] = b"cross_shard_merge/";
+
+    pub fn encode_cross_shard_merge_key(secondary: GlobalClusterId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(CROSS_SHARD_MERGE_PREFIX.len() + 8);
+        key.extend_from_slice(CROSS_SHARD_MERGE_PREFIX);
+        key.extend_from_slice(&encode_global_cluster_id(secondary));
+        key
+    }
+
+    pub fn decode_cross_shard_merge_key(bytes: &[u8]) -> Option<GlobalClusterId> {
+        let encoded = bytes.strip_prefix(CROSS_SHARD_MERGE_PREFIX)?;
+        if encoded.len() != 8 {
+            return None;
+        }
+        decode_global_cluster_id(encoded)
+    }
 }
 
 /// Linker state persistence operations
@@ -2260,6 +2298,47 @@ impl<'a> LinkerStatePersistence<'a> {
             linker_encoding::encode_next_cluster_id(next_id),
         )?;
         Ok(())
+    }
+
+    /// Persist a cross-shard redirect from a secondary cluster to its primary.
+    pub fn save_cross_shard_merge(
+        &self,
+        secondary: GlobalClusterId,
+        primary: GlobalClusterId,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        self.db.put_cf(
+            &cf,
+            linker_encoding::encode_cross_shard_merge_key(secondary),
+            linker_encoding::encode_global_cluster_id(primary),
+        )?;
+        Ok(())
+    }
+
+    /// Load all durable cross-shard redirects.
+    pub fn load_cross_shard_merges(&self) -> Result<Vec<(GlobalClusterId, GlobalClusterId)>> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        let mut mappings = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(linker_encoding::CROSS_SHARD_MERGE_PREFIX) {
+                continue;
+            }
+            let secondary = linker_encoding::decode_cross_shard_merge_key(&key)
+                .ok_or_else(|| anyhow!("invalid persisted cross-shard merge key"))?;
+            let primary = linker_encoding::decode_global_cluster_id(&value)
+                .filter(|_| value.len() == 8)
+                .ok_or_else(|| anyhow!("invalid persisted cross-shard merge value"))?;
+            mappings.push((secondary, primary));
+        }
+        Ok(mappings)
     }
 
     /// Load the next_cluster_id value.
@@ -2470,6 +2549,28 @@ mod tests {
         let second_id = store.add_record(record).unwrap();
         assert_eq!(second_id.0, 1);
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn reset_clears_all_persistent_resolution_state() {
+        let dir = tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        store.save_ontology_config(b"retained-config").unwrap();
+
+        for &cf_name in RESET_DATA_CFS {
+            let cf = store.db.cf_handle(cf_name).unwrap();
+            store.db.put_cf(cf, b"stale-key", b"stale-value").unwrap();
+        }
+        store.reset_data().unwrap();
+
+        for &cf_name in RESET_DATA_CFS {
+            let cf = store.db.cf_handle(cf_name).unwrap();
+            assert_eq!(store.db.iterator_cf(cf, IteratorMode::Start).count(), 0);
+        }
+        assert_eq!(
+            store.load_ontology_config().unwrap().as_deref(),
+            Some(b"retained-config".as_slice())
+        );
     }
 
     #[test]

@@ -167,6 +167,36 @@ fn linker_state_with_lru_config_persists() -> anyhow::Result<()> {
 }
 
 #[test]
+fn cross_shard_merge_mapping_survives_restart() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join("store");
+    std::fs::create_dir_all(&data_dir)?;
+    let primary = GlobalClusterId::new(0, 10, 0);
+    let secondary = GlobalClusterId::new(1, 20, 0);
+
+    {
+        let store = PersistentStore::open(&data_dir)?;
+        let mut unirust = Unirust::with_store(default_ontology_for_empty_store(), store);
+        unirust.stream_records(Vec::new())?;
+        unirust.apply_cross_shard_merge(primary, secondary)?;
+        assert_eq!(unirust.cross_shard_merge_count(), 1);
+    }
+
+    {
+        let store = PersistentStore::open(&data_dir)?;
+        let mut unirust = Unirust::with_store(default_ontology_for_empty_store(), store);
+        unirust.stream_records(Vec::new())?;
+        assert_eq!(unirust.cross_shard_merge_count(), 1);
+    }
+
+    Ok(())
+}
+
+fn default_ontology_for_empty_store() -> unirust_rs::Ontology {
+    unirust_rs::Ontology::new()
+}
+
+#[test]
 fn linker_persistence_round_trip_encoding() {
     // Test the encoding/decoding helpers directly
 

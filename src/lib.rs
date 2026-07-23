@@ -270,8 +270,11 @@ impl Unirust {
         let use_persistent_dsu = self.tuning.use_persistent_dsu && db.is_some();
         let use_tiered_index = self.tuning.use_tiered_index && db.is_some();
 
-        if use_persistent_dsu || use_tiered_index {
-            let db = db.unwrap();
+        let mut linker = if use_persistent_dsu || use_tiered_index {
+            let db = db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("persistent linker backend requires a database"))?
+                .clone();
             let dsu = if use_persistent_dsu {
                 let dsu_config = self.tuning.dsu_config.clone().unwrap_or_default();
                 dsu::DsuBackend::persistent(db.clone(), dsu_config)?
@@ -293,10 +296,16 @@ impl Unirust {
                 self.tuning.shard_id,
                 dsu,
                 index,
-            )
+            )?
         } else {
-            linker::StreamingLinker::new(self.store.as_ref(), &self.ontology, &self.tuning)
+            linker::StreamingLinker::new(self.store.as_ref(), &self.ontology, &self.tuning)?
+        };
+
+        if let Some(db) = db.as_ref() {
+            let persistence = LinkerStatePersistence::new(db);
+            linker.restore_cross_shard_merges(&persistence)?;
         }
+        Ok(linker)
     }
 
     // ========================================================================
@@ -446,6 +455,7 @@ impl Unirust {
         self.store
             .set_cluster_assignments_batch(&batch_assignments)?;
         self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
 
         // Summarize conflicts
         let conflicts = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
@@ -505,6 +515,7 @@ impl Unirust {
         }
         // Flush any staged records
         self.store.flush_staged_records()?;
+        self.store.sync()?;
         Ok(())
     }
 
@@ -825,6 +836,7 @@ impl Unirust {
         self.store
             .set_cluster_assignments_batch(&batch_assignments)?;
         self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
         self.invalidate_query_cache();
         Ok(assignments)
     }
@@ -887,6 +899,7 @@ impl Unirust {
 
         self.invalidate_query_cache();
         self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
         Ok(updates)
     }
 
@@ -996,6 +1009,7 @@ impl Unirust {
 
         self.invalidate_query_cache();
         self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
         Ok(updates)
     }
 
@@ -1151,7 +1165,13 @@ impl Unirust {
         let streaming = self.streaming.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
         })?;
-        Ok(streaming.apply_cross_shard_merge(primary, secondary))
+        let updated = streaming.apply_cross_shard_merge(primary, secondary);
+        if let Some(db) = self.store.shared_db() {
+            let persistence = LinkerStatePersistence::new(&db);
+            persistence.save_cross_shard_merge(secondary, primary)?;
+            self.store.sync()?;
+        }
+        Ok(updated)
     }
 
     /// Get the number of cross-shard merge mappings tracked.
@@ -1231,6 +1251,8 @@ impl Unirust {
             return Err(anyhow::anyhow!("Failed to flush staged records: {}", e));
         }
 
+        self.store.sync()?;
+
         Ok(())
     }
 }
@@ -1243,11 +1265,13 @@ mod persistence_error_tests {
     use crate::store::RecordStore;
     use crate::temporal::Interval;
 
-    struct FlushFailingStore {
+    struct FailingStore {
         inner: Store,
+        fail_flush: bool,
+        fail_sync: bool,
     }
 
-    impl RecordStore for FlushFailingStore {
+    impl RecordStore for FailingStore {
         fn add_record(&mut self, record: Record) -> anyhow::Result<RecordId> {
             self.inner.add_record(record)
         }
@@ -1314,7 +1338,17 @@ mod persistence_error_tests {
         }
 
         fn flush_staged_records(&mut self) -> anyhow::Result<usize> {
-            anyhow::bail!("injected flush failure")
+            if self.fail_flush {
+                anyhow::bail!("injected flush failure");
+            }
+            Ok(0)
+        }
+
+        fn sync(&self) -> anyhow::Result<()> {
+            if self.fail_sync {
+                anyhow::bail!("injected sync failure");
+            }
+            Ok(())
         }
     }
 
@@ -1324,8 +1358,10 @@ mod persistence_error_tests {
         ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
         let mut engine = Unirust::with_store(
             ontology,
-            FlushFailingStore {
+            FailingStore {
                 inner: Store::new(),
+                fail_flush: true,
+                fail_sync: false,
             },
         );
         let email_attr = engine.intern_attr("email");
@@ -1342,5 +1378,33 @@ mod persistence_error_tests {
 
         let error = engine.ingest(vec![record]).unwrap_err();
         assert!(error.to_string().contains("injected flush failure"));
+    }
+
+    #[test]
+    fn ingest_propagates_stable_storage_sync_failure() {
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+        let mut engine = Unirust::with_store(
+            ontology,
+            FailingStore {
+                inner: Store::new(),
+                fail_flush: false,
+                fail_sync: true,
+            },
+        );
+        let email_attr = engine.intern_attr("email");
+        let email_value = engine.intern_value("alice@example.com");
+        let record = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".into(), "crm".into(), "alice-sync".into()),
+            vec![Descriptor::new(
+                email_attr,
+                email_value,
+                Interval::new(0, 10).unwrap(),
+            )],
+        );
+
+        let error = engine.ingest(vec![record]).unwrap_err();
+        assert!(error.to_string().contains("injected sync failure"));
     }
 }

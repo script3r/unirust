@@ -7,6 +7,18 @@ Semantic Versioning.
 
 ### Fixed
 
+- Ingest acknowledgement now waits for a synchronous RocksDB WAL flush. The
+  external ingest WAL is removed only after records and entity-resolution state
+  have reached stable storage, closing a power-loss window for acknowledged data.
+- Ingest WAL files now carry a version, payload length, and checksum. WAL rename,
+  removal, and quarantine operations sync the parent directory; corrupt or
+  truncated WALs fail shard startup and are preserved for recovery.
+- Cross-shard merge redirects now persist before their RPC reports success and
+  reload when persistent linker state is reconstructed.
+- Persistent reset now clears DSU, tiered-index, and linker state together with
+  records and assignments in one RocksDB write batch, preventing stale clusters
+  from reappearing after reset or restart.
+- Explicit checkpoints sync the RocksDB WAL before creating a checkpoint.
 - Persistent shards no longer send large batches to in-memory partition stores.
   Acknowledged records and their entity-resolution assignments now survive a
   shard restart regardless of batch size.
@@ -45,5 +57,5 @@ Semantic Versioning.
 - Distributed integration tests now use temporary persistent shard stores; the
   in-memory store remains limited to unit tests.
 - Replaced the non-durable historical performance claim with a verified
-  five-shard persistent baseline of 70,539 records/second for the documented
-  10-million-record workload.
+  five-shard, power-loss-durable baseline of 50,598 records/second for the
+  documented 10-million-record workload.

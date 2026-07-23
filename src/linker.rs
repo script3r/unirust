@@ -1619,7 +1619,24 @@ impl StreamingLinker {
         persistence
             .flush_global_cluster_ids(self.global_cluster_ids.iter().map(|(k, v)| (*k, *v)))?;
 
+        for (secondary, primary) in &self.cross_shard_merges {
+            persistence.save_cross_shard_merge(*secondary, *primary)?;
+        }
+
         Ok(())
+    }
+
+    /// Restore durable cross-shard redirects and apply them to reconstructed state.
+    pub fn restore_cross_shard_merges(
+        &mut self,
+        persistence: &crate::persistence::LinkerStatePersistence,
+    ) -> Result<usize> {
+        let mappings = persistence.load_cross_shard_merges()?;
+        let count = mappings.len();
+        for (secondary, primary) in mappings {
+            self.apply_cross_shard_merge(primary, secondary);
+        }
+        Ok(count)
     }
 
     /// Restore linker state from persistent storage.
@@ -1646,6 +1663,8 @@ impl StreamingLinker {
         for (record_id, global_id) in global_ids {
             self.global_cluster_ids.insert(record_id, global_id);
         }
+
+        self.restore_cross_shard_merges(persistence)?;
 
         Ok(count)
     }

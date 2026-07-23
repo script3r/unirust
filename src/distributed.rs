@@ -59,6 +59,85 @@ struct IngestWal {
     temp_path: PathBuf,
 }
 
+const INGEST_WAL_MAGIC: &[u8; 8] = b"UNIRWAL\0";
+const INGEST_WAL_VERSION: u32 = 1;
+const INGEST_WAL_HEADER_LEN: usize = 24;
+
+fn encode_wal_batch(inputs: &[WalRecordInput]) -> Result<Vec<u8>, Status> {
+    let body = bincode::serialize(inputs).map_err(|err| Status::internal(err.to_string()))?;
+    let body_len = u64::try_from(body.len())
+        .map_err(|_| Status::resource_exhausted("ingest WAL batch is too large"))?;
+    let mut encoded = Vec::with_capacity(INGEST_WAL_HEADER_LEN + body.len());
+    encoded.extend_from_slice(INGEST_WAL_MAGIC);
+    encoded.extend_from_slice(&INGEST_WAL_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&body_len.to_be_bytes());
+    encoded.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+    encoded.extend_from_slice(&body);
+    Ok(encoded)
+}
+
+fn decode_wal_batch(bytes: &[u8]) -> Result<Vec<WalRecordInput>, String> {
+    // Accept the pre-0.2 unframed format so an upgrade can replay an existing WAL.
+    if !bytes.starts_with(INGEST_WAL_MAGIC) {
+        return bincode::deserialize(bytes).map_err(|err| err.to_string());
+    }
+    if bytes.len() < INGEST_WAL_HEADER_LEN {
+        return Err("truncated ingest WAL header".to_string());
+    }
+
+    let version = u32::from_be_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| "invalid ingest WAL version field".to_string())?,
+    );
+    if version != INGEST_WAL_VERSION {
+        return Err(format!("unsupported ingest WAL version {version}"));
+    }
+    let declared_len = u64::from_be_bytes(
+        bytes[12..20]
+            .try_into()
+            .map_err(|_| "invalid ingest WAL payload length field".to_string())?,
+    );
+    let declared_len = usize::try_from(declared_len)
+        .map_err(|_| "ingest WAL payload length exceeds this platform".to_string())?;
+    let expected_len = INGEST_WAL_HEADER_LEN
+        .checked_add(declared_len)
+        .ok_or_else(|| "ingest WAL payload length overflow".to_string())?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "ingest WAL length mismatch: expected {expected_len} bytes, found {}",
+            bytes.len()
+        ));
+    }
+
+    let expected_checksum = u32::from_be_bytes(
+        bytes[20..24]
+            .try_into()
+            .map_err(|_| "invalid ingest WAL checksum field".to_string())?,
+    );
+    let body = &bytes[INGEST_WAL_HEADER_LEN..];
+    let actual_checksum = crc32fast::hash(body);
+    if actual_checksum != expected_checksum {
+        return Err("ingest WAL checksum mismatch".to_string());
+    }
+    bincode::deserialize(body).map_err(|err| err.to_string())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), Status> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Status::internal("ingest WAL path has no parent directory"))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| Status::internal(format!("failed to sync WAL directory: {err}")))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), Status> {
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 impl IngestWal {
     fn new(data_dir: &Path) -> Self {
@@ -75,15 +154,16 @@ impl IngestWal {
             .iter()
             .map(wal_from_proto_input)
             .collect::<Result<_, Status>>()?;
-        let payload =
-            bincode::serialize(&inputs).map_err(|err| Status::internal(err.to_string()))?;
+        let payload = encode_wal_batch(&inputs)?;
         let mut file =
             fs::File::create(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
         file.write_all(&payload)
             .map_err(|err| Status::internal(err.to_string()))?;
         file.sync_all()
             .map_err(|err| Status::internal(err.to_string()))?;
+        drop(file);
         fs::rename(&self.temp_path, &self.path).map_err(|err| Status::internal(err.to_string()))?;
+        sync_parent_directory(&self.path)?;
         Ok(())
     }
 
@@ -99,14 +179,18 @@ impl IngestWal {
             return Ok(None);
         };
         let bytes = fs::read(path).map_err(|err| Status::internal(err.to_string()))?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let inputs: Vec<WalRecordInput> = match bincode::deserialize(&bytes) {
+        let inputs = match decode_wal_batch(&bytes) {
             Ok(inputs) => inputs,
-            Err(_) => {
-                self.quarantine_corrupt()?;
-                return Ok(None);
+            Err(reason) => {
+                let quarantined = self.quarantine_corrupt()?;
+                return Err(Status::data_loss(format!(
+                    "ingest WAL is corrupt ({reason}); preserved as {}",
+                    quarantined
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
             }
         };
         let records = inputs.into_iter().map(proto_from_wal_input).collect();
@@ -122,33 +206,43 @@ impl IngestWal {
     }
 
     fn clear(&self) -> Result<(), Status> {
+        let mut removed = false;
         if self.path.exists() {
             fs::remove_file(&self.path).map_err(|err| Status::internal(err.to_string()))?;
+            removed = true;
         }
         if self.temp_path.exists() {
             fs::remove_file(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
+            removed = true;
+        }
+        if removed {
+            sync_parent_directory(&self.path)?;
         }
         Ok(())
     }
 
-    fn quarantine_corrupt(&self) -> Result<(), Status> {
+    fn quarantine_corrupt(&self) -> Result<Vec<PathBuf>, Status> {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|err| Status::internal(err.to_string()))?
-            .as_secs();
-        let corrupt_path = self.path.with_extension(format!("bin.corrupt.{}", suffix));
-        if self.path.exists() {
-            if let Err(err) = fs::rename(&self.path, &corrupt_path) {
-                if self.path.exists() {
-                    fs::remove_file(&self.path).map_err(|err| Status::internal(err.to_string()))?;
-                }
-                return Err(Status::internal(err.to_string()));
+            .as_nanos();
+        let mut quarantined = Vec::new();
+        for source in [&self.path, &self.temp_path] {
+            if !source.exists() {
+                continue;
             }
+            let file_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| Status::internal("ingest WAL filename is not valid UTF-8"))?;
+            let destination = source.with_file_name(format!("{file_name}.corrupt.{suffix}"));
+            fs::rename(source, &destination).map_err(|err| Status::internal(err.to_string()))?;
+            quarantined.push(destination);
         }
-        if self.temp_path.exists() {
-            fs::remove_file(&self.temp_path).map_err(|err| Status::internal(err.to_string()))?;
+        if !quarantined.is_empty() {
+            sync_parent_directory(&self.path)?;
         }
-        Ok(())
+        Ok(quarantined)
     }
 }
 
@@ -3804,5 +3898,50 @@ fn merge_latency(acc: &mut proto::LatencyMetrics, other: Option<proto::LatencyMe
         acc.count += other.count;
         acc.total_micros += other.total_micros;
         acc.max_micros = acc.max_micros.max(other.max_micros);
+    }
+}
+
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
+
+    fn sample_wal_record() -> WalRecordInput {
+        WalRecordInput {
+            index: 7,
+            identity: WalRecordIdentity {
+                entity_type: "person".to_string(),
+                perspective: "crm".to_string(),
+                uid: "wal-checksum".to_string(),
+            },
+            descriptors: vec![WalRecordDescriptor {
+                attr: "email".to_string(),
+                value: "checksum@example.com".to_string(),
+                start: 0,
+                end: 10,
+            }],
+        }
+    }
+
+    #[test]
+    fn framed_wal_round_trips_and_detects_corruption() {
+        let records = vec![sample_wal_record()];
+        let mut encoded = encode_wal_batch(&records).expect("encode WAL");
+        let decoded = decode_wal_batch(&encoded).expect("decode WAL");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].identity.uid, "wal-checksum");
+
+        let last = encoded.last_mut().expect("WAL payload byte");
+        *last ^= 0x01;
+        assert!(decode_wal_batch(&encoded)
+            .expect_err("checksum mutation must fail")
+            .contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn legacy_unframed_wal_remains_replayable() {
+        let encoded = bincode::serialize(&vec![sample_wal_record()]).expect("encode legacy WAL");
+        let decoded = decode_wal_batch(&encoded).expect("decode legacy WAL");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].index, 7);
     }
 }
