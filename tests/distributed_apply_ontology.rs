@@ -4,6 +4,7 @@ use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic::Code;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
     QueryDescriptor, QueryEntitiesRequest, RecordDescriptor, RecordIdentity as ProtoRecordIdentity,
@@ -121,12 +122,54 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
         })
         .await?;
 
-    let response = client.query_entities(query).await?.into_inner();
+    let response = client.query_entities(query.clone()).await?.into_inner();
     match response.outcome {
         Some(proto::query_entities_response::Outcome::Matches(matches)) => {
             assert_eq!(matches.matches.len(), 1);
         }
         _ => anyhow::bail!("expected match after apply"),
+    }
+
+    client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(support::to_proto_config(&config)),
+        })
+        .await?;
+
+    let response = client.query_entities(query.clone()).await?.into_inner();
+    match response.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert_eq!(
+                matches.matches.len(),
+                1,
+                "reapplying the active ontology must not reset records"
+            );
+        }
+        _ => anyhow::bail!("expected match after reapplying the active ontology"),
+    }
+
+    let mut replacement = config.clone();
+    replacement
+        .strong_identifiers
+        .push("passport_number".to_string());
+    let error = client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(support::to_proto_config(&replacement)),
+        })
+        .await
+        .expect_err("replacing ontology on a nonempty cluster must fail");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+
+    let response = client.query_entities(query).await?.into_inner();
+    match response.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert_eq!(
+                matches.matches.len(),
+                1,
+                "a rejected ontology replacement must preserve records"
+            );
+        }
+        _ => anyhow::bail!("expected match after rejected ontology replacement"),
     }
 
     Ok(())

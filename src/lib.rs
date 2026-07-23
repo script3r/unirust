@@ -1078,6 +1078,20 @@ impl Unirust {
         self.store.load_conflict_summaries()
     }
 
+    /// Persist the durable cross-shard conflict set.
+    pub fn persist_cross_shard_conflicts(
+        &mut self,
+        conflicts: &[sharding::CrossShardConflict],
+    ) -> anyhow::Result<()> {
+        self.store.set_cross_shard_conflicts(conflicts)?;
+        self.store.sync()
+    }
+
+    /// Load cross-shard conflicts recovered from persistent storage.
+    pub fn load_cross_shard_conflicts(&self) -> anyhow::Result<Vec<sharding::CrossShardConflict>> {
+        self.store.load_cross_shard_conflicts()
+    }
+
     pub fn conflict_summary_count(&self) -> Option<usize> {
         self.conflict_cache
             .lock()

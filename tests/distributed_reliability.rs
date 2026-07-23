@@ -50,6 +50,35 @@ async fn spawn_shard(
     Ok((addr, handle))
 }
 
+async fn spawn_stoppable_shard(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+) -> anyhow::Result<(SocketAddr, tokio::sync::oneshot::Sender<()>, JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
+    )?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
+        Server::builder()
+            .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, shutdown_tx, handle))
+}
+
 async fn spawn_shard_with_data_dir(
     shard_id: u32,
     config: DistributedOntologyConfig,
@@ -246,6 +275,32 @@ async fn router_handles_partial_shard_availability() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_fails_when_boundary_metadata_is_incomplete() -> anyhow::Result<()> {
+    let config = support::build_iam_config();
+    let (shard0_addr, shutdown_shard0, shard0_handle) =
+        spawn_stoppable_shard(0, config.clone()).await?;
+    let (shard1_addr, _shard1_handle) = spawn_shard(1, config.clone()).await?;
+    let (router_addr, _router_handle) =
+        spawn_router(vec![shard0_addr, shard1_addr], config).await?;
+    let mut client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    shutdown_shard0
+        .send(())
+        .map_err(|()| anyhow::anyhow!("shard shutdown receiver dropped"))?;
+    shard0_handle.await?;
+
+    let error = client
+        .reconcile(proto::ReconcileRequest {
+            shard_metadata: Vec::new(),
+        })
+        .await
+        .expect_err("reconciliation must not succeed with a missing shard");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+
+    Ok(())
+}
+
 // Note: entity_resolution_consistent_after_shard_restart test is complex due to
 // RocksDB lock management. The shard_recovery_after_restart test covers the
 // core functionality of shard restart and data persistence.
@@ -336,6 +391,79 @@ async fn cluster_stats_reflect_all_shards() -> anyhow::Result<()> {
 
     // Should reflect all 20 records across both shards
     assert_eq!(stats.record_count, 20);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_shard_conflicts_survive_shard_restart() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let data_dir = temp_dir.path().join("shard0");
+    std::fs::create_dir_all(&data_dir)?;
+    let config = support::build_iam_config();
+
+    let (shard_addr, shard_handle) =
+        spawn_shard_with_data_dir(0, config.clone(), data_dir.clone()).await?;
+    let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+
+    let conflict = proto::CrossShardConflict {
+        identity_key_signature: Some(proto::IdentityKeySignature {
+            signature: vec![7; 32],
+        }),
+        cluster1: Some(proto::GlobalClusterId {
+            shard_id: 0,
+            local_id: 11,
+            version: 1,
+        }),
+        cluster2: Some(proto::GlobalClusterId {
+            shard_id: 1,
+            local_id: 22,
+            version: 1,
+        }),
+        interval_start: 10,
+        interval_end: 20,
+        perspective_hash: 31,
+        strong_id_hash1: 41,
+        strong_id_hash2: 42,
+    };
+    let stored = client
+        .store_cross_shard_conflicts(proto::StoreCrossShardConflictsRequest {
+            conflicts: vec![conflict.clone()],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(stored.stored_count, 1);
+
+    let duplicate = client
+        .store_cross_shard_conflicts(proto::StoreCrossShardConflictsRequest {
+            conflicts: vec![conflict],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(duplicate.stored_count, 0);
+
+    shard_handle.abort();
+    drop(client);
+    sleep(Duration::from_millis(100)).await;
+
+    let (shard_addr, _shard_handle) = spawn_shard_with_data_dir(0, config, data_dir).await?;
+    let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+    let conflicts = client
+        .list_conflicts(proto::ListConflictsRequest {
+            start: 0,
+            end: 0,
+            attribute: String::new(),
+        })
+        .await?
+        .into_inner()
+        .conflicts;
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].kind, "indirect_cross_shard");
+    assert_eq!(conflicts[0].start, 10);
+    assert_eq!(conflicts[0].end, 20);
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
+    assert_eq!(stats.cross_shard_conflicts, 1);
 
     Ok(())
 }

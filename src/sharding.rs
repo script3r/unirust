@@ -191,7 +191,7 @@ pub struct BoundaryEntry {
 /// This represents an indirect conflict where two clusters on different shards
 /// share an identity key but have conflicting strong identifiers within the
 /// same perspective - meaning they cannot be merged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossShardConflict {
     /// The identity key signature that links the conflicting clusters.
     pub identity_key_signature: IdentityKeySignature,

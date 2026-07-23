@@ -153,6 +153,19 @@ pub trait RecordStore: Send + Sync {
         None
     }
 
+    /// Persist cross-shard conflicts detected by distributed reconciliation.
+    fn set_cross_shard_conflicts(
+        &mut self,
+        _conflicts: &[crate::sharding::CrossShardConflict],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load persisted cross-shard conflicts.
+    fn load_cross_shard_conflicts(&self) -> Result<Vec<crate::sharding::CrossShardConflict>> {
+        Ok(Vec::new())
+    }
+
     /// Load conflict summary count if supported.
     fn conflict_summary_count(&self) -> Option<usize> {
         None

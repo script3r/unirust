@@ -83,6 +83,7 @@ const KEY_NEXT_VALUE_ID: &[u8] = b"next_value_id";
 const KEY_RECORD_COUNT: &[u8] = b"record_count";
 const KEY_CLUSTER_COUNT: &[u8] = b"cluster_count";
 const KEY_CONFLICT_SUMMARY_COUNT: &[u8] = b"conflict_summary_count";
+const KEY_CROSS_SHARD_CONFLICTS: &[u8] = b"cross_shard_conflicts";
 
 // DSU metadata keys
 const KEY_DSU_NEXT_CLUSTER_ID: &[u8] = b"dsu_next_cluster_id";
@@ -349,6 +350,7 @@ impl PersistentStore {
             .cf_handle(CF_METADATA)
             .ok_or_else(|| anyhow!("missing metadata column family"))?;
         batch.delete_cf(metadata_cf, KEY_INDEX_VERSION);
+        batch.delete_cf(metadata_cf, KEY_CROSS_SHARD_CONFLICTS);
         let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata(&mut batch)?;
         self.db.write(batch)?;
@@ -1035,6 +1037,33 @@ impl RecordStore for PersistentStore {
         } else {
             Some(summaries)
         }
+    }
+
+    fn set_cross_shard_conflicts(
+        &mut self,
+        conflicts: &[crate::sharding::CrossShardConflict],
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        self.db.put_cf(
+            cf,
+            KEY_CROSS_SHARD_CONFLICTS,
+            bincode::serialize(conflicts)?,
+        )?;
+        Ok(())
+    }
+
+    fn load_cross_shard_conflicts(&self) -> Result<Vec<crate::sharding::CrossShardConflict>> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        self.db
+            .get_cf(cf, KEY_CROSS_SHARD_CONFLICTS)?
+            .map(|bytes| bincode::deserialize(&bytes).map_err(Into::into))
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 
     fn conflict_summary_count(&self) -> Option<usize> {
