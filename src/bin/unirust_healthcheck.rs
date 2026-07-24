@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tonic::transport::Endpoint;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
 };
+use unirust_rs::transport_security::load_client_mtls;
 
 enum Service {
     Router(String),
@@ -13,6 +15,9 @@ enum Service {
 struct Options {
     service: Service,
     timeout: Duration,
+    ca_cert: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
 }
 
 fn print_help() {
@@ -26,6 +31,10 @@ OPTIONS:
         --router <URI>      Check a router and all of its shards
         --shard <URI>       Check one shard's recovery and store health
         --timeout-secs <N>  Connection and RPC timeout [default: 2]
+        --ca-cert <FILE>    PEM CA used to verify the service certificate
+        --client-cert <FILE>
+                            PEM client certificate
+        --client-key <FILE> PEM client private key
     -h, --help              Print help
 "#
     );
@@ -34,6 +43,9 @@ OPTIONS:
 fn parse_options() -> anyhow::Result<Option<Options>> {
     let mut service = None;
     let mut timeout_secs = 2u64;
+    let mut ca_cert = None;
+    let mut client_cert = None;
+    let mut client_key = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -68,6 +80,27 @@ fn parse_options() -> anyhow::Result<Option<Options>> {
                     anyhow::bail!("--timeout-secs must be greater than zero");
                 }
             }
+            "--ca-cert" => {
+                ca_cert = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--ca-cert requires a path"))?
+                        .into(),
+                );
+            }
+            "--client-cert" => {
+                client_cert = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--client-cert requires a path"))?
+                        .into(),
+                );
+            }
+            "--client-key" => {
+                client_key = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--client-key requires a path"))?
+                        .into(),
+                );
+            }
             _ => anyhow::bail!("unknown option {arg}"),
         }
     }
@@ -77,14 +110,25 @@ fn parse_options() -> anyhow::Result<Option<Options>> {
     Ok(Some(Options {
         service,
         timeout: Duration::from_secs(timeout_secs),
+        ca_cert,
+        client_cert,
+        client_key,
     }))
 }
 
-fn normalize_uri(uri: String) -> String {
+fn normalize_uri(uri: String, mtls: bool) -> anyhow::Result<String> {
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        uri
+        if mtls && uri.starts_with("http://") {
+            anyhow::bail!("mTLS health checks require an https:// endpoint");
+        }
+        if !mtls && uri.starts_with("https://") {
+            anyhow::bail!("https:// health checks require CA, client certificate, and client key");
+        }
+        Ok(uri)
+    } else if mtls {
+        Ok(format!("https://{uri}"))
     } else {
-        format!("http://{uri}")
+        Ok(format!("http://{uri}"))
     }
 }
 
@@ -93,14 +137,23 @@ async fn main() -> anyhow::Result<()> {
     let Some(options) = parse_options()? else {
         return Ok(());
     };
+    let mtls = load_client_mtls(
+        options.ca_cert.as_deref(),
+        options.client_cert.as_deref(),
+        options.client_key.as_deref(),
+    )?;
     let uri = match &options.service {
-        Service::Router(uri) | Service::Shard(uri) => normalize_uri(uri.clone()),
+        Service::Router(uri) | Service::Shard(uri) => normalize_uri(uri.clone(), mtls.is_some())?,
     };
-    let channel = Endpoint::from_shared(uri)?
+    let endpoint = Endpoint::from_shared(uri)?
         .connect_timeout(options.timeout)
-        .timeout(options.timeout)
-        .connect()
-        .await?;
+        .timeout(options.timeout);
+    let endpoint = if let Some(mtls) = mtls {
+        endpoint.tls_config(mtls)?
+    } else {
+        endpoint
+    };
+    let channel = endpoint.connect().await?;
     let response = match options.service {
         Service::Router(_) => RouterServiceClient::new(channel)
             .health_check(proto::HealthCheckRequest {})

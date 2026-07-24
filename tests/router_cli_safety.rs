@@ -50,3 +50,19 @@ fn router_binary_rejects_unknown_router_environment_variable() {
         "unexpected stderr: {stderr}"
     );
 }
+
+#[test]
+fn router_binary_rejects_partial_internal_mtls_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_unirust_router"))
+        .env_clear()
+        .args(["--shard-tls-ca", "/tmp/ca.pem"])
+        .output()
+        .expect("run router binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("router-to-shard mTLS requires all three certificate paths together"),
+        "unexpected stderr: {stderr}"
+    );
+}

@@ -41,6 +41,9 @@ fn config_env_path(key: &str) -> Option<&'static str> {
         "SHARD_ONTOLOGY" => Some("shard.ontology"),
         "SHARD_REPAIR" => Some("shard.repair"),
         "SHARD_CONFIG_VERSION" => Some("shard.config_version"),
+        "SHARD_TLS_CERT" => Some("shard.tls_cert"),
+        "SHARD_TLS_KEY" => Some("shard.tls_key"),
+        "SHARD_TLS_CLIENT_CA" => Some("shard.tls_client_ca"),
         "ROUTER_LISTEN" => Some("router.listen"),
         "ROUTER_SHARDS_FILE" => Some("router.shards_file"),
         "ROUTER_ONTOLOGY" => Some("router.ontology"),
@@ -49,6 +52,12 @@ fn config_env_path(key: &str) -> Option<&'static str> {
         "ROUTER_SHARD_REQUEST_TIMEOUT_SECS" => Some("router.shard_request_timeout_secs"),
         "ROUTER_SHARD_TCP_KEEPALIVE_SECS" => Some("router.shard_tcp_keepalive_secs"),
         "ROUTER_CHECKPOINT_INTERVAL_SECS" => Some("router.checkpoint_interval_secs"),
+        "ROUTER_TLS_CERT" => Some("router.tls_cert"),
+        "ROUTER_TLS_KEY" => Some("router.tls_key"),
+        "ROUTER_TLS_CLIENT_CA" => Some("router.tls_client_ca"),
+        "ROUTER_SHARD_TLS_CA" => Some("router.shard_tls_ca"),
+        "ROUTER_SHARD_TLS_CERT" => Some("router.shard_tls_cert"),
+        "ROUTER_SHARD_TLS_KEY" => Some("router.shard_tls_key"),
         "STORAGE_BLOCK_CACHE_MB" => Some("storage.block_cache_mb"),
         "STORAGE_WRITE_BUFFER_MB" => Some("storage.write_buffer_mb"),
         "STORAGE_RATE_LIMIT_MBPS" => Some("storage.rate_limit_mbps"),
@@ -112,6 +121,16 @@ fn router_shards_from_env() -> Result<Option<Vec<String>>, ConfigError> {
     Ok(Some(shards))
 }
 
+fn validate_mtls_group(name: &str, paths: [Option<&PathBuf>; 3]) -> Result<(), ConfigError> {
+    let configured = paths.iter().filter(|path| path.is_some()).count();
+    if configured != 0 && configured != paths.len() {
+        return Err(ConfigError {
+            message: format!("{name} requires all three certificate paths together"),
+        });
+    }
+    Ok(())
+}
+
 /// Main configuration for unirust components.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -164,7 +183,32 @@ impl UniConfig {
         // Layer 3: CLI overrides
         figment = figment.merge(Serialized::defaults(overrides));
 
-        figment.extract().map_err(ConfigError::from)
+        let config: Self = figment.extract().map_err(ConfigError::from)?;
+        validate_mtls_group(
+            "shard mTLS",
+            [
+                config.shard.tls_cert.as_ref(),
+                config.shard.tls_key.as_ref(),
+                config.shard.tls_client_ca.as_ref(),
+            ],
+        )?;
+        validate_mtls_group(
+            "router mTLS",
+            [
+                config.router.tls_cert.as_ref(),
+                config.router.tls_key.as_ref(),
+                config.router.tls_client_ca.as_ref(),
+            ],
+        )?;
+        validate_mtls_group(
+            "router-to-shard mTLS",
+            [
+                config.router.shard_tls_ca.as_ref(),
+                config.router.shard_tls_cert.as_ref(),
+                config.router.shard_tls_key.as_ref(),
+            ],
+        )?;
+        Ok(config)
     }
 
     /// Load from environment and optional config file only (no CLI overrides)
@@ -227,6 +271,12 @@ pub struct ShardConfig {
     pub repair: bool,
     /// Config version for compatibility checking
     pub config_version: Option<String>,
+    /// PEM server certificate for mutually authenticated TLS
+    pub tls_cert: Option<PathBuf>,
+    /// PEM server private key for mutually authenticated TLS
+    pub tls_key: Option<PathBuf>,
+    /// PEM CA used to require and verify client certificates
+    pub tls_client_ca: Option<PathBuf>,
 }
 
 impl Default for ShardConfig {
@@ -239,6 +289,9 @@ impl Default for ShardConfig {
             ontology: None,
             repair: false,
             config_version: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
         }
     }
 }
@@ -265,6 +318,18 @@ pub struct RouterConfig {
     pub shard_tcp_keepalive_secs: u64,
     /// Interval between automatic coordinated checkpoints (0 disables)
     pub checkpoint_interval_secs: u64,
+    /// PEM server certificate for mutually authenticated TLS
+    pub tls_cert: Option<PathBuf>,
+    /// PEM server private key for mutually authenticated TLS
+    pub tls_key: Option<PathBuf>,
+    /// PEM CA used to require and verify client certificates
+    pub tls_client_ca: Option<PathBuf>,
+    /// PEM CA used to verify shard server certificates
+    pub shard_tls_ca: Option<PathBuf>,
+    /// PEM router client certificate presented to shards
+    pub shard_tls_cert: Option<PathBuf>,
+    /// PEM router client private key presented to shards
+    pub shard_tls_key: Option<PathBuf>,
 }
 
 impl Default for RouterConfig {
@@ -279,6 +344,12 @@ impl Default for RouterConfig {
             shard_request_timeout_secs: DEFAULT_SHARD_REQUEST_TIMEOUT_SECS,
             shard_tcp_keepalive_secs: DEFAULT_SHARD_TCP_KEEPALIVE_SECS,
             checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
+            shard_tls_ca: None,
+            shard_tls_cert: None,
+            shard_tls_key: None,
         }
     }
 }
@@ -360,6 +431,12 @@ pub struct ShardOverrides {
     pub ontology: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_client_ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -375,6 +452,18 @@ pub struct RouterOverrides {
     pub ontology: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_client_ca: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_tls_ca: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_tls_cert: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_tls_key: Option<PathBuf>,
 }
 
 /// Configuration error.

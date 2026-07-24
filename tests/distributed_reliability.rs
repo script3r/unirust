@@ -487,6 +487,7 @@ async fn router_startup_times_out_when_shard_never_responds() -> anyhow::Result<
             connect_timeout: Duration::from_millis(100),
             request_timeout: Duration::from_millis(100),
             tcp_keepalive: Duration::from_secs(1),
+            shard_mtls: None,
         },
     )
     .await;

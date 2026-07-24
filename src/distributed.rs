@@ -3303,11 +3303,23 @@ impl Default for AdaptiveReconciliationConfig {
 }
 
 /// Failure bounds for router-to-shard transport and RPC calls.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RouterRpcConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub tcp_keepalive: Duration,
+    pub shard_mtls: Option<tonic::transport::ClientTlsConfig>,
+}
+
+impl std::fmt::Debug for RouterRpcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterRpcConfig")
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("shard_mtls_configured", &self.shard_mtls.is_some())
+            .finish()
+    }
 }
 
 impl Default for RouterRpcConfig {
@@ -3316,6 +3328,7 @@ impl Default for RouterRpcConfig {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(120),
             tcp_keepalive: Duration::from_secs(30),
+            shard_mtls: None,
         }
     }
 }
@@ -3517,11 +3530,29 @@ impl RouterNode {
         }
         let mut shard_clients = Vec::with_capacity(shard_count);
         for addr in shard_addrs {
+            let uses_https = addr.starts_with("https://");
             let endpoint = tonic::transport::Endpoint::from_shared(addr)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?
                 .connect_timeout(rpc_config.connect_timeout)
                 .timeout(rpc_config.request_timeout)
                 .tcp_keepalive(Some(rpc_config.tcp_keepalive));
+            let endpoint = match (&rpc_config.shard_mtls, uses_https) {
+                (Some(tls), true) => endpoint
+                    .tls_config(tls.clone())
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?,
+                (Some(_), false) => {
+                    return Err(Status::invalid_argument(
+                        "router-to-shard mTLS requires https:// shard addresses",
+                    ));
+                }
+                (None, true) => {
+                    return Err(Status::invalid_argument(
+                        "https:// shard addresses require explicit router-to-shard mTLS \
+                         certificate configuration",
+                    ));
+                }
+                (None, false) => endpoint,
+            };
             let channel = endpoint
                 .connect()
                 .await

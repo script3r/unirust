@@ -5,6 +5,7 @@ use unirust_rs::config::{normalize_shard_addrs, ConfigOverrides, RouterOverrides
 use unirust_rs::distributed::{
     proto, AdaptiveReconciliationConfig, DistributedOntologyConfig, RouterNode, RouterRpcConfig,
 };
+use unirust_rs::transport_security::{load_client_mtls, load_server_mtls};
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -36,6 +37,16 @@ OPTIONS:
         --config-version    Config version for compatibility checking
         --checkpoint-interval-secs <SECONDS>
                             Automatic coordinated checkpoint interval (0 disables)
+        --tls-cert <FILE>   PEM router server certificate
+        --tls-key <FILE>    PEM router server private key
+        --tls-client-ca <FILE>
+                            PEM CA used to require client certificates
+        --shard-tls-ca <FILE>
+                            PEM CA used to verify shard certificates
+        --shard-tls-cert <FILE>
+                            PEM router client certificate presented to shards
+        --shard-tls-key <FILE>
+                            PEM router client private key
     -h, --help              Print help
 
 ENVIRONMENT:
@@ -118,12 +129,36 @@ async fn main() -> anyhow::Result<()> {
     if let Some(interval) = parse_arg("--checkpoint-interval-secs") {
         router_overrides.checkpoint_interval_secs = Some(interval.parse()?);
     }
+    if let Some(path) = parse_arg("--tls-cert") {
+        router_overrides.tls_cert = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--tls-key") {
+        router_overrides.tls_key = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--tls-client-ca") {
+        router_overrides.tls_client_ca = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--shard-tls-ca") {
+        router_overrides.shard_tls_ca = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--shard-tls-cert") {
+        router_overrides.shard_tls_cert = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--shard-tls-key") {
+        router_overrides.shard_tls_key = Some(path.into());
+    }
 
     if router_overrides.listen.is_some()
         || router_overrides.shards.is_some()
         || router_overrides.shards_file.is_some()
         || router_overrides.ontology.is_some()
         || router_overrides.checkpoint_interval_secs.is_some()
+        || router_overrides.tls_cert.is_some()
+        || router_overrides.tls_key.is_some()
+        || router_overrides.tls_client_ca.is_some()
+        || router_overrides.shard_tls_ca.is_some()
+        || router_overrides.shard_tls_cert.is_some()
+        || router_overrides.shard_tls_key.is_some()
     {
         overrides.router = Some(router_overrides);
     }
@@ -133,6 +168,16 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| parse_arg("-c"))
         .or_else(|| std::env::var("UNIRUST_CONFIG").ok());
     let config = UniConfig::load(config_path.as_deref(), overrides)?;
+    let server_mtls = load_server_mtls(
+        config.router.tls_cert.as_deref(),
+        config.router.tls_key.as_deref(),
+        config.router.tls_client_ca.as_deref(),
+    )?;
+    let shard_mtls = load_client_mtls(
+        config.router.shard_tls_ca.as_deref(),
+        config.router.shard_tls_cert.as_deref(),
+        config.router.shard_tls_key.as_deref(),
+    )?;
 
     // Load ontology
     let ontology = load_ontology(config.router.ontology.as_deref())?;
@@ -154,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
         connect_timeout: std::time::Duration::from_secs(config.router.shard_connect_timeout_secs),
         request_timeout: std::time::Duration::from_secs(config.router.shard_request_timeout_secs),
         tcp_keepalive: std::time::Duration::from_secs(config.router.shard_tcp_keepalive_secs),
+        shard_mtls,
     };
 
     // Create router node
@@ -193,7 +239,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("Unirust router listening on {}", config.router.listen);
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(server_mtls) = server_mtls {
+        server = server.tls_config(server_mtls)?;
+    }
+    server
         .add_service(proto::router_service_server::RouterServiceServer::new(
             router,
         ))

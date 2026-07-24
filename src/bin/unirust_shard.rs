@@ -3,6 +3,7 @@ use std::fs;
 use tonic::transport::Server;
 use unirust_rs::config::{ConfigOverrides, Profile, ShardOverrides, UniConfig};
 use unirust_rs::distributed::{proto, DistributedOntologyConfig, ShardNode};
+use unirust_rs::transport_security::load_server_mtls;
 use unirust_rs::{restore_checkpoint_for_shard, StreamingTuning};
 
 fn parse_arg(flag: &str) -> Option<String> {
@@ -42,6 +43,10 @@ OPTIONS:
         --ephemeral         Allow an in-memory shard; all data is lost on process exit
         --allow-destructive-admin
                             Enable destructive admin RPCs such as Reset
+        --tls-cert <FILE>   PEM shard server certificate
+        --tls-key <FILE>    PEM shard server private key
+        --tls-client-ca <FILE>
+                            PEM CA used to require router client certificates
         --config-version    Config version for compatibility checking
     -h, --help              Print help
 
@@ -152,6 +157,15 @@ async fn main() -> anyhow::Result<()> {
     if has_flag("--repair") {
         shard_overrides.repair = Some(true);
     }
+    if let Some(path) = parse_arg("--tls-cert") {
+        shard_overrides.tls_cert = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--tls-key") {
+        shard_overrides.tls_key = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--tls-client-ca") {
+        shard_overrides.tls_client_ca = Some(path.into());
+    }
 
     if shard_overrides.listen.is_some()
         || shard_overrides.id.is_some()
@@ -159,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
         || shard_overrides.backup_dir.is_some()
         || shard_overrides.ontology.is_some()
         || shard_overrides.repair.is_some()
+        || shard_overrides.tls_cert.is_some()
+        || shard_overrides.tls_key.is_some()
+        || shard_overrides.tls_client_ca.is_some()
     {
         overrides.shard = Some(shard_overrides);
     }
@@ -168,6 +185,11 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| parse_arg("-c"))
         .or_else(|| std::env::var("UNIRUST_CONFIG").ok());
     let config = UniConfig::load(config_path.as_deref(), overrides)?;
+    let server_mtls = load_server_mtls(
+        config.shard.tls_cert.as_deref(),
+        config.shard.tls_key.as_deref(),
+        config.shard.tls_client_ca.as_deref(),
+    )?;
     if config.shard.data_dir.is_none() && !has_flag("--ephemeral") {
         anyhow::bail!(
             "persistent shard storage is required; configure --data-dir (or use --ephemeral \
@@ -215,7 +237,11 @@ async fn main() -> anyhow::Result<()> {
         "Unirust shard {} listening on {}",
         config.shard.id, config.shard.listen
     );
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(server_mtls) = server_mtls {
+        server = server.tls_config(server_mtls)?;
+    }
+    server
         .add_service(proto::shard_service_server::ShardServiceServer::new(
             shard.clone(),
         ))

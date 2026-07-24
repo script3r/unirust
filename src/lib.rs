@@ -50,6 +50,7 @@ pub mod query;
 pub mod sharding;
 pub mod store;
 pub mod temporal;
+pub mod transport_security;
 pub mod utils;
 
 /// Test support utilities (also used by benchmarks and integration tests)

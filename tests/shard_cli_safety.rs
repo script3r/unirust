@@ -58,3 +58,19 @@ fn shard_binary_rejects_unknown_shard_environment_variable() {
         "unexpected stderr: {stderr}"
     );
 }
+
+#[test]
+fn shard_binary_rejects_partial_mtls_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_unirust_shard"))
+        .env_clear()
+        .args(["--tls-cert", "/tmp/server.pem"])
+        .output()
+        .expect("run shard binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shard mTLS requires all three certificate paths together"),
+        "unexpected stderr: {stderr}"
+    );
+}

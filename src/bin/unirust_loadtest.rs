@@ -37,7 +37,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::sync::RwLock;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::shard_service_client::ShardServiceClient;
@@ -45,6 +45,7 @@ use unirust_rs::distributed::proto::{
     ApplyOntologyRequest, IdentityKeyConfig, IngestRecordsRequest, MetricsRequest, OntologyConfig,
     RecordDescriptor, RecordIdentity, RecordInput, StatsRequest,
 };
+use unirust_rs::transport_security::load_client_mtls;
 
 // =============================================================================
 // CONFIGURATION
@@ -63,6 +64,9 @@ pub struct LoadTestConfig {
     pub log_file: Option<PathBuf>,
     pub seed: u64,
     pub headless: bool,
+    pub tls_ca: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for LoadTestConfig {
@@ -79,6 +83,9 @@ impl Default for LoadTestConfig {
             log_file: None,
             seed: 42,
             headless: false,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -99,6 +106,21 @@ impl LoadTestConfig {
             if !(0.0..=1.0).contains(&value) {
                 bail!("{name} must be between 0.0 and 1.0");
             }
+        }
+        let tls_paths = [
+            self.tls_ca.as_ref(),
+            self.tls_cert.as_ref(),
+            self.tls_key.as_ref(),
+        ];
+        let configured = tls_paths.iter().filter(|path| path.is_some()).count();
+        if configured != 0 && configured != tls_paths.len() {
+            bail!("--tls-ca, --tls-cert, and --tls-key must be provided together");
+        }
+        if configured > 0 && self.router_addr.starts_with("http://") {
+            bail!("mTLS load tests require an https:// router address");
+        }
+        if configured == 0 && self.router_addr.starts_with("https://") {
+            bail!("https:// router addresses require mTLS certificate options");
         }
         Ok(())
     }
@@ -161,6 +183,15 @@ fn parse_args() -> LoadTestConfig {
             "--headless" => {
                 config.headless = true;
             }
+            "--tls-ca" => {
+                config.tls_ca = args.next().map(PathBuf::from);
+            }
+            "--tls-cert" => {
+                config.tls_cert = args.next().map(PathBuf::from);
+            }
+            "--tls-key" => {
+                config.tls_key = args.next().map(PathBuf::from);
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -193,6 +224,9 @@ OPTIONS:
     --log <PATH>          Log file path (logs to file only)
     --seed <N>            Random seed for reproducibility (default: 42)
     --headless            Run without TUI (for automation/CI)
+    --tls-ca <PATH>       PEM CA used to verify router/shard certificates
+    --tls-cert <PATH>     PEM client certificate
+    --tls-key <PATH>      PEM client private key
     -h, --help            Print help
 
 EXAMPLES:
@@ -1676,6 +1710,40 @@ fn write_report(config: &LoadTestConfig, metrics: &LoadTestMetrics) -> Result<Pa
 // PARALLEL STREAMING
 // =============================================================================
 
+async fn connect_channel(config: &LoadTestConfig, address: String) -> Result<Channel> {
+    let mtls = load_client_mtls(
+        config.tls_ca.as_deref(),
+        config.tls_cert.as_deref(),
+        config.tls_key.as_deref(),
+    )?;
+    let address = if address.starts_with("http://") || address.starts_with("https://") {
+        address
+    } else if mtls.is_some() {
+        format!("https://{address}")
+    } else {
+        format!("http://{address}")
+    };
+    if mtls.is_some() && address.starts_with("http://") {
+        bail!("mTLS requires an https:// endpoint");
+    }
+    if mtls.is_none() && address.starts_with("https://") {
+        bail!("https:// endpoints require mTLS certificate options");
+    }
+    let endpoint = Endpoint::from_shared(address)?;
+    let endpoint = if let Some(mtls) = mtls {
+        endpoint.tls_config(mtls)?
+    } else {
+        endpoint
+    };
+    Ok(endpoint.connect().await?)
+}
+
+async fn connect_router(config: &LoadTestConfig) -> Result<RouterServiceClient<Channel>> {
+    Ok(RouterServiceClient::new(
+        connect_channel(config, config.router_addr.clone()).await?,
+    ))
+}
+
 async fn run_parallel_streams(
     config: &LoadTestConfig,
     metrics: Arc<LoadTestMetrics>,
@@ -1709,10 +1777,10 @@ async fn run_parallel_streams(
         .map(|i| {
             let rx = rx.clone();
             let metrics = metrics.clone();
-            let router = config.router_addr.clone();
+            let connection_config = config.clone();
 
             tokio::spawn(async move {
-                let mut client = match RouterServiceClient::connect(router).await {
+                let mut client = match connect_router(&connection_config).await {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(stream = i, error = %e, "Failed to connect to router");
@@ -1831,16 +1899,15 @@ async fn poll_metrics_task(
     let mut interval = tokio::time::interval(Duration::from_millis(500));
 
     // Connect to router
-    let mut router_client = RouterServiceClient::connect(config.router_addr.clone())
-        .await
-        .ok();
+    let mut router_client = connect_router(config).await.ok();
 
     // Connect to shards
     let mut shard_clients: Vec<Option<ShardServiceClient<Channel>>> = Vec::new();
     for addr in &config.shard_addrs {
-        let client = ShardServiceClient::connect(format!("http://{}", addr))
+        let client = connect_channel(config, addr.clone())
             .await
-            .ok();
+            .ok()
+            .map(ShardServiceClient::new);
         shard_clients.push(client);
     }
 
@@ -2266,7 +2333,7 @@ async fn main() -> Result<()> {
 
     // Set ontology on router first
     {
-        let mut client = RouterServiceClient::connect(config.router_addr.clone()).await?;
+        let mut client = connect_router(&config).await?;
         client
             .set_ontology(ApplyOntologyRequest {
                 config: Some(build_ontology_config()),
