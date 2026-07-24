@@ -313,6 +313,15 @@ grpcurl -plaintext \
   127.0.0.1:50060 unirust.RouterService/Checkpoint
 ```
 
+Checkpoint creation uses a two-phase prepare/commit protocol. Every shard first
+flushes its in-memory linker state and creates a RocksDB snapshot. Only after
+all shards prepare successfully does the router write a binary commit marker to
+every snapshot. The response includes the shared `generation` and
+`committed: true`. A failed generation remains uncommitted and cannot be
+restored; retrying the same name is idempotent and completes any missing
+prepare or commit steps. Do not call the shard checkpoint RPC directly for a
+production backup.
+
 To recover from lost data volumes, stop the complete cluster and restore every
 shard from the same checkpoint generation into an empty replacement directory:
 
@@ -326,10 +335,14 @@ unirust_shard \
 ```
 
 Restore refuses a non-RocksDB source, symlinks, a nonempty destination, and an
-existing partial staging directory. It copies and syncs into a sibling staging
-directory before publishing the replacement with one rename. Restore the whole
-cluster together; restoring only one older shard beside newer peers can violate
-the cluster snapshot boundary.
+existing partial staging directory. It also requires matching binary
+prepare/commit markers, verifies the checkpoint belongs to the requested shard,
+and opens both the source and staged copy read-only with RocksDB paranoid checks.
+It copies and syncs into a sibling staging directory before publishing the
+replacement with one rename. Restore the whole cluster together; restoring
+only one older shard beside newer peers can violate the cluster snapshot
+boundary. Router startup then verifies the restored topology, ontology, and
+protocol versions before accepting traffic.
 
 Unirust does not schedule, replicate, encrypt, transfer, retain, or verify
 off-host backups. Without storage-layer replication, the recovery point is the

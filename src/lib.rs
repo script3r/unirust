@@ -76,7 +76,10 @@ pub use graph::KnowledgeGraph;
 pub use query::{QueryDescriptor, QueryMatch, QueryOutcome};
 
 // Storage (for custom backends)
-pub use persistence::{restore_checkpoint, PersistentStore};
+pub use persistence::{
+    read_cluster_checkpoint_manifest, restore_checkpoint, restore_checkpoint_for_shard,
+    ClusterCheckpointManifest, PersistentStore, CHECKPOINT_PROTOCOL_VERSION,
+};
 pub use store::{RecordStore, Store};
 
 // ============================================================================

@@ -556,6 +556,9 @@ async fn checkpoint_paths_cannot_escape_the_shard_data_directory() -> anyhow::Re
         let error = client
             .checkpoint(proto::CheckpointRequest {
                 path: unsafe_path.to_string(),
+                checkpoint_protocol_version: unirust_rs::CHECKPOINT_PROTOCOL_VERSION,
+                shard_count: 1,
+                finalize: false,
             })
             .await
             .expect_err("unsafe checkpoint path must be rejected");
@@ -565,6 +568,9 @@ async fn checkpoint_paths_cannot_escape_the_shard_data_directory() -> anyhow::Re
     let response = client
         .checkpoint(proto::CheckpointRequest {
             path: "operator-snapshot".to_string(),
+            checkpoint_protocol_version: unirust_rs::CHECKPOINT_PROTOCOL_VERSION,
+            shard_count: 1,
+            finalize: false,
         })
         .await?
         .into_inner();

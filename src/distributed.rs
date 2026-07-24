@@ -4,7 +4,10 @@ use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity};
 use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::partitioned::{ParallelPartitionedUnirust, PartitionConfig};
 use crate::perf::ConcurrentInterner;
-use crate::persistence::PersistentOpenOptions;
+use crate::persistence::{
+    commit_cluster_checkpoint, prepare_cluster_checkpoint, validate_prepared_cluster_checkpoint,
+    PersistentOpenOptions, CHECKPOINT_PROTOCOL_VERSION,
+};
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::sharding::{BloomFilter, IdentityKeySignature};
 use crate::store::{SourceRecordReservation, SourceReservationError, StoreMetrics};
@@ -74,6 +77,19 @@ fn validate_distributed_protocol(protocol_version: u32) -> Result<(), Status> {
             "distributed protocol mismatch: router {}, shard {}; deploy one coordinated Unirust \
              version across the complete cluster",
             DISTRIBUTED_PROTOCOL_VERSION, protocol_version
+        )))
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_checkpoint_protocol(protocol_version: u32) -> Result<(), Status> {
+    if protocol_version == CHECKPOINT_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "checkpoint protocol mismatch: router {}, shard {}; deploy one coordinated Unirust \
+             version across the complete cluster",
+            CHECKPOINT_PROTOCOL_VERSION, protocol_version
         )))
     }
 }
@@ -1176,7 +1192,9 @@ impl ShardNode {
                 }
                 backup_path
             } else {
-                path.join("checkpoints")
+                let checkpoint_root = path.join("checkpoints");
+                fs::create_dir_all(&checkpoint_root)?;
+                checkpoint_root.canonicalize()?
             };
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
@@ -1648,14 +1666,9 @@ fn resolve_checkpoint_path(checkpoint_root: &Path, requested: &str) -> Result<Pa
     }
     let candidate = PathBuf::from(requested);
     if candidate.is_absolute()
-        || candidate.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+        || candidate
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return Err(Status::invalid_argument(
             "checkpoint path must be relative and remain within the shard checkpoint directory",
@@ -2496,6 +2509,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             source_reservation_shard_count: source_reservation_backfill
                 .map(|value| value.1)
                 .unwrap_or_default(),
+            checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
         }))
     }
 
@@ -2526,23 +2540,66 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::CheckpointResponse>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
+        let request = request.into_inner();
+        validate_checkpoint_protocol(request.checkpoint_protocol_version)?;
+        if request.shard_count == 0 || self.shard_id >= request.shard_count {
+            return Err(Status::invalid_argument(format!(
+                "checkpoint shard {} is outside cluster shard count {}",
+                self.shard_id, request.shard_count
+            )));
+        }
         let checkpoint_root = self
             .checkpoint_root
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("checkpoint requires persistent storage"))?;
-        let target = resolve_checkpoint_path(checkpoint_root, &request.into_inner().path)?;
-        fs::create_dir_all(
-            target
-                .parent()
-                .ok_or_else(|| Status::internal("invalid checkpoint path"))?,
-        )
-        .map_err(|err| Status::internal(err.to_string()))?;
-        let unirust = read_unirust!(self);
-        unirust
-            .checkpoint_to_path(&target)
+        let target = resolve_checkpoint_path(checkpoint_root, &request.path)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| Status::internal("invalid checkpoint path"))?;
+        fs::create_dir_all(parent).map_err(|err| Status::internal(err.to_string()))?;
+        let parent = parent
+            .canonicalize()
             .map_err(|err| Status::internal(err.to_string()))?;
+        if !parent.starts_with(checkpoint_root) {
+            return Err(Status::invalid_argument(
+                "checkpoint path traverses outside the shard checkpoint directory",
+            ));
+        }
+        if target
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(Status::invalid_argument(
+                "checkpoint target must not be a symbolic link",
+            ));
+        }
+
+        if request.finalize {
+            commit_cluster_checkpoint(&target, &request.path, self.shard_id, request.shard_count)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        } else if target.exists() {
+            validate_prepared_cluster_checkpoint(
+                &target,
+                &request.path,
+                self.shard_id,
+                request.shard_count,
+            )
+            .map_err(|err| Status::already_exists(err.to_string()))?;
+        } else {
+            let mut unirust = write_unirust!(self);
+            unirust
+                .checkpoint_for_shutdown()
+                .map_err(|err| Status::internal(err.to_string()))?;
+            unirust
+                .checkpoint_to_path(&target)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            prepare_cluster_checkpoint(&target, &request.path, self.shard_id, request.shard_count)
+                .map_err(|err| Status::internal(err.to_string()))?;
+        }
         Ok(Response::new(proto::CheckpointResponse {
             paths: vec![target.to_string_lossy().to_string()],
+            generation: request.path,
+            committed: request.finalize,
         }))
     }
 
@@ -3456,6 +3513,7 @@ impl RouterNode {
                 .map_err(|err| Status::unavailable(err.to_string()))?
                 .into_inner();
             validate_distributed_protocol(response.protocol_version)?;
+            validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
             if response.version != config_version {
                 return Err(Status::failed_precondition(format!(
                     "config version mismatch: router {}, shard {}",
@@ -4582,6 +4640,7 @@ impl proto::router_service_server::RouterService for RouterNode {
             protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
             source_reservation_backfill_version: DISTRIBUTED_PROTOCOL_VERSION,
             source_reservation_shard_count: self.shard_clients.len() as u32,
+            checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
         }))
     }
 
@@ -4824,17 +4883,54 @@ impl proto::router_service_server::RouterService for RouterNode {
                 .as_nanos();
             payload.path = format!("cluster-{timestamp}");
         }
+        let shard_count = u32::try_from(self.shard_clients.len())
+            .map_err(|_| Status::resource_exhausted("shard count exceeds u32"))?;
+        payload.checkpoint_protocol_version = CHECKPOINT_PROTOCOL_VERSION;
+        payload.shard_count = shard_count;
+        payload.finalize = false;
+
         let mut paths = Vec::new();
-        for client in &self.shard_clients {
+        for (shard_id, client) in self.shard_clients.iter().enumerate() {
             let mut client = client.clone();
             let response = client
                 .checkpoint(Request::new(payload.clone()))
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?
                 .into_inner();
+            if response.committed
+                || response.generation != payload.path
+                || response.paths.len() != 1
+            {
+                return Err(Status::data_loss(format!(
+                    "shard {shard_id} returned an invalid checkpoint prepare response"
+                )));
+            }
             paths.extend(response.paths);
         }
-        Ok(Response::new(proto::CheckpointResponse { paths }))
+
+        payload.finalize = true;
+        for (shard_id, client) in self.shard_clients.iter().enumerate() {
+            let mut client = client.clone();
+            let response = client
+                .checkpoint(Request::new(payload.clone()))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?
+                .into_inner();
+            if !response.committed
+                || response.generation != payload.path
+                || response.paths.len() != 1
+            {
+                return Err(Status::data_loss(format!(
+                    "shard {shard_id} returned an invalid checkpoint commit response"
+                )));
+            }
+        }
+
+        Ok(Response::new(proto::CheckpointResponse {
+            paths,
+            generation: payload.path,
+            committed: true,
+        }))
     }
 
     async fn list_conflicts(

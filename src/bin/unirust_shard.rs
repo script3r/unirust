@@ -3,7 +3,7 @@ use std::fs;
 use tonic::transport::Server;
 use unirust_rs::config::{ConfigOverrides, Profile, ShardOverrides, UniConfig};
 use unirust_rs::distributed::{proto, DistributedOntologyConfig, ShardNode};
-use unirust_rs::{restore_checkpoint, StreamingTuning};
+use unirust_rs::{restore_checkpoint_for_shard, StreamingTuning};
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -180,7 +180,11 @@ async fn main() -> anyhow::Result<()> {
             .data_dir
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--restore-from requires --data-dir"))?;
-        restore_checkpoint(std::path::Path::new(&source), data_dir)?;
+        restore_checkpoint_for_shard(
+            std::path::Path::new(&source),
+            data_dir,
+            Some(u32::from(config.shard.id)),
+        )?;
     }
 
     // Get tuning from profile

@@ -13,9 +13,84 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub const CHECKPOINT_PROTOCOL_VERSION: u32 = 1;
+const CHECKPOINT_MANIFEST_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_MANIFEST_FILE: &str = "UNIRUST_CHECKPOINT_MANIFEST";
+const CHECKPOINT_COMMITTED_FILE: &str = "UNIRUST_CHECKPOINT_COMMITTED";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCheckpointManifest {
+    format_version: u32,
+    checkpoint_protocol_version: u32,
+    generation: String,
+    shard_id: u32,
+    shard_count: u32,
+}
+
+impl ClusterCheckpointManifest {
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+
+    pub fn shard_count(&self) -> u32 {
+        self.shard_count
+    }
+
+    fn new(generation: &str, shard_id: u32, shard_count: u32) -> Result<Self> {
+        if generation.is_empty() {
+            anyhow::bail!("checkpoint generation must not be empty");
+        }
+        if shard_count == 0 || shard_id >= shard_count {
+            anyhow::bail!(
+                "checkpoint shard {} is outside cluster shard count {}",
+                shard_id,
+                shard_count
+            );
+        }
+        Ok(Self {
+            format_version: CHECKPOINT_MANIFEST_FORMAT_VERSION,
+            checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
+            generation: generation.to_string(),
+            shard_id,
+            shard_count,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format_version != CHECKPOINT_MANIFEST_FORMAT_VERSION {
+            anyhow::bail!(
+                "unsupported checkpoint manifest format version {}",
+                self.format_version
+            );
+        }
+        if self.checkpoint_protocol_version != CHECKPOINT_PROTOCOL_VERSION {
+            anyhow::bail!(
+                "unsupported checkpoint protocol version {}",
+                self.checkpoint_protocol_version
+            );
+        }
+        if self.generation.is_empty() {
+            anyhow::bail!("checkpoint manifest generation is empty");
+        }
+        if self.shard_count == 0 || self.shard_id >= self.shard_count {
+            anyhow::bail!(
+                "checkpoint manifest shard {} is outside cluster shard count {}",
+                self.shard_id,
+                self.shard_count
+            );
+        }
+        Ok(())
+    }
+}
 
 const CF_RECORDS: &str = "records";
 const CF_METADATA: &str = "metadata";
@@ -77,18 +152,179 @@ fn copy_checkpoint_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_rocksdb_checkpoint(path: &Path) -> Result<()> {
+    let mut options = Options::default();
+    options.set_paranoid_checks(true);
+    let mut column_families = DB::list_cf(&options, path)?;
+    column_families.retain(|name| name != "default");
+    let db = DB::open_cf_for_read_only(&options, path, column_families, false)?;
+    drop(db);
+    Ok(())
+}
+
+fn read_manifest_file(path: &Path) -> Result<(ClusterCheckpointManifest, Vec<u8>)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("checkpoint marker {} must be a real file", path.display());
+    }
+    let bytes = fs::read(path)?;
+    let manifest: ClusterCheckpointManifest = bincode::deserialize(&bytes)?;
+    manifest.validate()?;
+    Ok((manifest, bytes))
+}
+
+fn write_marker_once(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("checkpoint marker {} must be a real file", path.display());
+        }
+        if fs::read(path)? == bytes {
+            return Ok(());
+        }
+        anyhow::bail!("checkpoint marker {} does not match", path.display());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("checkpoint marker name must be UTF-8"))?;
+    let staging = path.with_file_name(format!(".{file_name}.tmp"));
+    if staging.exists() {
+        fs::remove_file(&staging)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&staging, path)?;
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| anyhow!("checkpoint marker has no parent directory"))?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn prepare_cluster_checkpoint(
+    checkpoint: &Path,
+    generation: &str,
+    shard_id: u32,
+    shard_count: u32,
+) -> Result<()> {
+    if !checkpoint.is_dir() || !checkpoint.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "prepared checkpoint {} is not a RocksDB checkpoint",
+            checkpoint.display()
+        );
+    }
+    let expected = ClusterCheckpointManifest::new(generation, shard_id, shard_count)?;
+    let bytes = bincode::serialize(&expected)?;
+    write_marker_once(&checkpoint.join(CHECKPOINT_MANIFEST_FILE), &bytes)
+}
+
+pub(crate) fn validate_prepared_cluster_checkpoint(
+    checkpoint: &Path,
+    generation: &str,
+    shard_id: u32,
+    shard_count: u32,
+) -> Result<()> {
+    if !checkpoint.is_dir() || !checkpoint.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "prepared checkpoint {} is not a RocksDB checkpoint",
+            checkpoint.display()
+        );
+    }
+    let expected = ClusterCheckpointManifest::new(generation, shard_id, shard_count)?;
+    let (prepared, _) = read_manifest_file(&checkpoint.join(CHECKPOINT_MANIFEST_FILE))?;
+    if prepared != expected {
+        anyhow::bail!(
+            "prepared checkpoint {} does not match generation {} shard {}/{}",
+            checkpoint.display(),
+            generation,
+            shard_id,
+            shard_count
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn commit_cluster_checkpoint(
+    checkpoint: &Path,
+    generation: &str,
+    shard_id: u32,
+    shard_count: u32,
+) -> Result<()> {
+    let expected = ClusterCheckpointManifest::new(generation, shard_id, shard_count)?;
+    let (prepared, bytes) = read_manifest_file(&checkpoint.join(CHECKPOINT_MANIFEST_FILE))?;
+    if prepared != expected {
+        anyhow::bail!(
+            "prepared checkpoint {} does not match generation {} shard {}/{}",
+            checkpoint.display(),
+            generation,
+            shard_id,
+            shard_count
+        );
+    }
+    write_marker_once(&checkpoint.join(CHECKPOINT_COMMITTED_FILE), &bytes)
+}
+
+/// Read and validate a committed cluster checkpoint manifest.
+pub fn read_cluster_checkpoint_manifest(checkpoint: &Path) -> Result<ClusterCheckpointManifest> {
+    let metadata = fs::symlink_metadata(checkpoint)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("checkpoint source must be a real directory");
+    }
+    let checkpoint = checkpoint.canonicalize()?;
+    if !checkpoint.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "checkpoint source {} is not a RocksDB checkpoint",
+            checkpoint.display()
+        );
+    }
+    let (manifest, prepared_bytes) =
+        read_manifest_file(&checkpoint.join(CHECKPOINT_MANIFEST_FILE))?;
+    let (_committed, committed_bytes) =
+        read_manifest_file(&checkpoint.join(CHECKPOINT_COMMITTED_FILE))?;
+    if committed_bytes != prepared_bytes {
+        anyhow::bail!(
+            "checkpoint {} has mismatched prepare and commit markers",
+            checkpoint.display()
+        );
+    }
+    Ok(manifest)
+}
+
 /// Restore a RocksDB checkpoint into an empty replacement data directory.
 ///
 /// Copying occurs in a sibling staging directory and is made visible with one
-/// rename only after every file and directory has been synchronized.
+/// rename only after every file and directory has been synchronized. Only
+/// checkpoints committed by the router's cluster-wide two-phase protocol are
+/// accepted.
 pub fn restore_checkpoint(source: &Path, destination: &Path) -> Result<()> {
-    let source = source.canonicalize()?;
-    if !source.is_dir() || !source.join("CURRENT").is_file() {
+    restore_checkpoint_for_shard(source, destination, None)
+}
+
+/// Restore a committed cluster checkpoint and verify its shard identity.
+pub fn restore_checkpoint_for_shard(
+    source: &Path,
+    destination: &Path,
+    expected_shard_id: Option<u32>,
+) -> Result<()> {
+    let manifest = read_cluster_checkpoint_manifest(source)?;
+    if let Some(expected_shard_id) =
+        expected_shard_id.filter(|expected| *expected != manifest.shard_id)
+    {
         anyhow::bail!(
-            "restore source {} is not a RocksDB checkpoint",
-            source.display()
+            "checkpoint belongs to shard {}, not requested shard {}",
+            manifest.shard_id,
+            expected_shard_id
         );
     }
+
+    let source = source.canonicalize()?;
+    validate_rocksdb_checkpoint(&source)?;
 
     if destination.exists() {
         let metadata = fs::symlink_metadata(destination)?;
@@ -126,6 +362,7 @@ pub fn restore_checkpoint(source: &Path, destination: &Path) -> Result<()> {
     }
 
     copy_checkpoint_tree(&source, &staging)?;
+    validate_rocksdb_checkpoint(&staging)?;
     if destination.exists() {
         fs::remove_dir(&destination)?;
     }
@@ -3107,6 +3344,8 @@ mod tests {
             store.mark_source_reservation_backfill(2, 1).unwrap();
             store.checkpoint(&checkpoint_path).unwrap();
         }
+        prepare_cluster_checkpoint(&checkpoint_path, "unit-restore", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "unit-restore", 0, 1).unwrap();
 
         restore_checkpoint(&checkpoint_path, &replacement_path).unwrap();
         let mut restored = PersistentStore::open(&replacement_path).unwrap();
@@ -3141,6 +3380,8 @@ mod tests {
 
         let store = PersistentStore::open(&source_path).unwrap();
         store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "nonempty-destination", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "nonempty-destination", 0, 1).unwrap();
         fs::create_dir_all(&destination).unwrap();
         fs::write(destination.join("do-not-overwrite"), b"live data").unwrap();
 
@@ -3151,6 +3392,70 @@ mod tests {
             fs::read(destination.join("do-not-overwrite")).unwrap(),
             b"live data"
         );
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_uncommitted_and_wrong_shard_snapshots() {
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "cluster-generation", 0, 2).unwrap();
+
+        restore_checkpoint(&checkpoint_path, &destination)
+            .expect_err("prepared but uncommitted checkpoint must be rejected");
+        assert!(!destination.exists());
+
+        commit_cluster_checkpoint(&checkpoint_path, "cluster-generation", 0, 2).unwrap();
+        restore_checkpoint_for_shard(&checkpoint_path, &destination, Some(1))
+            .expect_err("checkpoint from another shard must be rejected");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn checkpoint_restore_validates_rocksdb_before_publish() {
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "corrupt-generation", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "corrupt-generation", 0, 1).unwrap();
+        fs::write(checkpoint_path.join("CURRENT"), b"not-a-valid-manifest\n").unwrap();
+
+        restore_checkpoint(&checkpoint_path, &destination)
+            .expect_err("corrupt RocksDB checkpoint must be rejected");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_restore_rejects_top_level_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let checkpoint_link = backup_volume.path().join("checkpoint-link");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "symlink-generation", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "symlink-generation", 0, 1).unwrap();
+        symlink(&checkpoint_path, &checkpoint_link).unwrap();
+
+        restore_checkpoint(&checkpoint_link, &destination)
+            .expect_err("checkpoint symlink must be rejected");
+        assert!(!destination.exists());
     }
 
     #[test]

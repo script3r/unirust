@@ -263,6 +263,7 @@ message ConfigVersionResponse {
   uint32 protocol_version = 3;
   uint32 source_reservation_backfill_version = 4;
   uint32 source_reservation_shard_count = 5;
+  uint32 checkpoint_protocol_version = 6;
 }
 
 // --- Durable Source Identity Reservation ---
@@ -298,10 +299,17 @@ message MarkSourceReservationsBackfilledResponse {}
 
 message CheckpointRequest {
   string path = 1;
+  // Internal router-to-shard coordination fields. External clients call the
+  // router with these left at their zero values.
+  uint32 checkpoint_protocol_version = 2;
+  uint32 shard_count = 3;
+  bool finalize = 4;
 }
 
 message CheckpointResponse {
   repeated string paths = 1;
+  string generation = 2;
+  bool committed = 3;
 }
 
 // --- Metrics ---
