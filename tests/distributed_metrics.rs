@@ -110,7 +110,7 @@ async fn metrics_report_requests() -> anyhow::Result<()> {
 
     router
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record_input(
                 0,
                 "person",

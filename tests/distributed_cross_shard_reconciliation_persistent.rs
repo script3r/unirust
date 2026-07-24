@@ -20,7 +20,7 @@ use unirust_rs::distributed::proto::{
 };
 use unirust_rs::distributed::{
     hash_record_to_shard, hash_source_identity_to_shard, DistributedOntologyConfig,
-    IdentityKeyConfig, RouterNode, ShardNode,
+    IdentityKeyConfig, RouterNode, ShardNode, DISTRIBUTED_PROTOCOL_VERSION,
 };
 use unirust_rs::{StreamingTuning, TuningProfile};
 
@@ -347,7 +347,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -374,7 +374,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -424,7 +424,7 @@ async fn three_shard_singleton_merge_survives_full_restart() -> anyhow::Result<(
         let mut shard_client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
         shard_client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 2,
+                internal_protocol_version: 3,
                 records: vec![record_input(
                     shard_id as u32,
                     "person",
@@ -534,7 +534,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
 
     let response = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![original.clone()],
         })
         .await?
@@ -544,7 +544,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
 
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![changed.clone()],
         })
         .await
@@ -581,7 +581,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
 
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![changed],
         })
         .await
@@ -591,7 +591,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
     original.index = 1;
     let retry = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![original],
         })
         .await?
@@ -664,7 +664,7 @@ async fn router_backfills_legacy_records_before_serving_ingest() -> anyhow::Resu
     assert_eq!(status_before.source_reservation_backfill_version, 0);
     original_target_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![original],
         })
         .await?;
@@ -676,14 +676,17 @@ async fn router_backfills_legacy_records_before_serving_ingest() -> anyhow::Resu
             .get_config_version(proto::ConfigVersionRequest {})
             .await?
             .into_inner();
-        assert_eq!(status.source_reservation_backfill_version, 2);
+        assert_eq!(
+            status.source_reservation_backfill_version,
+            DISTRIBUTED_PROTOCOL_VERSION
+        );
         assert_eq!(status.source_reservation_shard_count, 2);
     }
 
     let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![changed],
         })
         .await
@@ -749,7 +752,7 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
 
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record.clone()],
         })
         .await
@@ -787,7 +790,7 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
     record.index = 1;
     let retry = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record.clone()],
         })
         .await?
@@ -800,7 +803,7 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
     changed.descriptors[0].value = "changed-after-partial-failure@example.com".to_string();
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![changed],
         })
         .await
@@ -833,7 +836,7 @@ async fn partial_reconciliation_blocks_traffic_and_recovers_after_full_restart(
     let mut client1 = ShardServiceClient::connect(format!("http://{addr1}")).await?;
     client0
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record_input(
                 0,
                 "person",
@@ -848,7 +851,7 @@ async fn partial_reconciliation_blocks_traffic_and_recovers_after_full_restart(
         .await?;
     client1
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record_input(
                 1,
                 "person",
@@ -965,7 +968,7 @@ async fn partial_reconciliation_can_be_retried_in_place() -> anyhow::Result<()> 
         let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
         client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 2,
+                internal_protocol_version: 3,
                 records: vec![record_input(
                     0,
                     "person",

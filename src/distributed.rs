@@ -5,8 +5,9 @@ use crate::ontology::{Constraint, IdentityKey, Ontology, StrongIdentifier};
 use crate::partitioned::{ParallelPartitionedUnirust, PartitionConfig};
 use crate::perf::ConcurrentInterner;
 use crate::persistence::{
-    commit_cluster_checkpoint, prepare_cluster_checkpoint, validate_prepared_cluster_checkpoint,
-    PersistentOpenOptions, CHECKPOINT_PROTOCOL_VERSION,
+    commit_cluster_checkpoint, prepare_cluster_checkpoint, read_restored_checkpoint_manifest,
+    validate_prepared_cluster_checkpoint, ClusterCheckpointManifest, PersistentOpenOptions,
+    CHECKPOINT_PROTOCOL_VERSION,
 };
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::sharding::{BloomFilter, IdentityKeySignature};
@@ -66,7 +67,7 @@ struct IngestWal {
 const INGEST_WAL_MAGIC: &[u8; 8] = b"UNIRWAL\0";
 const INGEST_WAL_VERSION: u32 = 1;
 const INGEST_WAL_HEADER_LEN: usize = 24;
-pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 2;
+pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 3;
 
 #[allow(clippy::result_large_err)]
 fn validate_distributed_protocol(protocol_version: u32) -> Result<(), Status> {
@@ -1040,6 +1041,7 @@ pub struct ShardNode {
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
+    restored_checkpoint: Option<ClusterCheckpointManifest>,
     checkpoint_root: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_wal_lock: Arc<Mutex<()>>,
@@ -1196,6 +1198,16 @@ impl ShardNode {
                 fs::create_dir_all(&checkpoint_root)?;
                 checkpoint_root.canonicalize()?
             };
+            let restored_checkpoint = read_restored_checkpoint_manifest(&path)?;
+            if let Some(manifest) = &restored_checkpoint {
+                if manifest.shard_id() != shard_id {
+                    anyhow::bail!(
+                        "restored checkpoint belongs to shard {}, not configured shard {}",
+                        manifest.shard_id(),
+                        shard_id
+                    );
+                }
+            }
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
             let ingest_wal = Some(Arc::new(IngestWal::new(&path)));
@@ -1241,6 +1253,7 @@ impl ShardNode {
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
+                restored_checkpoint,
                 checkpoint_root: Some(checkpoint_root),
                 ingest_wal,
                 ingest_wal_lock: Arc::new(Mutex::new(())),
@@ -1300,6 +1313,7 @@ impl ShardNode {
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
+            restored_checkpoint: None,
             checkpoint_root: None,
             ingest_wal,
             ingest_wal_lock: Arc::new(Mutex::new(())),
@@ -2510,6 +2524,16 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map(|value| value.1)
                 .unwrap_or_default(),
             checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
+            restore_generation: self
+                .restored_checkpoint
+                .as_ref()
+                .map(|manifest| manifest.generation().to_string())
+                .unwrap_or_default(),
+            restore_shard_count: self
+                .restored_checkpoint
+                .as_ref()
+                .map(ClusterCheckpointManifest::shard_count)
+                .unwrap_or_default(),
         }))
     }
 
@@ -3409,6 +3433,8 @@ pub struct RouterNode {
     cluster_consistent: Arc<AtomicBool>,
     /// Latches closed while a partially applied reconciliation needs repair.
     reconciliation_consistent: Arc<AtomicBool>,
+    /// Shared base checkpoint generation when the complete cluster was restored.
+    restore_generation: Option<String>,
     /// Authoritative conflict view rebuilt from a consistent all-shard record scan.
     global_conflict_cache: Arc<parking_lot::RwLock<Option<Vec<proto::ConflictSummary>>>>,
 }
@@ -3507,6 +3533,7 @@ impl RouterNode {
         let expected_reservation_shard_count = u32::try_from(shard_count)
             .map_err(|_| Status::invalid_argument("shard count exceeds u32"))?;
         let mut source_reservation_backfill_required = Vec::with_capacity(shard_count);
+        let mut cluster_restore_state: Option<Option<(String, u32)>> = None;
         for (expected_shard_id, client) in shard_clients.iter().enumerate() {
             let mut client = client.clone();
             let response = client
@@ -3516,6 +3543,44 @@ impl RouterNode {
                 .into_inner();
             validate_distributed_protocol(response.protocol_version)?;
             validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
+            let shard_restore_state = match (
+                response.restore_generation.is_empty(),
+                response.restore_shard_count,
+            ) {
+                (true, 0) => None,
+                (false, count) if count > 0 => {
+                    if count != expected_reservation_shard_count {
+                        return Err(Status::failed_precondition(format!(
+                            "restored checkpoint generation {} was created for {} shards, \
+                                 but the router has {}",
+                            response.restore_generation, count, expected_reservation_shard_count
+                        )));
+                    }
+                    Some((response.restore_generation.clone(), count))
+                }
+                _ => {
+                    return Err(Status::data_loss(
+                        "shard reported incomplete restore checkpoint provenance",
+                    ));
+                }
+            };
+            if let Some(expected) = &cluster_restore_state {
+                if expected != &shard_restore_state {
+                    let message = match (expected, &shard_restore_state) {
+                        (Some((expected, _)), Some((actual, _))) => format!(
+                            "shards were restored from different checkpoint generations \
+                             ({expected} and {actual}); restore the complete cluster from one \
+                             coordinated generation"
+                        ),
+                        _ => "cluster mixes restored and unrestored shard volumes; restore the \
+                              complete cluster from one coordinated generation"
+                            .to_string(),
+                    };
+                    return Err(Status::failed_precondition(message));
+                }
+            } else {
+                cluster_restore_state = Some(shard_restore_state);
+            }
             if response.version != config_version {
                 return Err(Status::failed_precondition(format!(
                     "config version mismatch: router {}, shard {}",
@@ -3565,6 +3630,9 @@ impl RouterNode {
                 )));
             }
         }
+        let restore_generation = cluster_restore_state
+            .flatten()
+            .map(|(generation, _)| generation);
         let router = Arc::new(Self {
             shard_clients,
             ontology_config: Arc::new(RwLock::new(ontology_config)),
@@ -3577,6 +3645,7 @@ impl RouterNode {
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             cluster_consistent: Arc::new(AtomicBool::new(true)),
             reconciliation_consistent: Arc::new(AtomicBool::new(true)),
+            restore_generation,
             global_conflict_cache: Arc::new(parking_lot::RwLock::new(None)),
         });
 
@@ -4807,6 +4876,12 @@ impl proto::router_service_server::RouterService for RouterNode {
             source_reservation_backfill_version: DISTRIBUTED_PROTOCOL_VERSION,
             source_reservation_shard_count: self.shard_clients.len() as u32,
             checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
+            restore_generation: self.restore_generation.clone().unwrap_or_default(),
+            restore_shard_count: self
+                .restore_generation
+                .as_ref()
+                .map(|_| self.shard_clients.len() as u32)
+                .unwrap_or_default(),
         }))
     }
 
@@ -5577,7 +5652,7 @@ mod wal_tests {
         ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 2,
+                internal_protocol_version: 3,
                 records: vec![original.clone()],
             }),
         )
@@ -5589,7 +5664,7 @@ mod wal_tests {
         let error = ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 2,
+                internal_protocol_version: 3,
                 records: vec![conflicting],
             }),
         )

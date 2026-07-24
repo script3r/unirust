@@ -188,7 +188,7 @@ async fn external_checkpoint_restores_a_lost_shard_volume() -> anyhow::Result<()
     client
         .ingest_records(IngestRecordsRequest {
             records: vec![record(0, "backup@example.com")],
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
         })
         .await?;
     let before = client.get_stats(StatsRequest {}).await?.into_inner();
@@ -230,7 +230,7 @@ async fn external_checkpoint_restores_a_lost_shard_volume() -> anyhow::Result<()
     client
         .ingest_records(IngestRecordsRequest {
             records: vec![record(1, "backup@example.com")],
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
         })
         .await?;
     let retry_stats = client.get_stats(StatsRequest {}).await?.into_inner();
@@ -239,7 +239,7 @@ async fn external_checkpoint_restores_a_lost_shard_volume() -> anyhow::Result<()
     let error = client
         .ingest_records(IngestRecordsRequest {
             records: vec![record(2, "changed@example.com")],
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
         })
         .await
         .expect_err("restored immutable source identity must reject a changed payload");
@@ -403,6 +403,171 @@ async fn coordinated_checkpoint_restores_source_reservations_across_shards() -> 
     for (shard, handle) in restarted_nodes.into_iter().zip(restarted_handles) {
         stop_shard(shard, handle).await?;
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_rejects_partial_and_mixed_generation_restores() -> anyhow::Result<()> {
+    use proto::router_service_server::RouterService;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let data_volume = TempDir::new()?;
+    let backup_volume = TempDir::new()?;
+    let original_paths = (0..2)
+        .map(|shard_id| data_volume.path().join(format!("original-{shard_id}")))
+        .collect::<Vec<_>>();
+    let replacement_paths = (0..2)
+        .map(|shard_id| data_volume.path().join(format!("replacement-{shard_id}")))
+        .collect::<Vec<_>>();
+    let backup_roots = (0..2)
+        .map(|shard_id| backup_volume.path().join(format!("shard-{shard_id}")))
+        .collect::<Vec<_>>();
+
+    let mut original_addrs = Vec::new();
+    let mut original_nodes = Vec::new();
+    let mut original_handles = Vec::new();
+    for shard_id in 0..2 {
+        let (addr, shard, handle) = spawn_shard(
+            shard_id as u32,
+            original_paths[shard_id].clone(),
+            backup_roots[shard_id].clone(),
+            config(),
+        )
+        .await?;
+        original_addrs.push(addr);
+        original_nodes.push(shard);
+        original_handles.push(handle);
+    }
+    let router = RouterNode::connect(
+        original_addrs
+            .iter()
+            .map(|addr| format!("http://{addr}"))
+            .collect(),
+        config(),
+    )
+    .await?;
+    let generation_a = RouterService::checkpoint(
+        router.as_ref(),
+        Request::new(CheckpointRequest {
+            path: "generation-a".to_string(),
+            checkpoint_protocol_version: 0,
+            shard_count: 0,
+            finalize: false,
+        }),
+    )
+    .await?
+    .into_inner();
+    let generation_b = RouterService::checkpoint(
+        router.as_ref(),
+        Request::new(CheckpointRequest {
+            path: "generation-b".to_string(),
+            checkpoint_protocol_version: 0,
+            shard_count: 0,
+            finalize: false,
+        }),
+    )
+    .await?
+    .into_inner();
+    drop(router);
+    for (shard, handle) in original_nodes.into_iter().zip(original_handles) {
+        stop_shard(shard, handle).await?;
+    }
+
+    let wrong_shard_path = data_volume.path().join("wrong-shard");
+    restore_checkpoint(
+        std::path::Path::new(&generation_a.paths[0]),
+        &wrong_shard_path,
+    )?;
+    let wrong_shard_error = match ShardNode::new_with_storage_paths(
+        1,
+        config(),
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(wrong_shard_path),
+        Some(backup_roots[1].clone()),
+        false,
+        None,
+    ) {
+        Ok(_) => anyhow::bail!("shard accepted a checkpoint belonging to another shard"),
+        Err(error) => error,
+    };
+    assert!(wrong_shard_error
+        .to_string()
+        .contains("restored checkpoint belongs to shard 0, not configured shard 1"));
+
+    restore_checkpoint_for_shard(
+        std::path::Path::new(&generation_a.paths[0]),
+        &replacement_paths[0],
+        Some(0),
+    )?;
+    let (restored_addr, restored_node, restored_handle) = spawn_shard(
+        0,
+        replacement_paths[0].clone(),
+        backup_roots[0].clone(),
+        config(),
+    )
+    .await?;
+    let (live_addr, live_node, live_handle) = spawn_shard(
+        1,
+        original_paths[1].clone(),
+        backup_roots[1].clone(),
+        config(),
+    )
+    .await?;
+    let partial_error = match RouterNode::connect(
+        vec![
+            format!("http://{restored_addr}"),
+            format!("http://{live_addr}"),
+        ],
+        config(),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("router accepted a mix of restored and unrestored volumes"),
+        Err(error) => error,
+    };
+    assert_eq!(partial_error.code(), tonic::Code::FailedPrecondition);
+    assert!(partial_error.message().contains("restored and unrestored"));
+    stop_shard(restored_node, restored_handle).await?;
+    stop_shard(live_node, live_handle).await?;
+
+    restore_checkpoint_for_shard(
+        std::path::Path::new(&generation_b.paths[1]),
+        &replacement_paths[1],
+        Some(1),
+    )?;
+    let (generation_a_addr, generation_a_node, generation_a_handle) = spawn_shard(
+        0,
+        replacement_paths[0].clone(),
+        backup_roots[0].clone(),
+        config(),
+    )
+    .await?;
+    let (generation_b_addr, generation_b_node, generation_b_handle) = spawn_shard(
+        1,
+        replacement_paths[1].clone(),
+        backup_roots[1].clone(),
+        config(),
+    )
+    .await?;
+    let mixed_error = match RouterNode::connect(
+        vec![
+            format!("http://{generation_a_addr}"),
+            format!("http://{generation_b_addr}"),
+        ],
+        config(),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("router accepted shards restored from different generations"),
+        Err(error) => error,
+    };
+    assert_eq!(mixed_error.code(), tonic::Code::FailedPrecondition);
+    assert!(mixed_error
+        .message()
+        .contains("different checkpoint generations"));
+
+    stop_shard(generation_a_node, generation_a_handle).await?;
+    stop_shard(generation_b_node, generation_b_handle).await?;
     Ok(())
 }
 

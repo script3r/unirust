@@ -90,7 +90,7 @@ async fn shard_stream_ingest_accepts_chunks() -> anyhow::Result<()> {
     });
 
     tx.send(IngestRecordsChunk {
-        internal_protocol_version: 2,
+        internal_protocol_version: 3,
         records: vec![record_input(
             0,
             "person",
@@ -101,7 +101,7 @@ async fn shard_stream_ingest_accepts_chunks() -> anyhow::Result<()> {
     })
     .await?;
     tx.send(IngestRecordsChunk {
-        internal_protocol_version: 2,
+        internal_protocol_version: 3,
         records: vec![record_input(
             1,
             "person",

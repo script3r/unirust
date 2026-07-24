@@ -374,8 +374,12 @@ and opens both the source and staged copy read-only with RocksDB paranoid checks
 It copies and syncs into a sibling staging directory before publishing the
 replacement with one rename. Restore the whole cluster together; restoring
 only one older shard beside newer peers can violate the cluster snapshot
-boundary. Router startup then verifies the restored topology, ontology, and
-protocol versions before accepting traffic.
+boundary. Each shard retains the committed checkpoint provenance in its
+replacement data directory and refuses a manifest for another shard. Router
+startup requires every shard to be either unrestored or restored from the same
+generation and shard count, then verifies the topology, ontology, and protocol
+versions before accepting traffic. Mixed restored/unrestored volumes and
+different committed generations fail closed.
 
 The built-in scheduler only creates local coordinated checkpoints. Unirust does
 not replicate, encrypt, transfer, retain, or verify off-host backups. Without

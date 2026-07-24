@@ -296,6 +296,29 @@ pub fn read_cluster_checkpoint_manifest(checkpoint: &Path) -> Result<ClusterChec
     Ok(manifest)
 }
 
+/// Return the committed checkpoint provenance copied into a restored RocksDB
+/// data directory. A lone or corrupt marker is a recovery integrity failure,
+/// not an unrestored directory.
+pub(crate) fn read_restored_checkpoint_manifest(
+    data_dir: &Path,
+) -> Result<Option<ClusterCheckpointManifest>> {
+    let prepared = data_dir.join(CHECKPOINT_MANIFEST_FILE);
+    let committed = data_dir.join(CHECKPOINT_COMMITTED_FILE);
+    let marker_exists = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    match (marker_exists(&prepared)?, marker_exists(&committed)?) {
+        (false, false) => Ok(None),
+        (true, true) => read_cluster_checkpoint_manifest(data_dir).map(Some),
+        _ => anyhow::bail!(
+            "restored data directory {} contains incomplete checkpoint provenance",
+            data_dir.display()
+        ),
+    }
+}
+
 /// Restore a RocksDB checkpoint into an empty replacement data directory.
 ///
 /// Copying occurs in a sibling staging directory and is made visible with one
@@ -3427,6 +3450,23 @@ mod tests {
         restore_checkpoint_for_shard(&checkpoint_path, &destination, Some(1))
             .expect_err("checkpoint from another shard must be rejected");
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn restored_data_directory_rejects_incomplete_provenance() {
+        let _guard = lock_persistent_tests();
+        let data_volume = tempdir().unwrap();
+        fs::write(
+            data_volume.path().join(CHECKPOINT_MANIFEST_FILE),
+            b"incomplete",
+        )
+        .unwrap();
+
+        let error = read_restored_checkpoint_manifest(data_volume.path())
+            .expect_err("one restore marker must fail closed");
+        assert!(error
+            .to_string()
+            .contains("incomplete checkpoint provenance"));
     }
 
     #[test]

@@ -143,7 +143,7 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
         .collect();
     let response = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records,
         })
         .await?
@@ -191,7 +191,7 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
 
     let linked_after_restart = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record(
                 128,
                 "process-kill-after-restart".to_string(),
@@ -225,7 +225,7 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
 
         let linked_after_shutdown = client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 2,
+                internal_protocol_version: 3,
                 records: vec![record(
                     129,
                     "graceful-shutdown-after-restart".to_string(),

@@ -277,7 +277,7 @@ async fn shard_recovery_after_restart() -> anyhow::Result<()> {
         .collect();
     client
         .ingest_records(proto::IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records,
         })
         .await?;
@@ -342,7 +342,7 @@ async fn router_handles_partial_shard_availability() -> anyhow::Result<()> {
     );
     let response = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record],
         })
         .await?
@@ -522,7 +522,7 @@ async fn destructive_reset_is_disabled_and_preserves_records_by_default() -> any
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record_input(
                 0,
                 "person",
@@ -602,7 +602,7 @@ async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<(
 
     let ingest_error = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records: vec![record_input(
                 0,
                 "person",
@@ -656,7 +656,7 @@ async fn ingest_operations_complete_before_shutdown() -> anyhow::Result<()> {
 
         let response = client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 2,
+                internal_protocol_version: 3,
                 records,
             })
             .await?
@@ -707,7 +707,7 @@ async fn cluster_stats_reflect_all_shards() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 2,
+            internal_protocol_version: 3,
             records,
         })
         .await?;

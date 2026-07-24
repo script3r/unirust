@@ -264,6 +264,9 @@ message ConfigVersionResponse {
   uint32 source_reservation_backfill_version = 4;
   uint32 source_reservation_shard_count = 5;
   uint32 checkpoint_protocol_version = 6;
+  // Empty/zero for a volume that has never been restored from a checkpoint.
+  string restore_generation = 7;
+  uint32 restore_shard_count = 8;
 }
 
 // --- Durable Source Identity Reservation ---
