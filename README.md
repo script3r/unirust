@@ -309,6 +309,10 @@ directory and, for real volume-loss protection, in a separate failure domain:
 [shard]
 data_dir = "/var/lib/unirust/shard-0"
 backup_dir = "/var/backups/unirust/shard-0"
+
+[router]
+# Select this from the deployment RPO. Zero disables automatic checkpoints.
+checkpoint_interval_secs = 3600
 ```
 
 Trigger checkpoints through the router so router-mediated mutations remain
@@ -329,6 +333,14 @@ every snapshot. The response includes the shared `generation` and
 restored; retrying the same name is idempotent and completes any missing
 prepare or commit steps. Do not call the shard checkpoint RPC directly for a
 production backup.
+
+The router scheduler waits one configured interval before its first checkpoint.
+If a shard fails during prepare or commit, the scheduler retains and retries the
+same immutable generation instead of creating a stream of unrelated partial
+snapshots. Successful and failed generations are emitted to structured logs.
+The container deployment enables hourly checkpoints by default; set
+`UNIRUST_CHECKPOINT_INTERVAL_SECS` explicitly to choose another RPO or `0` to
+disable them.
 
 To recover from lost data volumes, stop the complete cluster and restore every
 shard from the same checkpoint generation into an empty replacement directory:
@@ -352,13 +364,14 @@ only one older shard beside newer peers can violate the cluster snapshot
 boundary. Router startup then verifies the restored topology, ontology, and
 protocol versions before accepting traffic.
 
-Unirust does not schedule, replicate, encrypt, transfer, retain, or verify
-off-host backups. Without storage-layer replication, the recovery point is the
-last completed coordinated checkpoint, so acknowledged writes after it can be
-lost in a volume failure. Production operators must automate checkpoints,
-off-host replication, retention, and periodic restore drills according to their
-RPO and RTO. Process crashes and ordinary restarts remain covered by the synced
-ingest WAL independently of this backup path.
+The built-in scheduler only creates local coordinated checkpoints. Unirust does
+not replicate, encrypt, transfer, retain, or verify off-host backups. Without
+storage-layer replication, the recovery point is the last completed coordinated
+checkpoint, so acknowledged writes after it can be lost in a volume failure.
+Production operators must provide off-host replication, retention, monitoring,
+and periodic restore drills according to their RPO and RTO. Process crashes and
+ordinary restarts remain covered by the synced ingest WAL independently of this
+backup path.
 
 ## Deployment Security
 

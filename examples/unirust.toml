@@ -42,6 +42,8 @@ shards = [
 shard_connect_timeout_secs = 10
 shard_request_timeout_secs = 120
 shard_tcp_keepalive_secs = 30
+# Automatic coordinated checkpoint interval (0 disables)
+# checkpoint_interval_secs = 3600
 
 # Advanced storage tuning (RocksDB)
 # These settings control the underlying storage engine performance.

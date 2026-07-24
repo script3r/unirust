@@ -14,6 +14,7 @@ LOG_DIR="${LOG_DIR:-$ROOT_DIR/cluster_logs}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/.cluster}"
 ONTOLOGY="${ONTOLOGY:-$ROOT_DIR/examples/loadtest-ontology.json}"
 CONFIG_VERSION="${CONFIG_VERSION:-}"
+CHECKPOINT_INTERVAL_SECS="${CHECKPOINT_INTERVAL_SECS:-0}"
 PROFILE="${PROFILE:-high-throughput}"
 REPAIR="${REPAIR:-0}"
 CARGO_FEATURES="${CARGO_FEATURES:-}"
@@ -36,6 +37,7 @@ Environment:
   ONTOLOGY=/path/to/ontology.json
     Default: $ROOT_DIR/examples/loadtest-ontology.json
   CONFIG_VERSION=optional-version-string
+  CHECKPOINT_INTERVAL_SECS=0  Automatic coordinated checkpoint interval (0 disables)
   PROFILE=balanced|low-latency|high-throughput|bulk-ingest|memory-saver|billion-scale
   REPAIR=0|1
   CARGO_FEATURES=comma-separated-cargo-features
@@ -170,6 +172,7 @@ start_cluster() {
   if [[ -n "$CONFIG_VERSION" ]]; then
     router_args+=(--config-version "$CONFIG_VERSION")
   fi
+  router_args+=(--checkpoint-interval-secs "$CHECKPOINT_INTERVAL_SECS")
 
   "$BIN_DIR/unirust_router" "${router_args[@]}" >"$LOG_DIR/router.log" 2>&1 &
   echo $! >"$RUN_DIR/router.pid"

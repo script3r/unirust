@@ -95,6 +95,8 @@ services:
         "shard-0:50061,shard-1:50061,shard-2:50061",
         "--ontology",
         "/etc/unirust/ontology.json",
+        "--checkpoint-interval-secs",
+        "${UNIRUST_CHECKPOINT_INTERVAL_SECS:-3600}",
       ]
     volumes:
       - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro

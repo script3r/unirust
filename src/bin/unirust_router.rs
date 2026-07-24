@@ -34,12 +34,16 @@ OPTIONS:
         --shards-file <F>   Path to file containing shard addresses (one per line)
     -o, --ontology <FILE>   Path to ontology config (JSON)
         --config-version    Config version for compatibility checking
+        --checkpoint-interval-secs <SECONDS>
+                            Automatic coordinated checkpoint interval (0 disables)
     -h, --help              Print help
 
 ENVIRONMENT:
     UNIRUST_CONFIG          Path to config file
     UNIRUST_ROUTER_LISTEN   Listen address
     UNIRUST_ROUTER_SHARDS   Comma-separated shard addresses
+    UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS
+                            Automatic coordinated checkpoint interval
 
 CONFIG FILE (unirust.toml):
     [router]
@@ -111,10 +115,15 @@ async fn main() -> anyhow::Result<()> {
         router_overrides.ontology = Some(ontology.into());
     }
 
+    if let Some(interval) = parse_arg("--checkpoint-interval-secs") {
+        router_overrides.checkpoint_interval_secs = Some(interval.parse()?);
+    }
+
     if router_overrides.listen.is_some()
         || router_overrides.shards.is_some()
         || router_overrides.shards_file.is_some()
         || router_overrides.ontology.is_some()
+        || router_overrides.checkpoint_interval_secs.is_some()
     {
         overrides.router = Some(router_overrides);
     }
@@ -167,6 +176,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?
     };
+    let checkpoint_task = if config.router.checkpoint_interval_secs > 0 {
+        tracing::info!(
+            interval_secs = config.router.checkpoint_interval_secs,
+            "automatic coordinated checkpoints enabled"
+        );
+        Some(
+            router
+                .clone()
+                .start_checkpoint_scheduler(std::time::Duration::from_secs(
+                    config.router.checkpoint_interval_secs,
+                ))?,
+        )
+    } else {
+        None
+    };
 
     println!("Unirust router listening on {}", config.router.listen);
     Server::builder()
@@ -175,6 +199,10 @@ async fn main() -> anyhow::Result<()> {
         ))
         .serve_with_shutdown(config.router.listen, shutdown_signal())
         .await?;
+    if let Some(checkpoint_task) = checkpoint_task {
+        checkpoint_task.abort();
+        let _ = checkpoint_task.await;
+    }
 
     Ok(())
 }

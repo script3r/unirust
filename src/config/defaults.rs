@@ -30,6 +30,10 @@ pub const DEFAULT_SHARD_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// TCP keepalive interval for router-to-shard connections.
 pub const DEFAULT_SHARD_TCP_KEEPALIVE_SECS: u64 = 30;
 
+/// Automatic coordinated checkpoints are disabled until backup storage and an
+/// operator-selected RPO have been configured.
+pub const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 0;
+
 // =============================================================================
 // Storage Defaults (RocksDB)
 // =============================================================================

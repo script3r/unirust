@@ -169,6 +169,8 @@ pub struct RouterConfig {
     pub shard_request_timeout_secs: u64,
     /// TCP keepalive interval for shard connections
     pub shard_tcp_keepalive_secs: u64,
+    /// Interval between automatic coordinated checkpoints (0 disables)
+    pub checkpoint_interval_secs: u64,
 }
 
 impl Default for RouterConfig {
@@ -182,6 +184,7 @@ impl Default for RouterConfig {
             shard_connect_timeout_secs: DEFAULT_SHARD_CONNECT_TIMEOUT_SECS,
             shard_request_timeout_secs: DEFAULT_SHARD_REQUEST_TIMEOUT_SECS,
             shard_tcp_keepalive_secs: DEFAULT_SHARD_TCP_KEEPALIVE_SECS,
+            checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
         }
     }
 }
@@ -276,6 +279,8 @@ pub struct RouterOverrides {
     pub shards_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ontology: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_interval_secs: Option<u64>,
 }
 
 /// Configuration error.
@@ -333,6 +338,10 @@ mod tests {
         assert_eq!(
             config.router.shard_request_timeout_secs,
             DEFAULT_SHARD_REQUEST_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.router.checkpoint_interval_secs,
+            DEFAULT_CHECKPOINT_INTERVAL_SECS
         );
     }
 

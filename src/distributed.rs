@@ -4212,6 +4212,85 @@ impl RouterNode {
         })
     }
 
+    /// Start periodic coordinated checkpoints. A failed two-phase generation is
+    /// retried with the same immutable name until it commits successfully.
+    #[allow(clippy::result_large_err)]
+    pub fn start_checkpoint_scheduler(
+        self: Arc<Self>,
+        checkpoint_interval: Duration,
+    ) -> Result<tokio::task::JoinHandle<()>, Status> {
+        if checkpoint_interval.is_zero() {
+            return Err(Status::invalid_argument(
+                "checkpoint interval must be greater than zero",
+            ));
+        }
+        let start = tokio::time::Instant::now()
+            .checked_add(checkpoint_interval)
+            .ok_or_else(|| Status::invalid_argument("checkpoint interval is too large"))?;
+        let router = Arc::downgrade(&self);
+        Ok(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(start, checkpoint_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut pending_generation = None;
+
+            loop {
+                ticker.tick().await;
+                let Some(router) = router.upgrade() else {
+                    return;
+                };
+                let generation = match pending_generation.clone() {
+                    Some(generation) => generation,
+                    None => {
+                        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                            Ok(timestamp) => timestamp.as_nanos(),
+                            Err(err) => {
+                                tracing::error!(
+                                    error = %err,
+                                    "automatic checkpoint skipped because the system clock is \
+                                     before the Unix epoch"
+                                );
+                                continue;
+                            }
+                        };
+                        let generation = format!("scheduled-{timestamp}");
+                        pending_generation = Some(generation.clone());
+                        generation
+                    }
+                };
+
+                let result =
+                    <RouterNode as proto::router_service_server::RouterService>::checkpoint(
+                        router.as_ref(),
+                        Request::new(proto::CheckpointRequest {
+                            path: generation.clone(),
+                            checkpoint_protocol_version: 0,
+                            shard_count: 0,
+                            finalize: false,
+                        }),
+                    )
+                    .await;
+                match result {
+                    Ok(response) => {
+                        let response = response.into_inner();
+                        tracing::info!(
+                            generation = response.generation,
+                            shard_paths = response.paths.len(),
+                            "automatic cluster checkpoint committed"
+                        );
+                        pending_generation = None;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            generation,
+                            "automatic cluster checkpoint failed; the same generation will retry"
+                        );
+                    }
+                }
+            }
+        }))
+    }
+
     async fn run_adaptive_reconciliation_once(&self) {
         let poll_complete = {
             let _mutation_guard = self.mutation_gate.read().await;

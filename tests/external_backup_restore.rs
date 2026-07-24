@@ -482,3 +482,76 @@ async fn partial_checkpoint_is_not_restorable_and_same_generation_can_retry() ->
     stop_shard(shard1, handle1).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_scheduler_retries_one_generation_until_commit() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let data_volume = TempDir::new()?;
+    let backup_volume = TempDir::new()?;
+    let backup_roots = (0..2)
+        .map(|shard_id| backup_volume.path().join(format!("shard-{shard_id}")))
+        .collect::<Vec<_>>();
+    let (addr0, shard0, handle0) = spawn_shard(
+        0,
+        data_volume.path().join("scheduled-shard-0"),
+        backup_roots[0].clone(),
+        config(),
+    )
+    .await?;
+    let (addr1, shard1, handle1) = spawn_fail_first_checkpoint_shard(
+        1,
+        data_volume.path().join("scheduled-shard-1"),
+        backup_roots[1].clone(),
+        config(),
+    )
+    .await?;
+    let router = RouterNode::connect(
+        vec![format!("http://{addr0}"), format!("http://{addr1}")],
+        config(),
+    )
+    .await?;
+    let scheduler = router
+        .clone()
+        .start_checkpoint_scheduler(Duration::from_millis(50))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let committed_generation = loop {
+        let mut committed_generation = None;
+        if backup_roots[0].is_dir() {
+            for entry in std::fs::read_dir(&backup_roots[0])? {
+                let entry = entry?;
+                let generation = entry.file_name();
+                let other = backup_roots[1].join(&generation);
+                if read_cluster_checkpoint_manifest(&entry.path()).is_ok()
+                    && read_cluster_checkpoint_manifest(&other).is_ok()
+                {
+                    committed_generation = generation.to_str().map(str::to_string);
+                    break;
+                }
+            }
+        }
+        if let Some(generation) = committed_generation {
+            break generation;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("scheduled checkpoint did not commit before the deadline");
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    scheduler.abort();
+    let _ = scheduler.await;
+
+    assert!(committed_generation.starts_with("scheduled-"));
+    let shard0_manifest =
+        read_cluster_checkpoint_manifest(&backup_roots[0].join(&committed_generation))?;
+    let shard1_manifest =
+        read_cluster_checkpoint_manifest(&backup_roots[1].join(&committed_generation))?;
+    assert_eq!(shard0_manifest.generation(), shard1_manifest.generation());
+    assert_eq!(shard0_manifest.shard_count(), 2);
+    assert_eq!(shard1_manifest.shard_count(), 2);
+
+    drop(router);
+    stop_shard(shard0, handle0).await?;
+    stop_shard(shard1, handle1).await?;
+    Ok(())
+}
