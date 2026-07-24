@@ -3247,8 +3247,17 @@ mod tests {
     use crate::{StreamingTuning, Unirust};
     use tempfile::tempdir;
 
+    static PERSISTENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_persistent_tests() -> std::sync::MutexGuard<'static, ()> {
+        PERSISTENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn persistent_store_round_trip() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -3271,6 +3280,7 @@ mod tests {
 
     #[test]
     fn source_reservation_survives_restart_and_rejects_changed_payload() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let identity = RecordIdentity::new(
             "person".to_string(),
@@ -3317,6 +3327,7 @@ mod tests {
 
     #[test]
     fn external_checkpoint_restores_records_and_reservation_state() {
+        let _guard = lock_persistent_tests();
         let data_volume = tempdir().unwrap();
         let backup_volume = tempdir().unwrap();
         let original_path = data_volume.path().join("original");
@@ -3372,6 +3383,7 @@ mod tests {
 
     #[test]
     fn checkpoint_restore_refuses_nonempty_destination() {
+        let _guard = lock_persistent_tests();
         let data_volume = tempdir().unwrap();
         let backup_volume = tempdir().unwrap();
         let source_path = data_volume.path().join("source");
@@ -3396,6 +3408,7 @@ mod tests {
 
     #[test]
     fn checkpoint_restore_rejects_uncommitted_and_wrong_shard_snapshots() {
+        let _guard = lock_persistent_tests();
         let data_volume = tempdir().unwrap();
         let backup_volume = tempdir().unwrap();
         let source_path = data_volume.path().join("source");
@@ -3418,6 +3431,7 @@ mod tests {
 
     #[test]
     fn checkpoint_restore_validates_rocksdb_before_publish() {
+        let _guard = lock_persistent_tests();
         let data_volume = tempdir().unwrap();
         let backup_volume = tempdir().unwrap();
         let source_path = data_volume.path().join("source");
@@ -3438,6 +3452,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checkpoint_restore_rejects_top_level_symlink() {
+        let _guard = lock_persistent_tests();
         use std::os::unix::fs::symlink;
 
         let data_volume = tempdir().unwrap();
@@ -3460,6 +3475,7 @@ mod tests {
 
     #[test]
     fn corrupt_record_read_poison_store_fail_closed() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
         let record_id;
@@ -3497,6 +3513,7 @@ mod tests {
 
     #[test]
     fn staged_batch_deduplicates_source_identity() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -3532,6 +3549,7 @@ mod tests {
 
     #[test]
     fn exhausted_record_id_sequence_survives_restart_without_wrapping() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
         let last_identity = RecordIdentity::new(
@@ -3576,6 +3594,7 @@ mod tests {
 
     #[test]
     fn batch_insert_deduplicates_source_identity() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let mut store = PersistentStore::open(dir.path()).unwrap();
         let identity = RecordIdentity::new(
@@ -3598,6 +3617,7 @@ mod tests {
 
     #[test]
     fn interner_watermark_advances_only_after_commit() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let mut store = PersistentStore::open(dir.path()).unwrap();
         store.interner_mut().intern_attr("email");
@@ -3614,6 +3634,7 @@ mod tests {
 
     #[test]
     fn persistent_store_retains_ontology_and_sequence() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -3660,6 +3681,7 @@ mod tests {
 
     #[test]
     fn reset_clears_all_persistent_resolution_state() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let mut store = PersistentStore::open(dir.path()).unwrap();
         store.save_ontology_config(b"retained-config").unwrap();
@@ -3682,6 +3704,7 @@ mod tests {
 
     #[test]
     fn persistent_store_preserves_conflict_results() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -3735,6 +3758,7 @@ mod tests {
 
     #[test]
     fn persistent_store_query_after_restart() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 

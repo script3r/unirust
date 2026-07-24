@@ -30,6 +30,7 @@ COPY benches ./benches
 RUN cargo build --release --locked --features test-support \
     --bin unirust_shard \
     --bin unirust_router \
+    --bin unirust_healthcheck \
     --bin unirust_client \
     --bin unirust_loadtest
 
@@ -39,7 +40,6 @@ FROM debian:bookworm-slim
 # Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -48,6 +48,7 @@ RUN useradd -m -u 1000 unirust
 # Copy binaries
 COPY --from=builder /app/target/release/unirust_shard /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_router /usr/local/bin/
+COPY --from=builder /app/target/release/unirust_healthcheck /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_client /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_loadtest /usr/local/bin/
 

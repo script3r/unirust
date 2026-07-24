@@ -297,6 +297,14 @@ The shard drains active mutations and flushes dirty DSU and authoritative store
 state before exit. Acknowledged ingests are additionally covered by an
 executable-level SIGKILL, restart, SIGTERM, and second-restart integration test.
 
+Use `unirust_healthcheck --shard <URI>` and
+`unirust_healthcheck --router <URI>` for readiness probes. These call the gRPC
+health methods rather than checking only for an open socket. Shard readiness
+requires completed WAL recovery and a healthy persistent store; router
+readiness additionally requires a consistent reconciliation state and a
+successful health response from every configured shard. The provided Compose
+deployment and cluster script use these semantic probes.
+
 Router-to-shard calls are bounded by configurable transport settings under
 `[router]`: `shard_connect_timeout_secs` (10 seconds by default),
 `shard_request_timeout_secs` (120 seconds), and

@@ -48,7 +48,7 @@ EOF
 }
 
 build_bins() {
-  local build_cmd=(cargo build --release --bin unirust_shard --bin unirust_router)
+  local build_cmd=(cargo build --release --bin unirust_shard --bin unirust_router --bin unirust_healthcheck)
   if [[ -n "$CARGO_FEATURES" ]]; then
     build_cmd+=(--features "$CARGO_FEATURES")
   fi
@@ -100,14 +100,14 @@ assert_cluster_stopped() {
   done
 }
 
-wait_for_port() {
-  local host="$1"
-  local port="$2"
+wait_for_health() {
+  local service="$1"
+  local endpoint="$2"
   local timeout_secs="$3"
   local start
   start="$(date +%s)"
   while true; do
-    if (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+    if "$BIN_DIR/unirust_healthcheck" "$service" "$endpoint" >/dev/null 2>&1; then
       return 0
     fi
     if [[ $(( $(date +%s) - start )) -ge "$timeout_secs" ]]; then
@@ -158,8 +158,8 @@ start_cluster() {
   done
 
   for port in "${shard_ports[@]}"; do
-    if ! wait_for_port "127.0.0.1" "$port" "$SHARD_WAIT_SECS"; then
-      echo "Shard on port ${port} failed to start within ${SHARD_WAIT_SECS}s."
+    if ! wait_for_health --shard "http://127.0.0.1:${port}" "$SHARD_WAIT_SECS"; then
+      echo "Shard on port ${port} did not become healthy within ${SHARD_WAIT_SECS}s."
       stop_cluster
       return 1
     fi
@@ -177,8 +177,8 @@ start_cluster() {
   "$BIN_DIR/unirust_router" "${router_args[@]}" >"$LOG_DIR/router.log" 2>&1 &
   echo $! >"$RUN_DIR/router.pid"
 
-  if ! wait_for_port "127.0.0.1" "$ROUTER_PORT" "$SHARD_WAIT_SECS"; then
-    echo "Router on port ${ROUTER_PORT} failed to start within ${SHARD_WAIT_SECS}s."
+  if ! wait_for_health --router "http://127.0.0.1:${ROUTER_PORT}" "$SHARD_WAIT_SECS"; then
+    echo "Router on port ${ROUTER_PORT} did not become healthy within ${SHARD_WAIT_SECS}s."
     stop_cluster
     return 1
   fi
