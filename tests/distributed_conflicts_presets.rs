@@ -272,6 +272,7 @@ async fn distributed_conflict_presets_match_local() -> anyhow::Result<()> {
         if !inputs.is_empty() {
             client
                 .ingest_records(IngestRecordsRequest {
+                    internal_protocol_version: 2,
                     records: inputs.clone(),
                 })
                 .await

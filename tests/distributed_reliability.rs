@@ -30,6 +30,10 @@ use unirust_rs::{StreamingTuning, TuningProfile};
 
 mod support;
 
+// These cases each open one or more RocksDB shards. Serialize them so the test
+// binary also runs under the default macOS per-process file descriptor limit.
+static PERSISTENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone)]
 struct FailSetOntology<S> {
     inner: S,
@@ -238,6 +242,7 @@ fn record_input(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_recovery_after_restart() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let temp_dir = tempdir()?;
     let data_dir = temp_dir.path().join("shard0");
     std::fs::create_dir_all(&data_dir)?;
@@ -271,7 +276,10 @@ async fn shard_recovery_after_restart() -> anyhow::Result<()> {
         })
         .collect();
     client
-        .ingest_records(proto::IngestRecordsRequest { records })
+        .ingest_records(proto::IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records,
+        })
         .await?;
 
     let stats = client.get_stats(StatsRequest {}).await?.into_inner();
@@ -305,6 +313,7 @@ async fn shard_recovery_after_restart() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_handles_partial_shard_availability() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -333,6 +342,7 @@ async fn router_handles_partial_shard_availability() -> anyhow::Result<()> {
     );
     let response = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
             records: vec![record],
         })
         .await?
@@ -357,6 +367,7 @@ async fn router_handles_partial_shard_availability() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconciliation_fails_when_boundary_metadata_is_incomplete() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let (shard0_addr, shutdown_shard0, shard0_handle) =
         spawn_stoppable_shard(0, config.clone()).await?;
@@ -383,6 +394,7 @@ async fn reconciliation_fails_when_boundary_metadata_is_incomplete() -> anyhow::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconciliation_rejects_caller_supplied_boundary_metadata() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let (shard_addr, _shard_handle) = spawn_shard(0, config.clone()).await?;
     let (router_addr, _router_handle) = spawn_router(vec![shard_addr], config).await?;
@@ -401,6 +413,7 @@ async fn reconciliation_rejects_caller_supplied_boundary_metadata() -> anyhow::R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_rejects_misordered_shard_endpoints() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let (shard_addr, _shard_handle) = spawn_shard(1, config.clone()).await?;
 
@@ -414,7 +427,35 @@ async fn router_rejects_misordered_shard_endpoints() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_rejects_shard_count_change_after_initialization() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let config = support::build_iam_config();
+    let (shard0_addr, _shard0_handle) = spawn_shard(0, config.clone()).await?;
+    let _initial_router =
+        RouterNode::connect(vec![format!("http://{shard0_addr}")], config.clone()).await?;
+
+    let (shard1_addr, _shard1_handle) = spawn_shard(1, config.clone()).await?;
+    let error = match RouterNode::connect(
+        vec![
+            format!("http://{shard0_addr}"),
+            format!("http://{shard1_addr}"),
+        ],
+        config,
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("router accepted a shard-count change without relocation"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("topology mismatch"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_requires_at_least_one_shard() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let error = match RouterNode::connect(Vec::new(), support::build_iam_config()).await {
         Ok(_) => anyhow::bail!("router accepted an empty shard list"),
         Err(error) => error,
@@ -426,6 +467,7 @@ async fn router_requires_at_least_one_shard() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_startup_times_out_when_shard_never_responds() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let _hung_peer = tokio::spawn(async move {
@@ -473,12 +515,14 @@ fn shard_id_must_fit_global_cluster_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destructive_reset_is_disabled_and_preserves_records_by_default() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let (shard_addr, _shard_handle) = spawn_shard(0, config).await?;
     let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
 
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
             records: vec![record_input(
                 0,
                 "person",
@@ -504,6 +548,7 @@ async fn destructive_reset_is_disabled_and_preserves_records_by_default() -> any
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_paths_cannot_escape_the_shard_data_directory() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (shard_addr, _shard_handle) = spawn_shard(0, support::build_iam_config()).await?;
     let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
 
@@ -533,6 +578,7 @@ async fn checkpoint_paths_cannot_escape_the_shard_data_directory() -> anyhow::Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let empty = DistributedOntologyConfig::empty();
     let (shard0_addr, _shard0_handle) = spawn_shard(0, empty.clone()).await?;
     let (shard1_addr, _shard1_handle) = spawn_set_ontology_failing_shard(1, empty.clone()).await?;
@@ -550,6 +596,7 @@ async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<(
 
     let ingest_error = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
             records: vec![record_input(
                 0,
                 "person",
@@ -572,6 +619,7 @@ async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingest_operations_complete_before_shutdown() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -601,7 +649,10 @@ async fn ingest_operations_complete_before_shutdown() -> anyhow::Result<()> {
             .collect();
 
         let response = client
-            .ingest_records(IngestRecordsRequest { records })
+            .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: 2,
+                records,
+            })
             .await?
             .into_inner();
 
@@ -618,6 +669,7 @@ async fn ingest_operations_complete_before_shutdown() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_stats_reflect_all_shards() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -648,7 +700,10 @@ async fn cluster_stats_reflect_all_shards() -> anyhow::Result<()> {
         .collect();
 
     client
-        .ingest_records(IngestRecordsRequest { records })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records,
+        })
         .await?;
 
     // Get stats from router
@@ -662,6 +717,7 @@ async fn cluster_stats_reflect_all_shards() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_shard_conflicts_survive_shard_restart() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let temp_dir = tempdir()?;
     let data_dir = temp_dir.path().join("shard0");
     std::fs::create_dir_all(&data_dir)?;

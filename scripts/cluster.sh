@@ -9,6 +9,7 @@ SHARDS="${SHARDS:-3}"
 ROUTER_PORT="${ROUTER_PORT:-50060}"
 SHARD_PORT_BASE="${SHARD_PORT_BASE:-50061}"
 DATA_DIR="${DATA_DIR:-$ROOT_DIR/cluster_data}"
+BACKUP_DIR="${BACKUP_DIR:-$ROOT_DIR/cluster_backups}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/cluster_logs}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/.cluster}"
 ONTOLOGY="${ONTOLOGY:-$ROOT_DIR/examples/loadtest-ontology.json}"
@@ -29,6 +30,7 @@ Environment:
   ROUTER_PORT=50060
   SHARD_PORT_BASE=50061
   DATA_DIR=$ROOT_DIR/cluster_data
+  BACKUP_DIR=$ROOT_DIR/cluster_backups
   LOG_DIR=$ROOT_DIR/cluster_logs
   RUN_DIR=$ROOT_DIR/.cluster
   ONTOLOGY=/path/to/ontology.json
@@ -116,15 +118,17 @@ wait_for_port() {
 start_cluster() {
   assert_cluster_stopped
   build_bins
-  mkdir -p "$DATA_DIR" "$LOG_DIR" "$RUN_DIR"
+  mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$LOG_DIR" "$RUN_DIR"
 
   local shard_list=""
   local shard_ports=()
   for i in $(seq 0 $((SHARDS - 1))); do
     local port=$((SHARD_PORT_BASE + i))
     local shard_dir="$DATA_DIR/shard-$i"
+    local backup_dir="$BACKUP_DIR/shard-$i"
     mkdir -p "$shard_dir"
-    local shard_args=(--listen "127.0.0.1:${port}" --shard-id "$i" --data-dir "$shard_dir")
+    mkdir -p "$backup_dir"
+    local shard_args=(--listen "127.0.0.1:${port}" --shard-id "$i" --data-dir "$shard_dir" --backup-dir "$backup_dir")
     if [[ -n "$ONTOLOGY" ]]; then
       shard_args+=(--ontology "$ONTOLOGY")
     fi

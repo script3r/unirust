@@ -118,6 +118,7 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
             records: vec![record],
         })
         .await?;

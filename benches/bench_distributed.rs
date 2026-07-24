@@ -434,7 +434,10 @@ fn bench_shardnode_ingest(c: &mut Criterion) {
             |(rt, shard, records)| {
                 let response = rt.block_on(async {
                     shard
-                        .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
+                        .ingest_records(Request::new(proto::IngestRecordsRequest {
+                            internal_protocol_version: 2,
+                            records,
+                        }))
                         .await
                         .expect("ingest")
                 });
@@ -485,6 +488,7 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
                         let batch = records[offset..end].to_vec();
                         let resp = shard
                             .ingest_records(Request::new(proto::IngestRecordsRequest {
+                                internal_protocol_version: 2,
                                 records: batch,
                             }))
                             .await

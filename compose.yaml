@@ -23,9 +23,10 @@ services:
       dockerfile: Containerfile
     volumes:
       - shard-0-data:/data
+      - shard-0-backup:/backup
       - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     command:
-      ["shard", "--shard-id", "0", "--data-dir", "/data", "--ontology", "/etc/unirust/ontology.json"]
+      ["shard", "--shard-id", "0", "--data-dir", "/data", "--backup-dir", "/backup", "--ontology", "/etc/unirust/ontology.json"]
     environment:
       UNIRUST_PROFILE: high-throughput
     networks:
@@ -43,9 +44,10 @@ services:
       context: .
       dockerfile: Containerfile
     command:
-      ["shard", "--shard-id", "1", "--data-dir", "/data", "--ontology", "/etc/unirust/ontology.json"]
+      ["shard", "--shard-id", "1", "--data-dir", "/data", "--backup-dir", "/backup", "--ontology", "/etc/unirust/ontology.json"]
     volumes:
       - shard-1-data:/data
+      - shard-1-backup:/backup
       - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     environment:
       UNIRUST_PROFILE: high-throughput
@@ -64,9 +66,10 @@ services:
       context: .
       dockerfile: Containerfile
     command:
-      ["shard", "--shard-id", "2", "--data-dir", "/data", "--ontology", "/etc/unirust/ontology.json"]
+      ["shard", "--shard-id", "2", "--data-dir", "/data", "--backup-dir", "/backup", "--ontology", "/etc/unirust/ontology.json"]
     volumes:
       - shard-2-data:/data
+      - shard-2-backup:/backup
       - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     environment:
       UNIRUST_PROFILE: high-throughput
@@ -135,5 +138,8 @@ networks:
 
 volumes:
   shard-0-data:
+  shard-0-backup:
   shard-1-data:
+  shard-1-backup:
   shard-2-data:
+  shard-2-backup:

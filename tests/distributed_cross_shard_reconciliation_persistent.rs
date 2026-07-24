@@ -2,27 +2,77 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::codegen::{http, Service};
+use tonic::server::NamedService;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
     ApplyOntologyRequest, IngestRecordsRequest, RecordDescriptor, RecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::{
-    DistributedOntologyConfig, IdentityKeyConfig, RouterNode, ShardNode,
+    hash_record_to_shard, hash_source_identity_to_shard, DistributedOntologyConfig,
+    IdentityKeyConfig, RouterNode, ShardNode,
 };
 use unirust_rs::{StreamingTuning, TuningProfile};
 
 mod support;
 
+// Each case opens multiple RocksDB instances with many column families. Running
+// them concurrently exceeds the default macOS per-process file descriptor limit.
+static PERSISTENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct SpawnedShard {
     addr: SocketAddr,
     _handle: JoinHandle<()>,
     _data_dir: TempDir,
+}
+
+#[derive(Clone)]
+struct FailIngest<S> {
+    inner: S,
+}
+
+impl<S, B> Service<http::Request<B>> for FailIngest<S>
+where
+    S: Service<
+            http::Request<B>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + Send,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/unirust.ShardService/IngestRecords" {
+            return Box::pin(async {
+                Ok(tonic::Status::unavailable("injected target ingest failure").into_http())
+            });
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
+impl<S> NamedService for FailIngest<S>
+where
+    S: NamedService,
+{
+    const NAME: &'static str = S::NAME;
 }
 
 async fn spawn_shard_persistent(
@@ -78,6 +128,33 @@ async fn spawn_shard_at(
             .add_service(proto::shard_service_server::ShardServiceServer::new(
                 service_shard,
             ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, shard, handle))
+}
+
+async fn spawn_ingest_failing_shard_at(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+    data_path: PathBuf,
+) -> anyhow::Result<(SocketAddr, ShardNode, JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_path),
+        false,
+        None,
+    )?;
+    let service_shard = shard.clone();
+    let service = proto::shard_service_server::ShardServiceServer::new(service_shard);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FailIngest { inner: service })
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("shard server");
@@ -151,6 +228,7 @@ fn build_email_config() -> DistributedOntologyConfig {
 /// Ensure cross-shard merges occur with persistent stores.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = build_email_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -193,6 +271,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -219,6 +298,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -241,6 +321,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_shard_singleton_merge_survives_full_restart() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let root = tempfile::tempdir()?;
     let config = build_email_config();
     let data_paths = (0..3)
@@ -267,6 +348,7 @@ async fn three_shard_singleton_merge_survives_full_restart() -> anyhow::Result<(
         let mut shard_client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
         shard_client
             .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: 2,
                 records: vec![record_input(
                     shard_id as u32,
                     "person",
@@ -318,6 +400,351 @@ async fn three_shard_singleton_merge_survives_full_restart() -> anyhow::Result<(
     assert_eq!(query_match_count(&mut router_client).await?, 1);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_identity_reservation_survives_routing_change_and_restart() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let data_paths = (0..2)
+        .map(|shard_id| root.path().join(format!("source-reservation-{shard_id}")))
+        .collect::<Vec<_>>();
+    for path in &data_paths {
+        std::fs::create_dir_all(path)?;
+    }
+
+    let mut original = record_input(
+        0,
+        "person",
+        "crm",
+        "immutable-source",
+        vec![("email", "route-original@example.com", 0, 100)],
+    );
+    let original_target = hash_record_to_shard(&config, &original, 2);
+    let mut changed = None;
+    for candidate in 0..1_000 {
+        let record = record_input(
+            0,
+            "person",
+            "crm",
+            "immutable-source",
+            vec![(
+                "email",
+                &format!("route-changed-{candidate}@example.com"),
+                0,
+                100,
+            )],
+        );
+        if hash_record_to_shard(&config, &record, 2) != original_target {
+            changed = Some(record);
+            break;
+        }
+    }
+    let changed = changed.expect("test must find a payload routed to the other shard");
+
+    let mut shard_nodes = Vec::new();
+    let mut shard_handles = Vec::new();
+    let mut shard_addrs = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) =
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?;
+        shard_addrs.push(addr);
+        shard_nodes.push(shard);
+        shard_handles.push(handle);
+    }
+    let (router_addr, router_handle) = spawn_router(shard_addrs.clone(), config.clone()).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    let response = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![original.clone()],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.assignments.len(), 1);
+    assert_eq!(response.assignments[0].shard_id as usize, original_target);
+
+    let error = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![changed.clone()],
+        })
+        .await
+        .expect_err("a routing change must not evade immutable source identity");
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(cluster_record_count(&shard_addrs).await?, 1);
+
+    drop(router_client);
+    router_handle.abort();
+    let _ = router_handle.await;
+    for shard in &shard_nodes {
+        shard.shutdown().await?;
+    }
+    for handle in shard_handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(shard_nodes);
+    sleep(Duration::from_millis(100)).await;
+
+    let mut restarted_nodes = Vec::new();
+    let mut restarted_handles = Vec::new();
+    let mut restarted_addrs = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) =
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?;
+        restarted_addrs.push(addr);
+        restarted_nodes.push(shard);
+        restarted_handles.push(handle);
+    }
+    let (router_addr, _router_handle) =
+        spawn_router(restarted_addrs.clone(), config.clone()).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    let error = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![changed],
+        })
+        .await
+        .expect_err("the source reservation must survive a full cluster restart");
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+    original.index = 1;
+    let retry = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![original],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(retry.assignments.len(), 1);
+    assert_eq!(retry.assignments[0].shard_id as usize, original_target);
+    assert_eq!(cluster_record_count(&restarted_addrs).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_backfills_legacy_records_before_serving_ingest() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let data_paths = (0..2)
+        .map(|shard_id| root.path().join(format!("legacy-reservation-{shard_id}")))
+        .collect::<Vec<_>>();
+    for path in &data_paths {
+        std::fs::create_dir_all(path)?;
+    }
+
+    let original = record_input(
+        0,
+        "person",
+        "crm",
+        "legacy-source",
+        vec![("email", "legacy-original@example.com", 0, 100)],
+    );
+    let original_target = hash_record_to_shard(&config, &original, 2);
+    let mut changed = None;
+    for candidate in 0..1_000 {
+        let record = record_input(
+            0,
+            "person",
+            "crm",
+            "legacy-source",
+            vec![(
+                "email",
+                &format!("legacy-changed-{candidate}@example.com"),
+                0,
+                100,
+            )],
+        );
+        if hash_record_to_shard(&config, &record, 2) != original_target {
+            changed = Some(record);
+            break;
+        }
+    }
+    let changed = changed.expect("test must find a changed payload routed elsewhere");
+
+    let mut shard_addrs = Vec::new();
+    let mut _shard_nodes = Vec::new();
+    let mut _shard_handles = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) =
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?;
+        shard_addrs.push(addr);
+        _shard_nodes.push(shard);
+        _shard_handles.push(handle);
+    }
+
+    let mut original_target_client =
+        ShardServiceClient::connect(format!("http://{}", shard_addrs[original_target])).await?;
+    let status_before = original_target_client
+        .get_config_version(proto::ConfigVersionRequest {})
+        .await?
+        .into_inner();
+    assert_eq!(status_before.source_reservation_backfill_version, 0);
+    original_target_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![original],
+        })
+        .await?;
+
+    let (router_addr, _router_handle) = spawn_router(shard_addrs.clone(), config.clone()).await?;
+    for shard_addr in &shard_addrs {
+        let mut shard_client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+        let status = shard_client
+            .get_config_version(proto::ConfigVersionRequest {})
+            .await?
+            .into_inner();
+        assert_eq!(status.source_reservation_backfill_version, 2);
+        assert_eq!(status.source_reservation_shard_count, 2);
+    }
+
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+    let error = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![changed],
+        })
+        .await
+        .expect_err("backfilled legacy source identity must reject a changed payload");
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(cluster_record_count(&shard_addrs).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let data_paths = (0..2)
+        .map(|shard_id| root.path().join(format!("partial-reservation-{shard_id}")))
+        .collect::<Vec<_>>();
+    for path in &data_paths {
+        std::fs::create_dir_all(path)?;
+    }
+
+    let mut selected = None;
+    for candidate in 0..1_000 {
+        let record = record_input(
+            0,
+            "person",
+            "crm",
+            &format!("partial-source-{candidate}"),
+            vec![(
+                "email",
+                &format!("partial-route-{candidate}@example.com"),
+                0,
+                100,
+            )],
+        );
+        let identity = record.identity.as_ref().unwrap();
+        let owner = hash_source_identity_to_shard(identity, 2);
+        let target = hash_record_to_shard(&config, &record, 2);
+        if owner != target {
+            selected = Some((record, owner, target));
+            break;
+        }
+    }
+    let (mut record, _owner, target) =
+        selected.expect("test must find distinct reservation owner and ingest target");
+
+    let mut shard_nodes = Vec::new();
+    let mut shard_handles = Vec::new();
+    let mut shard_addrs = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) = if shard_id == target {
+            spawn_ingest_failing_shard_at(shard_id as u32, config.clone(), path.clone()).await?
+        } else {
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?
+        };
+        shard_addrs.push(addr);
+        shard_nodes.push(shard);
+        shard_handles.push(handle);
+    }
+    let (router_addr, router_handle) = spawn_router(shard_addrs, config.clone()).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+
+    let error = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![record.clone()],
+        })
+        .await
+        .expect_err("ingest must fail while its target shard is unavailable");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+
+    drop(router_client);
+    router_handle.abort();
+    let _ = router_handle.await;
+    for shard in &shard_nodes {
+        shard.shutdown().await?;
+    }
+    for handle in shard_handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(shard_nodes);
+    sleep(Duration::from_millis(100)).await;
+
+    let mut restarted_nodes = Vec::new();
+    let mut restarted_handles = Vec::new();
+    let mut restarted_addrs = Vec::new();
+    for (shard_id, path) in data_paths.iter().enumerate() {
+        let (addr, shard, handle) =
+            spawn_shard_at(shard_id as u32, config.clone(), path.clone()).await?;
+        restarted_addrs.push(addr);
+        restarted_nodes.push(shard);
+        restarted_handles.push(handle);
+    }
+    let (router_addr, _router_handle) =
+        spawn_router(restarted_addrs.clone(), config.clone()).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
+    assert_eq!(cluster_record_count(&restarted_addrs).await?, 0);
+
+    record.index = 1;
+    let retry = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![record.clone()],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(retry.assignments.len(), 1);
+    assert_eq!(retry.assignments[0].shard_id as usize, target);
+    assert_eq!(cluster_record_count(&restarted_addrs).await?, 1);
+
+    let mut changed = record;
+    changed.descriptors[0].value = "changed-after-partial-failure@example.com".to_string();
+    let error = router_client
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![changed],
+        })
+        .await
+        .expect_err("the durable pre-ingest reservation must reject a changed payload");
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+    Ok(())
+}
+
+async fn cluster_record_count(shard_addrs: &[SocketAddr]) -> anyhow::Result<u64> {
+    let mut total = 0;
+    for shard_addr in shard_addrs {
+        let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+        total += client
+            .get_stats(proto::StatsRequest {})
+            .await?
+            .into_inner()
+            .record_count;
+    }
+    Ok(total)
 }
 
 async fn query_match_count(

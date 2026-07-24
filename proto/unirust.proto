@@ -33,6 +33,7 @@ message RecordInput {
 
 message IngestRecordsRequest {
   repeated RecordInput records = 1;
+  uint32 internal_protocol_version = 2;  // Router-to-shard only; clients leave this unset.
 }
 
 message IngestAssignment {
@@ -259,7 +260,39 @@ message ConfigVersionRequest {}
 message ConfigVersionResponse {
   string version = 1;
   OntologyConfig ontology_config = 2;
+  uint32 protocol_version = 3;
+  uint32 source_reservation_backfill_version = 4;
+  uint32 source_reservation_shard_count = 5;
 }
+
+// --- Durable Source Identity Reservation ---
+
+message SourceRecordReservation {
+  uint32 index = 1;
+  RecordIdentity identity = 2;
+  bytes payload_digest = 3;
+  uint32 target_shard_id = 4;
+}
+
+message ReserveSourceRecordsRequest {
+  repeated SourceRecordReservation reservations = 1;
+}
+
+message SourceRecordReservationResult {
+  uint32 index = 1;
+  uint32 target_shard_id = 2;
+}
+
+message ReserveSourceRecordsResponse {
+  repeated SourceRecordReservationResult reservations = 1;
+}
+
+message MarkSourceReservationsBackfilledRequest {
+  uint32 protocol_version = 1;
+  uint32 shard_count = 2;
+}
+
+message MarkSourceReservationsBackfilledResponse {}
 
 // --- Checkpoint ---
 
@@ -337,10 +370,12 @@ message ExportRecordsChunk {
 
 message ImportRecordsRequest {
   repeated RecordSnapshot records = 1;
+  uint32 internal_protocol_version = 2;
 }
 
 message ImportRecordsChunk {
   repeated RecordSnapshot records = 1;
+  uint32 internal_protocol_version = 2;
 }
 
 message ImportRecordsResponse {
@@ -493,6 +528,7 @@ message StoreCrossShardConflictsResponse {
 
 message IngestRecordsChunk {
   repeated RecordInput records = 1;
+  uint32 internal_protocol_version = 2;
 }
 
 // =============================================================================
@@ -505,6 +541,8 @@ service ShardService {
   rpc SetOntology(ApplyOntologyRequest) returns (ApplyOntologyResponse);
 
   // Core operations
+  rpc ReserveSourceRecords(ReserveSourceRecordsRequest) returns (ReserveSourceRecordsResponse);
+  rpc MarkSourceReservationsBackfilled(MarkSourceReservationsBackfilledRequest) returns (MarkSourceReservationsBackfilledResponse);
   rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
   rpc IngestRecordsStream(stream IngestRecordsChunk) returns (IngestRecordsResponse);
   rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);

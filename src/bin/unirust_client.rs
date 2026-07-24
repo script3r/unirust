@@ -80,7 +80,10 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     let response = client
-        .ingest_records(IngestRecordsRequest { records })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 0,
+            records,
+        })
         .await?
         .into_inner();
     println!("Assignments: {:?}", response.assignments);

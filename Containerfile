@@ -51,8 +51,8 @@ COPY --from=builder /app/target/release/unirust_router /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_client /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_loadtest /usr/local/bin/
 
-# Create data directory
-RUN mkdir -p /data && chown unirust:unirust /data
+# Create persistent data and checkpoint mount points
+RUN mkdir -p /data /backup && chown unirust:unirust /data /backup
 
 WORKDIR /app
 USER unirust

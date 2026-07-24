@@ -20,6 +20,26 @@ pub struct StoreMetrics {
     pub block_cache_usage_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRecordReservation {
+    pub identity: RecordIdentity,
+    pub payload_digest: [u8; 32],
+    pub target_shard_id: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceReservationError {
+    #[error("source record identity is already reserved for a different payload")]
+    PayloadConflict,
+    #[error(
+        "source record identity is already assigned to shard {existing_shard}, not shard {requested_shard}"
+    )]
+    TargetConflict {
+        existing_shard: u32,
+        requested_shard: u32,
+    },
+}
+
 /// Persistence abstraction for records and metadata.
 pub trait RecordStore: Send + Sync {
     /// Fail if the store observed an I/O or decode error that made a prior read incomplete.
@@ -266,6 +286,31 @@ pub trait RecordStore: Send + Sync {
         Ok(())
     }
 
+    /// Atomically reserve immutable source identities before distributed ingest.
+    ///
+    /// The returned target shard IDs correspond to the input order. Persistent
+    /// implementations must make newly created reservations durable before returning.
+    fn reserve_source_records(
+        &mut self,
+        _reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        anyhow::bail!("source record reservations are not supported by this record store")
+    }
+
+    /// Return the completed source-reservation migration protocol and shard count.
+    fn source_reservation_backfill(&self) -> Result<Option<(u32, u32)>> {
+        Ok(None)
+    }
+
+    /// Durably mark all records currently stored on this shard as reserved.
+    fn mark_source_reservation_backfill(
+        &mut self,
+        _protocol_version: u32,
+        _shard_count: u32,
+    ) -> Result<()> {
+        anyhow::bail!("source reservation migration markers are not supported by this record store")
+    }
+
     /// Optional store-level metrics.
     fn metrics(&self) -> Option<StoreMetrics> {
         None
@@ -285,6 +330,10 @@ pub struct Store {
     records: HashMap<RecordId, Record>,
     /// Identity to record ID mapping (idempotent ingest)
     identity_index: HashMap<RecordIdentity, RecordId>,
+    /// Cluster-wide immutable source identities owned by this shard.
+    source_reservations: HashMap<RecordIdentity, ([u8; 32], u32)>,
+    /// Completed distributed reservation migration version and topology size.
+    source_reservation_backfill: Option<(u32, u32)>,
     /// String interner for attributes and values
     interner: StringInterner,
     /// Attribute-value index for fast lookups
@@ -336,6 +385,8 @@ impl Store {
         Self {
             records: HashMap::new(),
             identity_index: HashMap::new(),
+            source_reservations: HashMap::new(),
+            source_reservation_backfill: None,
             interner: StringInterner::new(),
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
@@ -348,6 +399,8 @@ impl Store {
         Self {
             records: HashMap::new(),
             identity_index: HashMap::new(),
+            source_reservations: HashMap::new(),
+            source_reservation_backfill: None,
             interner,
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
@@ -459,6 +512,52 @@ impl Store {
         }
         let id = self.add_record(record)?;
         Ok((id, true))
+    }
+
+    fn reserve_source_records(
+        &mut self,
+        reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        let mut pending = HashMap::with_capacity(reservations.len());
+        let mut targets = Vec::with_capacity(reservations.len());
+
+        for reservation in reservations {
+            let existing = self
+                .source_reservations
+                .get(&reservation.identity)
+                .copied()
+                .or_else(|| pending.get(&reservation.identity).copied());
+            if let Some((payload_digest, target_shard_id)) = existing {
+                if payload_digest != reservation.payload_digest {
+                    return Err(SourceReservationError::PayloadConflict.into());
+                }
+                if target_shard_id != reservation.target_shard_id {
+                    return Err(SourceReservationError::TargetConflict {
+                        existing_shard: target_shard_id,
+                        requested_shard: reservation.target_shard_id,
+                    }
+                    .into());
+                }
+                targets.push(target_shard_id);
+            } else {
+                pending.insert(
+                    reservation.identity.clone(),
+                    (reservation.payload_digest, reservation.target_shard_id),
+                );
+                targets.push(reservation.target_shard_id);
+            }
+        }
+
+        self.source_reservations.extend(pending);
+        Ok(targets)
+    }
+
+    fn source_reservation_backfill(&self) -> Option<(u32, u32)> {
+        self.source_reservation_backfill
+    }
+
+    fn mark_source_reservation_backfill(&mut self, protocol_version: u32, shard_count: u32) {
+        self.source_reservation_backfill = Some((protocol_version, shard_count));
     }
 
     /// Add a record without re-interning. Used when records are pre-interned
@@ -746,6 +845,26 @@ impl RecordStore for Store {
 
     fn metrics(&self) -> Option<StoreMetrics> {
         Some(self.store_metrics())
+    }
+
+    fn reserve_source_records(
+        &mut self,
+        reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        Store::reserve_source_records(self, reservations)
+    }
+
+    fn source_reservation_backfill(&self) -> Result<Option<(u32, u32)>> {
+        Ok(Store::source_reservation_backfill(self))
+    }
+
+    fn mark_source_reservation_backfill(
+        &mut self,
+        protocol_version: u32,
+        shard_count: u32,
+    ) -> Result<()> {
+        Store::mark_source_reservation_backfill(self, protocol_version, shard_count);
+        Ok(())
     }
 
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
@@ -1046,6 +1165,61 @@ mod tests {
         assert!(!inserted);
         assert_eq!(first_id, second_id);
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn source_reservations_are_atomic_and_immutable() {
+        let mut store = Store::new();
+        let identity_a =
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "a".to_string());
+        let identity_b =
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "b".to_string());
+        let reservation_a = SourceRecordReservation {
+            identity: identity_a.clone(),
+            payload_digest: [1; 32],
+            target_shard_id: 2,
+        };
+
+        assert_eq!(
+            store
+                .reserve_source_records(std::slice::from_ref(&reservation_a))
+                .unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            store
+                .reserve_source_records(std::slice::from_ref(&reservation_a))
+                .unwrap(),
+            vec![2]
+        );
+
+        let error = store
+            .reserve_source_records(&[
+                SourceRecordReservation {
+                    identity: identity_b.clone(),
+                    payload_digest: [2; 32],
+                    target_shard_id: 1,
+                },
+                SourceRecordReservation {
+                    identity: identity_a,
+                    payload_digest: [3; 32],
+                    target_shard_id: 2,
+                },
+            ])
+            .expect_err("a conflicting batch must fail atomically");
+        assert!(error.downcast_ref::<SourceReservationError>().is_some());
+
+        assert_eq!(
+            store
+                .reserve_source_records(&[SourceRecordReservation {
+                    identity: identity_b,
+                    payload_digest: [4; 32],
+                    target_shard_id: 0,
+                }])
+                .unwrap(),
+            vec![0],
+            "the first item from the rejected batch must not be retained"
+        );
     }
 
     #[test]

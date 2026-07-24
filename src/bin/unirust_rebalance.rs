@@ -83,6 +83,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if router.is_none() {
+        anyhow::bail!(
+            "--router is required for imports; direct shard-to-shard copies bypass durable source \
+             reservations and are not a safe rebalance operation"
+        );
+    }
+
     let source = parse_arg("--source").ok_or_else(|| anyhow::anyhow!("--source is required"))?;
     let target = parse_arg("--target").ok_or_else(|| anyhow::anyhow!("--target is required"))?;
     let start_id: u32 = parse_arg("--start-id")
@@ -197,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             let count = chunk.records.len() as u64;
             tx.send(ImportRecordsChunk {
                 records: chunk.records,
+                internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             })
             .await
             .map_err(|_| anyhow::anyhow!("import stream closed"))?;
@@ -253,6 +261,8 @@ async fn main() -> anyhow::Result<()> {
                     .expect("target client")
                     .import_records(ImportRecordsRequest {
                         records: response.records,
+                        internal_protocol_version:
+                            unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                     })
                     .await?
                     .into_inner()

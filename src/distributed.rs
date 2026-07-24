@@ -7,7 +7,7 @@ use crate::perf::ConcurrentInterner;
 use crate::persistence::PersistentOpenOptions;
 use crate::query::{QueryDescriptor, QueryOutcome};
 use crate::sharding::{BloomFilter, IdentityKeySignature};
-use crate::store::StoreMetrics;
+use crate::store::{SourceRecordReservation, SourceReservationError, StoreMetrics};
 use crate::temporal::Interval;
 use crate::{PersistentStore, StreamingTuning, Unirust};
 use anyhow::Result as AnyResult;
@@ -63,6 +63,20 @@ struct IngestWal {
 const INGEST_WAL_MAGIC: &[u8; 8] = b"UNIRWAL\0";
 const INGEST_WAL_VERSION: u32 = 1;
 const INGEST_WAL_HEADER_LEN: usize = 24;
+pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 2;
+
+#[allow(clippy::result_large_err)]
+fn validate_distributed_protocol(protocol_version: u32) -> Result<(), Status> {
+    if protocol_version == DISTRIBUTED_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "distributed protocol mismatch: router {}, shard {}; deploy one coordinated Unirust \
+             version across the complete cluster",
+            DISTRIBUTED_PROTOCOL_VERSION, protocol_version
+        )))
+    }
+}
 
 fn encode_wal_batch(inputs: &[WalRecordInput]) -> Result<Vec<u8>, Status> {
     let body = bincode::serialize(inputs).map_err(|err| Status::internal(err.to_string()))?;
@@ -737,6 +751,62 @@ fn hash_route_component(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+fn source_identity_hash(identity: &proto::RecordIdentity) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"unirust.source-owner.v1");
+    hash_route_component(&mut hasher, &identity.entity_type);
+    hash_route_component(&mut hasher, &identity.perspective);
+    hash_route_component(&mut hasher, &identity.uid);
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest contains eight routing bytes"),
+    )
+}
+
+#[doc(hidden)]
+pub fn hash_source_identity_to_shard(
+    identity: &proto::RecordIdentity,
+    shard_count: usize,
+) -> usize {
+    (source_identity_hash(identity) % shard_count as u64) as usize
+}
+
+fn canonical_record_payload_digest(record: &proto::RecordInput) -> Result<[u8; 32], Status> {
+    let identity = record
+        .identity
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+    let mut descriptors = record
+        .descriptors
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.attr.as_str(),
+                descriptor.value.as_str(),
+                descriptor.start,
+                descriptor.end,
+            )
+        })
+        .collect::<Vec<_>>();
+    descriptors.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"unirust.source-payload.v1");
+    hash_route_component(&mut hasher, &identity.entity_type);
+    hash_route_component(&mut hasher, &identity.perspective);
+    hash_route_component(&mut hasher, &identity.uid);
+    hasher.update((descriptors.len() as u64).to_be_bytes());
+    for (attribute, value, start, end) in descriptors {
+        hash_route_component(&mut hasher, attribute);
+        hash_route_component(&mut hasher, value);
+        hasher.update(start.to_be_bytes());
+        hasher.update(end.to_be_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
 fn hash_record_to_u64(config: &DistributedOntologyConfig, record: &proto::RecordInput) -> u64 {
     let identity = record.identity.as_ref();
     let mut descriptors_by_attr: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -954,6 +1024,7 @@ pub struct ShardNode {
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
     data_dir: Option<PathBuf>,
+    checkpoint_root: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_wal_lock: Arc<Mutex<()>>,
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
@@ -1028,6 +1099,29 @@ impl ShardNode {
         repair_on_start: bool,
         config_version: Option<String>,
     ) -> AnyResult<Self> {
+        Self::new_with_storage_paths(
+            shard_id,
+            ontology_config,
+            tuning,
+            data_dir,
+            None,
+            repair_on_start,
+            config_version,
+        )
+    }
+
+    pub fn new_with_storage_paths(
+        shard_id: u32,
+        ontology_config: DistributedOntologyConfig,
+        tuning: StreamingTuning,
+        data_dir: Option<PathBuf>,
+        checkpoint_root: Option<PathBuf>,
+        repair_on_start: bool,
+        config_version: Option<String>,
+    ) -> AnyResult<Self> {
+        if data_dir.is_none() && checkpoint_root.is_some() {
+            anyhow::bail!("checkpoint root requires persistent shard storage");
+        }
         let shard_id_u16 = u16::try_from(shard_id)
             .map_err(|_| anyhow::anyhow!("shard_id {shard_id} exceeds u16"))?;
         // Set shard_id in tuning and enable boundary tracking for cross-shard reconciliation.
@@ -1068,6 +1162,22 @@ impl ShardNode {
         let concurrent_interner = Arc::new(ConcurrentInterner::new());
 
         if let Some(path) = data_dir.clone() {
+            let checkpoint_root = if let Some(checkpoint_root) = checkpoint_root {
+                fs::create_dir_all(&path)?;
+                fs::create_dir_all(&checkpoint_root)?;
+                let data_path = path.canonicalize()?;
+                let backup_path = checkpoint_root.canonicalize()?;
+                if backup_path.starts_with(&data_path) || data_path.starts_with(&backup_path) {
+                    anyhow::bail!(
+                        "external checkpoint root {} and data directory {} must be disjoint",
+                        backup_path.display(),
+                        data_path.display()
+                    );
+                }
+                backup_path
+            } else {
+                path.join("checkpoints")
+            };
             let (store, config, ontology) =
                 load_persistent_state(&path, ontology_config, repair_on_start)?;
             let ingest_wal = Some(Arc::new(IngestWal::new(&path)));
@@ -1113,6 +1223,7 @@ impl ShardNode {
                 tuning,
                 ontology_config: Arc::new(Mutex::new(config)),
                 data_dir: Some(path),
+                checkpoint_root: Some(checkpoint_root),
                 ingest_wal,
                 ingest_wal_lock: Arc::new(Mutex::new(())),
                 mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1171,6 +1282,7 @@ impl ShardNode {
             tuning,
             ontology_config: Arc::new(Mutex::new(ontology_config)),
             data_dir: None,
+            checkpoint_root: None,
             ingest_wal,
             ingest_wal_lock: Arc::new(Mutex::new(())),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1526,8 +1638,7 @@ impl ShardNode {
 }
 
 #[allow(clippy::result_large_err)]
-fn resolve_checkpoint_path(data_dir: &Path, requested: &str) -> Result<PathBuf, Status> {
-    let checkpoint_root = data_dir.join("checkpoints");
+fn resolve_checkpoint_path(checkpoint_root: &Path, requested: &str) -> Result<PathBuf, Status> {
     if requested.is_empty() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1895,6 +2006,109 @@ impl proto::shard_service_server::ShardService for ShardNode {
     type ExportRecordsStreamStream =
         Pin<Box<dyn Stream<Item = Result<proto::ExportRecordsChunk, Status>> + Send + 'static>>;
 
+    async fn reserve_source_records(
+        &self,
+        request: Request<proto::ReserveSourceRecordsRequest>,
+    ) -> Result<Response<proto::ReserveSourceRecordsResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_store_healthy()?;
+        let request = request.into_inner();
+        let mut reservations = Vec::with_capacity(request.reservations.len());
+        let mut indices = Vec::with_capacity(request.reservations.len());
+
+        for reservation in request.reservations {
+            let identity = reservation
+                .identity
+                .ok_or_else(|| Status::invalid_argument("reservation identity is required"))?;
+            if identity.entity_type.is_empty()
+                || identity.perspective.is_empty()
+                || identity.uid.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "reservation identity fields must not be empty",
+                ));
+            }
+            let payload_digest: [u8; 32] = reservation
+                .payload_digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("payload digest must be 32 bytes"))?;
+            indices.push(reservation.index);
+            reservations.push(SourceRecordReservation {
+                identity: RecordIdentity::new(
+                    identity.entity_type,
+                    identity.perspective,
+                    identity.uid,
+                ),
+                payload_digest,
+                target_shard_id: reservation.target_shard_id,
+            });
+        }
+
+        let targets = {
+            let mut unirust = write_unirust!(self);
+            unirust
+                .store_mut()
+                .reserve_source_records(&reservations)
+                .map_err(|err| {
+                    if let Some(conflict) = err.downcast_ref::<SourceReservationError>() {
+                        match conflict {
+                            SourceReservationError::PayloadConflict => {
+                                Status::already_exists(conflict.to_string())
+                            }
+                            SourceReservationError::TargetConflict { .. } => {
+                                Status::failed_precondition(conflict.to_string())
+                            }
+                        }
+                    } else {
+                        Status::internal(err.to_string())
+                    }
+                })?
+        };
+        let reservations = indices
+            .into_iter()
+            .zip(targets)
+            .map(
+                |(index, target_shard_id)| proto::SourceRecordReservationResult {
+                    index,
+                    target_shard_id,
+                },
+            )
+            .collect();
+        Ok(Response::new(proto::ReserveSourceRecordsResponse {
+            reservations,
+        }))
+    }
+
+    async fn mark_source_reservations_backfilled(
+        &self,
+        request: Request<proto::MarkSourceReservationsBackfilledRequest>,
+    ) -> Result<Response<proto::MarkSourceReservationsBackfilledResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_store_healthy()?;
+        let request = request.into_inner();
+        if request.protocol_version != DISTRIBUTED_PROTOCOL_VERSION {
+            return Err(Status::failed_precondition(format!(
+                "cannot mark source reservations for protocol {}; shard requires {}",
+                request.protocol_version, DISTRIBUTED_PROTOCOL_VERSION
+            )));
+        }
+        if request.shard_count == 0 {
+            return Err(Status::invalid_argument(
+                "source reservation shard count must be greater than zero",
+            ));
+        }
+
+        let mut unirust = write_unirust!(self);
+        unirust
+            .store_mut()
+            .mark_source_reservation_backfill(request.protocol_version, request.shard_count)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(
+            proto::MarkSourceReservationsBackfilledResponse {},
+        ))
+    }
+
     async fn set_ontology(
         &self,
         request: Request<proto::ApplyOntologyRequest>,
@@ -1995,7 +2209,9 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
         let start = Instant::now();
-        let records = request.into_inner().records;
+        let request = request.into_inner();
+        validate_distributed_protocol(request.internal_protocol_version)?;
+        let records = request.records;
         let record_count = records.len();
         let _wal_guard = if self.ingest_wal.is_some() {
             Some(self.ingest_wal_lock.lock().await)
@@ -2046,6 +2262,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             if chunk.records.is_empty() {
                 continue;
             }
+            validate_distributed_protocol(chunk.internal_protocol_version)?;
             record_count += chunk.records.len();
             let _wal_guard = if self.ingest_wal.is_some() {
                 Some(self.ingest_wal_lock.lock().await)
@@ -2265,9 +2482,20 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::ConfigVersionRequest>,
     ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
         let ontology_config = self.ontology_config.lock().await;
+        let source_reservation_backfill = read_unirust!(self)
+            .store()
+            .source_reservation_backfill()
+            .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(proto::ConfigVersionResponse {
             version: self.config_version.clone(),
             ontology_config: Some(to_proto_config(&ontology_config)),
+            protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            source_reservation_backfill_version: source_reservation_backfill
+                .map(|value| value.0)
+                .unwrap_or_default(),
+            source_reservation_shard_count: source_reservation_backfill
+                .map(|value| value.1)
+                .unwrap_or_default(),
         }))
     }
 
@@ -2298,11 +2526,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::CheckpointResponse>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
-        let data_dir = self
-            .data_dir
+        let checkpoint_root = self
+            .checkpoint_root
             .as_ref()
-            .ok_or_else(|| Status::failed_precondition("checkpoint requires --data-dir"))?;
-        let target = resolve_checkpoint_path(data_dir, &request.into_inner().path)?;
+            .ok_or_else(|| Status::failed_precondition("checkpoint requires persistent storage"))?;
+        let target = resolve_checkpoint_path(checkpoint_root, &request.into_inner().path)?;
         fs::create_dir_all(
             target
                 .parent()
@@ -2486,6 +2714,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
+        validate_distributed_protocol(request.internal_protocol_version)?;
         if request.records.is_empty() {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
         }
@@ -2515,6 +2744,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             if chunk.records.is_empty() {
                 continue;
             }
+            validate_distributed_protocol(chunk.internal_protocol_version)?;
             let mut unirust = write_unirust!(self);
             let records = Self::build_import_records(&mut unirust, &chunk.records)?;
             unirust
@@ -3215,6 +3445,9 @@ impl RouterNode {
             shard_clients.push(client);
         }
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
+        let expected_reservation_shard_count = u32::try_from(shard_count)
+            .map_err(|_| Status::invalid_argument("shard count exceeds u32"))?;
+        let mut source_reservation_backfill_required = Vec::with_capacity(shard_count);
         for (expected_shard_id, client) in shard_clients.iter().enumerate() {
             let mut client = client.clone();
             let response = client
@@ -3222,6 +3455,7 @@ impl RouterNode {
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?
                 .into_inner();
+            validate_distributed_protocol(response.protocol_version)?;
             if response.version != config_version {
                 return Err(Status::failed_precondition(format!(
                     "config version mismatch: router {}, shard {}",
@@ -3237,6 +3471,21 @@ impl RouterNode {
                      same ontology used by every shard",
                 ));
             }
+            if response.source_reservation_backfill_version == DISTRIBUTED_PROTOCOL_VERSION
+                && response.source_reservation_shard_count != 0
+                && response.source_reservation_shard_count != expected_reservation_shard_count
+            {
+                return Err(Status::failed_precondition(format!(
+                    "shard topology mismatch: shard was initialized for {} shards, router has {}; \
+                     online shard-count changes are unsupported without an atomic relocation \
+                     protocol",
+                    response.source_reservation_shard_count, expected_reservation_shard_count
+                )));
+            }
+            source_reservation_backfill_required.push(
+                response.source_reservation_backfill_version != DISTRIBUTED_PROTOCOL_VERSION
+                    || response.source_reservation_shard_count != expected_reservation_shard_count,
+            );
             let metadata = client
                 .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
                     since_version: 0,
@@ -3269,6 +3518,10 @@ impl RouterNode {
             cluster_consistent: Arc::new(AtomicBool::new(true)),
             global_conflict_cache: Arc::new(parking_lot::RwLock::new(None)),
         });
+
+        router
+            .backfill_source_reservations(source_reservation_backfill_required)
+            .await?;
 
         // Start adaptive reconciliation without keeping the router alive forever.
         router.clone().start_adaptive_reconciliation();
@@ -3371,6 +3624,243 @@ impl RouterNode {
 
     fn invalidate_global_conflict_cache(&self) {
         *self.global_conflict_cache.write() = None;
+    }
+
+    async fn backfill_source_reservations(&self, required: Vec<bool>) -> Result<(), Status> {
+        let shard_count = self.shard_clients.len();
+        let shard_count_u32 = u32::try_from(shard_count)
+            .map_err(|_| Status::invalid_argument("shard count exceeds u32"))?;
+
+        for (target_shard_id, requires_backfill) in required.into_iter().enumerate() {
+            if !requires_backfill {
+                continue;
+            }
+            let target_shard_id_u32 = u32::try_from(target_shard_id)
+                .map_err(|_| Status::invalid_argument("target shard exceeds u32"))?;
+            let mut target_client = self.shard_clients[target_shard_id].clone();
+            let mut start_id = 0;
+            let mut migrated_records = 0u64;
+
+            loop {
+                let response = target_client
+                    .export_records(Request::new(proto::ExportRecordsRequest {
+                        start_id,
+                        end_id: 0,
+                        limit: 10_000,
+                    }))
+                    .await
+                    .map_err(|err| Status::unavailable(err.to_string()))?
+                    .into_inner();
+                let mut owner_batches = vec![Vec::new(); shard_count];
+                let mut expected_targets = Vec::with_capacity(response.records.len());
+
+                for (position, snapshot) in response.records.into_iter().enumerate() {
+                    let identity = snapshot.identity.ok_or_else(|| {
+                        Status::data_loss("exported record is missing its source identity")
+                    })?;
+                    if identity.entity_type.is_empty()
+                        || identity.perspective.is_empty()
+                        || identity.uid.is_empty()
+                    {
+                        return Err(Status::data_loss(
+                            "exported record has an empty source identity field",
+                        ));
+                    }
+                    let reservation_index = u32::try_from(position).map_err(|_| {
+                        Status::resource_exhausted("reservation migration page exceeds u32 records")
+                    })?;
+                    let record = proto::RecordInput {
+                        index: reservation_index,
+                        identity: Some(identity.clone()),
+                        descriptors: snapshot.descriptors,
+                    };
+                    validate_record_inputs(std::slice::from_ref(&record)).map_err(|err| {
+                        Status::data_loss(format!(
+                            "stored record is invalid during source reservation migration: {}",
+                            err.message()
+                        ))
+                    })?;
+                    let owner_shard_id = hash_source_identity_to_shard(&identity, shard_count);
+                    owner_batches[owner_shard_id].push(proto::SourceRecordReservation {
+                        index: reservation_index,
+                        identity: Some(identity),
+                        payload_digest: canonical_record_payload_digest(&record)?.to_vec(),
+                        target_shard_id: target_shard_id_u32,
+                    });
+                    expected_targets.push(target_shard_id_u32);
+                }
+
+                self.dispatch_source_reservations(owner_batches, &expected_targets)
+                    .await?;
+                migrated_records = migrated_records.saturating_add(expected_targets.len() as u64);
+
+                if !response.has_more {
+                    break;
+                }
+                if response.next_start_id == 0 || response.next_start_id <= start_id {
+                    return Err(Status::data_loss(format!(
+                        "shard {target_shard_id} returned a non-progressing reservation migration \
+                         cursor"
+                    )));
+                }
+                start_id = response.next_start_id;
+            }
+
+            target_client
+                .mark_source_reservations_backfilled(Request::new(
+                    proto::MarkSourceReservationsBackfilledRequest {
+                        protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+                        shard_count: shard_count_u32,
+                    },
+                ))
+                .await?;
+            tracing::info!(
+                target_shard_id,
+                migrated_records,
+                "source reservation migration completed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn reserve_and_partition_source_records(
+        &self,
+        config: &DistributedOntologyConfig,
+        records: Vec<proto::RecordInput>,
+    ) -> Result<Vec<Vec<proto::RecordInput>>, Status> {
+        let shard_count = self.shard_clients.len();
+        let mut owner_batches = vec![Vec::new(); shard_count];
+        let mut expected_targets = Vec::with_capacity(records.len());
+
+        for (position, record) in records.iter().enumerate() {
+            let identity = record
+                .identity
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+            let reservation_index = u32::try_from(position)
+                .map_err(|_| Status::resource_exhausted("ingest batch exceeds u32 records"))?;
+            let target_shard_id = hash_record_to_shard(config, record, shard_count);
+            let target_shard_id = u32::try_from(target_shard_id)
+                .map_err(|_| Status::resource_exhausted("target shard exceeds u32"))?;
+            let owner_shard_id = hash_source_identity_to_shard(identity, shard_count);
+            owner_batches[owner_shard_id].push(proto::SourceRecordReservation {
+                index: reservation_index,
+                identity: Some(identity.clone()),
+                payload_digest: canonical_record_payload_digest(record)?.to_vec(),
+                target_shard_id,
+            });
+            expected_targets.push(target_shard_id);
+        }
+
+        let confirmed_targets = self
+            .dispatch_source_reservations(owner_batches, &expected_targets)
+            .await?;
+
+        let mut shard_batches = vec![Vec::new(); shard_count];
+        for (record, target_shard_id) in records.into_iter().zip(confirmed_targets) {
+            let target_shard_id = target_shard_id as usize;
+            shard_batches[target_shard_id].push(record);
+        }
+        Ok(shard_batches)
+    }
+
+    async fn reserve_source_snapshots_for_target(
+        &self,
+        target_shard_id: u32,
+        snapshots: &[proto::RecordSnapshot],
+    ) -> Result<(), Status> {
+        let shard_count = self.shard_clients.len();
+        if target_shard_id as usize >= shard_count {
+            return Err(Status::invalid_argument("target shard is out of range"));
+        }
+        let mut owner_batches = vec![Vec::new(); shard_count];
+        let mut expected_targets = Vec::with_capacity(snapshots.len());
+
+        for (position, snapshot) in snapshots.iter().enumerate() {
+            let identity = snapshot
+                .identity
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("imported record identity is required"))?;
+            let reservation_index = u32::try_from(position)
+                .map_err(|_| Status::resource_exhausted("import batch exceeds u32 records"))?;
+            let record = proto::RecordInput {
+                index: reservation_index,
+                identity: Some(identity.clone()),
+                descriptors: snapshot.descriptors.clone(),
+            };
+            validate_record_inputs(std::slice::from_ref(&record))?;
+            let owner_shard_id = hash_source_identity_to_shard(identity, shard_count);
+            owner_batches[owner_shard_id].push(proto::SourceRecordReservation {
+                index: reservation_index,
+                identity: Some(identity.clone()),
+                payload_digest: canonical_record_payload_digest(&record)?.to_vec(),
+                target_shard_id,
+            });
+            expected_targets.push(target_shard_id);
+        }
+        self.dispatch_source_reservations(owner_batches, &expected_targets)
+            .await?;
+        Ok(())
+    }
+
+    async fn dispatch_source_reservations(
+        &self,
+        owner_batches: Vec<Vec<proto::SourceRecordReservation>>,
+        expected_targets: &[u32],
+    ) -> Result<Vec<u32>, Status> {
+        let reservation_futures = owner_batches
+            .into_iter()
+            .enumerate()
+            .filter(|(_, reservations)| !reservations.is_empty())
+            .map(|(owner_shard_id, reservations)| {
+                let mut client = self.shard_clients[owner_shard_id].clone();
+                async move {
+                    client
+                        .reserve_source_records(Request::new(proto::ReserveSourceRecordsRequest {
+                            reservations,
+                        }))
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        let responses = futures::future::join_all(reservation_futures).await;
+        let mut confirmed_targets = vec![None; expected_targets.len()];
+        for response in responses {
+            let response = response?.into_inner();
+            for reservation in response.reservations {
+                let position = reservation.index as usize;
+                let expected_target = expected_targets.get(position).ok_or_else(|| {
+                    Status::data_loss("source reservation response index is out of range")
+                })?;
+                if reservation.target_shard_id != *expected_target {
+                    return Err(Status::data_loss(format!(
+                        "source reservation target mismatch at index {}: expected {}, received {}",
+                        reservation.index, expected_target, reservation.target_shard_id
+                    )));
+                }
+                let confirmed = confirmed_targets.get_mut(position).ok_or_else(|| {
+                    Status::data_loss("source reservation response index is out of range")
+                })?;
+                if confirmed.replace(reservation.target_shard_id).is_some() {
+                    return Err(Status::data_loss(
+                        "source reservation response contains a duplicate index",
+                    ));
+                }
+            }
+        }
+        if confirmed_targets.iter().any(Option::is_none) {
+            return Err(Status::data_loss(
+                "source reservation response omitted one or more records",
+            ));
+        }
+        confirmed_targets
+            .into_iter()
+            .map(|target| {
+                target.ok_or_else(|| {
+                    Status::data_loss("source reservation response omitted a verified target")
+                })
+            })
+            .collect()
     }
 
     async fn fetch_all_record_snapshots(&self) -> Result<Vec<proto::RecordSnapshot>, Status> {
@@ -3938,6 +4428,7 @@ impl proto::router_service_server::RouterService for RouterNode {
             let response = client
                 .ingest_records(Request::new(proto::IngestRecordsRequest {
                     records: batch.records,
+                    internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
                 }))
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?;
@@ -3947,14 +4438,12 @@ impl proto::router_service_server::RouterService for RouterNode {
             return Ok(response);
         }
 
-        // Multi-shard path: hash-based routing
+        // Multi-shard path: durably bind each immutable source identity to its
+        // canonical payload and routing destination before entity resolution.
         let config = self.ontology_config.read().await.clone();
-        let mut shard_batches: Vec<Vec<proto::RecordInput>> = vec![Vec::new(); shard_count];
-
-        for record in batch.records {
-            let shard_idx = hash_record_to_shard(&config, &record, shard_count);
-            shard_batches[shard_idx].push(record);
-        }
+        let shard_batches = self
+            .reserve_and_partition_source_records(&config, batch.records)
+            .await?;
 
         // Parallel shard ingest - spawn all shard requests concurrently
         let shard_futures: Vec<_> = shard_batches
@@ -3965,7 +4454,10 @@ impl proto::router_service_server::RouterService for RouterNode {
                 let mut client = self.shard_clients[idx].clone();
                 async move {
                     client
-                        .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
+                        .ingest_records(Request::new(proto::IngestRecordsRequest {
+                            records,
+                            internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+                        }))
                         .await
                 }
             })
@@ -3976,7 +4468,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         for response in shard_responses {
             match response {
                 Ok(resp) => results.extend(resp.into_inner().assignments),
-                Err(err) => return Err(Status::unavailable(err.to_string())),
+                Err(err) => return Err(err),
             }
         }
 
@@ -4087,6 +4579,9 @@ impl proto::router_service_server::RouterService for RouterNode {
         Ok(Response::new(proto::ConfigVersionResponse {
             version: self.config_version.clone(),
             ontology_config: Some(to_proto_config(&ontology_config)),
+            protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            source_reservation_backfill_version: DISTRIBUTED_PROTOCOL_VERSION,
+            source_reservation_shard_count: self.shard_clients.len() as u32,
         }))
     }
 
@@ -4215,10 +4710,13 @@ impl proto::router_service_server::RouterService for RouterNode {
         self.ensure_cluster_consistent()?;
         let request = request.into_inner();
         self.invalidate_global_conflict_cache();
+        self.reserve_source_snapshots_for_target(request.shard_id, &request.records)
+            .await?;
         let mut client = self.shard_client(request.shard_id)?;
         let response = client
             .import_records(Request::new(proto::ImportRecordsRequest {
                 records: request.records,
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
             }))
             .await
             .map_err(|err| Status::unavailable(err.to_string()))?
@@ -4243,14 +4741,18 @@ impl proto::router_service_server::RouterService for RouterNode {
 
         self.invalidate_global_conflict_cache();
         let shard_id = first.shard_id;
+        self.reserve_source_snapshots_for_target(shard_id, &first.records)
+            .await?;
         let mut client = self.shard_client(shard_id)?;
         let (tx, rx) = mpsc::channel(4);
         let (err_tx, err_rx) = oneshot::channel::<Result<(), Status>>();
+        let router = self.clone();
 
         tokio::spawn(async move {
             if tx
                 .send(proto::ImportRecordsChunk {
                     records: first.records,
+                    internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
                 })
                 .await
                 .is_err()
@@ -4267,9 +4769,17 @@ impl proto::router_service_server::RouterService for RouterNode {
                             )));
                             return;
                         }
+                        if let Err(err) = router
+                            .reserve_source_snapshots_for_target(shard_id, &chunk.records)
+                            .await
+                        {
+                            let _ = err_tx.send(Err(err));
+                            return;
+                        }
                         if tx
                             .send(proto::ImportRecordsChunk {
                                 records: chunk.records,
+                                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
                             })
                             .await
                             .is_err()
@@ -4306,7 +4816,14 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<proto::CheckpointRequest>,
     ) -> Result<Response<proto::CheckpointResponse>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
-        let payload = request.into_inner();
+        let mut payload = request.into_inner();
+        if payload.path.is_empty() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|err| Status::internal(err.to_string()))?
+                .as_nanos();
+            payload.path = format!("cluster-{timestamp}");
+        }
         let mut paths = Vec::new();
         for client in &self.shard_clients {
             let mut client = client.clone();
@@ -4708,6 +5225,16 @@ mod wal_tests {
     }
 
     #[test]
+    fn mixed_distributed_protocol_versions_fail_closed() {
+        validate_distributed_protocol(DISTRIBUTED_PROTOCOL_VERSION)
+            .expect("matching protocol must be accepted");
+        let error = validate_distributed_protocol(DISTRIBUTED_PROTOCOL_VERSION - 1)
+            .expect_err("mixed router and shard protocols must be rejected");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("coordinated Unirust version"));
+    }
+
+    #[test]
     fn pending_wal_cannot_be_overwritten() {
         let temp_dir = tempfile::tempdir().expect("temporary WAL directory");
         let wal = IngestWal::new(temp_dir.path());
@@ -4788,6 +5315,7 @@ mod wal_tests {
         ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
+                internal_protocol_version: 2,
                 records: vec![original.clone()],
             }),
         )
@@ -4799,6 +5327,7 @@ mod wal_tests {
         let error = ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
+                internal_protocol_version: 2,
                 records: vec![conflicting],
             }),
         )
@@ -4816,5 +5345,28 @@ mod wal_tests {
             .into_inner();
         assert_eq!(stats.record_count, 1);
         shard.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn shard_rejects_ingest_from_an_older_router_protocol() {
+        use proto::shard_service_server::ShardService;
+
+        let shard = ShardNode::new(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+        )
+        .expect("shard");
+        let error = ShardService::ingest_records(
+            &shard,
+            Request::new(proto::IngestRecordsRequest {
+                records: vec![proto_from_wal_input(sample_wal_record())],
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION - 1,
+            }),
+        )
+        .await
+        .expect_err("a new shard must reject ingest from an old router");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(shard.unirust.read().record_count(), 0);
     }
 }

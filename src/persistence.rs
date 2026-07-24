@@ -1,13 +1,18 @@
 use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity, StringInterner};
-use crate::store::{records_have_same_payload, RecordStore, Store, StoreMetrics};
+use crate::store::{
+    records_have_same_payload, RecordStore, SourceRecordReservation, SourceReservationError, Store,
+    StoreMetrics,
+};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
     checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +27,7 @@ const CF_INDEX_TEMPORAL_BUCKET: &str = "index_temporal_bucket";
 const CF_INDEX_IDENTITY: &str = "index_identity";
 const CF_CONFLICT_SUMMARIES: &str = "conflict_summaries";
 const CF_CLUSTER_ASSIGNMENTS: &str = "cluster_assignments";
+const CF_SOURCE_RESERVATIONS: &str = "source_reservations";
 
 thread_local! {
     static RECORD_SER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -36,6 +42,96 @@ where
         record.encode_into(&mut buf).map_err(|err| anyhow!(err))?;
         f(&buf)
     })
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn copy_checkpoint_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_checkpoint_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target)?;
+            fs::File::open(&target)?.sync_all()?;
+        } else {
+            anyhow::bail!(
+                "checkpoint contains unsupported non-file entry {}",
+                entry.path().display()
+            );
+        }
+    }
+    sync_directory(destination)?;
+    Ok(())
+}
+
+/// Restore a RocksDB checkpoint into an empty replacement data directory.
+///
+/// Copying occurs in a sibling staging directory and is made visible with one
+/// rename only after every file and directory has been synchronized.
+pub fn restore_checkpoint(source: &Path, destination: &Path) -> Result<()> {
+    let source = source.canonicalize()?;
+    if !source.is_dir() || !source.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "restore source {} is not a RocksDB checkpoint",
+            source.display()
+        );
+    }
+
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(destination)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            anyhow::bail!("restore destination must be an empty directory");
+        }
+        if fs::read_dir(destination)?.next().transpose()?.is_some() {
+            anyhow::bail!(
+                "refusing to restore over nonempty destination {}",
+                destination.display()
+            );
+        }
+    }
+
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("restore destination must have a UTF-8 directory name"))?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    if parent.starts_with(&source) {
+        anyhow::bail!("restore destination must not be inside the checkpoint");
+    }
+    let destination = parent.join(name);
+    let staging = parent.join(format!(".{name}.restore.tmp"));
+    if staging.exists() {
+        anyhow::bail!(
+            "restore staging directory {} already exists; inspect and remove it before retrying",
+            staging.display()
+        );
+    }
+
+    copy_checkpoint_tree(&source, &staging)?;
+    if destination.exists() {
+        fs::remove_dir(&destination)?;
+    }
+    fs::rename(&staging, &destination)?;
+    sync_directory(&parent)?;
+    Ok(())
 }
 
 // DSU persistence column families
@@ -63,6 +159,7 @@ const RESET_DATA_CFS: &[&str] = &[
     CF_INDEX_IDENTITY,
     CF_CONFLICT_SUMMARIES,
     CF_CLUSTER_ASSIGNMENTS,
+    CF_SOURCE_RESERVATIONS,
     CF_DSU_PARENT,
     CF_DSU_RANK,
     CF_DSU_GUARDS,
@@ -85,6 +182,13 @@ const KEY_RECORD_COUNT: &[u8] = b"record_count";
 const KEY_CLUSTER_COUNT: &[u8] = b"cluster_count";
 const KEY_CONFLICT_SUMMARY_COUNT: &[u8] = b"conflict_summary_count";
 const KEY_CROSS_SHARD_CONFLICTS: &[u8] = b"cross_shard_conflicts";
+const KEY_SOURCE_RESERVATION_BACKFILL: &[u8] = b"source_reservation_backfill";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SourceReservationValue {
+    payload_digest: [u8; 32],
+    target_shard_id: u32,
+}
 
 // DSU metadata keys
 const KEY_DSU_NEXT_CLUSTER_ID: &[u8] = b"dsu_next_cluster_id";
@@ -326,6 +430,7 @@ impl PersistentStore {
             .ok_or_else(|| anyhow!("missing metadata column family"))?;
         batch.delete_cf(metadata_cf, KEY_INDEX_VERSION);
         batch.delete_cf(metadata_cf, KEY_CROSS_SHARD_CONFLICTS);
+        batch.delete_cf(metadata_cf, KEY_SOURCE_RESERVATION_BACKFILL);
         batch.put_cf(metadata_cf, KEY_NEXT_RECORD_ID, bincode::serialize(&0u32)?);
         batch.put_cf(metadata_cf, KEY_RECORD_COUNT, bincode::serialize(&0u64)?);
         batch.put_cf(metadata_cf, KEY_CLUSTER_COUNT, bincode::serialize(&0u64)?);
@@ -810,6 +915,122 @@ impl RecordStore for PersistentStore {
 
     fn flush_staged_records(&mut self) -> Result<usize> {
         PersistentStore::flush_staged_records(self)
+    }
+
+    fn reserve_source_records(
+        &mut self,
+        reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        self.ensure_healthy()?;
+        let cf = self
+            .db
+            .cf_handle(CF_SOURCE_RESERVATIONS)
+            .ok_or_else(|| anyhow!("missing source reservations column family"))?;
+        let mut pending = HashMap::with_capacity(reservations.len());
+        let mut targets = Vec::with_capacity(reservations.len());
+
+        for reservation in reservations {
+            let key = encode_identity_index(&reservation.identity)?;
+            let stored = if let Some(value) = pending.get(&key).copied() {
+                Some(value)
+            } else {
+                let bytes = match self.db.get_cf(cf, &key) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        self.mark_read_fault();
+                        return Err(err.into());
+                    }
+                };
+                match bytes {
+                    Some(bytes) => match bincode::deserialize::<SourceReservationValue>(&bytes) {
+                        Ok(value) => Some(value),
+                        Err(err) => {
+                            self.mark_read_fault();
+                            return Err(err.into());
+                        }
+                    },
+                    None => None,
+                }
+            };
+
+            if let Some(stored) = stored {
+                if stored.payload_digest != reservation.payload_digest {
+                    return Err(SourceReservationError::PayloadConflict.into());
+                }
+                if stored.target_shard_id != reservation.target_shard_id {
+                    return Err(SourceReservationError::TargetConflict {
+                        existing_shard: stored.target_shard_id,
+                        requested_shard: reservation.target_shard_id,
+                    }
+                    .into());
+                }
+                targets.push(stored.target_shard_id);
+            } else {
+                let value = SourceReservationValue {
+                    payload_digest: reservation.payload_digest,
+                    target_shard_id: reservation.target_shard_id,
+                };
+                pending.insert(key, value);
+                targets.push(value.target_shard_id);
+            }
+        }
+
+        if !pending.is_empty() {
+            let mut batch = WriteBatch::default();
+            for (key, value) in pending {
+                batch.put_cf(cf, key, bincode::serialize(&value)?);
+            }
+            let mut options = WriteOptions::default();
+            options.set_sync(true);
+            self.db.write_opt(batch, &options)?;
+        }
+        Ok(targets)
+    }
+
+    fn source_reservation_backfill(&self) -> Result<Option<(u32, u32)>> {
+        self.ensure_healthy()?;
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        let bytes = match self.db.get_cf(cf, KEY_SOURCE_RESERVATION_BACKFILL) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.mark_read_fault();
+                return Err(err.into());
+            }
+        };
+        match bytes {
+            Some(bytes) => match bincode::deserialize(&bytes) {
+                Ok(value) => Ok(Some(value)),
+                Err(err) => {
+                    self.mark_read_fault();
+                    Err(err.into())
+                }
+            },
+            None => Ok(None),
+        }
+    }
+
+    fn mark_source_reservation_backfill(
+        &mut self,
+        protocol_version: u32,
+        shard_count: u32,
+    ) -> Result<()> {
+        self.ensure_healthy()?;
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.db.put_cf_opt(
+            cf,
+            KEY_SOURCE_RESERVATION_BACKFILL,
+            bincode::serialize(&(protocol_version, shard_count))?,
+            &options,
+        )?;
+        Ok(())
     }
 
     fn sync(&self) -> Result<()> {
@@ -1765,6 +1986,10 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
         ),
         ColumnFamilyDescriptor::new(
             CF_CLUSTER_ASSIGNMENTS,
+            build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_SOURCE_RESERVATIONS,
             build_cf_options(&base, &index_block_opts, None, None),
         ),
         // DSU column families - 4-byte record_id keys, optimized for sequential access
@@ -2805,6 +3030,127 @@ mod tests {
         let loaded = store.get_record(record_id).unwrap();
         assert_eq!(loaded.identity.uid, "1");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn source_reservation_survives_restart_and_rejects_changed_payload() {
+        let dir = tempdir().unwrap();
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "durable-source".to_string(),
+        );
+        let reservation = SourceRecordReservation {
+            identity: identity.clone(),
+            payload_digest: [7; 32],
+            target_shard_id: 1,
+        };
+
+        {
+            let mut store = PersistentStore::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .reserve_source_records(std::slice::from_ref(&reservation))
+                    .unwrap(),
+                vec![1]
+            );
+            store.mark_source_reservation_backfill(2, 3).unwrap();
+        }
+
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        assert_eq!(store.source_reservation_backfill().unwrap(), Some((2, 3)));
+        assert_eq!(
+            store
+                .reserve_source_records(std::slice::from_ref(&reservation))
+                .unwrap(),
+            vec![1]
+        );
+        let error = store
+            .reserve_source_records(&[SourceRecordReservation {
+                identity,
+                payload_digest: [8; 32],
+                target_shard_id: 1,
+            }])
+            .expect_err("a changed payload must remain rejected after restart");
+        assert!(matches!(
+            error.downcast_ref::<SourceReservationError>(),
+            Some(SourceReservationError::PayloadConflict)
+        ));
+    }
+
+    #[test]
+    fn external_checkpoint_restores_records_and_reservation_state() {
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let original_path = data_volume.path().join("original");
+        let checkpoint_path = backup_volume.path().join("checkpoint-1");
+        let replacement_path = data_volume.path().join("replacement");
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "restored-source".to_string(),
+        );
+
+        {
+            let mut store = PersistentStore::open(&original_path).unwrap();
+            let record_id = store
+                .add_record(Record::new(RecordId(0), identity.clone(), Vec::new()))
+                .unwrap();
+            assert_eq!(record_id, RecordId(0));
+            store
+                .reserve_source_records(&[SourceRecordReservation {
+                    identity: identity.clone(),
+                    payload_digest: [9; 32],
+                    target_shard_id: 0,
+                }])
+                .unwrap();
+            store.mark_source_reservation_backfill(2, 1).unwrap();
+            store.checkpoint(&checkpoint_path).unwrap();
+        }
+
+        restore_checkpoint(&checkpoint_path, &replacement_path).unwrap();
+        let mut restored = PersistentStore::open(&replacement_path).unwrap();
+        assert_eq!(
+            restored.get_record_id_by_identity(&identity),
+            Some(RecordId(0))
+        );
+        assert_eq!(
+            restored.source_reservation_backfill().unwrap(),
+            Some((2, 1))
+        );
+        let error = restored
+            .reserve_source_records(&[SourceRecordReservation {
+                identity,
+                payload_digest: [10; 32],
+                target_shard_id: 0,
+            }])
+            .expect_err("restored reservation must reject a changed payload");
+        assert!(matches!(
+            error.downcast_ref::<SourceReservationError>(),
+            Some(SourceReservationError::PayloadConflict)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_nonempty_destination() {
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("do-not-overwrite"), b"live data").unwrap();
+
+        let error = restore_checkpoint(&checkpoint_path, &destination)
+            .expect_err("restore must not overwrite a nonempty directory");
+        assert!(error.to_string().contains("refusing to restore"));
+        assert_eq!(
+            fs::read(destination.join("do-not-overwrite")).unwrap(),
+            b"live data"
+        );
     }
 
     #[test]

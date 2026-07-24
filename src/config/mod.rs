@@ -10,6 +10,7 @@
 //! listen = "0.0.0.0:50061"
 //! id = 0
 //! data_dir = "/var/lib/unirust"
+//! backup_dir = "/var/backups/unirust/shard-0"
 //!
 //! [router]
 //! listen = "0.0.0.0:50060"
@@ -124,6 +125,8 @@ pub struct ShardConfig {
     pub id: u16,
     /// Data directory for persistence
     pub data_dir: Option<PathBuf>,
+    /// Checkpoint root, ideally on storage independent from the data directory
+    pub backup_dir: Option<PathBuf>,
     /// Path to ontology configuration file (JSON)
     pub ontology: Option<PathBuf>,
     /// Run repair on startup
@@ -138,6 +141,7 @@ impl Default for ShardConfig {
             listen: DEFAULT_SHARD_ADDR.parse().unwrap(),
             id: 0,
             data_dir: None,
+            backup_dir: None,
             ontology: None,
             repair: false,
             config_version: None,
@@ -254,6 +258,8 @@ pub struct ShardOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ontology: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair: Option<bool>,
@@ -318,6 +324,7 @@ mod tests {
         let config = UniConfig::default();
         assert_eq!(config.profile, Profile::BillionScaleHighPerformance);
         assert_eq!(config.shard.id, 0);
+        assert!(config.shard.backup_dir.is_none());
         assert_eq!(config.storage.block_cache_mb, DEFAULT_BLOCK_CACHE_MB);
         assert_eq!(
             config.router.shard_connect_timeout_secs,

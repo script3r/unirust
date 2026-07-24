@@ -3,7 +3,7 @@ use std::fs;
 use tonic::transport::Server;
 use unirust_rs::config::{ConfigOverrides, Profile, ShardOverrides, UniConfig};
 use unirust_rs::distributed::{proto, DistributedOntologyConfig, ShardNode};
-use unirust_rs::StreamingTuning;
+use unirust_rs::{restore_checkpoint, StreamingTuning};
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -31,6 +31,9 @@ OPTIONS:
     -l, --listen <ADDR>     Override listen address [default: 127.0.0.1:50061]
     -i, --shard-id <ID>     Override shard ID [default: 0]
     -d, --data-dir <DIR>    Override data directory
+        --backup-dir <DIR>  Checkpoint root on an independent volume
+        --restore-from <DIR>
+                            Restore a checkpoint into an empty data directory before startup
     -o, --ontology <FILE>   Path to ontology config (JSON)
     -p, --profile <NAME>    Tuning profile: balanced, low-latency, high-throughput,
                             bulk-ingest, memory-saver, billion-scale,
@@ -48,6 +51,8 @@ ENVIRONMENT:
     UNIRUST_SHARD_LISTEN    Listen address
     UNIRUST_SHARD_ID        Shard ID
     UNIRUST_SHARD_DATA_DIR  Data directory
+    UNIRUST_SHARD_BACKUP_DIR
+                            Checkpoint root
 
 CONFIG FILE (unirust.toml):
     profile = "billion-scale-high-performance"
@@ -56,6 +61,7 @@ CONFIG FILE (unirust.toml):
     listen = "0.0.0.0:50061"
     id = 0
     data_dir = "/var/lib/unirust"
+    backup_dir = "/var/backups/unirust/shard-0"
 "#
     );
 }
@@ -135,6 +141,10 @@ async fn main() -> anyhow::Result<()> {
         shard_overrides.data_dir = Some(data_dir.into());
     }
 
+    if let Some(backup_dir) = parse_arg("--backup-dir") {
+        shard_overrides.backup_dir = Some(backup_dir.into());
+    }
+
     if let Some(ontology) = parse_arg("--ontology").or_else(|| parse_arg("-o")) {
         shard_overrides.ontology = Some(ontology.into());
     }
@@ -146,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
     if shard_overrides.listen.is_some()
         || shard_overrides.id.is_some()
         || shard_overrides.data_dir.is_some()
+        || shard_overrides.backup_dir.is_some()
         || shard_overrides.ontology.is_some()
         || shard_overrides.repair.is_some()
     {
@@ -163,6 +174,14 @@ async fn main() -> anyhow::Result<()> {
              explicitly for disposable development data)"
         );
     }
+    if let Some(source) = parse_arg("--restore-from") {
+        let data_dir = config
+            .shard
+            .data_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--restore-from requires --data-dir"))?;
+        restore_checkpoint(std::path::Path::new(&source), data_dir)?;
+    }
 
     // Get tuning from profile
     let profile = config.profile.to_tuning_profile();
@@ -177,11 +196,12 @@ async fn main() -> anyhow::Result<()> {
     let config_version = parse_arg("--config-version").or(config.shard.config_version.clone());
 
     // Create shard node
-    let shard = ShardNode::new_with_data_dir(
+    let shard = ShardNode::new_with_storage_paths(
         config.shard.id as u32,
         ontology,
         tuning,
         config.shard.data_dir.clone(),
+        config.shard.backup_dir.clone(),
         config.shard.repair,
         config_version,
     )?

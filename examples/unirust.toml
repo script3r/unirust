@@ -17,6 +17,8 @@ listen = "0.0.0.0:50061"
 id = 0
 # Data directory for persistence (comment out for in-memory only)
 # data_dir = "/var/lib/unirust/shard-0"
+# Checkpoint root on an independent volume (use a unique path per shard)
+# backup_dir = "/var/backups/unirust/shard-0"
 # Path to ontology configuration (JSON)
 # ontology = "/etc/unirust/ontology.json"
 # Run repair on startup (recovers from unclean shutdown)

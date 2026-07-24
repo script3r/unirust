@@ -232,6 +232,27 @@ intervals is rejected instead of acknowledging data that would be discarded.
 Temporal revisions must use a new source-record UID; entity resolution links the
 snapshots through their configured identity keys.
 
+In a multi-shard cluster, the router first durably reserves that source identity
+on a shard selected only from the source tuple. The reservation stores a
+canonical binary payload digest and the original ingest target before the record
+enters the normal shard entity-resolution path. This prevents a changed
+identity-key value from routing the same source UID to another shard. If target
+ingest fails after reservation, retry the exact request; the reservation remains
+valid and no record has bypassed entity resolution.
+
+Router startup performs a crash-resumable one-time reservation backfill for
+records written by an earlier release. Each target shard is marked complete only
+after every exported record has been reserved durably. Conflicting legacy
+duplicates make startup fail closed for operator repair. The internal router and
+shard protocol is versioned, and mixed versions are rejected, so upgrades must
+replace the full cluster with one coordinated Unirust version before restarting
+the router. Shard gRPC ports are internal APIs; client ingest must use the router.
+The persisted reservation directory is also bound to the configured shard count.
+Router startup rejects shard-count changes because the current import API cannot
+atomically move a record, update its reservation, and delete the old copy.
+Cross-shard copy imports therefore fail closed; online scale-out and scale-in
+require a future transactional relocation protocol or an offline rebuild.
+
 The shard reconstructs all derived linker state before opening its gRPC
 listener. Recovery currently scans all persisted records, so recovery time is
 O(record count). This is a correctness-first crash-recovery path, not a bounded
@@ -270,6 +291,53 @@ Router-to-shard calls are bounded by configurable transport settings under
 mutation was rolled back; the shard may have committed just before the response
 was lost. Retry ingest with the same immutable source-record identity and
 payload so the operation is resolved idempotently.
+
+### External Backups
+
+Configure each shard with a unique checkpoint root on storage outside its data
+directory and, for real volume-loss protection, in a separate failure domain:
+
+```toml
+[shard]
+data_dir = "/var/lib/unirust/shard-0"
+backup_dir = "/var/backups/unirust/shard-0"
+```
+
+Trigger checkpoints through the router so router-mediated mutations remain
+blocked for the complete cluster snapshot. A supplied name is created beneath
+every shard's configured backup root:
+
+```bash
+grpcurl -plaintext \
+  -d '{"path":"backup-2026-07-24T1300Z"}' \
+  127.0.0.1:50060 unirust.RouterService/Checkpoint
+```
+
+To recover from lost data volumes, stop the complete cluster and restore every
+shard from the same checkpoint generation into an empty replacement directory:
+
+```bash
+unirust_shard \
+  --shard-id 0 \
+  --data-dir /replacement/shard-0 \
+  --backup-dir /var/backups/unirust/shard-0 \
+  --restore-from /var/backups/unirust/shard-0/backup-2026-07-24T1300Z \
+  --ontology /etc/unirust/ontology.json
+```
+
+Restore refuses a non-RocksDB source, symlinks, a nonempty destination, and an
+existing partial staging directory. It copies and syncs into a sibling staging
+directory before publishing the replacement with one rename. Restore the whole
+cluster together; restoring only one older shard beside newer peers can violate
+the cluster snapshot boundary.
+
+Unirust does not schedule, replicate, encrypt, transfer, retain, or verify
+off-host backups. Without storage-layer replication, the recovery point is the
+last completed coordinated checkpoint, so acknowledged writes after it can be
+lost in a volume failure. Production operators must automate checkpoints,
+off-host replication, retention, and periodic restore drills according to their
+RPO and RTO. Process crashes and ordinary restarts remain covered by the synced
+ingest WAL independently of this backup path.
 
 ## Deployment Security
 

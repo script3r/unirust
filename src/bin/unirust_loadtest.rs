@@ -393,7 +393,6 @@ fn build_ontology_config() -> OntologyConfig {
 
 /// Seed data for creating overlapping entities
 struct UserSeed {
-    uid: String,
     user_sid: String,
     user_upn: String,
     employee_id: String,
@@ -402,7 +401,6 @@ struct UserSeed {
 }
 
 struct AssetSeed {
-    uid: String,
     asset_id: String,
     hostname: String,
     ip_address: String,
@@ -412,7 +410,6 @@ struct AssetSeed {
 
 /// Generic entity seed for other types
 struct EntitySeed {
-    uid: String,
     #[allow(dead_code)]
     identity_attr: String,
     identity_value: String,
@@ -590,7 +587,7 @@ impl CyberEntityGenerator {
     }
 
     /// Generate a user entity. Returns (uid, descriptors, perspective_override).
-    /// When overlapping, reuses UID from pool to create clusters.
+    /// When overlapping, reuses identity keys from the pool to create clusters.
     /// When conflicting, uses same perspective and different strong identifier.
     /// When cross-shard, uses different user_upn (partitioning key) but same user_sid
     /// (secondary identity key) to create cross-shard merge candidates.
@@ -635,7 +632,6 @@ impl CyberEntityGenerator {
             } else if is_overlap {
                 let idx = self.rng.random_range(0..self.user_pool.len());
                 // Clone seed values upfront to avoid borrow conflicts
-                let seed_uid = self.user_pool[idx].uid.clone();
                 let seed_user_sid = self.user_pool[idx].user_sid.clone();
                 let seed_user_upn = self.user_pool[idx].user_upn.clone();
                 let seed_employee_id = self.user_pool[idx].employee_id.clone();
@@ -661,9 +657,9 @@ impl CyberEntityGenerator {
                         Some(seed_perspective), // SAME perspective - required for conflict detection
                     )
                 } else {
-                    // Exact overlap - same cluster, no conflict
+                    // Same identity keys link a distinct source record into the cluster.
                     (
-                        seed_uid,
+                        self.next_uid(),
                         seed_user_sid,
                         seed_user_upn,
                         seed_employee_id,
@@ -682,7 +678,6 @@ impl CyberEntityGenerator {
 
                 if self.user_pool.len() < self.pool_size {
                     self.user_pool.push(UserSeed {
-                        uid: uid.clone(),
                         user_sid: user_sid.clone(),
                         user_upn: user_upn.clone(),
                         employee_id: employee_id.clone(),
@@ -737,14 +732,13 @@ impl CyberEntityGenerator {
 
         let (uid, session_id) = if is_overlap {
             let idx = self.rng.random_range(0..self.session_pool.len());
-            let seed = &self.session_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let session_id = self.session_pool[idx].identity_value.clone();
+            (self.next_uid(), session_id)
         } else {
             let uid = self.next_uid();
             let session_id = format!("SES-{:016X}", self.rng.random::<u64>());
             if self.session_pool.len() < self.pool_size {
                 self.session_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "session_id".to_string(),
                     identity_value: session_id.clone(),
                 });
@@ -799,14 +793,13 @@ impl CyberEntityGenerator {
 
         let (uid, process_hash) = if is_overlap {
             let idx = self.rng.random_range(0..self.process_pool.len());
-            let seed = &self.process_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let process_hash = self.process_pool[idx].identity_value.clone();
+            (self.next_uid(), process_hash)
         } else {
             let uid = self.next_uid();
             let process_hash = format!("{:064x}", self.rng.random::<u128>());
             if self.process_pool.len() < self.pool_size {
                 self.process_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "process_hash".to_string(),
                     identity_value: process_hash.clone(),
                 });
@@ -874,14 +867,13 @@ impl CyberEntityGenerator {
 
         let (uid, flow_id) = if is_overlap {
             let idx = self.rng.random_range(0..self.connection_pool.len());
-            let seed = &self.connection_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let flow_id = self.connection_pool[idx].identity_value.clone();
+            (self.next_uid(), flow_id)
         } else {
             let uid = self.next_uid();
             let flow_id = format!("FLOW-{:016X}", self.rng.random::<u64>());
             if self.connection_pool.len() < self.pool_size {
                 self.connection_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "flow_id".to_string(),
                     identity_value: flow_id.clone(),
                 });
@@ -959,7 +951,6 @@ impl CyberEntityGenerator {
         let (uid, asset_id, hostname, ip_address, os_type, perspective_override) = if is_overlap {
             let idx = self.rng.random_range(0..self.asset_pool.len());
             // Clone seed values upfront to avoid borrow conflicts
-            let seed_uid = self.asset_pool[idx].uid.clone();
             let seed_asset_id = self.asset_pool[idx].asset_id.clone();
             let seed_hostname = self.asset_pool[idx].hostname.clone();
             let seed_ip_address = self.asset_pool[idx].ip_address.clone();
@@ -981,7 +972,7 @@ impl CyberEntityGenerator {
                 )
             } else {
                 (
-                    seed_uid,
+                    self.next_uid(),
                     seed_asset_id,
                     seed_hostname,
                     seed_ip_address,
@@ -1011,7 +1002,6 @@ impl CyberEntityGenerator {
 
             if self.asset_pool.len() < self.pool_size {
                 self.asset_pool.push(AssetSeed {
-                    uid: uid.clone(),
                     asset_id: asset_id.clone(),
                     hostname: hostname.clone(),
                     ip_address: ip_address.clone(),
@@ -1073,26 +1063,17 @@ impl CyberEntityGenerator {
 
         let (uid, cve_id, severity, status) = if is_overlap {
             let idx = self.rng.random_range(0..self.vuln_pool.len());
-            let seed = &self.vuln_pool[idx];
+            let cve_id = self.vuln_pool[idx].identity_value.clone();
+            let uid = self.next_uid();
             if is_conflict {
                 let severities = ["Critical", "High", "Medium", "Low", "Info"];
                 let new_severity =
                     severities[self.rng.random_range(0..severities.len())].to_string();
                 let statuses = ["Open", "In Progress", "Remediated", "Accepted"];
                 let new_status = statuses[self.rng.random_range(0..statuses.len())].to_string();
-                (
-                    seed.uid.clone(),
-                    seed.identity_value.clone(),
-                    new_severity,
-                    new_status,
-                )
+                (uid, cve_id, new_severity, new_status)
             } else {
-                (
-                    seed.uid.clone(),
-                    seed.identity_value.clone(),
-                    "Medium".to_string(),
-                    "Open".to_string(),
-                )
+                (uid, cve_id, "Medium".to_string(), "Open".to_string())
             }
         } else {
             let uid = self.next_uid();
@@ -1108,7 +1089,6 @@ impl CyberEntityGenerator {
 
             if self.vuln_pool.len() < self.pool_size {
                 self.vuln_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "cve_id".to_string(),
                     identity_value: cve_id.clone(),
                 });
@@ -1164,14 +1144,13 @@ impl CyberEntityGenerator {
 
         let (uid, alert_id) = if is_overlap {
             let idx = self.rng.random_range(0..self.alert_pool.len());
-            let seed = &self.alert_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let alert_id = self.alert_pool[idx].identity_value.clone();
+            (self.next_uid(), alert_id)
         } else {
             let uid = self.next_uid();
             let alert_id = format!("ALERT-{:016X}", self.rng.random::<u64>());
             if self.alert_pool.len() < self.pool_size {
                 self.alert_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "alert_id".to_string(),
                     identity_value: alert_id.clone(),
                 });
@@ -1232,14 +1211,13 @@ impl CyberEntityGenerator {
 
         let (uid, file_hash) = if is_overlap {
             let idx = self.rng.random_range(0..self.file_pool.len());
-            let seed = &self.file_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let file_hash = self.file_pool[idx].identity_value.clone();
+            (self.next_uid(), file_hash)
         } else {
             let uid = self.next_uid();
             let file_hash = format!("{:064x}", self.rng.random::<u128>());
             if self.file_pool.len() < self.pool_size {
                 self.file_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "file_hash".to_string(),
                     identity_value: file_hash.clone(),
                 });
@@ -1768,6 +1746,7 @@ async fn run_parallel_streams(
 
                         match client
                             .ingest_records(IngestRecordsRequest {
+                                internal_protocol_version: 0,
                                 records: batch.clone(),
                             })
                             .await
@@ -2353,6 +2332,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn report_uses_single_record_counters_and_measured_rpc_latency() {
@@ -2392,6 +2372,30 @@ mod tests {
         config.batch_size = 5_000;
         config.overlap_probability = 1.1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn overlap_records_keep_source_identities_unique() {
+        let mut generator = CyberEntityGenerator::new(42, 1.0, 0.0, 0.0);
+        let records = generator
+            .generate_batch(2_000)
+            .into_iter()
+            .chain(generator.generate_batch(2_000))
+            .collect::<Vec<_>>();
+
+        let source_identities = records
+            .iter()
+            .map(|record| {
+                let identity = record.identity.as_ref().expect("generated identity");
+                (
+                    identity.entity_type.as_str(),
+                    identity.perspective.as_str(),
+                    identity.uid.as_str(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(source_identities.len(), records.len());
     }
 
     #[test]
