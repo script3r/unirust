@@ -21,6 +21,15 @@ pub const DEFAULT_SHARD_COUNT: usize = 5;
 /// Default router listen address
 pub const DEFAULT_ROUTER_ADDR: &str = "127.0.0.1:50060";
 
+/// Maximum time to establish a router-to-shard connection.
+pub const DEFAULT_SHARD_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum time for one router-to-shard RPC.
+pub const DEFAULT_SHARD_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// TCP keepalive interval for router-to-shard connections.
+pub const DEFAULT_SHARD_TCP_KEEPALIVE_SECS: u64 = 30;
+
 // =============================================================================
 // Storage Defaults (RocksDB)
 // =============================================================================

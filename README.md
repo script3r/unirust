@@ -263,6 +263,14 @@ The shard drains active mutations and flushes dirty DSU and authoritative store
 state before exit. Acknowledged ingests are additionally covered by an
 executable-level SIGKILL, restart, SIGTERM, and second-restart integration test.
 
+Router-to-shard calls are bounded by configurable transport settings under
+`[router]`: `shard_connect_timeout_secs` (10 seconds by default),
+`shard_request_timeout_secs` (120 seconds), and
+`shard_tcp_keepalive_secs` (30 seconds). A deadline error is not proof that a
+mutation was rolled back; the shard may have committed just before the response
+was lost. Retry ingest with the same immutable source-record identity and
+payload so the operation is resolved idempotently.
+
 ## Deployment Security
 
 The gRPC services do not currently terminate TLS or authenticate callers.

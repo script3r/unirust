@@ -3,7 +3,7 @@ use std::fs;
 use tonic::transport::Server;
 use unirust_rs::config::{normalize_shard_addrs, ConfigOverrides, RouterOverrides, UniConfig};
 use unirust_rs::distributed::{
-    proto, AdaptiveReconciliationConfig, DistributedOntologyConfig, RouterNode,
+    proto, AdaptiveReconciliationConfig, DistributedOntologyConfig, RouterNode, RouterRpcConfig,
 };
 
 fn parse_arg(flag: &str) -> Option<String> {
@@ -141,22 +141,29 @@ async fn main() -> anyhow::Result<()> {
             config.reconciliation.min_interval_secs,
         ),
     };
+    let rpc = RouterRpcConfig {
+        connect_timeout: std::time::Duration::from_secs(config.router.shard_connect_timeout_secs),
+        request_timeout: std::time::Duration::from_secs(config.router.shard_request_timeout_secs),
+        tcp_keepalive: std::time::Duration::from_secs(config.router.shard_tcp_keepalive_secs),
+    };
 
     // Create router node
     let router = if let Some(path) = &config.router.shards_file {
-        RouterNode::connect_from_file_with_reconciliation(
+        RouterNode::connect_from_file_with_runtime_config(
             path,
             ontology,
             config_version,
             reconciliation,
+            rpc,
         )
         .await?
     } else {
-        RouterNode::connect_with_version_and_reconciliation(
+        RouterNode::connect_with_runtime_config(
             shard_addrs,
             ontology,
             config_version,
             reconciliation,
+            rpc,
         )
         .await?
     };

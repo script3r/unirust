@@ -159,6 +159,12 @@ pub struct RouterConfig {
     pub ontology: Option<PathBuf>,
     /// Config version for compatibility checking
     pub config_version: Option<String>,
+    /// Maximum time to establish a shard connection
+    pub shard_connect_timeout_secs: u64,
+    /// Maximum time for one shard RPC
+    pub shard_request_timeout_secs: u64,
+    /// TCP keepalive interval for shard connections
+    pub shard_tcp_keepalive_secs: u64,
 }
 
 impl Default for RouterConfig {
@@ -169,6 +175,9 @@ impl Default for RouterConfig {
             shards_file: None,
             ontology: None,
             config_version: None,
+            shard_connect_timeout_secs: DEFAULT_SHARD_CONNECT_TIMEOUT_SECS,
+            shard_request_timeout_secs: DEFAULT_SHARD_REQUEST_TIMEOUT_SECS,
+            shard_tcp_keepalive_secs: DEFAULT_SHARD_TCP_KEEPALIVE_SECS,
         }
     }
 }
@@ -310,6 +319,14 @@ mod tests {
         assert_eq!(config.profile, Profile::BillionScaleHighPerformance);
         assert_eq!(config.shard.id, 0);
         assert_eq!(config.storage.block_cache_mb, DEFAULT_BLOCK_CACHE_MB);
+        assert_eq!(
+            config.router.shard_connect_timeout_secs,
+            DEFAULT_SHARD_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.router.shard_request_timeout_secs,
+            DEFAULT_SHARD_REQUEST_TIMEOUT_SECS
+        );
     }
 
     #[test]

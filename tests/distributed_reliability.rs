@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 use tokio::task::JoinHandle;
@@ -23,7 +23,9 @@ use unirust_rs::distributed::proto::{
     ApplyOntologyRequest, IngestRecordsRequest, RecordDescriptor, RecordIdentity, RecordInput,
     StatsRequest,
 };
-use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
+use unirust_rs::distributed::{
+    AdaptiveReconciliationConfig, DistributedOntologyConfig, RouterNode, RouterRpcConfig, ShardNode,
+};
 use unirust_rs::{StreamingTuning, TuningProfile};
 
 mod support;
@@ -419,6 +421,43 @@ async fn router_requires_at_least_one_shard() -> anyhow::Result<()> {
     };
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_startup_times_out_when_shard_never_responds() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let _hung_peer = tokio::spawn(async move {
+        let Ok((_socket, _peer)) = listener.accept().await else {
+            return;
+        };
+        std::future::pending::<()>().await;
+    });
+
+    let start = Instant::now();
+    let result = RouterNode::connect_with_runtime_config(
+        vec![format!("http://{addr}")],
+        support::build_iam_config(),
+        None,
+        AdaptiveReconciliationConfig::default(),
+        RouterRpcConfig {
+            connect_timeout: Duration::from_millis(100),
+            request_timeout: Duration::from_millis(100),
+            tcp_keepalive: Duration::from_secs(1),
+        },
+    )
+    .await;
+    let error = match result {
+        Ok(_) => anyhow::bail!("router connected to a shard that never answered"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "router startup exceeded its configured shard RPC deadline"
+    );
     Ok(())
 }
 

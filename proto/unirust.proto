@@ -375,6 +375,14 @@ message IdentityKeySignature {
   bytes signature = 1;  // 32-byte hash
 }
 
+message BoundaryStrongId {
+  string perspective = 1;
+  string attribute = 2;
+  string value = 3;
+  int64 interval_start = 4;
+  int64 interval_end = 5;
+}
+
 message ClusterBoundaryEntry {
   GlobalClusterId cluster_id = 1;
   int64 interval_start = 2;
@@ -383,7 +391,10 @@ message ClusterBoundaryEntry {
   // Strong ID hashes per perspective for cross-shard conflict detection.
   // Key: perspective name hash, Value: hash of strong ID values.
   // Two clusters conflict if they share a perspective but have different values.
+  // Deprecated: retained for rolling compatibility with pre-0.2 nodes.
   map<uint64, uint64> perspective_strong_ids = 5;
+  // Exact temporal observations used for authoritative merge guards.
+  repeated BoundaryStrongId strong_ids = 6;
 }
 
 message BoundaryMetadata {

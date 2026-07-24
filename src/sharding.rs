@@ -146,6 +146,15 @@ impl BloomFilter {
 }
 
 /// Entry in the cluster boundary index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BoundaryStrongId {
+    pub perspective: String,
+    pub attribute: String,
+    pub value: String,
+    pub interval: Interval,
+}
+
+/// Entry in the cluster boundary index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryEntry {
     pub cluster_id: GlobalClusterId,
@@ -156,6 +165,9 @@ pub struct BoundaryEntry {
     /// Two clusters conflict if they share a perspective key but have different values.
     #[serde(default)]
     pub perspective_strong_ids: HashMap<u64, u64>,
+    /// Exact strong-ID observations used for temporal conflict checks.
+    #[serde(default)]
+    pub strong_ids: Vec<BoundaryStrongId>,
 }
 
 /// A cross-shard conflict detected during reconciliation.
@@ -243,13 +255,49 @@ impl ClusterBoundaryIndex {
         interval: Interval,
         perspective_strong_ids: HashMap<u64, u64>,
     ) {
+        self.register_boundary_key_with_conflict_data(
+            signature,
+            cluster_id,
+            interval,
+            perspective_strong_ids,
+            Vec::new(),
+        );
+    }
+
+    /// Register a cluster's identity key with exact temporal strong-ID observations.
+    pub fn register_boundary_key_with_conflict_data(
+        &mut self,
+        signature: IdentityKeySignature,
+        cluster_id: GlobalClusterId,
+        interval: Interval,
+        perspective_strong_ids: HashMap<u64, u64>,
+        mut strong_ids: Vec<BoundaryStrongId>,
+    ) {
         self.key_bloom.insert(&signature);
+        strong_ids.sort_by(|left, right| {
+            (
+                &left.perspective,
+                &left.attribute,
+                &left.value,
+                left.interval.start,
+                left.interval.end,
+            )
+                .cmp(&(
+                    &right.perspective,
+                    &right.attribute,
+                    &right.value,
+                    right.interval.start,
+                    right.interval.end,
+                ))
+        });
+        strong_ids.dedup();
 
         let entry = BoundaryEntry {
             cluster_id,
             interval,
             shard_id: self.shard_id,
             perspective_strong_ids,
+            strong_ids,
         };
 
         self.boundary_keys.entry(signature).or_default().push(entry);
@@ -511,22 +559,15 @@ impl IncrementalReconciler {
                                 // Record the conflict and skip this merge
                                 conflicts_blocked += 1;
 
-                                // Compute the overlapping interval
-                                let overlap_start = e1.interval.start.max(e2.interval.start);
-                                let overlap_end = e1.interval.end.min(e2.interval.end);
-                                if let Ok(overlap_interval) =
-                                    Interval::new(overlap_start, overlap_end)
-                                {
-                                    detected_conflicts.push(CrossShardConflict {
-                                        identity_key_signature: sig,
-                                        cluster1: e1.cluster_id,
-                                        cluster2: e2.cluster_id,
-                                        interval: overlap_interval,
-                                        perspective_hash: conflict_detail.perspective_hash,
-                                        strong_id_hash1: conflict_detail.strong_id_hash1,
-                                        strong_id_hash2: conflict_detail.strong_id_hash2,
-                                    });
-                                }
+                                detected_conflicts.push(CrossShardConflict {
+                                    identity_key_signature: sig,
+                                    cluster1: e1.cluster_id,
+                                    cluster2: e2.cluster_id,
+                                    interval: conflict_detail.interval,
+                                    perspective_hash: conflict_detail.perspective_hash,
+                                    strong_id_hash1: conflict_detail.strong_id_hash1,
+                                    strong_id_hash2: conflict_detail.strong_id_hash2,
+                                });
                                 continue;
                             }
 
@@ -649,21 +690,15 @@ impl IncrementalReconciler {
                             // Record the conflict and skip this merge
                             conflicts_blocked += 1;
 
-                            // Compute the overlapping interval
-                            let overlap_start = e1.interval.start.max(e2.interval.start);
-                            let overlap_end = e1.interval.end.min(e2.interval.end);
-                            if let Ok(overlap_interval) = Interval::new(overlap_start, overlap_end)
-                            {
-                                detected_conflicts.push(CrossShardConflict {
-                                    identity_key_signature: *sig,
-                                    cluster1: e1.cluster_id,
-                                    cluster2: e2.cluster_id,
-                                    interval: overlap_interval,
-                                    perspective_hash: conflict_detail.perspective_hash,
-                                    strong_id_hash1: conflict_detail.strong_id_hash1,
-                                    strong_id_hash2: conflict_detail.strong_id_hash2,
-                                });
-                            }
+                            detected_conflicts.push(CrossShardConflict {
+                                identity_key_signature: *sig,
+                                cluster1: e1.cluster_id,
+                                cluster2: e2.cluster_id,
+                                interval: conflict_detail.interval,
+                                perspective_hash: conflict_detail.perspective_hash,
+                                strong_id_hash1: conflict_detail.strong_id_hash1,
+                                strong_id_hash2: conflict_detail.strong_id_hash2,
+                            });
                             continue;
                         }
 
@@ -822,6 +857,21 @@ struct ConflictDetail {
     perspective_hash: u64,
     strong_id_hash1: u64,
     strong_id_hash2: u64,
+    interval: Interval,
+}
+
+fn stable_boundary_hash(domain: &[u8], values: &[&str]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for value in values {
+        hash_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest contains eight boundary hash bytes"),
+    )
 }
 
 /// Check if two boundary entries have conflicting strong IDs.
@@ -833,6 +883,43 @@ struct ConflictDetail {
 ///
 /// Returns `Some(ConflictDetail)` if a conflict is found, `None` otherwise.
 fn detect_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> Option<ConflictDetail> {
+    if !e1.strong_ids.is_empty() && !e2.strong_ids.is_empty() {
+        for strong_id_1 in &e1.strong_ids {
+            for strong_id_2 in &e2.strong_ids {
+                if strong_id_1.perspective != strong_id_2.perspective
+                    || strong_id_1.attribute != strong_id_2.attribute
+                    || strong_id_1.value == strong_id_2.value
+                {
+                    continue;
+                }
+                let Some(interval) =
+                    crate::temporal::intersect(&strong_id_1.interval, &strong_id_2.interval)
+                else {
+                    continue;
+                };
+                return Some(ConflictDetail {
+                    perspective_hash: stable_boundary_hash(
+                        b"unirust.boundary-perspective.v1",
+                        &[&strong_id_1.perspective],
+                    ),
+                    strong_id_hash1: stable_boundary_hash(
+                        b"unirust.boundary-strong-id.v1",
+                        &[&strong_id_1.attribute, &strong_id_1.value],
+                    ),
+                    strong_id_hash2: stable_boundary_hash(
+                        b"unirust.boundary-strong-id.v1",
+                        &[&strong_id_2.attribute, &strong_id_2.value],
+                    ),
+                    interval,
+                });
+            }
+        }
+        return None;
+    }
+
+    let interval = crate::temporal::intersect(&e1.interval, &e2.interval)?;
+
+    // Compatibility fallback for metadata from nodes that predate exact observations.
     // Check each perspective in e1 against e2
     for (perspective_hash, strong_id_hash_1) in &e1.perspective_strong_ids {
         if let Some(strong_id_hash_2) = e2.perspective_strong_ids.get(perspective_hash) {
@@ -843,6 +930,7 @@ fn detect_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> Option
                     perspective_hash: *perspective_hash,
                     strong_id_hash1: *strong_id_hash_1,
                     strong_id_hash2: *strong_id_hash_2,
+                    interval,
                 });
             }
         }
@@ -1124,6 +1212,109 @@ mod tests {
                 0x3d, 0x0c, 0x70, 0x41,
             ]
         );
+    }
+
+    #[test]
+    fn exact_boundary_guards_preserve_attribute_and_interval_semantics() {
+        let boundary_interval = Interval::new(0, 30).unwrap();
+        let cluster0 = GlobalClusterId::new(0, 1, 0);
+        let cluster1 = GlobalClusterId::new(1, 1, 0);
+        let entry0 = BoundaryEntry {
+            cluster_id: cluster0,
+            interval: boundary_interval,
+            shard_id: 0,
+            perspective_strong_ids: HashMap::new(),
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "A".to_string(),
+                interval: Interval::new(0, 10).unwrap(),
+            }],
+        };
+
+        let different_time = BoundaryEntry {
+            cluster_id: cluster1,
+            interval: boundary_interval,
+            shard_id: 1,
+            perspective_strong_ids: HashMap::new(),
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(10, 20).unwrap(),
+            }],
+        };
+        assert!(
+            detect_cross_shard_conflict(&entry0, &different_time).is_none(),
+            "adjacent strong-ID validity intervals do not conflict"
+        );
+
+        let different_attribute = BoundaryEntry {
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "account_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(0, 10).unwrap(),
+            }],
+            ..different_time.clone()
+        };
+        assert!(
+            detect_cross_shard_conflict(&entry0, &different_attribute).is_none(),
+            "different strong-ID attributes do not conflict"
+        );
+
+        let overlapping_value = BoundaryEntry {
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(5, 15).unwrap(),
+            }],
+            ..different_time
+        };
+        let conflict = detect_cross_shard_conflict(&entry0, &overlapping_value)
+            .expect("overlapping different values for one strong ID must conflict");
+        assert_eq!(conflict.interval, Interval::new(5, 10).unwrap());
+    }
+
+    #[test]
+    fn reconciler_merges_clusters_with_nonoverlapping_strong_id_values() {
+        let signature = IdentityKeySignature::from_bytes([7; 32]);
+        let boundary_interval = Interval::new(0, 30).unwrap();
+        let mut shard0 = ClusterBoundaryIndex::new_small(0);
+        shard0.register_boundary_key_with_conflict_data(
+            signature,
+            GlobalClusterId::new(0, 1, 0),
+            boundary_interval,
+            HashMap::new(),
+            vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "A".to_string(),
+                interval: Interval::new(0, 10).unwrap(),
+            }],
+        );
+        let mut shard1 = ClusterBoundaryIndex::new_small(1);
+        shard1.register_boundary_key_with_conflict_data(
+            signature,
+            GlobalClusterId::new(1, 1, 0),
+            boundary_interval,
+            HashMap::new(),
+            vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(10, 20).unwrap(),
+            }],
+        );
+
+        let mut reconciler = IncrementalReconciler::new();
+        reconciler.add_shard_boundary(shard0);
+        reconciler.add_shard_boundary(shard1);
+        let result = reconciler.reconcile();
+
+        assert_eq!(result.conflicts_blocked, 0);
+        assert_eq!(result.merges_performed, 1);
     }
 
     #[test]
@@ -1549,6 +1740,7 @@ mod tests {
             interval,
             shard_id: 0,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         // Strong ID: ts_code="TS1" (represented by hash)
         entry0.perspective_strong_ids.insert(
@@ -1565,6 +1757,7 @@ mod tests {
             interval,
             shard_id: 1,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         // Strong ID: ts_code="TS2" (DIFFERENT from Record 1!)
         entry1_a.perspective_strong_ids.insert(
@@ -1581,6 +1774,7 @@ mod tests {
             interval,
             shard_id: 1,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         // Strong ID: axioma_id="AI1" (different perspective, no conflict)
         entry1_b.perspective_strong_ids.insert(
@@ -1672,6 +1866,7 @@ mod tests {
             interval,
             shard_id: 0,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         entry0
             .perspective_strong_ids
@@ -1686,6 +1881,7 @@ mod tests {
             interval,
             shard_id: 1,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         entry1
             .perspective_strong_ids

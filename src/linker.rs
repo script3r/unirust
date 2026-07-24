@@ -15,8 +15,9 @@ use crate::index::IndexBackend;
 use crate::model::{ClusterId, GlobalClusterId, InternerLookup, KeyValue, Record, RecordId};
 use crate::ontology::Ontology;
 use crate::perf::bigtable_opts::PartitionOptimizations;
-use crate::sharding::IdentityKeySignature as ShardingKeySignature;
-use crate::sharding::IdentityKeySignature;
+use crate::sharding::{
+    BoundaryStrongId, IdentityKeySignature, IdentityKeySignature as ShardingKeySignature,
+};
 use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
@@ -38,11 +39,71 @@ type CandidateVec = SmallVec<[(RecordId, Interval); 32]>;
 /// Data stored for boundary signatures to support cross-shard conflict detection.
 #[derive(Debug, Clone)]
 struct BoundaryData {
-    /// Merged interval for this (signature, cluster) combination.
-    interval: Interval,
+    /// Coalesced identity-key intervals for this (signature, cluster) combination.
+    intervals: Vec<Interval>,
     /// Strong ID hashes per perspective for conflict detection.
     /// Key: hash of perspective name, Value: hash of (attr_id, value_id) tuples.
     perspective_strong_ids: HashMap<u64, u64>,
+    /// Exact temporal observations used by the distributed merge guard.
+    strong_ids: Vec<BoundaryStrongId>,
+}
+
+fn coalesce_boundary_intervals(intervals: &mut Vec<Interval>) {
+    intervals.sort_by_key(|interval| (interval.start, interval.end));
+    let mut coalesced: Vec<Interval> = Vec::with_capacity(intervals.len());
+    for interval in intervals.drain(..) {
+        if let Some(previous) = coalesced.last_mut() {
+            if interval.start <= previous.end {
+                previous.end = previous.end.max(interval.end);
+                continue;
+            }
+        }
+        coalesced.push(interval);
+    }
+    *intervals = coalesced;
+}
+
+fn sort_dedup_boundary_strong_ids(strong_ids: &mut Vec<BoundaryStrongId>) {
+    strong_ids.sort_by(|left, right| {
+        (
+            &left.perspective,
+            &left.attribute,
+            &left.value,
+            left.interval.start,
+            left.interval.end,
+        )
+            .cmp(&(
+                &right.perspective,
+                &right.attribute,
+                &right.value,
+                right.interval.start,
+                right.interval.end,
+            ))
+    });
+    strong_ids.dedup();
+}
+
+impl BoundaryData {
+    fn new(
+        interval: Interval,
+        perspective_strong_ids: HashMap<u64, u64>,
+        strong_ids: Vec<BoundaryStrongId>,
+    ) -> Self {
+        Self {
+            intervals: vec![interval],
+            perspective_strong_ids,
+            strong_ids,
+        }
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.intervals.extend(other.intervals.iter().copied());
+        coalesce_boundary_intervals(&mut self.intervals);
+        self.perspective_strong_ids
+            .extend(other.perspective_strong_ids.clone());
+        self.strong_ids.extend(other.strong_ids.iter().cloned());
+        sort_dedup_boundary_strong_ids(&mut self.strong_ids);
+    }
 }
 
 /// Metrics for observability of the streaming linker.
@@ -1287,12 +1348,15 @@ impl StreamingLinker {
     pub fn export_boundary_index(&self) -> crate::sharding::ClusterBoundaryIndex {
         let mut index = crate::sharding::ClusterBoundaryIndex::new_small(self.shard_id);
         for ((sig, global_id), data) in &self.boundary_signatures {
-            index.register_boundary_key_with_strong_ids(
-                *sig,
-                *global_id,
-                data.interval,
-                data.perspective_strong_ids.clone(),
-            );
+            for interval in &data.intervals {
+                index.register_boundary_key_with_conflict_data(
+                    *sig,
+                    *global_id,
+                    *interval,
+                    data.perspective_strong_ids.clone(),
+                    data.strong_ids.clone(),
+                );
+            }
         }
         index
     }
@@ -1302,7 +1366,11 @@ impl StreamingLinker {
     pub fn drain_boundaries(&mut self) -> Vec<(ShardingKeySignature, GlobalClusterId, Interval)> {
         std::mem::take(&mut self.boundary_signatures)
             .into_iter()
-            .map(|((sig, global_id), data)| (sig, global_id, data.interval))
+            .flat_map(|((sig, global_id), data)| {
+                data.intervals
+                    .into_iter()
+                    .map(move |interval| (sig, global_id, interval))
+            })
             .collect()
     }
 
@@ -1337,25 +1405,26 @@ impl StreamingLinker {
             .peek(&new_root)
             .map(|summary| summary.compute_perspective_strong_ids(interner))
             .unwrap_or_default();
+        let strong_ids = self
+            .strong_id_summaries
+            .peek(&new_root)
+            .map(|summary| summary.compute_boundary_strong_ids(interner))
+            .unwrap_or_default();
 
         // Merge intervals for the same (signature, cluster) combination
         self.boundary_signatures
             .entry(key)
             .and_modify(|existing| {
-                let new_start = existing.interval.start.min(interval.start);
-                let new_end = existing.interval.end.max(interval.end);
-                if let Ok(merged) = Interval::new(new_start, new_end) {
-                    existing.interval = merged;
-                }
+                existing.intervals.push(interval);
+                coalesce_boundary_intervals(&mut existing.intervals);
                 // Also merge perspective_strong_ids from the updated cluster
                 for (k, v) in &perspective_strong_ids {
                     existing.perspective_strong_ids.entry(*k).or_insert(*v);
                 }
+                existing.strong_ids.extend(strong_ids.iter().cloned());
+                sort_dedup_boundary_strong_ids(&mut existing.strong_ids);
             })
-            .or_insert_with(|| BoundaryData {
-                interval,
-                perspective_strong_ids,
-            });
+            .or_insert_with(|| BoundaryData::new(interval, perspective_strong_ids, strong_ids));
 
         // Mark this key as dirty for adaptive reconciliation
         self.dirty_boundary_keys.insert(sharding_sig);
@@ -1387,17 +1456,7 @@ impl StreamingLinker {
                 // Merge with existing BoundaryData for primary if present
                 self.boundary_signatures
                     .entry(new_key)
-                    .and_modify(|existing| {
-                        let new_start = existing.interval.start.min(data.interval.start);
-                        let new_end = existing.interval.end.max(data.interval.end);
-                        if let Ok(merged) = Interval::new(new_start, new_end) {
-                            existing.interval = merged;
-                        }
-                        // Merge perspective strong IDs
-                        for (k, v) in &data.perspective_strong_ids {
-                            existing.perspective_strong_ids.entry(*k).or_insert(*v);
-                        }
-                    })
+                    .and_modify(|existing| existing.merge_from(&data))
                     .or_insert(data);
                 // Mark this key as dirty for adaptive reconciliation
                 self.dirty_boundary_keys.insert(sig);
@@ -1716,6 +1775,31 @@ impl StrongIdSummary {
                 coalesce_value_intervals(value_entry);
             }
         }
+    }
+
+    /// Export exact string-valued observations for distributed temporal guards.
+    fn compute_boundary_strong_ids(&self, interner: &dyn InternerLookup) -> Vec<BoundaryStrongId> {
+        let mut observations = Vec::new();
+        for (perspective, attrs) in &self.by_perspective {
+            for (attr_id, values) in attrs {
+                let Some(attribute) = interner.get_attr_string(*attr_id) else {
+                    continue;
+                };
+                for (value_id, intervals) in values {
+                    let Some(value) = interner.get_value_string(*value_id) else {
+                        continue;
+                    };
+                    observations.extend(intervals.iter().map(|interval| BoundaryStrongId {
+                        perspective: perspective.clone(),
+                        attribute: attribute.clone(),
+                        value: value.clone(),
+                        interval: *interval,
+                    }));
+                }
+            }
+        }
+        sort_dedup_boundary_strong_ids(&mut observations);
+        observations
     }
 
     /// Compute perspective -> strong_id_hash for cross-shard conflict detection.
@@ -2095,17 +2179,7 @@ fn reconcile_global_cluster_ids(
         if let Some(data) = boundary_signatures.remove(&(signature, old_id)) {
             boundary_signatures
                 .entry((signature, canonical))
-                .and_modify(|existing| {
-                    if let Ok(interval) = Interval::new(
-                        existing.interval.start.min(data.interval.start),
-                        existing.interval.end.max(data.interval.end),
-                    ) {
-                        existing.interval = interval;
-                    }
-                    existing
-                        .perspective_strong_ids
-                        .extend(data.perspective_strong_ids.clone());
-                })
+                .and_modify(|existing| existing.merge_from(&data))
                 .or_insert(data);
             dirty_boundary_keys.insert(signature);
         }

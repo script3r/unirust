@@ -856,6 +856,18 @@ fn cross_shard_conflict_to_proto(
     }
 }
 
+fn boundary_strong_id_to_proto(
+    strong_id: crate::sharding::BoundaryStrongId,
+) -> proto::BoundaryStrongId {
+    proto::BoundaryStrongId {
+        perspective: strong_id.perspective,
+        attribute: strong_id.attribute,
+        value: strong_id.value,
+        interval_start: strong_id.interval.start,
+        interval_end: strong_id.interval.end,
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn boundary_index_from_metadata(
     metadata: &proto::BoundaryMetadata,
@@ -893,11 +905,33 @@ fn boundary_index_from_metadata(
                 .map_err(|_| Status::data_loss("boundary cluster version exceeds u16"))?;
             let interval = Interval::new(entry.interval_start, entry.interval_end)
                 .map_err(|err| Status::data_loss(err.to_string()))?;
-            boundary_index.register_boundary_key_with_strong_ids(
+            let strong_ids = entry
+                .strong_ids
+                .iter()
+                .map(|strong_id| {
+                    if strong_id.perspective.is_empty()
+                        || strong_id.attribute.is_empty()
+                        || strong_id.value.is_empty()
+                    {
+                        return Err(Status::data_loss(
+                            "boundary strong-ID fields must not be empty",
+                        ));
+                    }
+                    Ok(crate::sharding::BoundaryStrongId {
+                        perspective: strong_id.perspective.clone(),
+                        attribute: strong_id.attribute.clone(),
+                        value: strong_id.value.clone(),
+                        interval: Interval::new(strong_id.interval_start, strong_id.interval_end)
+                            .map_err(|err| Status::data_loss(err.to_string()))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            boundary_index.register_boundary_key_with_conflict_data(
                 signature,
                 GlobalClusterId::new(cluster_shard, cluster.local_id, cluster_version),
                 interval,
                 entry.perspective_strong_ids.clone(),
+                strong_ids,
             );
         }
     }
@@ -2658,6 +2692,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
                                         interval_end: e.interval.end,
                                         shard_id: e.shard_id as u32,
                                         perspective_strong_ids: e.perspective_strong_ids.clone(),
+                                        strong_ids: e
+                                            .strong_ids
+                                            .into_iter()
+                                            .map(boundary_strong_id_to_proto)
+                                            .collect(),
                                     })
                                     .collect(),
                             })
@@ -2774,6 +2813,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
                             interval_end: e.interval.end,
                             shard_id: e.shard_id as u32,
                             perspective_strong_ids: e.perspective_strong_ids.clone(),
+                            strong_ids: e
+                                .strong_ids
+                                .iter()
+                                .cloned()
+                                .map(boundary_strong_id_to_proto)
+                                .collect(),
                         })
                         .collect();
 
@@ -2946,6 +2991,24 @@ impl Default for AdaptiveReconciliationConfig {
     }
 }
 
+/// Failure bounds for router-to-shard transport and RPC calls.
+#[derive(Debug, Clone)]
+pub struct RouterRpcConfig {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub tcp_keepalive: Duration,
+}
+
+impl Default for RouterRpcConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(120),
+            tcp_keepalive: Duration::from_secs(30),
+        }
+    }
+}
+
 /// State for a dirty boundary key.
 #[derive(Debug)]
 struct DirtyKeyState {
@@ -3089,6 +3152,23 @@ impl RouterNode {
         config_version: Option<String>,
         reconciliation_config: AdaptiveReconciliationConfig,
     ) -> Result<Arc<Self>, Status> {
+        Self::connect_with_runtime_config(
+            shard_addrs,
+            ontology_config,
+            config_version,
+            reconciliation_config,
+            RouterRpcConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_with_runtime_config(
+        shard_addrs: Vec<String>,
+        ontology_config: DistributedOntologyConfig,
+        config_version: Option<String>,
+        reconciliation_config: AdaptiveReconciliationConfig,
+        rpc_config: RouterRpcConfig,
+    ) -> Result<Arc<Self>, Status> {
         if reconciliation_config.key_count_threshold == 0 {
             return Err(Status::invalid_argument(
                 "reconciliation key_count_threshold must be greater than zero",
@@ -3099,6 +3179,14 @@ impl RouterNode {
         {
             return Err(Status::invalid_argument(
                 "reconciliation idle_ingest_rate must be finite and nonnegative",
+            ));
+        }
+        if rpc_config.connect_timeout.is_zero()
+            || rpc_config.request_timeout.is_zero()
+            || rpc_config.tcp_keepalive.is_zero()
+        {
+            return Err(Status::invalid_argument(
+                "router shard RPC timeouts and TCP keepalive must be greater than zero",
             ));
         }
         let shard_count = shard_addrs.len();
@@ -3114,9 +3202,16 @@ impl RouterNode {
         }
         let mut shard_clients = Vec::with_capacity(shard_count);
         for addr in shard_addrs {
-            let client = proto::shard_service_client::ShardServiceClient::connect(addr)
+            let endpoint = tonic::transport::Endpoint::from_shared(addr)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?
+                .connect_timeout(rpc_config.connect_timeout)
+                .timeout(rpc_config.request_timeout)
+                .tcp_keepalive(Some(rpc_config.tcp_keepalive));
+            let channel = endpoint
+                .connect()
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?;
+            let client = proto::shard_service_client::ShardServiceClient::new(channel);
             shard_clients.push(client);
         }
         let config_version = config_version.unwrap_or_else(|| "unversioned".to_string());
@@ -3201,6 +3296,23 @@ impl RouterNode {
         config_version: Option<String>,
         reconciliation_config: AdaptiveReconciliationConfig,
     ) -> Result<Arc<Self>, Status> {
+        Self::connect_from_file_with_runtime_config(
+            path,
+            ontology_config,
+            config_version,
+            reconciliation_config,
+            RouterRpcConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_from_file_with_runtime_config(
+        path: impl AsRef<Path>,
+        ontology_config: DistributedOntologyConfig,
+        config_version: Option<String>,
+        reconciliation_config: AdaptiveReconciliationConfig,
+        rpc_config: RouterRpcConfig,
+    ) -> Result<Arc<Self>, Status> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let shard_addrs = content
@@ -3219,11 +3331,12 @@ impl RouterNode {
         if shard_addrs.is_empty() {
             return Err(Status::invalid_argument("no shard addresses found"));
         }
-        Self::connect_with_version_and_reconciliation(
+        Self::connect_with_runtime_config(
             shard_addrs,
             ontology_config,
             config_version,
             reconciliation_config,
+            rpc_config,
         )
         .await
     }

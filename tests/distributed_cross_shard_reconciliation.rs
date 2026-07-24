@@ -557,8 +557,186 @@ async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test that boundary metadata includes perspective_strong_ids.
-/// This directly tests the serialization fix.
+/// Different strong-ID values are compatible when their validity intervals do not overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_shard_merge_respects_strong_id_validity_intervals() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let config = build_instrument_config();
+    let empty_config = DistributedOntologyConfig::empty();
+
+    let (shard0_addr, _shard0_handle) = spawn_shard(0, empty_config.clone()).await?;
+    let (shard1_addr, _shard1_handle) = spawn_shard(1, empty_config.clone()).await?;
+    let (router_addr, _router_handle) =
+        spawn_router(vec![shard0_addr, shard1_addr], empty_config).await?;
+
+    let mut router_client = RouterServiceClient::connect(format!("http://{}", router_addr)).await?;
+    let mut shard0_client = ShardServiceClient::connect(format!("http://{}", shard0_addr)).await?;
+    let mut shard1_client = ShardServiceClient::connect(format!("http://{}", shard1_addr)).await?;
+    router_client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(to_proto_config(&config)),
+        })
+        .await?;
+
+    shard0_client
+        .ingest_records(IngestRecordsRequest {
+            records: vec![record_input(
+                0,
+                "instrument",
+                "msci",
+                "historical",
+                vec![
+                    ("isin", "ISIN_TEMPORAL", 0, 30),
+                    ("country", "US", 0, 30),
+                    ("ts_code", "TS_OLD", 0, 10),
+                ],
+            )],
+        })
+        .await?;
+    shard1_client
+        .ingest_records(IngestRecordsRequest {
+            records: vec![record_input(
+                1,
+                "instrument",
+                "msci",
+                "current",
+                vec![
+                    ("isin", "ISIN_TEMPORAL", 0, 30),
+                    ("country", "US", 0, 30),
+                    ("ts_code", "TS_NEW", 10, 20),
+                ],
+            )],
+        })
+        .await?;
+
+    let reconcile = router_client
+        .reconcile(proto::ReconcileRequest {
+            shard_metadata: vec![],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(reconcile.conflicts_blocked, 0);
+    assert_eq!(reconcile.merges_performed, 1);
+
+    let query = router_client
+        .query_entities(proto::QueryEntitiesRequest {
+            descriptors: vec![
+                proto::QueryDescriptor {
+                    attr: "isin".to_string(),
+                    value: "ISIN_TEMPORAL".to_string(),
+                },
+                proto::QueryDescriptor {
+                    attr: "country".to_string(),
+                    value: "US".to_string(),
+                },
+            ],
+            start: 0,
+            end: 30,
+        })
+        .await?
+        .into_inner();
+    let matches = match query.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => matches.matches,
+        other => anyhow::bail!("expected one reconciled temporal entity, got {other:?}"),
+    };
+    assert_eq!(matches.len(), 1);
+
+    Ok(())
+}
+
+/// Disjoint observations of one identity key must not be widened across the temporal gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_shard_reconciliation_preserves_identity_key_gaps() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let config = DistributedOntologyConfig {
+        identity_keys: vec![
+            IdentityKeyConfig {
+                name: "account".to_string(),
+                attributes: vec!["account".to_string()],
+            },
+            IdentityKeyConfig {
+                name: "bridge".to_string(),
+                attributes: vec!["bridge".to_string()],
+            },
+        ],
+        strong_identifiers: Vec::new(),
+        constraints: Vec::new(),
+    };
+    let empty_config = DistributedOntologyConfig::empty();
+    let (shard0_addr, _shard0_handle) = spawn_shard(0, empty_config.clone()).await?;
+    let (shard1_addr, _shard1_handle) = spawn_shard(1, empty_config.clone()).await?;
+    let (router_addr, _router_handle) =
+        spawn_router(vec![shard0_addr, shard1_addr], empty_config).await?;
+
+    let mut router_client = RouterServiceClient::connect(format!("http://{}", router_addr)).await?;
+    let mut shard0_client = ShardServiceClient::connect(format!("http://{}", shard0_addr)).await?;
+    let mut shard1_client = ShardServiceClient::connect(format!("http://{}", shard1_addr)).await?;
+    router_client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(to_proto_config(&config)),
+        })
+        .await?;
+
+    // These two records form one local cluster through `bridge`, but `account=A`
+    // is valid only before and after the middle gap.
+    let shard0_ingest = shard0_client
+        .ingest_records(IngestRecordsRequest {
+            records: vec![
+                record_input(
+                    0,
+                    "person",
+                    "crm",
+                    "before",
+                    vec![("account", "A", 0, 10), ("bridge", "B", 0, 30)],
+                ),
+                record_input(
+                    1,
+                    "person",
+                    "crm",
+                    "after",
+                    vec![("account", "A", 20, 30), ("bridge", "B", 0, 30)],
+                ),
+            ],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        shard0_ingest.assignments[0].cluster_id, shard0_ingest.assignments[1].cluster_id,
+        "bridge identity key must form one local cluster"
+    );
+    shard1_client
+        .ingest_records(IngestRecordsRequest {
+            records: vec![record_input(
+                2,
+                "person",
+                "crm",
+                "middle",
+                vec![("account", "A", 10, 20)],
+            )],
+        })
+        .await?;
+
+    let reconcile = router_client
+        .reconcile(proto::ReconcileRequest {
+            shard_metadata: vec![],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(reconcile.merges_performed, 0);
+
+    let stats = router_client
+        .get_stats(proto::StatsRequest {})
+        .await?
+        .into_inner();
+    assert_eq!(
+        stats.cross_shard_merges, 0,
+        "adaptive reconciliation must not merge through the temporal gap"
+    );
+
+    Ok(())
+}
+
+/// Test that boundary metadata includes exact temporal strong-ID observations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<()> {
     let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
@@ -621,26 +799,29 @@ async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<(
 
     let metadata = metadata_response.metadata.expect("metadata should exist");
 
-    // Find entries and check for perspective_strong_ids
-    let has_strong_ids = metadata.entries.iter().any(|key_entries| {
-        key_entries
-            .entries
-            .iter()
-            .any(|entry| !entry.perspective_strong_ids.is_empty())
-    });
+    let exact_strong_ids = metadata
+        .entries
+        .iter()
+        .flat_map(|key_entries| &key_entries.entries)
+        .flat_map(|entry| &entry.strong_ids)
+        .collect::<Vec<_>>();
 
     assert!(
-        has_strong_ids,
-        "Expected boundary entries to have perspective_strong_ids populated. \
-         This indicates the proto serialization is working correctly. \
-         Metadata entries: {:?}",
+        exact_strong_ids.iter().any(|strong_id| {
+            strong_id.perspective == "msci"
+                && strong_id.attribute == "ts_code"
+                && strong_id.value == "TS_DE_001"
+                && strong_id.interval_start == 0
+                && strong_id.interval_end == 100
+        }),
+        "expected exact temporal strong-ID metadata; entries: {:?}",
         metadata.entries
     );
 
     Ok(())
 }
 
-/// Test dirty boundary keys also include perspective_strong_ids.
+/// Test dirty boundary keys also include exact temporal strong-ID observations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<()> {
     let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
@@ -700,18 +881,22 @@ async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<
         .await?
         .into_inner();
 
-    // Check if any dirty key entries have perspective_strong_ids
-    let has_strong_ids = dirty_keys_response.dirty_keys.iter().any(|dirty_key| {
-        dirty_key
-            .entries
-            .iter()
-            .any(|entry| !entry.perspective_strong_ids.is_empty())
-    });
+    let exact_strong_ids = dirty_keys_response
+        .dirty_keys
+        .iter()
+        .flat_map(|dirty_key| &dirty_key.entries)
+        .flat_map(|entry| &entry.strong_ids)
+        .collect::<Vec<_>>();
 
     assert!(
-        has_strong_ids,
-        "Expected dirty boundary key entries to have perspective_strong_ids populated. \
-         Dirty keys: {:?}",
+        exact_strong_ids.iter().any(|strong_id| {
+            strong_id.perspective == "bloomberg"
+                && strong_id.attribute == "ts_code"
+                && strong_id.value == "TS_FR_001"
+                && strong_id.interval_start == 0
+                && strong_id.interval_end == 100
+        }),
+        "expected exact temporal strong-ID dirty-key metadata; dirty keys: {:?}",
         dirty_keys_response.dirty_keys
     );
 

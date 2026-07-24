@@ -36,6 +36,10 @@ shards = [
 # shards_file = "/etc/unirust/shards.txt"
 # Path to ontology configuration (JSON)
 # ontology = "/etc/unirust/ontology.json"
+# Router-to-shard failure bounds
+shard_connect_timeout_secs = 10
+shard_request_timeout_secs = 120
+shard_tcp_keepalive_secs = 30
 
 # Advanced storage tuning (RocksDB)
 # These settings control the underlying storage engine performance.
