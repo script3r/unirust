@@ -3407,6 +3407,8 @@ pub struct RouterNode {
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
     /// Latches closed if a distributed ontology mutation cannot be rolled back.
     cluster_consistent: Arc<AtomicBool>,
+    /// Latches closed while a partially applied reconciliation needs repair.
+    reconciliation_consistent: Arc<AtomicBool>,
     /// Authoritative conflict view rebuilt from a consistent all-shard record scan.
     global_conflict_cache: Arc<parking_lot::RwLock<Option<Vec<proto::ConflictSummary>>>>,
 }
@@ -3574,12 +3576,14 @@ impl RouterNode {
             )),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             cluster_consistent: Arc::new(AtomicBool::new(true)),
+            reconciliation_consistent: Arc::new(AtomicBool::new(true)),
             global_conflict_cache: Arc::new(parking_lot::RwLock::new(None)),
         });
 
         router
             .backfill_source_reservations(source_reservation_backfill_required)
             .await?;
+        router.recover_dirty_reconciliation_on_startup().await?;
 
         // Start adaptive reconciliation without keeping the router alive forever.
         router.clone().start_adaptive_reconciliation();
@@ -3669,7 +3673,7 @@ impl RouterNode {
     }
 
     #[allow(clippy::result_large_err)]
-    fn ensure_cluster_consistent(&self) -> Result<(), Status> {
+    fn ensure_ontology_consistent(&self) -> Result<(), Status> {
         if self.cluster_consistent.load(Ordering::Acquire) {
             Ok(())
         } else {
@@ -3680,8 +3684,80 @@ impl RouterNode {
         }
     }
 
+    #[allow(clippy::result_large_err)]
+    fn ensure_cluster_consistent(&self) -> Result<(), Status> {
+        self.ensure_ontology_consistent()?;
+        if self.reconciliation_consistent.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "cluster is blocked after a partially applied cross-shard reconciliation; retry \
+                 Reconcile or restart the router to repair retained dirty keys before serving \
+                 traffic",
+            ))
+        }
+    }
+
     fn invalidate_global_conflict_cache(&self) {
         *self.global_conflict_cache.write() = None;
+    }
+
+    async fn recover_dirty_reconciliation_on_startup(&self) -> Result<(), Status> {
+        let mut dirty_keys = std::collections::HashSet::new();
+        for (expected_shard_id, client) in self.shard_clients.iter().enumerate() {
+            let mut client = client.clone();
+            let response = client
+                .get_dirty_boundary_keys(Request::new(proto::GetDirtyBoundaryKeysRequest {}))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?
+                .into_inner();
+            if response.shard_id as usize != expected_shard_id {
+                return Err(Status::data_loss(format!(
+                    "dirty-key response from endpoint {expected_shard_id} reports shard {}",
+                    response.shard_id
+                )));
+            }
+            for dirty_key in response.dirty_keys {
+                let signature = dirty_key.signature.ok_or_else(|| {
+                    Status::data_loss("dirty-key response is missing a signature")
+                })?;
+                let signature = <[u8; 32]>::try_from(signature.signature.as_slice())
+                    .map_err(|_| Status::data_loss("dirty-key signature must be 32 bytes"))?;
+                dirty_keys.insert(IdentityKeySignature::from_bytes(signature));
+            }
+        }
+        if dirty_keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut dirty_keys = dirty_keys.into_iter().collect::<Vec<_>>();
+        dirty_keys.sort_by_key(|signature| *signature.to_bytes());
+        tracing::warn!(
+            dirty_keys = dirty_keys.len(),
+            "router startup is repairing retained cross-shard reconciliation work"
+        );
+        self.reconcile_dirty_keys(&dirty_keys).await?;
+
+        let keys = dirty_keys
+            .iter()
+            .map(|signature| proto::IdentityKeySignature {
+                signature: signature.to_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        for (shard_id, client) in self.shard_clients.iter().enumerate() {
+            let mut client = client.clone();
+            client
+                .clear_dirty_keys(Request::new(proto::ClearDirtyKeysRequest {
+                    keys: keys.clone(),
+                }))
+                .await
+                .map_err(|err| {
+                    Status::unavailable(format!(
+                        "failed to clear recovered dirty keys on shard {shard_id}: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     async fn backfill_source_reservations(&self, required: Vec<bool>) -> Result<(), Status> {
@@ -4055,6 +4131,16 @@ impl RouterNode {
         &self,
         result: &crate::sharding::ReconciliationResult,
     ) -> Result<(), Status> {
+        let outcome = self.apply_reconciliation_result_inner(result).await;
+        self.reconciliation_consistent
+            .store(outcome.is_ok(), Ordering::Release);
+        outcome
+    }
+
+    async fn apply_reconciliation_result_inner(
+        &self,
+        result: &crate::sharding::ReconciliationResult,
+    ) -> Result<(), Status> {
         for (primary, secondary) in &result.merged_clusters {
             for shard_id in 0..self.shard_clients.len() {
                 let shard_id = u16::try_from(shard_id)
@@ -4129,7 +4215,7 @@ impl RouterNode {
     async fn run_adaptive_reconciliation_once(&self) {
         let poll_complete = {
             let _mutation_guard = self.mutation_gate.read().await;
-            if self.ensure_cluster_consistent().is_err() {
+            if self.ensure_ontology_consistent().is_err() {
                 return;
             }
 
@@ -4198,14 +4284,15 @@ impl RouterNode {
         let should_run = {
             let coordinator = self.reconciliation_coordinator.lock().await;
             let ingest_rate = self.current_ingest_rate();
-            coordinator.should_reconcile(ingest_rate)
+            !self.reconciliation_consistent.load(Ordering::Acquire)
+                || coordinator.should_reconcile(ingest_rate)
         };
 
         if should_run {
             // Pause router-mediated ingest while refetching metadata, applying merges,
             // and clearing exactly the reconciled dirty-key generation.
             let _mutation_guard = self.mutation_gate.write().await;
-            if self.ensure_cluster_consistent().is_err() {
+            if self.ensure_ontology_consistent().is_err() {
                 return;
             }
             // 3. Take dirty keys and perform targeted reconciliation
@@ -5002,7 +5089,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         request: Request<proto::ReconcileRequest>,
     ) -> Result<Response<proto::ReconcileResponse>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
-        self.ensure_cluster_consistent()?;
+        self.ensure_ontology_consistent()?;
         let req = request.into_inner();
         if !req.shard_metadata.is_empty() {
             return Err(Status::invalid_argument(

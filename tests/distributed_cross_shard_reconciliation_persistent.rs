@@ -3,6 +3,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tempfile::TempDir;
@@ -75,6 +77,50 @@ where
     const NAME: &'static str = S::NAME;
 }
 
+#[derive(Clone)]
+struct FailFirstApplyMerge<S> {
+    inner: S,
+    fail_next: Arc<AtomicBool>,
+}
+
+impl<S, B> Service<http::Request<B>> for FailFirstApplyMerge<S>
+where
+    S: Service<
+            http::Request<B>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + Send,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/unirust.ShardService/ApplyMerge"
+            && self.fail_next.swap(false, Ordering::AcqRel)
+        {
+            return Box::pin(async {
+                Ok(tonic::Status::unavailable("injected ApplyMerge failure").into_http())
+            });
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
+impl<S> NamedService for FailFirstApplyMerge<S>
+where
+    S: NamedService,
+{
+    const NAME: &'static str = S::NAME;
+}
+
 async fn spawn_shard_persistent(
     shard_id: u32,
     config: DistributedOntologyConfig,
@@ -128,6 +174,36 @@ async fn spawn_shard_at(
             .add_service(proto::shard_service_server::ShardServiceServer::new(
                 service_shard,
             ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, shard, handle))
+}
+
+async fn spawn_apply_merge_failing_shard_at(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+    data_path: PathBuf,
+) -> anyhow::Result<(SocketAddr, ShardNode, JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_path),
+        false,
+        None,
+    )?;
+    let service = proto::shard_service_server::ShardServiceServer::new(shard.clone());
+    let service = FailFirstApplyMerge {
+        inner: service,
+        fail_next: Arc::new(AtomicBool::new(true)),
+    };
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("shard server");
@@ -731,6 +807,217 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
         .expect_err("the durable pre-ingest reservation must reject a changed payload");
     assert_eq!(error.code(), tonic::Code::AlreadyExists);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_reconciliation_blocks_traffic_and_recovers_after_full_restart(
+) -> anyhow::Result<()> {
+    use proto::router_service_server::RouterService;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let path0 = root.path().join("reconcile-shard-0");
+    let path1 = root.path().join("reconcile-shard-1");
+    let (addr0, shard0, handle0) = spawn_shard_at(0, config.clone(), path0.clone()).await?;
+    let (addr1, shard1, handle1) =
+        spawn_apply_merge_failing_shard_at(1, config.clone(), path1.clone()).await?;
+    let router = RouterNode::connect(
+        vec![format!("http://{addr0}"), format!("http://{addr1}")],
+        config.clone(),
+    )
+    .await?;
+
+    let mut client0 = ShardServiceClient::connect(format!("http://{addr0}")).await?;
+    let mut client1 = ShardServiceClient::connect(format!("http://{addr1}")).await?;
+    client0
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![record_input(
+                0,
+                "person",
+                "hr",
+                "partial-merge-0",
+                vec![
+                    ("email", "partial-merge@example.com", 0, 100),
+                    ("ssn", "1234", 0, 100),
+                ],
+            )],
+        })
+        .await?;
+    client1
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 2,
+            records: vec![record_input(
+                1,
+                "person",
+                "hr",
+                "partial-merge-1",
+                vec![
+                    ("email", "partial-merge@example.com", 0, 100),
+                    ("ssn", "1234", 0, 100),
+                ],
+            )],
+        })
+        .await?;
+
+    let error = RouterService::reconcile(
+        router.as_ref(),
+        tonic::Request::new(proto::ReconcileRequest {
+            shard_metadata: Vec::new(),
+        }),
+    )
+    .await
+    .expect_err("second shard must fail the first merge application");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+
+    let blocked = RouterService::ingest_records(
+        router.as_ref(),
+        tonic::Request::new(IngestRecordsRequest {
+            internal_protocol_version: 0,
+            records: vec![record_input(
+                2,
+                "person",
+                "hr",
+                "blocked-during-partial-merge",
+                vec![("email", "blocked@example.com", 0, 100)],
+            )],
+        }),
+    )
+    .await
+    .expect_err("traffic must fail closed after a partial reconciliation apply");
+    assert_eq!(blocked.code(), tonic::Code::FailedPrecondition);
+
+    drop(client0);
+    drop(client1);
+    drop(router);
+    shard0.shutdown().await?;
+    shard1.shutdown().await?;
+    handle0.abort();
+    handle1.abort();
+    let _ = handle0.await;
+    let _ = handle1.await;
+    drop(shard0);
+    drop(shard1);
+    sleep(Duration::from_millis(100)).await;
+
+    let (restarted_addr0, restarted_shard0, restarted_handle0) =
+        spawn_shard_at(0, config.clone(), path0).await?;
+    let (restarted_addr1, restarted_shard1, restarted_handle1) =
+        spawn_shard_at(1, config.clone(), path1).await?;
+    let restarted_router = RouterNode::connect(
+        vec![
+            format!("http://{restarted_addr0}"),
+            format!("http://{restarted_addr1}"),
+        ],
+        config,
+    )
+    .await?;
+    let query = RouterService::query_entities(
+        restarted_router.as_ref(),
+        tonic::Request::new(proto::QueryEntitiesRequest {
+            descriptors: vec![proto::QueryDescriptor {
+                attr: "email".to_string(),
+                value: "partial-merge@example.com".to_string(),
+            }],
+            start: 0,
+            end: 100,
+        }),
+    )
+    .await?
+    .into_inner();
+    match query.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert_eq!(matches.matches.len(), 1);
+        }
+        other => anyhow::bail!("expected one reconciled entity after restart, got {other:?}"),
+    }
+
+    drop(restarted_router);
+    restarted_shard0.shutdown().await?;
+    restarted_shard1.shutdown().await?;
+    restarted_handle0.abort();
+    restarted_handle1.abort();
+    let _ = restarted_handle0.await;
+    let _ = restarted_handle1.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_reconciliation_can_be_retried_in_place() -> anyhow::Result<()> {
+    use proto::router_service_server::RouterService;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let (addr0, shard0, handle0) =
+        spawn_shard_at(0, config.clone(), root.path().join("retry-shard-0")).await?;
+    let (addr1, shard1, handle1) =
+        spawn_apply_merge_failing_shard_at(1, config.clone(), root.path().join("retry-shard-1"))
+            .await?;
+    let router = RouterNode::connect(
+        vec![format!("http://{addr0}"), format!("http://{addr1}")],
+        config,
+    )
+    .await?;
+    for (shard_addr, uid) in [(addr0, "retry-merge-0"), (addr1, "retry-merge-1")] {
+        let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+        client
+            .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: 2,
+                records: vec![record_input(
+                    0,
+                    "person",
+                    "hr",
+                    uid,
+                    vec![
+                        ("email", "retry-merge@example.com", 0, 100),
+                        ("ssn", "1234", 0, 100),
+                    ],
+                )],
+            })
+            .await?;
+    }
+
+    let request = proto::ReconcileRequest {
+        shard_metadata: Vec::new(),
+    };
+    RouterService::reconcile(router.as_ref(), tonic::Request::new(request.clone()))
+        .await
+        .expect_err("first merge application must fail");
+    let retried = RouterService::reconcile(router.as_ref(), tonic::Request::new(request))
+        .await?
+        .into_inner();
+    assert_eq!(retried.merges_performed, 1);
+
+    let query = RouterService::query_entities(
+        router.as_ref(),
+        tonic::Request::new(proto::QueryEntitiesRequest {
+            descriptors: vec![proto::QueryDescriptor {
+                attr: "email".to_string(),
+                value: "retry-merge@example.com".to_string(),
+            }],
+            start: 0,
+            end: 100,
+        }),
+    )
+    .await?
+    .into_inner();
+    match query.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert_eq!(matches.matches.len(), 1);
+        }
+        other => anyhow::bail!("expected one reconciled entity after retry, got {other:?}"),
+    }
+
+    drop(router);
+    shard0.shutdown().await?;
+    shard1.shutdown().await?;
+    handle0.abort();
+    handle1.abort();
+    let _ = handle0.await;
+    let _ = handle1.await;
     Ok(())
 }
 

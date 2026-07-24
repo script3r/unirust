@@ -253,6 +253,14 @@ atomically move a record, update its reservation, and delete the old copy.
 Cross-shard copy imports therefore fail closed; online scale-out and scale-in
 require a future transactional relocation protocol or an offline rebuild.
 
+Cross-shard redirects are durably applied to every shard and are idempotent. If
+any shard fails while a reconciliation result is being applied, the router
+latches the cluster closed for ingest, query, and administrative traffic rather
+than serving a partially updated global view. Retrying `Reconcile` repairs the
+retained dirty keys in place. After a router or full-cluster restart, router
+startup performs that repair before returning a serviceable node and clears the
+dirty generation only after every shard converges.
+
 The shard reconstructs all derived linker state before opening its gRPC
 listener. Recovery currently scans all persisted records, so recovery time is
 O(record count). This is a correctness-first crash-recovery path, not a bounded
