@@ -178,11 +178,7 @@ impl AlignedMetrics {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             hot_key_exits: self.hot_key_exits.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
-            avg_latency_us: if batches > 0 {
-                total_latency / batches
-            } else {
-                0
-            },
+            avg_latency_us: total_latency.checked_div(batches).unwrap_or(0),
             max_latency_us: self.max_latency_us.load(Ordering::Relaxed),
             dropped_requests: self.dropped_requests.load(Ordering::Relaxed),
         }

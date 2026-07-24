@@ -2,7 +2,10 @@ use std::fs;
 
 use tonic::transport::Server;
 use unirust_rs::config::{normalize_shard_addrs, ConfigOverrides, RouterOverrides, UniConfig};
-use unirust_rs::distributed::{proto, DistributedOntologyConfig, RouterNode};
+use unirust_rs::distributed::{
+    proto, AdaptiveReconciliationConfig, DistributedOntologyConfig, RouterNode, RouterRpcConfig,
+};
+use unirust_rs::transport_security::{load_client_mtls, load_server_mtls};
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -32,12 +35,26 @@ OPTIONS:
         --shards-file <F>   Path to file containing shard addresses (one per line)
     -o, --ontology <FILE>   Path to ontology config (JSON)
         --config-version    Config version for compatibility checking
+        --checkpoint-interval-secs <SECONDS>
+                            Automatic coordinated checkpoint interval (0 disables)
+        --tls-cert <FILE>   PEM router server certificate
+        --tls-key <FILE>    PEM router server private key
+        --tls-client-ca <FILE>
+                            PEM CA used to require client certificates
+        --shard-tls-ca <FILE>
+                            PEM CA used to verify shard certificates
+        --shard-tls-cert <FILE>
+                            PEM router client certificate presented to shards
+        --shard-tls-key <FILE>
+                            PEM router client private key
     -h, --help              Print help
 
 ENVIRONMENT:
     UNIRUST_CONFIG          Path to config file
     UNIRUST_ROUTER_LISTEN   Listen address
     UNIRUST_ROUTER_SHARDS   Comma-separated shard addresses
+    UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS
+                            Automatic coordinated checkpoint interval
 
 CONFIG FILE (unirust.toml):
     [router]
@@ -54,6 +71,24 @@ fn load_ontology(path: Option<&std::path::Path>) -> anyhow::Result<DistributedOn
         Ok(config)
     } else {
         Ok(DistributedOntologyConfig::empty())
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -91,10 +126,39 @@ async fn main() -> anyhow::Result<()> {
         router_overrides.ontology = Some(ontology.into());
     }
 
+    if let Some(interval) = parse_arg("--checkpoint-interval-secs") {
+        router_overrides.checkpoint_interval_secs = Some(interval.parse()?);
+    }
+    if let Some(path) = parse_arg("--tls-cert") {
+        router_overrides.tls_cert = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--tls-key") {
+        router_overrides.tls_key = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--tls-client-ca") {
+        router_overrides.tls_client_ca = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--shard-tls-ca") {
+        router_overrides.shard_tls_ca = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--shard-tls-cert") {
+        router_overrides.shard_tls_cert = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--shard-tls-key") {
+        router_overrides.shard_tls_key = Some(path.into());
+    }
+
     if router_overrides.listen.is_some()
         || router_overrides.shards.is_some()
         || router_overrides.shards_file.is_some()
         || router_overrides.ontology.is_some()
+        || router_overrides.checkpoint_interval_secs.is_some()
+        || router_overrides.tls_cert.is_some()
+        || router_overrides.tls_key.is_some()
+        || router_overrides.tls_client_ca.is_some()
+        || router_overrides.shard_tls_ca.is_some()
+        || router_overrides.shard_tls_cert.is_some()
+        || router_overrides.shard_tls_key.is_some()
     {
         overrides.router = Some(router_overrides);
     }
@@ -104,6 +168,16 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| parse_arg("-c"))
         .or_else(|| std::env::var("UNIRUST_CONFIG").ok());
     let config = UniConfig::load(config_path.as_deref(), overrides)?;
+    let server_mtls = load_server_mtls(
+        config.router.tls_cert.as_deref(),
+        config.router.tls_key.as_deref(),
+        config.router.tls_client_ca.as_deref(),
+    )?;
+    let shard_mtls = load_client_mtls(
+        config.router.shard_tls_ca.as_deref(),
+        config.router.shard_tls_cert.as_deref(),
+        config.router.shard_tls_key.as_deref(),
+    )?;
 
     // Load ontology
     let ontology = load_ontology(config.router.ontology.as_deref())?;
@@ -113,21 +187,72 @@ async fn main() -> anyhow::Result<()> {
 
     // Normalize shard addresses
     let shard_addrs = normalize_shard_addrs(&config.router.shards);
+    let reconciliation = AdaptiveReconciliationConfig {
+        key_count_threshold: config.reconciliation.key_count_threshold,
+        max_staleness: std::time::Duration::from_secs(config.reconciliation.max_staleness_secs),
+        idle_ingest_rate: config.reconciliation.idle_ingest_rate,
+        min_reconcile_interval: std::time::Duration::from_secs(
+            config.reconciliation.min_interval_secs,
+        ),
+    };
+    let rpc = RouterRpcConfig {
+        connect_timeout: std::time::Duration::from_secs(config.router.shard_connect_timeout_secs),
+        request_timeout: std::time::Duration::from_secs(config.router.shard_request_timeout_secs),
+        tcp_keepalive: std::time::Duration::from_secs(config.router.shard_tcp_keepalive_secs),
+        shard_mtls,
+    };
 
     // Create router node
     let router = if let Some(path) = &config.router.shards_file {
-        RouterNode::connect_from_file(path.to_str().unwrap(), ontology, config_version).await?
+        RouterNode::connect_from_file_with_runtime_config(
+            path,
+            ontology,
+            config_version,
+            reconciliation,
+            rpc,
+        )
+        .await?
     } else {
-        RouterNode::connect_with_version(shard_addrs, ontology, config_version).await?
+        RouterNode::connect_with_runtime_config(
+            shard_addrs,
+            ontology,
+            config_version,
+            reconciliation,
+            rpc,
+        )
+        .await?
+    };
+    let checkpoint_task = if config.router.checkpoint_interval_secs > 0 {
+        tracing::info!(
+            interval_secs = config.router.checkpoint_interval_secs,
+            "automatic coordinated checkpoints enabled"
+        );
+        Some(
+            router
+                .clone()
+                .start_checkpoint_scheduler(std::time::Duration::from_secs(
+                    config.router.checkpoint_interval_secs,
+                ))?,
+        )
+    } else {
+        None
     };
 
     println!("Unirust router listening on {}", config.router.listen);
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(server_mtls) = server_mtls {
+        server = server.tls_config(server_mtls)?;
+    }
+    server
         .add_service(proto::router_service_server::RouterServiceServer::new(
             router,
         ))
-        .serve(config.router.listen)
+        .serve_with_shutdown(config.router.listen, shutdown_signal())
         .await?;
+    if let Some(checkpoint_task) = checkpoint_task {
+        checkpoint_task.abort();
+        let _ = checkpoint_task.await;
+    }
 
     Ok(())
 }

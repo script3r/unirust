@@ -20,8 +20,38 @@ pub struct StoreMetrics {
     pub block_cache_usage_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRecordReservation {
+    pub identity: RecordIdentity,
+    pub payload_digest: [u8; 32],
+    pub target_shard_id: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceReservationError {
+    #[error("source record identity is already reserved for a different payload")]
+    PayloadConflict,
+    #[error(
+        "source record identity is already assigned to shard {existing_shard}, not shard {requested_shard}"
+    )]
+    TargetConflict {
+        existing_shard: u32,
+        requested_shard: u32,
+    },
+}
+
 /// Persistence abstraction for records and metadata.
 pub trait RecordStore: Send + Sync {
+    /// Fail if the store observed an I/O or decode error that made a prior read incomplete.
+    fn ensure_healthy(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove all records and derived state while keeping the store usable.
+    fn reset_data(&mut self) -> Result<()> {
+        anyhow::bail!("reset is not supported by this record store")
+    }
+
     /// Add a single record and return its assigned ID.
     fn add_record(&mut self, record: Record) -> Result<RecordId>;
 
@@ -153,6 +183,19 @@ pub trait RecordStore: Send + Sync {
         None
     }
 
+    /// Persist cross-shard conflicts detected by distributed reconciliation.
+    fn set_cross_shard_conflicts(
+        &mut self,
+        _conflicts: &[crate::sharding::CrossShardConflict],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load persisted cross-shard conflicts.
+    fn load_cross_shard_conflicts(&self) -> Result<Vec<crate::sharding::CrossShardConflict>> {
+        Ok(Vec::new())
+    }
+
     /// Load conflict summary count if supported.
     fn conflict_summary_count(&self) -> Option<usize> {
         None
@@ -219,10 +262,53 @@ pub trait RecordStore: Send + Sync {
         self.add_record_if_absent(record)
     }
 
+    /// Stage a record while preserving its explicit ID.
+    fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        _record: Record,
+    ) -> Result<(RecordId, bool)> {
+        Err(anyhow::anyhow!(
+            "explicit record ID staging is not supported by this store"
+        ))
+    }
+
     /// Flush all staged records to the database. Returns count of flushed records.
     /// Default implementation returns 0 (no staging support).
     fn flush_staged_records(&mut self) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Make all completed writes durable on stable storage.
+    ///
+    /// In-memory stores have nothing to synchronize. Persistent implementations
+    /// must not return until their recovery log is synced.
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Atomically reserve immutable source identities before distributed ingest.
+    ///
+    /// The returned target shard IDs correspond to the input order. Persistent
+    /// implementations must make newly created reservations durable before returning.
+    fn reserve_source_records(
+        &mut self,
+        _reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        anyhow::bail!("source record reservations are not supported by this record store")
+    }
+
+    /// Return the completed source-reservation migration protocol and shard count.
+    fn source_reservation_backfill(&self) -> Result<Option<(u32, u32)>> {
+        Ok(None)
+    }
+
+    /// Durably mark all records currently stored on this shard as reserved.
+    fn mark_source_reservation_backfill(
+        &mut self,
+        _protocol_version: u32,
+        _shard_count: u32,
+    ) -> Result<()> {
+        anyhow::bail!("source reservation migration markers are not supported by this record store")
     }
 
     /// Optional store-level metrics.
@@ -244,6 +330,10 @@ pub struct Store {
     records: HashMap<RecordId, Record>,
     /// Identity to record ID mapping (idempotent ingest)
     identity_index: HashMap<RecordIdentity, RecordId>,
+    /// Cluster-wide immutable source identities owned by this shard.
+    source_reservations: HashMap<RecordIdentity, ([u8; 32], u32)>,
+    /// Completed distributed reservation migration version and topology size.
+    source_reservation_backfill: Option<(u32, u32)>,
     /// String interner for attributes and values
     interner: StringInterner,
     /// Attribute-value index for fast lookups
@@ -254,12 +344,49 @@ pub struct Store {
     next_record_id: u32,
 }
 
+pub(crate) fn records_have_same_payload(left: &Record, right: &Record) -> bool {
+    if left.identity != right.identity || left.descriptors.len() != right.descriptors.len() {
+        return false;
+    }
+
+    let canonical_descriptors = |record: &Record| {
+        let mut descriptors = record
+            .descriptors
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.attr.0,
+                    descriptor.value.0,
+                    descriptor.interval.start,
+                    descriptor.interval.end,
+                )
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_unstable();
+        descriptors
+    };
+
+    canonical_descriptors(left) == canonical_descriptors(right)
+}
+
+fn ensure_idempotent_record(existing: &Record, incoming: &Record) -> Result<()> {
+    if records_have_same_payload(existing, incoming) {
+        Ok(())
+    } else {
+        anyhow::bail!("source record identity already exists with a different payload")
+    }
+}
+
 impl Store {
+    const EXHAUSTED_RECORD_ID: u32 = u32::MAX;
+
     /// Create a new store
     pub fn new() -> Self {
         Self {
             records: HashMap::new(),
             identity_index: HashMap::new(),
+            source_reservations: HashMap::new(),
+            source_reservation_backfill: None,
             interner: StringInterner::new(),
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
@@ -272,6 +399,8 @@ impl Store {
         Self {
             records: HashMap::new(),
             identity_index: HashMap::new(),
+            source_reservations: HashMap::new(),
+            source_reservation_backfill: None,
             interner,
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
@@ -290,17 +419,42 @@ impl Store {
         }
     }
 
+    fn allocate_record_id(&mut self) -> Result<RecordId> {
+        if self.next_record_id == Self::EXHAUSTED_RECORD_ID {
+            anyhow::bail!("record ID space exhausted");
+        }
+        let record_id = RecordId(self.next_record_id);
+        self.next_record_id += 1;
+        Ok(record_id)
+    }
+
+    fn advance_past_explicit_record_id(&mut self, record_id: RecordId) {
+        self.next_record_id = self.next_record_id.max(record_id.0.saturating_add(1));
+    }
+
     /// Prepare a record for persistence without storing it in memory.
     pub fn prepare_record(&mut self, record: &mut Record) -> Result<RecordId> {
         self.intern_record(record);
 
         if record.id.0 == 0 {
-            record.id = RecordId(self.next_record_id);
-            self.next_record_id += 1;
+            record.id = self.allocate_record_id()?;
         } else {
-            self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+            if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+                anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+            }
+            self.advance_past_explicit_record_id(record.id);
         }
 
+        Ok(record.id)
+    }
+
+    /// Prepare a record without treating ID zero as an allocation sentinel.
+    pub fn prepare_record_with_explicit_id(&mut self, record: &mut Record) -> Result<RecordId> {
+        self.intern_record(record);
+        if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+            anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+        }
+        self.advance_past_explicit_record_id(record.id);
         Ok(record.id)
     }
 
@@ -321,8 +475,11 @@ impl Store {
     /// Insert a record with an explicit ID without assigning a new one.
     pub fn insert_record(&mut self, mut record: Record) -> Result<RecordId> {
         self.intern_record(&mut record);
+        if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+            anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+        }
 
-        self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+        self.advance_past_explicit_record_id(record.id);
 
         let record_id = record.id;
         let identity = record.identity.clone();
@@ -346,10 +503,61 @@ impl Store {
     /// Add a record if its identity is new; returns (id, inserted).
     pub fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            let stored = self
+                .records
+                .get(&existing)
+                .ok_or_else(|| anyhow::anyhow!("identity index references a missing record"))?;
+            ensure_idempotent_record(stored, &record)?;
             return Ok((existing, false));
         }
         let id = self.add_record(record)?;
         Ok((id, true))
+    }
+
+    fn reserve_source_records(
+        &mut self,
+        reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        let mut pending = HashMap::with_capacity(reservations.len());
+        let mut targets = Vec::with_capacity(reservations.len());
+
+        for reservation in reservations {
+            let existing = self
+                .source_reservations
+                .get(&reservation.identity)
+                .copied()
+                .or_else(|| pending.get(&reservation.identity).copied());
+            if let Some((payload_digest, target_shard_id)) = existing {
+                if payload_digest != reservation.payload_digest {
+                    return Err(SourceReservationError::PayloadConflict.into());
+                }
+                if target_shard_id != reservation.target_shard_id {
+                    return Err(SourceReservationError::TargetConflict {
+                        existing_shard: target_shard_id,
+                        requested_shard: reservation.target_shard_id,
+                    }
+                    .into());
+                }
+                targets.push(target_shard_id);
+            } else {
+                pending.insert(
+                    reservation.identity.clone(),
+                    (reservation.payload_digest, reservation.target_shard_id),
+                );
+                targets.push(reservation.target_shard_id);
+            }
+        }
+
+        self.source_reservations.extend(pending);
+        Ok(targets)
+    }
+
+    fn source_reservation_backfill(&self) -> Option<(u32, u32)> {
+        self.source_reservation_backfill
+    }
+
+    fn mark_source_reservation_backfill(&mut self, protocol_version: u32, shard_count: u32) {
+        self.source_reservation_backfill = Some((protocol_version, shard_count));
     }
 
     /// Add a record without re-interning. Used when records are pre-interned
@@ -360,10 +568,12 @@ impl Store {
     pub fn add_record_raw(&mut self, mut record: Record) -> Result<RecordId> {
         // Assign record ID without interning
         if record.id.0 == 0 {
-            record.id = RecordId(self.next_record_id);
-            self.next_record_id += 1;
+            record.id = self.allocate_record_id()?;
         } else {
-            self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+            if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+                anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+            }
+            self.advance_past_explicit_record_id(record.id);
         }
 
         let record_id = record.id;
@@ -381,6 +591,11 @@ impl Store {
     /// Used when records are pre-interned with an external interner.
     pub fn add_record_if_absent_raw(&mut self, record: Record) -> Result<(RecordId, bool)> {
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            let stored = self
+                .records
+                .get(&existing)
+                .ok_or_else(|| anyhow::anyhow!("identity index references a missing record"))?;
+            ensure_idempotent_record(stored, &record)?;
             return Ok((existing, false));
         }
         let id = self.add_record_raw(record)?;
@@ -539,6 +754,11 @@ impl Default for Store {
 }
 
 impl RecordStore for Store {
+    fn reset_data(&mut self) -> Result<()> {
+        *self = Store::new();
+        Ok(())
+    }
+
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
         Store::add_record(self, record)
     }
@@ -627,8 +847,47 @@ impl RecordStore for Store {
         Some(self.store_metrics())
     }
 
+    fn reserve_source_records(
+        &mut self,
+        reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        Store::reserve_source_records(self, reservations)
+    }
+
+    fn source_reservation_backfill(&self) -> Result<Option<(u32, u32)>> {
+        Ok(Store::source_reservation_backfill(self))
+    }
+
+    fn mark_source_reservation_backfill(
+        &mut self,
+        protocol_version: u32,
+        shard_count: u32,
+    ) -> Result<()> {
+        Store::mark_source_reservation_backfill(self, protocol_version, shard_count);
+        Ok(())
+    }
+
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         Store::add_record_if_absent(self, record)
+    }
+
+    fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        record: Record,
+    ) -> Result<(RecordId, bool)> {
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            let stored = self
+                .records
+                .get(&existing)
+                .ok_or_else(|| anyhow::anyhow!("identity index references a missing record"))?;
+            ensure_idempotent_record(stored, &record)?;
+            return Ok((existing, false));
+        }
+        if self.records.contains_key(&record.id) {
+            anyhow::bail!("record ID {} already exists", record.id.0);
+        }
+        let id = self.insert_record(record)?;
+        Ok((id, true))
     }
 }
 
@@ -797,6 +1056,81 @@ mod tests {
     }
 
     #[test]
+    fn record_id_allocation_fails_closed_at_u32_boundary() {
+        let mut store = Store::new();
+        store.set_next_record_id(u32::MAX - 1);
+
+        let last = Record::new(
+            RecordId(0),
+            RecordIdentity::new(
+                "person".to_string(),
+                "crm".to_string(),
+                "last-id".to_string(),
+            ),
+            vec![],
+        );
+        assert_eq!(store.add_record(last).unwrap(), RecordId(u32::MAX - 1));
+
+        let overflow = Record::new(
+            RecordId(0),
+            RecordIdentity::new(
+                "person".to_string(),
+                "crm".to_string(),
+                "overflow".to_string(),
+            ),
+            vec![],
+        );
+        let error = store
+            .add_record(overflow)
+            .expect_err("record IDs must never wrap");
+        assert!(error.to_string().contains("record ID space exhausted"));
+        assert_eq!(store.len(), 1);
+        assert!(store.get_record(RecordId(u32::MAX - 1)).is_some());
+        assert!(store.get_record(RecordId(0)).is_none());
+    }
+
+    #[test]
+    fn explicit_last_record_id_exhausts_future_allocation() {
+        let mut store = Store::new();
+        let explicit = Record::new(
+            RecordId(u32::MAX - 1),
+            RecordIdentity::new(
+                "person".to_string(),
+                "import".to_string(),
+                "max-id".to_string(),
+            ),
+            vec![],
+        );
+        store
+            .stage_record_with_explicit_id_if_absent(explicit)
+            .unwrap();
+
+        let next = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "next".to_string()),
+            vec![],
+        );
+        let error = store
+            .add_record(next)
+            .expect_err("allocation after the maximum explicit ID must fail");
+        assert!(error.to_string().contains("record ID space exhausted"));
+
+        let reserved = Record::new(
+            RecordId(u32::MAX),
+            RecordIdentity::new(
+                "person".to_string(),
+                "import".to_string(),
+                "reserved".to_string(),
+            ),
+            vec![],
+        );
+        let error = store
+            .stage_record_with_explicit_id_if_absent(reserved)
+            .expect_err("the exhaustion sentinel must not be assignable");
+        assert!(error.to_string().contains("is reserved"));
+    }
+
+    #[test]
     fn test_add_records() {
         let mut store = Store::new();
 
@@ -830,6 +1164,111 @@ mod tests {
         let (second_id, inserted) = store.add_record_if_absent(record_b).unwrap();
         assert!(!inserted);
         assert_eq!(first_id, second_id);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn source_reservations_are_atomic_and_immutable() {
+        let mut store = Store::new();
+        let identity_a =
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "a".to_string());
+        let identity_b =
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "b".to_string());
+        let reservation_a = SourceRecordReservation {
+            identity: identity_a.clone(),
+            payload_digest: [1; 32],
+            target_shard_id: 2,
+        };
+
+        assert_eq!(
+            store
+                .reserve_source_records(std::slice::from_ref(&reservation_a))
+                .unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            store
+                .reserve_source_records(std::slice::from_ref(&reservation_a))
+                .unwrap(),
+            vec![2]
+        );
+
+        let error = store
+            .reserve_source_records(&[
+                SourceRecordReservation {
+                    identity: identity_b.clone(),
+                    payload_digest: [2; 32],
+                    target_shard_id: 1,
+                },
+                SourceRecordReservation {
+                    identity: identity_a,
+                    payload_digest: [3; 32],
+                    target_shard_id: 2,
+                },
+            ])
+            .expect_err("a conflicting batch must fail atomically");
+        assert!(error.downcast_ref::<SourceReservationError>().is_some());
+
+        assert_eq!(
+            store
+                .reserve_source_records(&[SourceRecordReservation {
+                    identity: identity_b,
+                    payload_digest: [4; 32],
+                    target_shard_id: 0,
+                }])
+                .unwrap(),
+            vec![0],
+            "the first item from the rejected batch must not be retained"
+        );
+    }
+
+    #[test]
+    fn repeated_identity_requires_the_same_semantic_payload() {
+        let mut store = Store::new();
+        let email = store.intern_attr("email");
+        let phone = store.intern_attr("phone");
+        let email_value = store.intern_value("same@example.com");
+        let phone_value = store.intern_value("555-0100");
+        let interval = Interval::new(0, 10).unwrap();
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "immutable-1".to_string(),
+        );
+        let first = Record::new(
+            RecordId(0),
+            identity.clone(),
+            vec![
+                Descriptor::new(email, email_value, interval),
+                Descriptor::new(phone, phone_value, interval),
+            ],
+        );
+        let reordered_retry = Record::new(
+            RecordId(0),
+            identity.clone(),
+            vec![
+                Descriptor::new(phone, phone_value, interval),
+                Descriptor::new(email, email_value, interval),
+            ],
+        );
+        let changed = Record::new(
+            RecordId(0),
+            identity,
+            vec![Descriptor::new(email, phone_value, interval)],
+        );
+
+        let (record_id, inserted) = store.add_record_if_absent(first).unwrap();
+        assert!(inserted);
+        let (retry_id, inserted) = store
+            .add_record_if_absent(reordered_retry)
+            .expect("descriptor ordering must not change payload identity");
+        assert_eq!(retry_id, record_id);
+        assert!(!inserted);
+
+        let error = store
+            .add_record_if_absent(changed)
+            .expect_err("changed payload must not be silently discarded");
+        assert!(error.to_string().contains("different payload"));
         assert_eq!(store.len(), 1);
     }
 

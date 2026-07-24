@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 
+use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic::Code;
 use unirust_rs::distributed::proto::{
     self, router_service_client::RouterServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
     QueryDescriptor, QueryEntitiesRequest, RecordDescriptor, RecordIdentity as ProtoRecordIdentity,
@@ -19,12 +21,17 @@ async fn spawn_shard(
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -111,11 +118,12 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record],
         })
         .await?;
 
-    let response = client.query_entities(query).await?.into_inner();
+    let response = client.query_entities(query.clone()).await?.into_inner();
     match response.outcome {
         Some(proto::query_entities_response::Outcome::Matches(matches)) => {
             assert_eq!(matches.matches.len(), 1);
@@ -123,5 +131,65 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
         _ => anyhow::bail!("expected match after apply"),
     }
 
+    client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(support::to_proto_config(&config)),
+        })
+        .await?;
+
+    let response = client.query_entities(query.clone()).await?.into_inner();
+    match response.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert_eq!(
+                matches.matches.len(),
+                1,
+                "reapplying the active ontology must not reset records"
+            );
+        }
+        _ => anyhow::bail!("expected match after reapplying the active ontology"),
+    }
+
+    let mut replacement = config.clone();
+    replacement
+        .strong_identifiers
+        .push("passport_number".to_string());
+    let error = client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(support::to_proto_config(&replacement)),
+        })
+        .await
+        .expect_err("replacing ontology on a nonempty cluster must fail");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+
+    let response = client.query_entities(query).await?.into_inner();
+    match response.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert_eq!(
+                matches.matches.len(),
+                1,
+                "a rejected ontology replacement must preserve records"
+            );
+        }
+        _ => anyhow::bail!("expected match after rejected ontology replacement"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_rejects_a_shard_with_a_different_restored_ontology() -> anyhow::Result<()> {
+    let (shard_addr, _shard_handle) = spawn_shard(0, support::build_iam_config()).await?;
+    let error = match RouterNode::connect(
+        vec![format!("http://{shard_addr}")],
+        DistributedOntologyConfig::empty(),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("router unexpectedly accepted a mismatched shard ontology"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("ontology mismatch"));
     Ok(())
 }

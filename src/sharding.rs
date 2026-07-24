@@ -10,9 +10,15 @@ use crate::temporal::{is_overlapping, Interval};
 use crate::ClusterAssignment;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+
+fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
 
 /// A signature of identity key values for fast lookup.
 /// This is a 32-byte hash of the identity key's attribute-value pairs.
@@ -22,35 +28,15 @@ pub struct IdentityKeySignature(pub [u8; 32]);
 impl IdentityKeySignature {
     /// Create a new signature from identity key values.
     pub fn from_key_values(entity_type: &str, key_values: &[KeyValue]) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Use two hashers to fill 32 bytes
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-
-        entity_type.hash(&mut hasher1);
-        entity_type.hash(&mut hasher2);
-
-        for (i, kv) in key_values.iter().enumerate() {
-            kv.hash(&mut hasher1);
-            // Mix in index for hasher2 to get different bits
-            (kv, i).hash(&mut hasher2);
+        let mut hasher = Sha256::new();
+        hasher.update(b"unirust.identity-key.numeric.v1");
+        hash_length_prefixed(&mut hasher, entity_type.as_bytes());
+        hasher.update((key_values.len() as u64).to_be_bytes());
+        for key_value in key_values {
+            hasher.update(key_value.attr.0.to_be_bytes());
+            hasher.update(key_value.value.0.to_be_bytes());
         }
-
-        let h1 = hasher1.finish().to_le_bytes();
-        let h2 = hasher2.finish().to_le_bytes();
-
-        let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&h1);
-        bytes[8..16].copy_from_slice(&h2);
-        // Fill remaining with XOR variations
-        for i in 0..8 {
-            bytes[16 + i] = h1[i] ^ h2[7 - i];
-            bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
-        }
-
-        Self(bytes)
+        Self(hasher.finalize().into())
     }
 
     /// Create a signature from identity key values using the interner's string values.
@@ -60,35 +46,21 @@ impl IdentityKeySignature {
         key_values: &[KeyValue],
         interner: &dyn InternerLookup,
     ) -> Option<Self> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-
-        entity_type.hash(&mut hasher1);
-        entity_type.hash(&mut hasher2);
-
-        for (i, kv) in key_values.iter().enumerate() {
-            let attr = interner.get_attr_string(kv.attr)?;
-            let value = interner.get_value_string(kv.value)?;
-            attr.hash(&mut hasher1);
-            value.hash(&mut hasher1);
-            ((attr, value), i).hash(&mut hasher2);
+        let mut hasher = Sha256::new();
+        hasher.update(b"unirust.identity-key.text.v1");
+        hash_length_prefixed(&mut hasher, entity_type.as_bytes());
+        hasher.update((key_values.len() as u64).to_be_bytes());
+        for key_value in key_values {
+            hash_length_prefixed(
+                &mut hasher,
+                interner.get_attr_string(key_value.attr)?.as_bytes(),
+            );
+            hash_length_prefixed(
+                &mut hasher,
+                interner.get_value_string(key_value.value)?.as_bytes(),
+            );
         }
-
-        let h1 = hasher1.finish().to_le_bytes();
-        let h2 = hasher2.finish().to_le_bytes();
-
-        let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&h1);
-        bytes[8..16].copy_from_slice(&h2);
-        for i in 0..8 {
-            bytes[16 + i] = h1[i] ^ h2[7 - i];
-            bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
-        }
-
-        Some(Self(bytes))
+        Some(Self(hasher.finalize().into()))
     }
 
     /// Convert to bytes for storage.
@@ -174,6 +146,15 @@ impl BloomFilter {
 }
 
 /// Entry in the cluster boundary index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BoundaryStrongId {
+    pub perspective: String,
+    pub attribute: String,
+    pub value: String,
+    pub interval: Interval,
+}
+
+/// Entry in the cluster boundary index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryEntry {
     pub cluster_id: GlobalClusterId,
@@ -184,6 +165,9 @@ pub struct BoundaryEntry {
     /// Two clusters conflict if they share a perspective key but have different values.
     #[serde(default)]
     pub perspective_strong_ids: HashMap<u64, u64>,
+    /// Exact strong-ID observations used for temporal conflict checks.
+    #[serde(default)]
+    pub strong_ids: Vec<BoundaryStrongId>,
 }
 
 /// A cross-shard conflict detected during reconciliation.
@@ -191,7 +175,7 @@ pub struct BoundaryEntry {
 /// This represents an indirect conflict where two clusters on different shards
 /// share an identity key but have conflicting strong identifiers within the
 /// same perspective - meaning they cannot be merged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossShardConflict {
     /// The identity key signature that links the conflicting clusters.
     pub identity_key_signature: IdentityKeySignature,
@@ -271,13 +255,49 @@ impl ClusterBoundaryIndex {
         interval: Interval,
         perspective_strong_ids: HashMap<u64, u64>,
     ) {
+        self.register_boundary_key_with_conflict_data(
+            signature,
+            cluster_id,
+            interval,
+            perspective_strong_ids,
+            Vec::new(),
+        );
+    }
+
+    /// Register a cluster's identity key with exact temporal strong-ID observations.
+    pub fn register_boundary_key_with_conflict_data(
+        &mut self,
+        signature: IdentityKeySignature,
+        cluster_id: GlobalClusterId,
+        interval: Interval,
+        perspective_strong_ids: HashMap<u64, u64>,
+        mut strong_ids: Vec<BoundaryStrongId>,
+    ) {
         self.key_bloom.insert(&signature);
+        strong_ids.sort_by(|left, right| {
+            (
+                &left.perspective,
+                &left.attribute,
+                &left.value,
+                left.interval.start,
+                left.interval.end,
+            )
+                .cmp(&(
+                    &right.perspective,
+                    &right.attribute,
+                    &right.value,
+                    right.interval.start,
+                    right.interval.end,
+                ))
+        });
+        strong_ids.dedup();
 
         let entry = BoundaryEntry {
             cluster_id,
             interval,
             shard_id: self.shard_id,
             perspective_strong_ids,
+            strong_ids,
         };
 
         self.boundary_keys.entry(signature).or_default().push(entry);
@@ -497,7 +517,7 @@ impl IncrementalReconciler {
     ) {
         let mut merges = Vec::new();
         let mut merge_candidates = 0;
-        let mut conflicts_blocked = 0;
+        let mut conflicts_blocked = 0usize;
         let mut detected_conflicts = Vec::new();
 
         // Build a map of all signatures to their entries across all shards
@@ -539,22 +559,15 @@ impl IncrementalReconciler {
                                 // Record the conflict and skip this merge
                                 conflicts_blocked += 1;
 
-                                // Compute the overlapping interval
-                                let overlap_start = e1.interval.start.max(e2.interval.start);
-                                let overlap_end = e1.interval.end.min(e2.interval.end);
-                                if let Ok(overlap_interval) =
-                                    Interval::new(overlap_start, overlap_end)
-                                {
-                                    detected_conflicts.push(CrossShardConflict {
-                                        identity_key_signature: sig,
-                                        cluster1: e1.cluster_id,
-                                        cluster2: e2.cluster_id,
-                                        interval: overlap_interval,
-                                        perspective_hash: conflict_detail.perspective_hash,
-                                        strong_id_hash1: conflict_detail.strong_id_hash1,
-                                        strong_id_hash2: conflict_detail.strong_id_hash2,
-                                    });
-                                }
+                                detected_conflicts.push(CrossShardConflict {
+                                    identity_key_signature: sig,
+                                    cluster1: e1.cluster_id,
+                                    cluster2: e2.cluster_id,
+                                    interval: conflict_detail.interval,
+                                    perspective_hash: conflict_detail.perspective_hash,
+                                    strong_id_hash1: conflict_detail.strong_id_hash1,
+                                    strong_id_hash2: conflict_detail.strong_id_hash2,
+                                });
                                 continue;
                             }
 
@@ -571,10 +584,12 @@ impl IncrementalReconciler {
             }
         }
 
+        let (merges, component_conflicts_blocked) =
+            canonicalize_merges(merges, &detected_conflicts);
         (
             merges,
             merge_candidates,
-            conflicts_blocked,
+            conflicts_blocked.saturating_add(component_conflicts_blocked),
             detected_conflicts,
         )
     }
@@ -636,7 +651,7 @@ impl IncrementalReconciler {
 
         let mut merges = Vec::new();
         let mut merge_candidates = 0;
-        let mut conflicts_blocked = 0;
+        let mut conflicts_blocked = 0usize;
         let mut keys_matched = 0;
         let mut detected_conflicts = Vec::new();
 
@@ -675,21 +690,15 @@ impl IncrementalReconciler {
                             // Record the conflict and skip this merge
                             conflicts_blocked += 1;
 
-                            // Compute the overlapping interval
-                            let overlap_start = e1.interval.start.max(e2.interval.start);
-                            let overlap_end = e1.interval.end.min(e2.interval.end);
-                            if let Ok(overlap_interval) = Interval::new(overlap_start, overlap_end)
-                            {
-                                detected_conflicts.push(CrossShardConflict {
-                                    identity_key_signature: *sig,
-                                    cluster1: e1.cluster_id,
-                                    cluster2: e2.cluster_id,
-                                    interval: overlap_interval,
-                                    perspective_hash: conflict_detail.perspective_hash,
-                                    strong_id_hash1: conflict_detail.strong_id_hash1,
-                                    strong_id_hash2: conflict_detail.strong_id_hash2,
-                                });
-                            }
+                            detected_conflicts.push(CrossShardConflict {
+                                identity_key_signature: *sig,
+                                cluster1: e1.cluster_id,
+                                cluster2: e2.cluster_id,
+                                interval: conflict_detail.interval,
+                                perspective_hash: conflict_detail.perspective_hash,
+                                strong_id_hash1: conflict_detail.strong_id_hash1,
+                                strong_id_hash2: conflict_detail.strong_id_hash2,
+                            });
                             continue;
                         }
 
@@ -705,6 +714,9 @@ impl IncrementalReconciler {
             }
         }
 
+        let (merges, component_conflicts_blocked) =
+            canonicalize_merges(merges, &detected_conflicts);
+        conflicts_blocked = conflicts_blocked.saturating_add(component_conflicts_blocked);
         self.pending_merges = merges.clone();
 
         ReconciliationResult {
@@ -728,6 +740,112 @@ impl IncrementalReconciler {
     }
 }
 
+fn canonicalize_merges(
+    merges: Vec<(GlobalClusterId, GlobalClusterId)>,
+    conflicts: &[CrossShardConflict],
+) -> (Vec<(GlobalClusterId, GlobalClusterId)>, usize) {
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+
+    let mut edges = merges
+        .into_iter()
+        .filter(|(left, right)| left != right)
+        .map(|(left, right)| {
+            if left.to_u64() <= right.to_u64() {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by_key(|(left, right)| (left.to_u64(), right.to_u64()));
+    edges.dedup();
+
+    let mut nodes = edges
+        .iter()
+        .flat_map(|(left, right)| [*left, *right])
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(GlobalClusterId::to_u64);
+    nodes.dedup();
+    let node_index = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (*node, index))
+        .collect::<HashMap<_, _>>();
+
+    let mut blocked_by_node: HashMap<GlobalClusterId, HashSet<GlobalClusterId>> = HashMap::new();
+    for conflict in conflicts {
+        if conflict.cluster1 == conflict.cluster2 {
+            continue;
+        }
+        blocked_by_node
+            .entry(conflict.cluster1)
+            .or_default()
+            .insert(conflict.cluster2);
+        blocked_by_node
+            .entry(conflict.cluster2)
+            .or_default()
+            .insert(conflict.cluster1);
+    }
+
+    let mut parent = (0..nodes.len()).collect::<Vec<_>>();
+    let mut members = nodes
+        .iter()
+        .map(|node| HashSet::from([*node]))
+        .collect::<Vec<_>>();
+    let mut blocked = nodes
+        .iter()
+        .map(|node| blocked_by_node.remove(node).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let mut component_conflicts_blocked = 0usize;
+
+    for (left, right) in edges {
+        let mut left_root = find(&mut parent, node_index[&left]);
+        let mut right_root = find(&mut parent, node_index[&right]);
+        if left_root == right_root {
+            continue;
+        }
+        if !blocked[left_root].is_disjoint(&members[right_root])
+            || !blocked[right_root].is_disjoint(&members[left_root])
+        {
+            component_conflicts_blocked = component_conflicts_blocked.saturating_add(1);
+            continue;
+        }
+        if nodes[left_root].to_u64() > nodes[right_root].to_u64() {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+        parent[right_root] = left_root;
+        let right_members = std::mem::take(&mut members[right_root]);
+        members[left_root].extend(right_members);
+        let right_blocked = std::mem::take(&mut blocked[right_root]);
+        blocked[left_root].extend(right_blocked);
+    }
+
+    let mut canonical = Vec::new();
+    for (index, component_members) in members.iter().enumerate() {
+        if find(&mut parent, index) != index {
+            continue;
+        }
+        let mut component = component_members.iter().copied().collect::<Vec<_>>();
+        component.sort_by_key(GlobalClusterId::to_u64);
+        if let Some(primary) = component.first().copied() {
+            canonical.extend(
+                component
+                    .into_iter()
+                    .skip(1)
+                    .map(|secondary| (primary, secondary)),
+            );
+        }
+    }
+    canonical.sort_by_key(|(primary, secondary)| (primary.to_u64(), secondary.to_u64()));
+    (canonical, component_conflicts_blocked)
+}
+
 impl Default for IncrementalReconciler {
     fn default() -> Self {
         Self::new()
@@ -739,6 +857,21 @@ struct ConflictDetail {
     perspective_hash: u64,
     strong_id_hash1: u64,
     strong_id_hash2: u64,
+    interval: Interval,
+}
+
+fn stable_boundary_hash(domain: &[u8], values: &[&str]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for value in values {
+        hash_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest contains eight boundary hash bytes"),
+    )
 }
 
 /// Check if two boundary entries have conflicting strong IDs.
@@ -750,6 +883,43 @@ struct ConflictDetail {
 ///
 /// Returns `Some(ConflictDetail)` if a conflict is found, `None` otherwise.
 fn detect_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> Option<ConflictDetail> {
+    if !e1.strong_ids.is_empty() && !e2.strong_ids.is_empty() {
+        for strong_id_1 in &e1.strong_ids {
+            for strong_id_2 in &e2.strong_ids {
+                if strong_id_1.perspective != strong_id_2.perspective
+                    || strong_id_1.attribute != strong_id_2.attribute
+                    || strong_id_1.value == strong_id_2.value
+                {
+                    continue;
+                }
+                let Some(interval) =
+                    crate::temporal::intersect(&strong_id_1.interval, &strong_id_2.interval)
+                else {
+                    continue;
+                };
+                return Some(ConflictDetail {
+                    perspective_hash: stable_boundary_hash(
+                        b"unirust.boundary-perspective.v1",
+                        &[&strong_id_1.perspective],
+                    ),
+                    strong_id_hash1: stable_boundary_hash(
+                        b"unirust.boundary-strong-id.v1",
+                        &[&strong_id_1.attribute, &strong_id_1.value],
+                    ),
+                    strong_id_hash2: stable_boundary_hash(
+                        b"unirust.boundary-strong-id.v1",
+                        &[&strong_id_2.attribute, &strong_id_2.value],
+                    ),
+                    interval,
+                });
+            }
+        }
+        return None;
+    }
+
+    let interval = crate::temporal::intersect(&e1.interval, &e2.interval)?;
+
+    // Compatibility fallback for metadata from nodes that predate exact observations.
     // Check each perspective in e1 against e2
     for (perspective_hash, strong_id_hash_1) in &e1.perspective_strong_ids {
         if let Some(strong_id_hash_2) = e2.perspective_strong_ids.get(perspective_hash) {
@@ -760,6 +930,7 @@ fn detect_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> Option
                     perspective_hash: *perspective_hash,
                     strong_id_hash1: *strong_id_hash_1,
                     strong_id_hash2: *strong_id_hash_2,
+                    interval,
                 });
             }
         }
@@ -857,7 +1028,7 @@ impl ShardedStreamEngine {
         let shard_count = self.shards.len();
         let shards = std::mem::take(&mut self.shards);
         let mut handles = Vec::with_capacity(shard_count);
-        for ((idx, shard), bucket) in shards.into_iter().enumerate().zip(buckets.into_iter()) {
+        for ((idx, shard), bucket) in shards.into_iter().enumerate().zip(buckets) {
             handles.push(std::thread::spawn(
                 move || -> Result<(usize, ShardState, Vec<ShardedClusterAssignment>)> {
                     let mut shard = shard;
@@ -1020,6 +1191,131 @@ mod tests {
     use crate::model::{Descriptor, RecordIdentity};
     use crate::perf::ConcurrentInterner;
     use crate::Interval;
+
+    #[test]
+    fn text_identity_signature_has_a_stable_protocol_vector() {
+        let mut interner = StringInterner::new();
+        let attr = interner.intern_attr("email");
+        let value = interner.intern_value("alice@example.com");
+        let signature = IdentityKeySignature::from_key_values_with_interner(
+            "person",
+            &[KeyValue::new(attr, value)],
+            &interner,
+        )
+        .expect("signature");
+
+        assert_eq!(
+            signature.0,
+            [
+                0x82, 0xb4, 0x0d, 0xdb, 0x19, 0xe7, 0x35, 0xda, 0x21, 0x5e, 0xb6, 0xb4, 0x23, 0x4a,
+                0x0d, 0x7f, 0x1b, 0x83, 0xd6, 0x60, 0x06, 0xc0, 0x87, 0xb5, 0xc8, 0x10, 0x6b, 0xb8,
+                0x3d, 0x0c, 0x70, 0x41,
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_boundary_guards_preserve_attribute_and_interval_semantics() {
+        let boundary_interval = Interval::new(0, 30).unwrap();
+        let cluster0 = GlobalClusterId::new(0, 1, 0);
+        let cluster1 = GlobalClusterId::new(1, 1, 0);
+        let entry0 = BoundaryEntry {
+            cluster_id: cluster0,
+            interval: boundary_interval,
+            shard_id: 0,
+            perspective_strong_ids: HashMap::new(),
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "A".to_string(),
+                interval: Interval::new(0, 10).unwrap(),
+            }],
+        };
+
+        let different_time = BoundaryEntry {
+            cluster_id: cluster1,
+            interval: boundary_interval,
+            shard_id: 1,
+            perspective_strong_ids: HashMap::new(),
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(10, 20).unwrap(),
+            }],
+        };
+        assert!(
+            detect_cross_shard_conflict(&entry0, &different_time).is_none(),
+            "adjacent strong-ID validity intervals do not conflict"
+        );
+
+        let different_attribute = BoundaryEntry {
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "account_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(0, 10).unwrap(),
+            }],
+            ..different_time.clone()
+        };
+        assert!(
+            detect_cross_shard_conflict(&entry0, &different_attribute).is_none(),
+            "different strong-ID attributes do not conflict"
+        );
+
+        let overlapping_value = BoundaryEntry {
+            strong_ids: vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(5, 15).unwrap(),
+            }],
+            ..different_time
+        };
+        let conflict = detect_cross_shard_conflict(&entry0, &overlapping_value)
+            .expect("overlapping different values for one strong ID must conflict");
+        assert_eq!(conflict.interval, Interval::new(5, 10).unwrap());
+    }
+
+    #[test]
+    fn reconciler_merges_clusters_with_nonoverlapping_strong_id_values() {
+        let signature = IdentityKeySignature::from_bytes([7; 32]);
+        let boundary_interval = Interval::new(0, 30).unwrap();
+        let mut shard0 = ClusterBoundaryIndex::new_small(0);
+        shard0.register_boundary_key_with_conflict_data(
+            signature,
+            GlobalClusterId::new(0, 1, 0),
+            boundary_interval,
+            HashMap::new(),
+            vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "A".to_string(),
+                interval: Interval::new(0, 10).unwrap(),
+            }],
+        );
+        let mut shard1 = ClusterBoundaryIndex::new_small(1);
+        shard1.register_boundary_key_with_conflict_data(
+            signature,
+            GlobalClusterId::new(1, 1, 0),
+            boundary_interval,
+            HashMap::new(),
+            vec![BoundaryStrongId {
+                perspective: "crm".to_string(),
+                attribute: "employee_id".to_string(),
+                value: "B".to_string(),
+                interval: Interval::new(10, 20).unwrap(),
+            }],
+        );
+
+        let mut reconciler = IncrementalReconciler::new();
+        reconciler.add_shard_boundary(shard0);
+        reconciler.add_shard_boundary(shard1);
+        let result = reconciler.reconcile();
+
+        assert_eq!(result.conflicts_blocked, 0);
+        assert_eq!(result.merges_performed, 1);
+    }
 
     #[test]
     fn sharded_reconcile_matches_single_linker() {
@@ -1306,6 +1602,62 @@ mod tests {
     }
 
     #[test]
+    fn reconciler_redirects_every_component_member_to_one_primary() {
+        use crate::model::{AttrId, ValueId};
+
+        let mut reconciler = IncrementalReconciler::new();
+        let signature = IdentityKeySignature::from_key_values(
+            "person",
+            &[KeyValue::new(AttrId(1), ValueId(2))],
+        );
+        let interval = Interval::new(0, 100).unwrap();
+        let clusters = [
+            GlobalClusterId::new(0, 10, 0),
+            GlobalClusterId::new(1, 20, 0),
+            GlobalClusterId::new(2, 30, 0),
+        ];
+
+        for (shard_id, cluster_id) in clusters.into_iter().enumerate() {
+            let mut boundary = ClusterBoundaryIndex::new_small(shard_id as u16);
+            boundary.register_boundary_key(signature, cluster_id, interval);
+            reconciler.add_shard_boundary(boundary);
+        }
+
+        let result = reconciler.reconcile();
+        assert_eq!(
+            result.merged_clusters,
+            vec![(clusters[0], clusters[1]), (clusters[0], clusters[2])]
+        );
+        assert_eq!(result.merges_performed, 2);
+        assert_eq!(result.merge_candidates, 3);
+    }
+
+    #[test]
+    fn component_merge_does_not_bridge_a_cannot_link_pair() {
+        use crate::model::{AttrId, ValueId};
+
+        let a = GlobalClusterId::new(0, 10, 0);
+        let b = GlobalClusterId::new(1, 20, 0);
+        let c = GlobalClusterId::new(2, 30, 0);
+        let conflict = CrossShardConflict {
+            identity_key_signature: IdentityKeySignature::from_key_values(
+                "person",
+                &[KeyValue::new(AttrId(1), ValueId(2))],
+            ),
+            cluster1: a,
+            cluster2: c,
+            interval: Interval::new(0, 100).unwrap(),
+            perspective_hash: 1,
+            strong_id_hash1: 2,
+            strong_id_hash2: 3,
+        };
+
+        let (merges, blocked) = canonicalize_merges(vec![(a, b), (b, c)], &[conflict]);
+        assert_eq!(merges, vec![(a, b)]);
+        assert_eq!(blocked, 1);
+    }
+
+    #[test]
     fn test_boundary_metadata_export_import() {
         use crate::model::{AttrId, ValueId};
 
@@ -1388,6 +1740,7 @@ mod tests {
             interval,
             shard_id: 0,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         // Strong ID: ts_code="TS1" (represented by hash)
         entry0.perspective_strong_ids.insert(
@@ -1404,6 +1757,7 @@ mod tests {
             interval,
             shard_id: 1,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         // Strong ID: ts_code="TS2" (DIFFERENT from Record 1!)
         entry1_a.perspective_strong_ids.insert(
@@ -1420,6 +1774,7 @@ mod tests {
             interval,
             shard_id: 1,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         // Strong ID: axioma_id="AI1" (different perspective, no conflict)
         entry1_b.perspective_strong_ids.insert(
@@ -1511,6 +1866,7 @@ mod tests {
             interval,
             shard_id: 0,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         entry0
             .perspective_strong_ids
@@ -1525,6 +1881,7 @@ mod tests {
             interval,
             shard_id: 1,
             perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
         };
         entry1
             .perspective_strong_ids

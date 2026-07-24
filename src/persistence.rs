@@ -1,14 +1,96 @@
-use crate::model::{Record, RecordId, RecordIdentity, StringInterner};
-use crate::store::{RecordStore, Store, StoreMetrics};
+use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity, StringInterner};
+use crate::store::{
+    records_have_same_payload, RecordStore, SourceRecordReservation, SourceReservationError, Store,
+    StoreMetrics,
+};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
     checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub const CHECKPOINT_PROTOCOL_VERSION: u32 = 1;
+const CHECKPOINT_MANIFEST_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_MANIFEST_FILE: &str = "UNIRUST_CHECKPOINT_MANIFEST";
+const CHECKPOINT_COMMITTED_FILE: &str = "UNIRUST_CHECKPOINT_COMMITTED";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCheckpointManifest {
+    format_version: u32,
+    checkpoint_protocol_version: u32,
+    generation: String,
+    shard_id: u32,
+    shard_count: u32,
+}
+
+impl ClusterCheckpointManifest {
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+
+    pub fn shard_count(&self) -> u32 {
+        self.shard_count
+    }
+
+    fn new(generation: &str, shard_id: u32, shard_count: u32) -> Result<Self> {
+        if generation.is_empty() {
+            anyhow::bail!("checkpoint generation must not be empty");
+        }
+        if shard_count == 0 || shard_id >= shard_count {
+            anyhow::bail!(
+                "checkpoint shard {} is outside cluster shard count {}",
+                shard_id,
+                shard_count
+            );
+        }
+        Ok(Self {
+            format_version: CHECKPOINT_MANIFEST_FORMAT_VERSION,
+            checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
+            generation: generation.to_string(),
+            shard_id,
+            shard_count,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format_version != CHECKPOINT_MANIFEST_FORMAT_VERSION {
+            anyhow::bail!(
+                "unsupported checkpoint manifest format version {}",
+                self.format_version
+            );
+        }
+        if self.checkpoint_protocol_version != CHECKPOINT_PROTOCOL_VERSION {
+            anyhow::bail!(
+                "unsupported checkpoint protocol version {}",
+                self.checkpoint_protocol_version
+            );
+        }
+        if self.generation.is_empty() {
+            anyhow::bail!("checkpoint manifest generation is empty");
+        }
+        if self.shard_count == 0 || self.shard_id >= self.shard_count {
+            anyhow::bail!(
+                "checkpoint manifest shard {} is outside cluster shard count {}",
+                self.shard_id,
+                self.shard_count
+            );
+        }
+        Ok(())
+    }
+}
 
 const CF_RECORDS: &str = "records";
 const CF_METADATA: &str = "metadata";
@@ -20,6 +102,7 @@ const CF_INDEX_TEMPORAL_BUCKET: &str = "index_temporal_bucket";
 const CF_INDEX_IDENTITY: &str = "index_identity";
 const CF_CONFLICT_SUMMARIES: &str = "conflict_summaries";
 const CF_CLUSTER_ASSIGNMENTS: &str = "cluster_assignments";
+const CF_SOURCE_RESERVATIONS: &str = "source_reservations";
 
 thread_local! {
     static RECORD_SER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -34,6 +117,281 @@ where
         record.encode_into(&mut buf).map_err(|err| anyhow!(err))?;
         f(&buf)
     })
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn copy_checkpoint_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_checkpoint_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target)?;
+            fs::File::open(&target)?.sync_all()?;
+        } else {
+            anyhow::bail!(
+                "checkpoint contains unsupported non-file entry {}",
+                entry.path().display()
+            );
+        }
+    }
+    sync_directory(destination)?;
+    Ok(())
+}
+
+fn validate_rocksdb_checkpoint(path: &Path) -> Result<()> {
+    let mut options = Options::default();
+    options.set_paranoid_checks(true);
+    let mut column_families = DB::list_cf(&options, path)?;
+    column_families.retain(|name| name != "default");
+    let db = DB::open_cf_for_read_only(&options, path, column_families, false)?;
+    drop(db);
+    Ok(())
+}
+
+fn read_manifest_file(path: &Path) -> Result<(ClusterCheckpointManifest, Vec<u8>)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("checkpoint marker {} must be a real file", path.display());
+    }
+    let bytes = fs::read(path)?;
+    let manifest: ClusterCheckpointManifest = bincode::deserialize(&bytes)?;
+    manifest.validate()?;
+    Ok((manifest, bytes))
+}
+
+fn write_marker_once(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("checkpoint marker {} must be a real file", path.display());
+        }
+        if fs::read(path)? == bytes {
+            return Ok(());
+        }
+        anyhow::bail!("checkpoint marker {} does not match", path.display());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("checkpoint marker name must be UTF-8"))?;
+    let staging = path.with_file_name(format!(".{file_name}.tmp"));
+    if staging.exists() {
+        fs::remove_file(&staging)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&staging, path)?;
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| anyhow!("checkpoint marker has no parent directory"))?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn prepare_cluster_checkpoint(
+    checkpoint: &Path,
+    generation: &str,
+    shard_id: u32,
+    shard_count: u32,
+) -> Result<()> {
+    if !checkpoint.is_dir() || !checkpoint.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "prepared checkpoint {} is not a RocksDB checkpoint",
+            checkpoint.display()
+        );
+    }
+    let expected = ClusterCheckpointManifest::new(generation, shard_id, shard_count)?;
+    let bytes = bincode::serialize(&expected)?;
+    write_marker_once(&checkpoint.join(CHECKPOINT_MANIFEST_FILE), &bytes)
+}
+
+pub(crate) fn validate_prepared_cluster_checkpoint(
+    checkpoint: &Path,
+    generation: &str,
+    shard_id: u32,
+    shard_count: u32,
+) -> Result<()> {
+    if !checkpoint.is_dir() || !checkpoint.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "prepared checkpoint {} is not a RocksDB checkpoint",
+            checkpoint.display()
+        );
+    }
+    let expected = ClusterCheckpointManifest::new(generation, shard_id, shard_count)?;
+    let (prepared, _) = read_manifest_file(&checkpoint.join(CHECKPOINT_MANIFEST_FILE))?;
+    if prepared != expected {
+        anyhow::bail!(
+            "prepared checkpoint {} does not match generation {} shard {}/{}",
+            checkpoint.display(),
+            generation,
+            shard_id,
+            shard_count
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn commit_cluster_checkpoint(
+    checkpoint: &Path,
+    generation: &str,
+    shard_id: u32,
+    shard_count: u32,
+) -> Result<()> {
+    let expected = ClusterCheckpointManifest::new(generation, shard_id, shard_count)?;
+    let (prepared, bytes) = read_manifest_file(&checkpoint.join(CHECKPOINT_MANIFEST_FILE))?;
+    if prepared != expected {
+        anyhow::bail!(
+            "prepared checkpoint {} does not match generation {} shard {}/{}",
+            checkpoint.display(),
+            generation,
+            shard_id,
+            shard_count
+        );
+    }
+    write_marker_once(&checkpoint.join(CHECKPOINT_COMMITTED_FILE), &bytes)
+}
+
+/// Read and validate a committed cluster checkpoint manifest.
+pub fn read_cluster_checkpoint_manifest(checkpoint: &Path) -> Result<ClusterCheckpointManifest> {
+    let metadata = fs::symlink_metadata(checkpoint)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("checkpoint source must be a real directory");
+    }
+    let checkpoint = checkpoint.canonicalize()?;
+    if !checkpoint.join("CURRENT").is_file() {
+        anyhow::bail!(
+            "checkpoint source {} is not a RocksDB checkpoint",
+            checkpoint.display()
+        );
+    }
+    let (manifest, prepared_bytes) =
+        read_manifest_file(&checkpoint.join(CHECKPOINT_MANIFEST_FILE))?;
+    let (_committed, committed_bytes) =
+        read_manifest_file(&checkpoint.join(CHECKPOINT_COMMITTED_FILE))?;
+    if committed_bytes != prepared_bytes {
+        anyhow::bail!(
+            "checkpoint {} has mismatched prepare and commit markers",
+            checkpoint.display()
+        );
+    }
+    Ok(manifest)
+}
+
+/// Return the committed checkpoint provenance copied into a restored RocksDB
+/// data directory. A lone or corrupt marker is a recovery integrity failure,
+/// not an unrestored directory.
+pub(crate) fn read_restored_checkpoint_manifest(
+    data_dir: &Path,
+) -> Result<Option<ClusterCheckpointManifest>> {
+    let prepared = data_dir.join(CHECKPOINT_MANIFEST_FILE);
+    let committed = data_dir.join(CHECKPOINT_COMMITTED_FILE);
+    let marker_exists = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    match (marker_exists(&prepared)?, marker_exists(&committed)?) {
+        (false, false) => Ok(None),
+        (true, true) => read_cluster_checkpoint_manifest(data_dir).map(Some),
+        _ => anyhow::bail!(
+            "restored data directory {} contains incomplete checkpoint provenance",
+            data_dir.display()
+        ),
+    }
+}
+
+/// Restore a RocksDB checkpoint into an empty replacement data directory.
+///
+/// Copying occurs in a sibling staging directory and is made visible with one
+/// rename only after every file and directory has been synchronized. Only
+/// checkpoints committed by the router's cluster-wide two-phase protocol are
+/// accepted.
+pub fn restore_checkpoint(source: &Path, destination: &Path) -> Result<()> {
+    restore_checkpoint_for_shard(source, destination, None)
+}
+
+/// Restore a committed cluster checkpoint and verify its shard identity.
+pub fn restore_checkpoint_for_shard(
+    source: &Path,
+    destination: &Path,
+    expected_shard_id: Option<u32>,
+) -> Result<()> {
+    let manifest = read_cluster_checkpoint_manifest(source)?;
+    if let Some(expected_shard_id) =
+        expected_shard_id.filter(|expected| *expected != manifest.shard_id)
+    {
+        anyhow::bail!(
+            "checkpoint belongs to shard {}, not requested shard {}",
+            manifest.shard_id,
+            expected_shard_id
+        );
+    }
+
+    let source = source.canonicalize()?;
+    validate_rocksdb_checkpoint(&source)?;
+
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(destination)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            anyhow::bail!("restore destination must be an empty directory");
+        }
+        if fs::read_dir(destination)?.next().transpose()?.is_some() {
+            anyhow::bail!(
+                "refusing to restore over nonempty destination {}",
+                destination.display()
+            );
+        }
+    }
+
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("restore destination must have a UTF-8 directory name"))?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    if parent.starts_with(&source) {
+        anyhow::bail!("restore destination must not be inside the checkpoint");
+    }
+    let destination = parent.join(name);
+    let staging = parent.join(format!(".{name}.restore.tmp"));
+    if staging.exists() {
+        anyhow::bail!(
+            "restore staging directory {} already exists; inspect and remove it before retrying",
+            staging.display()
+        );
+    }
+
+    copy_checkpoint_tree(&source, &staging)?;
+    validate_rocksdb_checkpoint(&staging)?;
+    if destination.exists() {
+        fs::remove_dir(&destination)?;
+    }
+    fs::rename(&staging, &destination)?;
+    sync_directory(&parent)?;
+    Ok(())
 }
 
 // DSU persistence column families
@@ -51,6 +409,28 @@ const CF_LINKER_CLUSTER_IDS: &str = "linker_cluster_ids";
 const CF_LINKER_GLOBAL_IDS: &str = "linker_global_ids";
 const CF_LINKER_METADATA: &str = "linker_metadata";
 
+const RESET_DATA_CFS: &[&str] = &[
+    CF_RECORDS,
+    CF_INTERNER,
+    CF_INDEX_ATTR_VALUE,
+    CF_INDEX_ENTITY_TYPE,
+    CF_INDEX_PERSPECTIVE,
+    CF_INDEX_TEMPORAL_BUCKET,
+    CF_INDEX_IDENTITY,
+    CF_CONFLICT_SUMMARIES,
+    CF_CLUSTER_ASSIGNMENTS,
+    CF_SOURCE_RESERVATIONS,
+    CF_DSU_PARENT,
+    CF_DSU_RANK,
+    CF_DSU_GUARDS,
+    CF_DSU_METADATA,
+    CF_INDEX_IDENTITY_KEYS,
+    CF_INDEX_KEY_STATS,
+    CF_LINKER_CLUSTER_IDS,
+    CF_LINKER_GLOBAL_IDS,
+    CF_LINKER_METADATA,
+];
+
 const KEY_NEXT_RECORD_ID: &[u8] = b"next_record_id";
 const KEY_INTERNER: &[u8] = b"interner";
 const KEY_ONTOLOGY_CONFIG: &[u8] = b"ontology_config";
@@ -61,6 +441,14 @@ const KEY_NEXT_VALUE_ID: &[u8] = b"next_value_id";
 const KEY_RECORD_COUNT: &[u8] = b"record_count";
 const KEY_CLUSTER_COUNT: &[u8] = b"cluster_count";
 const KEY_CONFLICT_SUMMARY_COUNT: &[u8] = b"conflict_summary_count";
+const KEY_CROSS_SHARD_CONFLICTS: &[u8] = b"cross_shard_conflicts";
+const KEY_SOURCE_RESERVATION_BACKFILL: &[u8] = b"source_reservation_backfill";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SourceReservationValue {
+    payload_digest: [u8; 32],
+    target_shard_id: u32,
+}
 
 // DSU metadata keys
 const KEY_DSU_NEXT_CLUSTER_ID: &[u8] = b"dsu_next_cluster_id";
@@ -114,14 +502,17 @@ pub struct PersistentStore {
     db: Arc<DB>,
     cache: Mutex<LruCache<RecordId, Record>>,
     staged_records: Mutex<Vec<Record>>,
+    staged_identities: Mutex<HashMap<RecordIdentity, RecordId>>,
     persisted_attr_id: u32,
     persisted_value_id: u32,
     record_count: u64,
     cluster_count: u64,
     conflict_summary_count: u64,
+    read_fault: AtomicBool,
 }
 
-/// Create WriteOptions for fast async writes (no WAL sync)
+/// Create WriteOptions for grouped writes. A high-level ingest calls
+/// `RecordStore::sync` once after all related batches have been written.
 fn fast_write_opts() -> WriteOptions {
     let mut opts = WriteOptions::default();
     opts.set_sync(false);
@@ -166,11 +557,13 @@ impl PersistentStore {
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("cache capacity"),
             )),
             staged_records: Mutex::new(Vec::new()),
+            staged_identities: Mutex::new(HashMap::new()),
             persisted_attr_id,
             persisted_value_id,
             record_count,
             cluster_count,
             conflict_summary_count,
+            read_fault: AtomicBool::new(false),
         };
         instance.rebuild_indexes_if_needed()?;
         if should_persist_count {
@@ -187,7 +580,11 @@ impl PersistentStore {
         &mut self.inner
     }
 
-    pub fn persist_interner(&mut self, batch: &mut WriteBatch) -> Result<()> {
+    fn mark_read_fault(&self) {
+        self.read_fault.store(true, Ordering::Release);
+    }
+
+    fn append_interner_to_batch(&self, batch: &mut WriteBatch) -> Result<(u32, u32)> {
         let interner_cf = self
             .db
             .cf_handle(CF_INTERNER)
@@ -216,8 +613,6 @@ impl PersistentStore {
             }
         }
 
-        self.persisted_attr_id = next_attr;
-        self.persisted_value_id = next_value;
         batch.put_cf(
             self.db
                 .cf_handle(CF_METADATA)
@@ -232,7 +627,12 @@ impl PersistentStore {
             KEY_NEXT_VALUE_ID,
             bincode::serialize(&next_value)?,
         );
-        Ok(())
+        Ok((next_attr, next_value))
+    }
+
+    fn commit_interner_watermark(&mut self, watermark: (u32, u32)) {
+        self.persisted_attr_id = watermark.0;
+        self.persisted_value_id = watermark.1;
     }
 
     pub fn persist_metadata(&self, batch: &mut WriteBatch) -> Result<()> {
@@ -255,20 +655,7 @@ impl PersistentStore {
         Ok(())
     }
 
-    pub fn persist_record(&self, record: &Record) -> Result<()> {
-        let records_cf = self
-            .db
-            .cf_handle(CF_RECORDS)
-            .ok_or_else(|| anyhow!("missing records column family"))?;
-        let key = record.id.0.to_be_bytes();
-        with_record_bytes(record, |bytes| {
-            self.db.put_cf(records_cf, key, bytes)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    pub fn index_record(&self, record: &Record) -> Result<()> {
+    fn index_record(&self, record: &Record) -> Result<()> {
         let mut batch = WriteBatch::default();
         self.index_record_with_batch(record, &mut batch)?;
         self.db.write(batch)?;
@@ -293,36 +680,61 @@ impl PersistentStore {
     }
 
     pub fn reset_data(&mut self) -> Result<()> {
-        clear_cf(&self.db, CF_RECORDS)?;
-        clear_cf(&self.db, CF_INTERNER)?;
-        clear_cf(&self.db, CF_INDEX_ATTR_VALUE)?;
-        clear_cf(&self.db, CF_INDEX_ENTITY_TYPE)?;
-        clear_cf(&self.db, CF_INDEX_PERSPECTIVE)?;
-        clear_cf(&self.db, CF_INDEX_TEMPORAL_BUCKET)?;
-        clear_cf(&self.db, CF_INDEX_IDENTITY)?;
-        clear_cf(&self.db, CF_CONFLICT_SUMMARIES)?;
-        clear_cf(&self.db, CF_CLUSTER_ASSIGNMENTS)?;
-        remove_metadata_key(&self.db, KEY_NEXT_RECORD_ID)?;
-        remove_metadata_key(&self.db, KEY_INDEX_VERSION)?;
+        let mut batch = WriteBatch::default();
+        for &cf_name in RESET_DATA_CFS {
+            clear_cf_in_batch(&self.db, cf_name, &mut batch)?;
+        }
+        let metadata_cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        batch.delete_cf(metadata_cf, KEY_INDEX_VERSION);
+        batch.delete_cf(metadata_cf, KEY_CROSS_SHARD_CONFLICTS);
+        batch.delete_cf(metadata_cf, KEY_SOURCE_RESERVATION_BACKFILL);
+        batch.put_cf(metadata_cf, KEY_NEXT_RECORD_ID, bincode::serialize(&0u32)?);
+        batch.put_cf(metadata_cf, KEY_RECORD_COUNT, bincode::serialize(&0u64)?);
+        batch.put_cf(metadata_cf, KEY_CLUSTER_COUNT, bincode::serialize(&0u64)?);
+        batch.put_cf(
+            metadata_cf,
+            KEY_CONFLICT_SUMMARY_COUNT,
+            bincode::serialize(&0u64)?,
+        );
+        batch.put_cf(metadata_cf, KEY_NEXT_ATTR_ID, bincode::serialize(&0u32)?);
+        batch.put_cf(metadata_cf, KEY_NEXT_VALUE_ID, bincode::serialize(&0u32)?);
+        self.db.write(batch)?;
+        self.db.flush_wal(true)?;
+
+        // Only publish the empty live view after the durable reset commits.
         self.inner = Store::new();
         self.persisted_attr_id = 0;
         self.persisted_value_id = 0;
         self.record_count = 0;
         self.cluster_count = 0;
         self.conflict_summary_count = 0;
-        let mut batch = WriteBatch::default();
-        self.persist_interner(&mut batch)?;
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
+        self.read_fault.store(false, Ordering::Release);
+        self.staged_records
+            .get_mut()
+            .map_err(|_| anyhow!("staged records lock poisoned"))?
+            .clear();
+        self.staged_identities
+            .get_mut()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .clear();
+        self.cache
+            .get_mut()
+            .map_err(|_| anyhow!("record cache lock poisoned"))?
+            .clear();
         Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
         self.db.flush()?;
         Ok(())
     }
 
     pub fn checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.db.flush_wal(true)?;
         let checkpoint = Checkpoint::new(&self.db)?;
         checkpoint.create_checkpoint(path)?;
         Ok(())
@@ -330,41 +742,119 @@ impl PersistentStore {
 
     pub fn persist_state(&mut self) -> Result<()> {
         let mut batch = WriteBatch::default();
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata(&mut batch)?;
         self.db.write(batch)?;
+        self.db.flush_wal(true)?;
+        self.commit_interner_watermark(watermark);
         Ok(())
     }
 
     /// Stage a record for later batch write. Returns (record_id, inserted).
     /// The record is added to cache immediately so it's readable, but not yet persisted to DB.
     pub fn stage_record_if_absent(&mut self, mut record: Record) -> Result<(RecordId, bool)> {
+        <Self as RecordStore>::ensure_healthy(self)?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            self.ensure_idempotent_record(existing, &record)?;
+            return Ok((existing, false));
+        }
+        <Self as RecordStore>::ensure_healthy(self)?;
+
+        if let Some(existing) = self
+            .staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .get(&record.identity)
+            .copied()
+        {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
 
         let record_id = self.inner.prepare_record(&mut record)?;
+        let identity = record.identity.clone();
 
         // Add to cache immediately so it's readable
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(record_id, record.clone());
-        }
+        self.cache
+            .lock()
+            .map_err(|_| anyhow!("record cache lock poisoned"))?
+            .put(record_id, record.clone());
 
         // Stage for later batch write
-        if let Ok(mut staged) = self.staged_records.lock() {
-            staged.push(record);
-        }
+        self.staged_records
+            .lock()
+            .map_err(|_| anyhow!("staged records lock poisoned"))?
+            .push(record);
+        self.staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .insert(identity, record_id);
 
         Ok((record_id, true))
     }
 
+    pub fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        mut record: Record,
+    ) -> Result<(RecordId, bool)> {
+        <Self as RecordStore>::ensure_healthy(self)?;
+        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            self.ensure_idempotent_record(existing, &record)?;
+            return Ok((existing, false));
+        }
+        <Self as RecordStore>::ensure_healthy(self)?;
+        if let Some(existing) = self
+            .staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .get(&record.identity)
+            .copied()
+        {
+            self.ensure_idempotent_record(existing, &record)?;
+            return Ok((existing, false));
+        }
+        if self.get_record(record.id).is_some() {
+            anyhow::bail!("record ID {} already exists", record.id.0);
+        }
+        <Self as RecordStore>::ensure_healthy(self)?;
+
+        let record_id = self.inner.prepare_record_with_explicit_id(&mut record)?;
+        let identity = record.identity.clone();
+        self.cache
+            .lock()
+            .map_err(|_| anyhow!("record cache lock poisoned"))?
+            .put(record_id, record.clone());
+        self.staged_records
+            .lock()
+            .map_err(|_| anyhow!("staged records lock poisoned"))?
+            .push(record);
+        self.staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .insert(identity, record_id);
+        Ok((record_id, true))
+    }
+
+    fn ensure_idempotent_record(&self, existing_id: RecordId, incoming: &Record) -> Result<()> {
+        let existing = self
+            .get_record(existing_id)
+            .ok_or_else(|| anyhow!("identity index references a missing record"))?;
+        <Self as RecordStore>::ensure_healthy(self)?;
+        if records_have_same_payload(&existing, incoming) {
+            Ok(())
+        } else {
+            anyhow::bail!("source record identity already exists with a different payload")
+        }
+    }
+
     /// Flush all staged records to the database in a single batch write.
     pub fn flush_staged_records(&mut self) -> Result<usize> {
+        <Self as RecordStore>::ensure_healthy(self)?;
         let records = {
             let mut staged = self
                 .staged_records
                 .lock()
-                .map_err(|_| anyhow!("lock error"))?;
+                .map_err(|_| anyhow!("staged records lock poisoned"))?;
             std::mem::take(&mut *staged)
         };
 
@@ -373,28 +863,43 @@ impl PersistentStore {
         }
 
         let count = records.len();
-        let records_cf = self
-            .db
-            .cf_handle(CF_RECORDS)
-            .ok_or_else(|| anyhow!("missing records column family"))?;
-
-        let mut batch = WriteBatch::default();
-
-        for record in &records {
-            let key = record.id.0.to_be_bytes();
-            with_record_bytes(record, |bytes| {
-                batch.put_cf(records_cf, key, bytes);
-                Ok(())
-            })?;
-            self.index_record_with_batch(record, &mut batch)?;
-        }
-
         let next_count = self.record_count.saturating_add(count as u64);
-        self.persist_interner(&mut batch)?;
-        self.persist_metadata_with_count(&mut batch, next_count)?;
+        let write_result = (|| -> Result<(u32, u32)> {
+            let mut batch = WriteBatch::default();
+            let watermark = self.append_interner_to_batch(&mut batch)?;
+            self.persist_metadata_with_count(&mut batch, next_count)?;
+            let records_cf = self
+                .db
+                .cf_handle(CF_RECORDS)
+                .ok_or_else(|| anyhow!("missing records column family"))?;
+            for record in &records {
+                let key = record.id.0.to_be_bytes();
+                with_record_bytes(record, |bytes| {
+                    batch.put_cf(records_cf, key, bytes);
+                    Ok(())
+                })?;
+                self.index_record_with_batch(record, &mut batch)?;
+            }
+            self.db.write_opt(batch, &fast_write_opts())?;
+            Ok(watermark)
+        })();
 
-        self.db.write_opt(batch, &fast_write_opts())?;
+        let watermark = match write_result {
+            Ok(watermark) => watermark,
+            Err(error) => {
+                *self
+                    .staged_records
+                    .lock()
+                    .map_err(|_| anyhow!("staged records lock poisoned"))? = records;
+                return Err(error);
+            }
+        };
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
+        self.staged_identities
+            .lock()
+            .map_err(|_| anyhow!("staged identities lock poisoned"))?
+            .clear();
 
         Ok(count)
     }
@@ -407,10 +912,24 @@ impl PersistentStore {
     }
 
     fn lookup_interner_id(&self, prefix: u8, value: &str) -> Option<u32> {
-        let interner_cf = self.db.cf_handle(CF_INTERNER)?;
+        let interner_cf = match self.db.cf_handle(CF_INTERNER) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let key = encode_interner_lookup_key(prefix, value);
-        let bytes = self.db.get_cf(interner_cf, key).ok()??;
+        let bytes = match self.db.get_cf(interner_cf, key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         if bytes.len() != 4 {
+            self.mark_read_fault();
             return None;
         }
         let mut buf = [0u8; 4];
@@ -419,15 +938,48 @@ impl PersistentStore {
     }
 
     fn lookup_interner_value(&self, prefix: u8, id: u32) -> Option<String> {
-        let interner_cf = self.db.cf_handle(CF_INTERNER)?;
+        let interner_cf = match self.db.cf_handle(CF_INTERNER) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let key = encode_interner_key(prefix, id);
-        let bytes = self.db.get_cf(interner_cf, key).ok()??;
-        String::from_utf8(bytes).ok()
+        let bytes = match self.db.get_cf(interner_cf, key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        match String::from_utf8(bytes) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.mark_read_fault();
+                None
+            }
+        }
     }
 }
 
 impl RecordStore for PersistentStore {
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.read_fault.load(Ordering::Acquire) {
+            anyhow::bail!(
+                "persistent store observed an I/O or decode failure; restart before continuing"
+            );
+        }
+        Ok(())
+    }
+
+    fn reset_data(&mut self) -> Result<()> {
+        PersistentStore::reset_data(self)
+    }
+
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
+        self.ensure_healthy()?;
         let mut record = record;
         let record_id = self.inner.prepare_record(&mut record)?;
         let next_count = self.record_count.saturating_add(1);
@@ -442,9 +994,10 @@ impl RecordStore for PersistentStore {
             Ok(())
         })?;
         self.index_record_with_batch(&record, &mut batch)?;
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
         if let Ok(mut cache) = self.cache.lock() {
             cache.put(record_id, record);
@@ -453,6 +1006,7 @@ impl RecordStore for PersistentStore {
     }
 
     fn add_records(&mut self, records: Vec<Record>) -> Result<()> {
+        self.ensure_healthy()?;
         if records.is_empty() {
             return Ok(());
         }
@@ -485,11 +1039,12 @@ impl RecordStore for PersistentStore {
         let next_count = self
             .record_count
             .saturating_add(prepared_records.len() as u64);
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 
         // Single write for all records
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
 
         // Update cache
@@ -503,14 +1058,18 @@ impl RecordStore for PersistentStore {
     }
 
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        self.ensure_healthy()?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
+        self.ensure_healthy()?;
         let record_id = self.add_record(record)?;
         Ok((record_id, true))
     }
 
     fn add_records_if_absent(&mut self, records: Vec<Record>) -> Result<Vec<(RecordId, bool)>> {
+        self.ensure_healthy()?;
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -519,16 +1078,29 @@ impl RecordStore for PersistentStore {
         let mut results = Vec::with_capacity(records.len());
         let mut new_records = Vec::new();
         let mut new_record_indices = Vec::new();
+        let mut pending_identities = HashMap::new();
+        let mut pending_duplicates = Vec::new();
 
         for (idx, record) in records.into_iter().enumerate() {
             if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+                self.ensure_idempotent_record(existing, &record)?;
                 results.push((existing, false));
+            } else if let Some(&new_record_index) = pending_identities.get(&record.identity) {
+                if !records_have_same_payload(&new_records[new_record_index], &record) {
+                    anyhow::bail!(
+                        "source record identity appears more than once with different payloads"
+                    );
+                }
+                results.push((RecordId(0), false));
+                pending_duplicates.push((idx, new_record_index));
             } else {
                 results.push((RecordId(0), true)); // Placeholder, will be filled in
                 new_record_indices.push(idx);
+                pending_identities.insert(record.identity.clone(), new_records.len());
                 new_records.push(record);
             }
         }
+        self.ensure_healthy()?;
 
         if new_records.is_empty() {
             return Ok(results);
@@ -564,16 +1136,20 @@ impl RecordStore for PersistentStore {
         let next_count = self
             .record_count
             .saturating_add(prepared_records.len() as u64);
-        self.persist_interner(&mut batch)?;
+        let watermark = self.append_interner_to_batch(&mut batch)?;
         self.persist_metadata_with_count(&mut batch, next_count)?;
 
         // Single write for all new records
         self.db.write(batch)?;
+        self.commit_interner_watermark(watermark);
         self.record_count = next_count;
 
         // Update results with actual record IDs
         for (i, idx) in new_record_indices.into_iter().enumerate() {
             results[idx].0 = assigned_ids[i];
+        }
+        for (idx, new_record_index) in pending_duplicates {
+            results[idx].0 = assigned_ids[new_record_index];
         }
 
         // Update cache
@@ -590,8 +1166,137 @@ impl RecordStore for PersistentStore {
         PersistentStore::stage_record_if_absent(self, record)
     }
 
+    fn stage_record_with_explicit_id_if_absent(
+        &mut self,
+        record: Record,
+    ) -> Result<(RecordId, bool)> {
+        PersistentStore::stage_record_with_explicit_id_if_absent(self, record)
+    }
+
     fn flush_staged_records(&mut self) -> Result<usize> {
         PersistentStore::flush_staged_records(self)
+    }
+
+    fn reserve_source_records(
+        &mut self,
+        reservations: &[SourceRecordReservation],
+    ) -> Result<Vec<u32>> {
+        self.ensure_healthy()?;
+        let cf = self
+            .db
+            .cf_handle(CF_SOURCE_RESERVATIONS)
+            .ok_or_else(|| anyhow!("missing source reservations column family"))?;
+        let mut pending = HashMap::with_capacity(reservations.len());
+        let mut targets = Vec::with_capacity(reservations.len());
+
+        for reservation in reservations {
+            let key = encode_identity_index(&reservation.identity)?;
+            let stored = if let Some(value) = pending.get(&key).copied() {
+                Some(value)
+            } else {
+                let bytes = match self.db.get_cf(cf, &key) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        self.mark_read_fault();
+                        return Err(err.into());
+                    }
+                };
+                match bytes {
+                    Some(bytes) => match bincode::deserialize::<SourceReservationValue>(&bytes) {
+                        Ok(value) => Some(value),
+                        Err(err) => {
+                            self.mark_read_fault();
+                            return Err(err.into());
+                        }
+                    },
+                    None => None,
+                }
+            };
+
+            if let Some(stored) = stored {
+                if stored.payload_digest != reservation.payload_digest {
+                    return Err(SourceReservationError::PayloadConflict.into());
+                }
+                if stored.target_shard_id != reservation.target_shard_id {
+                    return Err(SourceReservationError::TargetConflict {
+                        existing_shard: stored.target_shard_id,
+                        requested_shard: reservation.target_shard_id,
+                    }
+                    .into());
+                }
+                targets.push(stored.target_shard_id);
+            } else {
+                let value = SourceReservationValue {
+                    payload_digest: reservation.payload_digest,
+                    target_shard_id: reservation.target_shard_id,
+                };
+                pending.insert(key, value);
+                targets.push(value.target_shard_id);
+            }
+        }
+
+        if !pending.is_empty() {
+            let mut batch = WriteBatch::default();
+            for (key, value) in pending {
+                batch.put_cf(cf, key, bincode::serialize(&value)?);
+            }
+            let mut options = WriteOptions::default();
+            options.set_sync(true);
+            self.db.write_opt(batch, &options)?;
+        }
+        Ok(targets)
+    }
+
+    fn source_reservation_backfill(&self) -> Result<Option<(u32, u32)>> {
+        self.ensure_healthy()?;
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        let bytes = match self.db.get_cf(cf, KEY_SOURCE_RESERVATION_BACKFILL) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.mark_read_fault();
+                return Err(err.into());
+            }
+        };
+        match bytes {
+            Some(bytes) => match bincode::deserialize(&bytes) {
+                Ok(value) => Ok(Some(value)),
+                Err(err) => {
+                    self.mark_read_fault();
+                    Err(err.into())
+                }
+            },
+            None => Ok(None),
+        }
+    }
+
+    fn mark_source_reservation_backfill(
+        &mut self,
+        protocol_version: u32,
+        shard_count: u32,
+    ) -> Result<()> {
+        self.ensure_healthy()?;
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.db.put_cf_opt(
+            cf,
+            KEY_SOURCE_RESERVATION_BACKFILL,
+            bincode::serialize(&(protocol_version, shard_count))?,
+            &options,
+        )?;
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.ensure_healthy()?;
+        self.db.flush_wal(true)?;
+        Ok(())
     }
 
     fn get_record(&self, id: RecordId) -> Option<Record> {
@@ -601,10 +1306,29 @@ impl RecordStore for PersistentStore {
             }
         }
 
-        let records_cf = self.db.cf_handle(CF_RECORDS)?;
+        let records_cf = match self.db.cf_handle(CF_RECORDS) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let key = id.0.to_be_bytes();
-        let bytes = self.db.get_cf(records_cf, key).ok()??;
-        let record: Record = bincode::deserialize(&bytes).ok()?;
+        let bytes = match self.db.get_cf(records_cf, key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        let record: Record = match bincode::deserialize(&bytes) {
+            Ok(record) => record,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         if let Ok(mut cache) = self.cache.lock() {
             cache.put(id, record.clone());
         }
@@ -614,23 +1338,56 @@ impl RecordStore for PersistentStore {
     fn get_all_records(&self) -> Vec<Record> {
         let records_cf = match self.db.cf_handle(CF_RECORDS) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
-        self.db
-            .iterator_cf(records_cf, IteratorMode::Start)
-            .filter_map(|entry| {
-                entry
-                    .ok()
-                    .and_then(|(_, value)| bincode::deserialize(&value).ok())
-            })
-            .collect()
+        let mut records = Vec::new();
+        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
+            let (_, value) = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            };
+            match bincode::deserialize(&value) {
+                Ok(record) => records.push(record),
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            }
+        }
+        records
     }
 
     fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
-        let identity_cf = self.db.cf_handle(CF_INDEX_IDENTITY)?;
-        let key = encode_identity_index(identity).ok()?;
-        let value = self.db.get_cf(identity_cf, key).ok()??;
+        let identity_cf = match self.db.cf_handle(CF_INDEX_IDENTITY) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        let key = match encode_identity_index(identity) {
+            Ok(key) => key,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
+        let value = match self.db.get_cf(identity_cf, key) {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(_) => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         if value.len() != 4 {
+            self.mark_read_fault();
             return None;
         }
         let mut bytes = [0u8; 4];
@@ -641,15 +1398,25 @@ impl RecordStore for PersistentStore {
     fn for_each_record(&self, f: &mut dyn FnMut(Record)) {
         let records_cf = match self.db.cf_handle(CF_RECORDS) {
             Some(cf) => cf,
-            None => return,
+            None => {
+                self.mark_read_fault();
+                return;
+            }
         };
-        for (_key, value) in self
-            .db
-            .iterator_cf(records_cf, IteratorMode::Start)
-            .flatten()
-        {
-            if let Ok(record) = bincode::deserialize(&value) {
-                f(record);
+        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
+            let (_key, value) = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            };
+            match bincode::deserialize(&value) {
+                Ok(record) => f(record),
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             }
         }
     }
@@ -657,7 +1424,10 @@ impl RecordStore for PersistentStore {
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_ENTITY_TYPE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_string_prefix(entity_type);
         let iter = self
@@ -668,7 +1438,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -677,8 +1450,14 @@ impl RecordStore for PersistentStore {
                 if seen.insert(record_id) {
                     if let Some(record) = self.get_record(RecordId(record_id)) {
                         records.push(record);
+                    } else {
+                        self.mark_read_fault();
+                        break;
                     }
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -687,7 +1466,10 @@ impl RecordStore for PersistentStore {
     fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_PERSPECTIVE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_string_prefix(perspective);
         let iter = self
@@ -698,7 +1480,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -707,8 +1492,14 @@ impl RecordStore for PersistentStore {
                 if seen.insert(record_id) {
                     if let Some(record) = self.get_record(RecordId(record_id)) {
                         records.push(record);
+                    } else {
+                        self.mark_read_fault();
+                        break;
                     }
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -717,7 +1508,10 @@ impl RecordStore for PersistentStore {
     fn get_records_with_attribute(&self, attr: crate::model::AttrId) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_ATTR_VALUE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_attr_prefix(attr.0);
         let iter = self
@@ -728,7 +1522,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -737,8 +1534,14 @@ impl RecordStore for PersistentStore {
                 if seen.insert(record_id) {
                     if let Some(record) = self.get_record(RecordId(record_id)) {
                         records.push(record);
+                    } else {
+                        self.mark_read_fault();
+                        break;
                     }
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -747,7 +1550,10 @@ impl RecordStore for PersistentStore {
     fn get_records_in_interval(&self, interval: crate::temporal::Interval) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_TEMPORAL_BUCKET) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let mut candidates = std::collections::HashSet::new();
         for bucket in buckets_for_interval(interval.start, interval.end) {
@@ -758,13 +1564,19 @@ impl RecordStore for PersistentStore {
             for entry in iter {
                 let (key, _) = match entry {
                     Ok(pair) => pair,
-                    Err(_) => break,
+                    Err(_) => {
+                        self.mark_read_fault();
+                        break;
+                    }
                 };
                 if !key.starts_with(&prefix) {
                     break;
                 }
                 if let Some(record_id) = decode_temporal_record_id(&key) {
                     candidates.insert(record_id);
+                } else {
+                    self.mark_read_fault();
+                    break;
                 }
             }
         }
@@ -776,6 +1588,9 @@ impl RecordStore for PersistentStore {
                 }) {
                     records.push(record);
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         records
@@ -789,7 +1604,10 @@ impl RecordStore for PersistentStore {
     ) -> Vec<(RecordId, crate::temporal::Interval)> {
         let cf = match self.db.cf_handle(CF_INDEX_ATTR_VALUE) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let prefix = encode_attr_value_prefix(attr.0, value.0);
         let iter = self
@@ -799,7 +1617,10 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, _) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if !key.starts_with(&prefix) {
                 break;
@@ -808,6 +1629,9 @@ impl RecordStore for PersistentStore {
                 if let Some(overlap) = crate::temporal::intersect(&record_interval, &interval) {
                     matches.push((RecordId(record_id), overlap));
                 }
+            } else {
+                self.mark_read_fault();
+                break;
             }
         }
         matches
@@ -864,11 +1688,18 @@ impl RecordStore for PersistentStore {
     }
 
     fn set_cluster_count(&mut self, count: usize) -> Result<()> {
+        let previous = self.cluster_count;
         self.cluster_count = count as u64;
-        let mut batch = WriteBatch::default();
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        Ok(())
+        let result = (|| {
+            let mut batch = WriteBatch::default();
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.cluster_count = previous;
+        }
+        result
     }
 
     fn cluster_count(&self) -> Option<usize> {
@@ -886,10 +1717,17 @@ impl RecordStore for PersistentStore {
         let bytes = bincode::serialize(summaries)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, b"latest", bytes);
+        let previous = self.conflict_summary_count;
         self.conflict_summary_count = summaries.len() as u64;
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        Ok(())
+        let result = (|| {
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.conflict_summary_count = previous;
+        }
+        result
     }
 
     fn set_cluster_conflict_summaries(
@@ -902,14 +1740,13 @@ impl RecordStore for PersistentStore {
             .cf_handle(CF_CONFLICT_SUMMARIES)
             .ok_or_else(|| anyhow!("missing conflict summaries column family"))?;
         let key = cluster_id.0.to_be_bytes();
-        let existing = self.db.get_cf(cf, key).ok().flatten();
-        let existing_len = existing
-            .as_ref()
-            .and_then(|bytes| {
-                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(bytes).ok()
-            })
-            .map(|summaries| summaries.len())
-            .unwrap_or(0);
+        let existing = self.db.get_cf(cf, key)?;
+        let existing_len = match existing {
+            Some(bytes) => {
+                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&bytes)?.len()
+            }
+            None => 0,
+        };
         let new_len = summaries.len();
         let total = self
             .conflict_summary_count
@@ -918,23 +1755,45 @@ impl RecordStore for PersistentStore {
         let bytes = bincode::serialize(summaries)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, key, bytes);
+        let previous = self.conflict_summary_count;
         self.conflict_summary_count = total;
-        self.persist_metadata(&mut batch)?;
-        self.db.write(batch)?;
-        Ok(())
+        let result = (|| {
+            self.persist_metadata(&mut batch)?;
+            self.db.write(batch)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.conflict_summary_count = previous;
+        }
+        result
     }
 
     fn load_conflict_summaries(&self) -> Option<Vec<crate::conflicts::ConflictSummary>> {
-        let cf = self.db.cf_handle(CF_CONFLICT_SUMMARIES)?;
+        let cf = match self.db.cf_handle(CF_CONFLICT_SUMMARIES) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let mut summaries = Vec::new();
-        for (key, value) in self.db.iterator_cf(cf, IteratorMode::Start).flatten() {
+        for entry in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, value) = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
+            };
             if key.as_ref() == b"latest" {
                 continue;
             }
-            if let Ok(mut parsed) =
-                bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&value)
-            {
-                summaries.append(&mut parsed);
+            match bincode::deserialize::<Vec<crate::conflicts::ConflictSummary>>(&value) {
+                Ok(mut parsed) => summaries.append(&mut parsed),
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             }
         }
         if summaries.is_empty() {
@@ -942,6 +1801,33 @@ impl RecordStore for PersistentStore {
         } else {
             Some(summaries)
         }
+    }
+
+    fn set_cross_shard_conflicts(
+        &mut self,
+        conflicts: &[crate::sharding::CrossShardConflict],
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        self.db.put_cf(
+            cf,
+            KEY_CROSS_SHARD_CONFLICTS,
+            bincode::serialize(conflicts)?,
+        )?;
+        Ok(())
+    }
+
+    fn load_cross_shard_conflicts(&self) -> Result<Vec<crate::sharding::CrossShardConflict>> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("missing metadata column family"))?;
+        self.db
+            .get_cf(cf, KEY_CROSS_SHARD_CONFLICTS)?
+            .map(|bytes| bincode::deserialize(&bytes).map_err(Into::into))
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 
     fn conflict_summary_count(&self) -> Option<usize> {
@@ -990,7 +1876,10 @@ impl RecordStore for PersistentStore {
     ) -> Vec<Record> {
         let records_cf = match self.db.cf_handle(CF_RECORDS) {
             Some(cf) => cf,
-            None => return Vec::new(),
+            None => {
+                self.mark_read_fault();
+                return Vec::new();
+            }
         };
         let mut records = Vec::new();
         let start_key = start.0.to_be_bytes();
@@ -1001,18 +1890,30 @@ impl RecordStore for PersistentStore {
         for entry in iter {
             let (key, value) = match entry {
                 Ok(pair) => pair,
-                Err(_) => break,
+                Err(_) => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             let record_id = match decode_record_id_key(&key) {
                 Some(id) => id,
-                None => continue,
+                None => {
+                    self.mark_read_fault();
+                    break;
+                }
             };
             if record_id >= end.0 {
                 break;
             }
-            if let Ok(record) = bincode::deserialize::<Record>(&value) {
-                records.push(record);
-                if max_results > 0 && records.len() >= max_results {
+            match bincode::deserialize::<Record>(&value) {
+                Ok(record) => {
+                    records.push(record);
+                    if max_results > 0 && records.len() >= max_results {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    self.mark_read_fault();
                     break;
                 }
             }
@@ -1021,20 +1922,44 @@ impl RecordStore for PersistentStore {
     }
 
     fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
-        let records_cf = self.db.cf_handle(CF_RECORDS)?;
+        let records_cf = match self.db.cf_handle(CF_RECORDS) {
+            Some(cf) => cf,
+            None => {
+                self.mark_read_fault();
+                return None;
+            }
+        };
         let mut start_iter = self.db.iterator_cf(records_cf, IteratorMode::Start);
-        let min_id = start_iter
-            .next()
-            .and_then(|entry| entry.ok())
-            .and_then(|(key, _)| decode_record_id_key(&key))
-            .map(RecordId)?;
+        let min_id = match start_iter.next() {
+            Some(Ok((key, _))) => match decode_record_id_key(&key) {
+                Some(id) => RecordId(id),
+                None => {
+                    self.mark_read_fault();
+                    return None;
+                }
+            },
+            Some(Err(_)) => {
+                self.mark_read_fault();
+                return None;
+            }
+            None => return None,
+        };
 
         let mut end_iter = self.db.iterator_cf(records_cf, IteratorMode::End);
-        let max_id = end_iter
-            .next()
-            .and_then(|entry| entry.ok())
-            .and_then(|(key, _)| decode_record_id_key(&key))
-            .map(RecordId)?;
+        let max_id = match end_iter.next() {
+            Some(Ok((key, _))) => match decode_record_id_key(&key) {
+                Some(id) => RecordId(id),
+                None => {
+                    self.mark_read_fault();
+                    return None;
+                }
+            },
+            Some(Err(_)) => {
+                self.mark_read_fault();
+                return None;
+            }
+            None => return None,
+        };
 
         Some((min_id, max_id))
     }
@@ -1321,6 +2246,10 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
         ),
         ColumnFamilyDescriptor::new(
             CF_CLUSTER_ASSIGNMENTS,
+            build_cf_options(&base, &index_block_opts, None, None),
+        ),
+        ColumnFamilyDescriptor::new(
+            CF_SOURCE_RESERVATIONS,
             build_cf_options(&base, &index_block_opts, None, None),
         ),
         // DSU column families - 4-byte record_id keys, optimized for sequential access
@@ -1740,30 +2669,45 @@ fn load_metadata<T: serde::de::DeserializeOwned>(db: &DB, key: &[u8]) -> Result<
     }
 }
 
-fn clear_cf(db: &DB, cf_name: &str) -> Result<()> {
+fn clear_cf_in_batch(db: &DB, cf_name: &str, batch: &mut WriteBatch) -> Result<()> {
     let cf = db
         .cf_handle(cf_name)
         .ok_or_else(|| anyhow!("missing column family {cf_name}"))?;
-    let keys: Vec<Vec<u8>> = db
-        .iterator_cf(cf, IteratorMode::Start)
-        .map(|entry| entry.map(|(key, _)| key.to_vec()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if keys.is_empty() {
-        return Ok(());
-    }
+    // Keys are either fixed-width (under 64 bytes) or begin with a discriminator
+    // below 0xff, so this exclusive bound covers their complete encoded keyspace.
+    // A range tombstone avoids materializing millions of keys.
+    batch.delete_range_cf(cf, &[][..], &[u8::MAX; 64][..]);
+    Ok(())
+}
+
+fn clear_cf(db: &DB, cf_name: &str) -> Result<()> {
     let mut batch = WriteBatch::default();
-    for key in keys {
-        batch.delete_cf(cf, key);
-    }
+    clear_cf_in_batch(db, cf_name, &mut batch)?;
     db.write(batch)?;
     Ok(())
 }
 
-fn remove_metadata_key(db: &DB, key: &[u8]) -> Result<()> {
-    let metadata_cf = db
-        .cf_handle(CF_METADATA)
-        .ok_or_else(|| anyhow!("missing metadata column family"))?;
-    db.delete_cf(metadata_cf, key)?;
+/// Clear linker structures that can be reconstructed from durable records.
+///
+/// A crash can leave an older, internally consistent DSU snapshot alongside newer
+/// acknowledged records. Reusing that mixed-generation state during a record scan
+/// skips merges that are required to rebuild summaries and boundary metadata. Start
+/// recovery from an empty derived state instead; records and their persisted
+/// assignments remain untouched.
+pub(crate) fn clear_rebuildable_linker_state(db: &DB) -> Result<()> {
+    let mut batch = WriteBatch::default();
+    for cf_name in [
+        CF_DSU_PARENT,
+        CF_DSU_RANK,
+        CF_DSU_GUARDS,
+        CF_DSU_METADATA,
+        CF_INDEX_IDENTITY_KEYS,
+        CF_INDEX_KEY_STATS,
+    ] {
+        clear_cf_in_batch(db, cf_name, &mut batch)?;
+    }
+    db.write(batch)?;
+    db.flush_wal(true)?;
     Ok(())
 }
 
@@ -2129,6 +3073,24 @@ pub mod linker_encoding {
 
     /// The metadata key for next_cluster_id
     pub const KEY_NEXT_CLUSTER_ID: &[u8] = b"linker_next_cluster_id";
+
+    /// Prefix for durable cross-shard merge mappings.
+    pub const CROSS_SHARD_MERGE_PREFIX: &[u8] = b"cross_shard_merge/";
+
+    pub fn encode_cross_shard_merge_key(secondary: GlobalClusterId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(CROSS_SHARD_MERGE_PREFIX.len() + 8);
+        key.extend_from_slice(CROSS_SHARD_MERGE_PREFIX);
+        key.extend_from_slice(&encode_global_cluster_id(secondary));
+        key
+    }
+
+    pub fn decode_cross_shard_merge_key(bytes: &[u8]) -> Option<GlobalClusterId> {
+        let encoded = bytes.strip_prefix(CROSS_SHARD_MERGE_PREFIX)?;
+        if encoded.len() != 8 {
+            return None;
+        }
+        decode_global_cluster_id(encoded)
+    }
 }
 
 /// Linker state persistence operations
@@ -2196,6 +3158,47 @@ impl<'a> LinkerStatePersistence<'a> {
             linker_encoding::encode_next_cluster_id(next_id),
         )?;
         Ok(())
+    }
+
+    /// Persist a cross-shard redirect from a secondary cluster to its primary.
+    pub fn save_cross_shard_merge(
+        &self,
+        secondary: GlobalClusterId,
+        primary: GlobalClusterId,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        self.db.put_cf(
+            &cf,
+            linker_encoding::encode_cross_shard_merge_key(secondary),
+            linker_encoding::encode_global_cluster_id(primary),
+        )?;
+        Ok(())
+    }
+
+    /// Load all durable cross-shard redirects.
+    pub fn load_cross_shard_merges(&self) -> Result<Vec<(GlobalClusterId, GlobalClusterId)>> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        let mut mappings = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(linker_encoding::CROSS_SHARD_MERGE_PREFIX) {
+                continue;
+            }
+            let secondary = linker_encoding::decode_cross_shard_merge_key(&key)
+                .ok_or_else(|| anyhow!("invalid persisted cross-shard merge key"))?;
+            let primary = linker_encoding::decode_global_cluster_id(&value)
+                .filter(|_| value.len() == 8)
+                .ok_or_else(|| anyhow!("invalid persisted cross-shard merge value"))?;
+            mappings.push((secondary, primary));
+        }
+        Ok(mappings)
     }
 
     /// Load the next_cluster_id value.
@@ -2267,8 +3270,17 @@ mod tests {
     use crate::{StreamingTuning, Unirust};
     use tempfile::tempdir;
 
+    static PERSISTENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_persistent_tests() -> std::sync::MutexGuard<'static, ()> {
+        PERSISTENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn persistent_store_round_trip() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -2290,7 +3302,379 @@ mod tests {
     }
 
     #[test]
+    fn source_reservation_survives_restart_and_rejects_changed_payload() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "durable-source".to_string(),
+        );
+        let reservation = SourceRecordReservation {
+            identity: identity.clone(),
+            payload_digest: [7; 32],
+            target_shard_id: 1,
+        };
+
+        {
+            let mut store = PersistentStore::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .reserve_source_records(std::slice::from_ref(&reservation))
+                    .unwrap(),
+                vec![1]
+            );
+            store.mark_source_reservation_backfill(2, 3).unwrap();
+        }
+
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        assert_eq!(store.source_reservation_backfill().unwrap(), Some((2, 3)));
+        assert_eq!(
+            store
+                .reserve_source_records(std::slice::from_ref(&reservation))
+                .unwrap(),
+            vec![1]
+        );
+        let error = store
+            .reserve_source_records(&[SourceRecordReservation {
+                identity,
+                payload_digest: [8; 32],
+                target_shard_id: 1,
+            }])
+            .expect_err("a changed payload must remain rejected after restart");
+        assert!(matches!(
+            error.downcast_ref::<SourceReservationError>(),
+            Some(SourceReservationError::PayloadConflict)
+        ));
+    }
+
+    #[test]
+    fn external_checkpoint_restores_records_and_reservation_state() {
+        let _guard = lock_persistent_tests();
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let original_path = data_volume.path().join("original");
+        let checkpoint_path = backup_volume.path().join("checkpoint-1");
+        let replacement_path = data_volume.path().join("replacement");
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "restored-source".to_string(),
+        );
+
+        {
+            let mut store = PersistentStore::open(&original_path).unwrap();
+            let record_id = store
+                .add_record(Record::new(RecordId(0), identity.clone(), Vec::new()))
+                .unwrap();
+            assert_eq!(record_id, RecordId(0));
+            store
+                .reserve_source_records(&[SourceRecordReservation {
+                    identity: identity.clone(),
+                    payload_digest: [9; 32],
+                    target_shard_id: 0,
+                }])
+                .unwrap();
+            store.mark_source_reservation_backfill(2, 1).unwrap();
+            store.checkpoint(&checkpoint_path).unwrap();
+        }
+        prepare_cluster_checkpoint(&checkpoint_path, "unit-restore", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "unit-restore", 0, 1).unwrap();
+
+        restore_checkpoint(&checkpoint_path, &replacement_path).unwrap();
+        let mut restored = PersistentStore::open(&replacement_path).unwrap();
+        assert_eq!(
+            restored.get_record_id_by_identity(&identity),
+            Some(RecordId(0))
+        );
+        assert_eq!(
+            restored.source_reservation_backfill().unwrap(),
+            Some((2, 1))
+        );
+        let error = restored
+            .reserve_source_records(&[SourceRecordReservation {
+                identity,
+                payload_digest: [10; 32],
+                target_shard_id: 0,
+            }])
+            .expect_err("restored reservation must reject a changed payload");
+        assert!(matches!(
+            error.downcast_ref::<SourceReservationError>(),
+            Some(SourceReservationError::PayloadConflict)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_nonempty_destination() {
+        let _guard = lock_persistent_tests();
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "nonempty-destination", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "nonempty-destination", 0, 1).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("do-not-overwrite"), b"live data").unwrap();
+
+        let error = restore_checkpoint(&checkpoint_path, &destination)
+            .expect_err("restore must not overwrite a nonempty directory");
+        assert!(error.to_string().contains("refusing to restore"));
+        assert_eq!(
+            fs::read(destination.join("do-not-overwrite")).unwrap(),
+            b"live data"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_uncommitted_and_wrong_shard_snapshots() {
+        let _guard = lock_persistent_tests();
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "cluster-generation", 0, 2).unwrap();
+
+        restore_checkpoint(&checkpoint_path, &destination)
+            .expect_err("prepared but uncommitted checkpoint must be rejected");
+        assert!(!destination.exists());
+
+        commit_cluster_checkpoint(&checkpoint_path, "cluster-generation", 0, 2).unwrap();
+        restore_checkpoint_for_shard(&checkpoint_path, &destination, Some(1))
+            .expect_err("checkpoint from another shard must be rejected");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn restored_data_directory_rejects_incomplete_provenance() {
+        let _guard = lock_persistent_tests();
+        let data_volume = tempdir().unwrap();
+        fs::write(
+            data_volume.path().join(CHECKPOINT_MANIFEST_FILE),
+            b"incomplete",
+        )
+        .unwrap();
+
+        let error = read_restored_checkpoint_manifest(data_volume.path())
+            .expect_err("one restore marker must fail closed");
+        assert!(error
+            .to_string()
+            .contains("incomplete checkpoint provenance"));
+    }
+
+    #[test]
+    fn checkpoint_restore_validates_rocksdb_before_publish() {
+        let _guard = lock_persistent_tests();
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "corrupt-generation", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "corrupt-generation", 0, 1).unwrap();
+        fs::write(checkpoint_path.join("CURRENT"), b"not-a-valid-manifest\n").unwrap();
+
+        restore_checkpoint(&checkpoint_path, &destination)
+            .expect_err("corrupt RocksDB checkpoint must be rejected");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_restore_rejects_top_level_symlink() {
+        let _guard = lock_persistent_tests();
+        use std::os::unix::fs::symlink;
+
+        let data_volume = tempdir().unwrap();
+        let backup_volume = tempdir().unwrap();
+        let source_path = data_volume.path().join("source");
+        let checkpoint_path = backup_volume.path().join("checkpoint");
+        let checkpoint_link = backup_volume.path().join("checkpoint-link");
+        let destination = data_volume.path().join("replacement");
+
+        let store = PersistentStore::open(&source_path).unwrap();
+        store.checkpoint(&checkpoint_path).unwrap();
+        prepare_cluster_checkpoint(&checkpoint_path, "symlink-generation", 0, 1).unwrap();
+        commit_cluster_checkpoint(&checkpoint_path, "symlink-generation", 0, 1).unwrap();
+        symlink(&checkpoint_path, &checkpoint_link).unwrap();
+
+        restore_checkpoint(&checkpoint_link, &destination)
+            .expect_err("checkpoint symlink must be rejected");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn corrupt_record_read_poison_store_fail_closed() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+        let record_id;
+        {
+            let mut store = PersistentStore::open(path).unwrap();
+            let attr = store.interner_mut().intern_attr("email");
+            let value = store.interner_mut().intern_value("corrupt@example.com");
+            record_id = store
+                .add_record(Record::new(
+                    RecordId(0),
+                    RecordIdentity::new(
+                        "person".to_string(),
+                        "crm".to_string(),
+                        "corrupt".to_string(),
+                    ),
+                    vec![Descriptor::new(attr, value, Interval::new(0, 10).unwrap())],
+                ))
+                .unwrap();
+        }
+
+        let store = PersistentStore::open(path).unwrap();
+        let records_cf = store.db.cf_handle(CF_RECORDS).unwrap();
+        store
+            .db
+            .put_cf(records_cf, record_id.0.to_be_bytes(), b"not-a-record")
+            .unwrap();
+
+        assert!(store.get_record(record_id).is_none());
+        assert!(store.ensure_healthy().is_err());
+        assert!(
+            store.sync().is_err(),
+            "an ingest acknowledgement must fail after an incomplete read"
+        );
+    }
+
+    #[test]
+    fn staged_batch_deduplicates_source_identity() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let attr = store.interner_mut().intern_attr("email");
+        let value = store.interner_mut().intern_value("alice@example.com");
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "alice-1".to_string(),
+        );
+        let make_record = || {
+            Record::new(
+                RecordId(0),
+                identity.clone(),
+                vec![Descriptor::new(attr, value, Interval::new(0, 10).unwrap())],
+            )
+        };
+
+        let first = store.stage_record_if_absent(make_record()).unwrap();
+        let second = store.stage_record_if_absent(make_record()).unwrap();
+
+        assert!(first.1);
+        assert!(!second.1);
+        assert_eq!(first.0, second.0);
+        assert_eq!(store.flush_staged_records().unwrap(), 1);
+        drop(store);
+
+        let store = PersistentStore::open(path).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get_record_id_by_identity(&identity), Some(first.0));
+    }
+
+    #[test]
+    fn exhausted_record_id_sequence_survives_restart_without_wrapping() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+        let last_identity = RecordIdentity::new(
+            "person".to_string(),
+            "import".to_string(),
+            "last-id".to_string(),
+        );
+
+        {
+            let mut store = PersistentStore::open(path).unwrap();
+            let record = Record::new(RecordId(u32::MAX - 1), last_identity.clone(), Vec::new());
+            let (record_id, inserted) = store
+                .stage_record_with_explicit_id_if_absent(record)
+                .unwrap();
+            assert_eq!(record_id, RecordId(u32::MAX - 1));
+            assert!(inserted);
+            assert_eq!(store.flush_staged_records().unwrap(), 1);
+            store.sync().unwrap();
+        }
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let next = Record::new(
+            RecordId(0),
+            RecordIdentity::new(
+                "person".to_string(),
+                "crm".to_string(),
+                "must-not-wrap".to_string(),
+            ),
+            Vec::new(),
+        );
+        let error = store
+            .add_record(next)
+            .expect_err("persisted record ID exhaustion must fail closed");
+        assert!(error.to_string().contains("record ID space exhausted"));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.get_record_id_by_identity(&last_identity),
+            Some(RecordId(u32::MAX - 1))
+        );
+        assert!(store.get_record(RecordId(0)).is_none());
+    }
+
+    #[test]
+    fn batch_insert_deduplicates_source_identity() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "alice-1".to_string(),
+        );
+        let make_record = || Record::new(RecordId(0), identity.clone(), Vec::new());
+
+        let results = store
+            .add_records_if_absent(vec![make_record(), make_record()])
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1);
+        assert!(!results[1].1);
+        assert_eq!(results[0].0, results[1].0);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn interner_watermark_advances_only_after_commit() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        store.interner_mut().intern_attr("email");
+
+        let mut batch = WriteBatch::default();
+        let watermark = store.append_interner_to_batch(&mut batch).unwrap();
+
+        assert_eq!(store.persisted_attr_id, 0);
+        assert_eq!(watermark.0, 1);
+        store.db.write(batch).unwrap();
+        store.commit_interner_watermark(watermark);
+        assert_eq!(store.persisted_attr_id, 1);
+    }
+
+    #[test]
     fn persistent_store_retains_ontology_and_sequence() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -2336,7 +3720,31 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_all_persistent_resolution_state() {
+        let _guard = lock_persistent_tests();
+        let dir = tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        store.save_ontology_config(b"retained-config").unwrap();
+
+        for &cf_name in RESET_DATA_CFS {
+            let cf = store.db.cf_handle(cf_name).unwrap();
+            store.db.put_cf(cf, b"stale-key", b"stale-value").unwrap();
+        }
+        store.reset_data().unwrap();
+
+        for &cf_name in RESET_DATA_CFS {
+            let cf = store.db.cf_handle(cf_name).unwrap();
+            assert_eq!(store.db.iterator_cf(cf, IteratorMode::Start).count(), 0);
+        }
+        assert_eq!(
+            store.load_ontology_config().unwrap().as_deref(),
+            Some(b"retained-config".as_slice())
+        );
+    }
+
+    #[test]
     fn persistent_store_preserves_conflict_results() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 
@@ -2390,6 +3798,7 @@ mod tests {
 
     #[test]
     fn persistent_store_query_after_restart() {
+        let _guard = lock_persistent_tests();
         let dir = tempdir().unwrap();
         let path = dir.path();
 

@@ -680,30 +680,6 @@ impl PersistentTemporalDSU {
         Ok(())
     }
 
-    /// Save metadata to RocksDB
-    fn save_metadata(&self) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(self.cf_metadata)
-            .ok_or_else(|| anyhow!("missing DSU metadata column family"))?;
-
-        let next_id = self.next_cluster_id.load(Ordering::SeqCst);
-        self.db.put_cf(
-            cf,
-            crate::persistence::dsu_keys::NEXT_CLUSTER_ID,
-            next_id.to_be_bytes(),
-        )?;
-
-        let count = self.cluster_count.load(Ordering::SeqCst);
-        self.db.put_cf(
-            cf,
-            crate::persistence::dsu_keys::CLUSTER_COUNT,
-            count.to_be_bytes(),
-        )?;
-
-        Ok(())
-    }
-
     /// Add a record to the DSU (record becomes its own parent with rank 0)
     pub fn add_record(&mut self, record_id: RecordId) -> Result<()> {
         // Check if already exists in cache or disk
@@ -1103,9 +1079,9 @@ impl PersistentTemporalDSU {
             .cf_handle(self.cf_parent)
             .ok_or_else(|| anyhow!("missing DSU parent column family"))?;
 
-        for (record_id, parent_id) in self.dirty_parents.drain() {
-            let key = crate::persistence::dsu_encoding::encode_record_key(record_id);
-            let value = crate::persistence::dsu_encoding::encode_parent_value(parent_id);
+        for (record_id, parent_id) in &self.dirty_parents {
+            let key = crate::persistence::dsu_encoding::encode_record_key(*record_id);
+            let value = crate::persistence::dsu_encoding::encode_parent_value(*parent_id);
             batch.put_cf(parent_cf, key, value);
         }
 
@@ -1115,9 +1091,9 @@ impl PersistentTemporalDSU {
             .cf_handle(self.cf_rank)
             .ok_or_else(|| anyhow!("missing DSU rank column family"))?;
 
-        for (record_id, rank) in self.dirty_ranks.drain() {
-            let key = crate::persistence::dsu_encoding::encode_record_key(record_id);
-            let value = crate::persistence::dsu_encoding::encode_rank_value(rank);
+        for (record_id, rank) in &self.dirty_ranks {
+            let key = crate::persistence::dsu_encoding::encode_record_key(*record_id);
+            let value = crate::persistence::dsu_encoding::encode_rank_value(*rank);
             batch.put_cf(rank_cf, key, value);
         }
 
@@ -1127,17 +1103,35 @@ impl PersistentTemporalDSU {
             .cf_handle(self.cf_guards)
             .ok_or_else(|| anyhow!("missing DSU guards column family"))?;
 
-        for (record_id, guards) in self.dirty_guards.drain() {
-            let key = crate::persistence::dsu_encoding::encode_record_key(record_id);
-            let value = crate::persistence::dsu_encoding::encode_guards(&guards)?;
+        for (record_id, guards) in &self.dirty_guards {
+            let key = crate::persistence::dsu_encoding::encode_record_key(*record_id);
+            let value = crate::persistence::dsu_encoding::encode_guards(guards)?;
             batch.put_cf(guards_cf, key, value);
         }
 
-        // Write batch
-        self.db.write(batch)?;
+        // State and metadata must commit atomically. Keep dirty entries intact until
+        // RocksDB confirms the write so a transient failure remains retryable.
+        let metadata_cf = self
+            .db
+            .cf_handle(self.cf_metadata)
+            .ok_or_else(|| anyhow!("missing DSU metadata column family"))?;
+        let next_id = self.next_cluster_id.load(Ordering::SeqCst);
+        batch.put_cf(
+            metadata_cf,
+            crate::persistence::dsu_keys::NEXT_CLUSTER_ID,
+            next_id.to_be_bytes(),
+        );
+        let count = self.cluster_count.load(Ordering::SeqCst);
+        batch.put_cf(
+            metadata_cf,
+            crate::persistence::dsu_keys::CLUSTER_COUNT,
+            count.to_be_bytes(),
+        );
 
-        // Save metadata
-        self.save_metadata()?;
+        self.db.write(batch)?;
+        self.dirty_parents.clear();
+        self.dirty_ranks.clear();
+        self.dirty_guards.clear();
 
         Ok(())
     }

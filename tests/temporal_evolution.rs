@@ -14,7 +14,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
-#[allow(unused_imports)]
 use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -29,18 +28,27 @@ use unirust_rs::{StreamingTuning, TuningProfile};
 
 mod support;
 
+// Each scenario starts a persistent cluster. Serialize this integration file so
+// concurrent RocksDB instances stay within the process file-descriptor limit.
+static PERSISTENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn spawn_shard(
     shard_id: u32,
     config: DistributedOntologyConfig,
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -157,6 +165,7 @@ async fn setup_cluster() -> anyhow::Result<(RouterServiceClient<tonic::transport
 /// produces the same cluster state as ingesting all descriptors at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_ingestion_equals_batch_ingestion() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     // Setup: Two separate clusters, one for incremental, one for batch
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
@@ -220,16 +229,19 @@ async fn incremental_ingestion_equals_batch_ingestion() -> anyhow::Result<()> {
     // Ingest incrementally
     client_inc
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record_c1.clone()],
         })
         .await?;
     client_inc
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record_c2.clone()],
         })
         .await?;
     client_inc
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record_c3.clone()],
         })
         .await?;
@@ -237,6 +249,7 @@ async fn incremental_ingestion_equals_batch_ingestion() -> anyhow::Result<()> {
     // Batch: Ingest all 3 at once
     client_batch
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record_c1, record_c2, record_c3],
         })
         .await?;
@@ -295,6 +308,7 @@ async fn incremental_ingestion_equals_batch_ingestion() -> anyhow::Result<()> {
 /// Ingesting C1→C2→C3 should produce same result as C3→C2→C1 or C2→C1→C3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingestion_order_independence() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -356,6 +370,7 @@ async fn ingestion_order_independence() -> anyhow::Result<()> {
         for &idx in order {
             client
                 .ingest_records(IngestRecordsRequest {
+                    internal_protocol_version: 3,
                     records: vec![records[idx].clone()],
                 })
                 .await?;
@@ -396,6 +411,7 @@ async fn ingestion_order_independence() -> anyhow::Result<()> {
 /// Entity has email in month 1, phone in month 2, address in month 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temporal_descriptor_evolution() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     // Entity evolves over time with different descriptors from different source records.
@@ -430,13 +446,22 @@ async fn temporal_descriptor_evolution() -> anyhow::Result<()> {
 
     // Ingest over time
     client
-        .ingest_records(IngestRecordsRequest { records: vec![jan] })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
+            records: vec![jan],
+        })
         .await?;
     client
-        .ingest_records(IngestRecordsRequest { records: vec![feb] })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
+            records: vec![feb],
+        })
         .await?;
     client
-        .ingest_records(IngestRecordsRequest { records: vec![mar] })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
+            records: vec![mar],
+        })
         .await?;
 
     // Query by email - should find the entity
@@ -522,6 +547,7 @@ async fn temporal_descriptor_evolution() -> anyhow::Result<()> {
 /// Entity gets additional contact info from a second source record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attribute_value_changes_over_time() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     // Two source records that share an identity key (email) and merge.
@@ -546,6 +572,7 @@ async fn attribute_value_changes_over_time() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![initial, with_secondary],
         })
         .await?;
@@ -612,6 +639,7 @@ async fn attribute_value_changes_over_time() -> anyhow::Result<()> {
 /// and can be queried incrementally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     // CRM perspective first
@@ -624,6 +652,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
     );
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![crm_record],
         })
         .await?;
@@ -654,6 +683,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
     );
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![erp_record],
         })
         .await?;
@@ -690,6 +720,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
     );
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![hr_record],
         })
         .await?;
@@ -720,6 +751,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
 /// Test idempotency: re-ingesting the same record should not change state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idempotent_re_ingestion() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     let record = record_input(
@@ -736,6 +768,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
     // First ingestion
     let resp1 = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record.clone()],
         })
         .await?
@@ -745,6 +778,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
     // Second ingestion (identical)
     let resp2 = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record.clone()],
         })
         .await?
@@ -760,6 +794,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
     // Third ingestion
     let resp3 = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record],
         })
         .await?
@@ -788,6 +823,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
 /// Test that partial descriptor overlap correctly extends entity validity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     // First record: email valid Jan-Mar
@@ -799,22 +835,25 @@ async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
         vec![("email", "overlap@example.com", 202401, 202404)],
     );
 
-    // Second record: same entity, email valid Feb-Apr (overlapping)
+    // Second source snapshot: same resolved entity, email valid Feb-Apr (overlapping).
+    // Source record identities are immutable, so each snapshot has its own UID.
     let feb_apr = record_input(
         1,
         "person",
         "crm",
-        "overlap_001",
+        "overlap_002",
         vec![("email", "overlap@example.com", 202402, 202405)],
     );
 
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![jan_mar],
         })
         .await?;
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![feb_apr],
         })
         .await?;
@@ -835,6 +874,27 @@ async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
         "entity found across full range"
     );
 
+    // The extension-only interval proves the second snapshot was persisted.
+    let extension_response = client
+        .query_entities(QueryEntitiesRequest {
+            descriptors: vec![ProtoQueryDescriptor {
+                attr: "email".to_string(),
+                value: "overlap@example.com".to_string(),
+            }],
+            start: 202404,
+            end: 202405,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        count_matches(&extension_response),
+        1,
+        "entity found in extension-only interval"
+    );
+
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
+    assert_eq!(stats.record_count, 2, "both source snapshots persisted");
+
     Ok(())
 }
 
@@ -842,6 +902,7 @@ async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
 /// Entity email spans full range, but phone has a gap (only in Q1 and Q3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temporal_gap_between_records() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     // Two source records with the same email (spanning full range for identity key overlap).
@@ -871,6 +932,7 @@ async fn temporal_gap_between_records() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![q1, q3],
         })
         .await?;
@@ -967,6 +1029,7 @@ async fn temporal_gap_between_records() -> anyhow::Result<()> {
 /// regardless of which record is ingested first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_cluster_regardless_of_insertion_order() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -1021,6 +1084,7 @@ async fn same_cluster_regardless_of_insertion_order() -> anyhow::Result<()> {
         for &idx in order {
             let resp = client
                 .ingest_records(IngestRecordsRequest {
+                    internal_protocol_version: 3,
                     records: vec![records[idx].clone()],
                 })
                 .await?
@@ -1052,6 +1116,7 @@ async fn same_cluster_regardless_of_insertion_order() -> anyhow::Result<()> {
 /// All records in a batch with same identity key go to same cluster.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_ingestion_consistent_cluster() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -1094,6 +1159,7 @@ async fn batch_ingestion_consistent_cluster() -> anyhow::Result<()> {
 
     let batch_resp = batch_client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: records.clone(),
         })
         .await?
@@ -1120,6 +1186,7 @@ async fn batch_ingestion_consistent_cluster() -> anyhow::Result<()> {
     for record in &records {
         let resp = seq_client
             .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: 3,
                 records: vec![record.clone()],
             })
             .await?
@@ -1145,6 +1212,7 @@ async fn batch_ingestion_consistent_cluster() -> anyhow::Result<()> {
 /// regardless of interleaved insertion order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_entities_stay_separate_any_order() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -1203,6 +1271,7 @@ async fn independent_entities_stay_separate_any_order() -> anyhow::Result<()> {
         for &idx in order {
             client
                 .ingest_records(IngestRecordsRequest {
+                    internal_protocol_version: 3,
                     records: vec![records[idx].clone()],
                 })
                 .await?;
@@ -1268,6 +1337,7 @@ async fn independent_entities_stay_separate_any_order() -> anyhow::Result<()> {
 /// Test late-arriving record merges into existing cluster correctly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_arrival_merges_into_existing_cluster() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
     let (mut client,) = setup_cluster().await?;
 
     // First, ingest two records that form a cluster
@@ -1288,6 +1358,7 @@ async fn late_arrival_merges_into_existing_cluster() -> anyhow::Result<()> {
 
     let resp1 = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![rec1, rec2],
         })
         .await?
@@ -1314,6 +1385,7 @@ async fn late_arrival_merges_into_existing_cluster() -> anyhow::Result<()> {
 
     let resp2 = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![late_rec],
         })
         .await?

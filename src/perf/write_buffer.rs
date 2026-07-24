@@ -113,12 +113,8 @@ impl WriteBufferStats {
     /// Get average stall duration
     pub fn avg_stall_duration(&self) -> Duration {
         let stalls = self.stalls.load(Ordering::Relaxed);
-        if stalls == 0 {
-            Duration::ZERO
-        } else {
-            let total_us = self.stall_duration_us.load(Ordering::Relaxed);
-            Duration::from_micros(total_us / stalls)
-        }
+        let total_us = self.stall_duration_us.load(Ordering::Relaxed);
+        Duration::from_micros(total_us.checked_div(stalls).unwrap_or(0))
     }
 }
 

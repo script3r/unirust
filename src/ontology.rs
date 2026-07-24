@@ -355,7 +355,7 @@ impl Ontology {
                         attribute_name,
                         ..
                     } => {
-                        if let Some(ref name) = attribute_name {
+                        if let Some(name) = attribute_name {
                             *attribute = intern_fn(name);
                         }
                     }
@@ -364,7 +364,7 @@ impl Ontology {
                         attribute_name,
                         ..
                     } => {
-                        if let Some(ref name) = attribute_name {
+                        if let Some(name) = attribute_name {
                             *attribute = intern_fn(name);
                         }
                     }

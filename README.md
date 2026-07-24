@@ -26,7 +26,7 @@ Unirust will:
 - **Conflict Detection**: Automatic detection of attribute conflicts within clusters
 - **Distributed**: Router + multi-shard architecture for horizontal scaling
 - **Persistent**: RocksDB storage with crash recovery
-- **High Performance**: 400K+ records/sec via batch-parallel processing, lock-free DSU, SIMD hashing
+- **Measured Performance**: Release baselines use persistent shards and include full entity resolution; see the benchmark below
 
 ## Quick Start
 
@@ -52,7 +52,13 @@ cargo build --release
 
 ```bash
 # Use the cluster script
-SHARDS=5 ./scripts/cluster.sh start
+SHARDS=5 ONTOLOGY=/etc/unirust/ontology.json ./scripts/cluster.sh start
+
+# Restart the same persistent cluster without deleting records
+SHARDS=5 ONTOLOGY=/etc/unirust/ontology.json ./scripts/cluster.sh restart
+
+# Destructive reset is separate and requires explicit confirmation
+UNIRUST_CONFIRM_RESET=1 ./scripts/cluster.sh reset
 
 # Or start manually:
 ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0
@@ -132,7 +138,12 @@ write_buffer_mb = 256
 | `UNIRUST_PROFILE` | Tuning profile |
 | `UNIRUST_SHARD_LISTEN` | Shard listen address |
 | `UNIRUST_SHARD_ID` | Shard ID |
+| `UNIRUST_SHARD_DATA_DIR` | Persistent shard data directory |
+| `UNIRUST_SHARD_BACKUP_DIR` | External checkpoint root |
 | `UNIRUST_ROUTER_SHARDS` | Comma-separated shard addresses |
+| `UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS` | Coordinated checkpoint interval (`0` disables) |
+| `UNIRUST_ROUTER_SHARD_CONNECT_TIMEOUT_SECS` | Shard connection timeout |
+| `UNIRUST_ROUTER_SHARD_REQUEST_TIMEOUT_SECS` | Per-RPC shard timeout |
 
 ### Tuning Profiles
 
@@ -141,9 +152,9 @@ write_buffer_mb = 256
 | `balanced` | General purpose (default for library) |
 | `low-latency` | Interactive queries, fast responses |
 | `high-throughput` | Batch processing (default for binaries) |
-| `bulk-ingest` | Maximum ingest speed, reduced matching |
+| `bulk-ingest` | Large initial loads with lower candidate caps; entity resolution remains enabled |
 | `memory-saver` | Constrained environments |
-| `billion-scale` | Persistent DSU for huge datasets |
+| `billion-scale` | Disk-backed DSU/index; see the recovery and memory limits below |
 
 ## API Reference
 
@@ -187,42 +198,234 @@ See [DESIGN.md](DESIGN.md) for detailed architecture documentation, including:
 
 ## Examples
 
-The `examples/` directory contains comprehensive examples:
+The `examples/` directory demonstrates the supported sharded deployment model:
 
-- `in_memory.rs` - In-memory entity resolution, perfect for learning
-- `persistent_shard.rs` - Single-shard with RocksDB persistence
 - `cluster.rs` - Full 3-shard distributed cluster with router
-- `unirust.toml` - Example configuration file
+- `unirust.toml` - Persistent router and shard configuration
 
 Run examples:
 ```bash
-# Simple in-memory example
-cargo run --example in_memory
-
-# Persistent storage with single shard
-cargo run --example persistent_shard
-
-# Distributed cluster (requires cluster running first)
+# Distributed cluster (requires the persistent cluster running first)
 SHARDS=3 ./scripts/cluster.sh start
 cargo run --example cluster
 ./scripts/cluster.sh stop
 ```
 
+## Durability
+
+Persistent shards use two recovery layers for every ingest request:
+
+1. The request is written to a versioned, checksummed binary ingest WAL. The
+   file and its parent directory are synced before entity resolution begins.
+2. Records, indexes, cluster assignments, and all other state produced by the
+   request are written to RocksDB, then its WAL is synced to stable storage.
+3. Only after that sync succeeds is the ingest WAL removed and the request
+   acknowledged. Its directory is synced again after removal.
+
+On restart, a remaining ingest WAL is replayed idempotently. A pending WAL is
+never overwritten by a later request; a failed ingest therefore requires shard
+restart and replay before more traffic is accepted. A truncated or corrupt WAL
+is preserved with a `.corrupt.*` suffix and shard startup fails with a data-loss
+error instead of accepting traffic with an unknown recovery gap. Cross-shard
+merge redirects are also persisted before acknowledgement and reloaded when the
+streaming linker is reconstructed.
+
+The tuple `(entity_type, perspective, uid)` identifies one immutable source
+record. Retrying that identity with the same descriptors is idempotent, including
+when descriptor order differs. Reusing it with different values or validity
+intervals is rejected instead of acknowledging data that would be discarded.
+Temporal revisions must use a new source-record UID; entity resolution links the
+snapshots through their configured identity keys.
+
+In a multi-shard cluster, the router first durably reserves that source identity
+on a shard selected only from the source tuple. The reservation stores a
+canonical binary payload digest and the original ingest target before the record
+enters the normal shard entity-resolution path. This prevents a changed
+identity-key value from routing the same source UID to another shard. If target
+ingest fails after reservation, retry the exact request; the reservation remains
+valid and no record has bypassed entity resolution.
+
+Router startup performs a crash-resumable one-time reservation backfill for
+records written by an earlier release. Each target shard is marked complete only
+after every exported record has been reserved durably. Conflicting legacy
+duplicates make startup fail closed for operator repair. The internal router and
+shard protocol is versioned, and mixed versions are rejected, so upgrades must
+replace the full cluster with one coordinated Unirust version before restarting
+the router. Shard gRPC ports are internal APIs; client ingest must use the router.
+The persisted reservation directory is also bound to the configured shard count.
+Router startup rejects shard-count changes because the current import API cannot
+atomically move a record, update its reservation, and delete the old copy.
+Cross-shard copy imports therefore fail closed; online scale-out and scale-in
+require a future transactional relocation protocol or an offline rebuild.
+
+Cross-shard redirects are durably applied to every shard and are idempotent. If
+any shard fails while a reconciliation result is being applied, the router
+latches the cluster closed for ingest, query, and administrative traffic rather
+than serving a partially updated global view. Retrying `Reconcile` repairs the
+retained dirty keys in place. After a router or full-cluster restart, router
+startup performs that repair before returning a serviceable node and clears the
+dirty generation only after every shard converges.
+
+The shard reconstructs all derived linker state before opening its gRPC
+listener. Recovery currently scans all persisted records, so recovery time is
+O(record count). This is a correctness-first crash-recovery path, not a bounded
+recovery-time guarantee. Measure restart time at the intended dataset size and
+set orchestration startup probes accordingly.
+
+`LinkerStateConfig` cache capacities are not enforced because the current LRU
+backend has no durable spill/read-through path. Evicting cluster IDs, strong-ID
+summaries, or record perspectives would change entity-resolution results.
+Persistent profiles therefore retain this correctness-critical working set in
+memory even though their DSU and identity index are disk-backed. The
+`billion-scale` profile must not be treated as proof that a billion-record
+deployment fits a given memory or recovery-time budget.
+
+`scripts/cluster.sh start` and `restart` preserve `DATA_DIR`. Only the explicit
+`reset` action deletes shard data, and it requires `UNIRUST_CONFIRM_RESET=1`.
+The script defaults to `examples/loadtest-ontology.json`; set `ONTOLOGY` to the
+same immutable configuration on every shard and router for another deployment.
+Router startup compares the complete ontology reported by every shard and fails
+closed on a mismatch.
+
+The destructive gRPC `Reset` method is disabled by default because a sequential
+multi-shard reset cannot be atomic. The supported production reset is the
+confirmed offline script action. Test or isolated admin deployments can opt in
+with the shard flag `--allow-destructive-admin`.
+
+The shard and router binaries handle SIGINT/SIGTERM with graceful gRPC shutdown.
+The shard drains active mutations and flushes dirty DSU and authoritative store
+state before exit. Acknowledged ingests are additionally covered by an
+executable-level SIGKILL, restart, SIGTERM, and second-restart integration test.
+
+Use `unirust_healthcheck --shard <URI>` and
+`unirust_healthcheck --router <URI>` for readiness probes. These call the gRPC
+health methods rather than checking only for an open socket. Shard readiness
+requires completed WAL recovery and a healthy persistent store; router
+readiness additionally requires a consistent reconciliation state and a
+successful health response from every configured shard. The provided Compose
+deployment and cluster script use these semantic probes.
+
+Router-to-shard calls are bounded by configurable transport settings under
+`[router]`: `shard_connect_timeout_secs` (10 seconds by default),
+`shard_request_timeout_secs` (120 seconds), and
+`shard_tcp_keepalive_secs` (30 seconds). A deadline error is not proof that a
+mutation was rolled back; the shard may have committed just before the response
+was lost. Retry ingest with the same immutable source-record identity and
+payload so the operation is resolved idempotently.
+
+### External Backups
+
+Configure each shard with a unique checkpoint root on storage outside its data
+directory and, for real volume-loss protection, in a separate failure domain:
+
+```toml
+[shard]
+data_dir = "/var/lib/unirust/shard-0"
+backup_dir = "/var/backups/unirust/shard-0"
+
+[router]
+# Select this from the deployment RPO. Zero disables automatic checkpoints.
+checkpoint_interval_secs = 3600
+```
+
+Trigger checkpoints through the router so router-mediated mutations remain
+blocked for the complete cluster snapshot. A supplied name is created beneath
+every shard's configured backup root:
+
+```bash
+grpcurl -plaintext \
+  -d '{"path":"backup-2026-07-24T1300Z"}' \
+  127.0.0.1:50060 unirust.RouterService/Checkpoint
+```
+
+Checkpoint creation uses a two-phase prepare/commit protocol. Every shard first
+flushes its in-memory linker state and creates a RocksDB snapshot. Only after
+all shards prepare successfully does the router write a binary commit marker to
+every snapshot. The response includes the shared `generation` and
+`committed: true`. A failed generation remains uncommitted and cannot be
+restored; retrying the same name is idempotent and completes any missing
+prepare or commit steps. Do not call the shard checkpoint RPC directly for a
+production backup.
+
+The router scheduler waits one configured interval before its first checkpoint.
+If a shard fails during prepare or commit, the scheduler retains and retries the
+same immutable generation instead of creating a stream of unrelated partial
+snapshots. Successful and failed generations are emitted to structured logs.
+The container deployment enables hourly checkpoints by default; set
+`UNIRUST_CHECKPOINT_INTERVAL_SECS` explicitly to choose another RPO or `0` to
+disable them.
+
+To recover from lost data volumes, stop the complete cluster and restore every
+shard from the same checkpoint generation into an empty replacement directory:
+
+```bash
+unirust_shard \
+  --shard-id 0 \
+  --data-dir /replacement/shard-0 \
+  --backup-dir /var/backups/unirust/shard-0 \
+  --restore-from /var/backups/unirust/shard-0/backup-2026-07-24T1300Z \
+  --ontology /etc/unirust/ontology.json
+```
+
+Restore refuses a non-RocksDB source, symlinks, a nonempty destination, and an
+existing partial staging directory. It also requires matching binary
+prepare/commit markers, verifies the checkpoint belongs to the requested shard,
+and opens both the source and staged copy read-only with RocksDB paranoid checks.
+It copies and syncs into a sibling staging directory before publishing the
+replacement with one rename. Restore the whole cluster together; restoring
+only one older shard beside newer peers can violate the cluster snapshot
+boundary. Each shard retains the committed checkpoint provenance in its
+replacement data directory and refuses a manifest for another shard. Router
+startup requires every shard to be either unrestored or restored from the same
+generation and shard count, then verifies the topology, ontology, and protocol
+versions before accepting traffic. Mixed restored/unrestored volumes and
+different committed generations fail closed.
+
+The built-in scheduler only creates local coordinated checkpoints. Unirust does
+not replicate, encrypt, transfer, retain, or verify off-host backups. Without
+storage-layer replication, the recovery point is the last completed coordinated
+checkpoint, so acknowledged writes after it can be lost in a volume failure.
+Production operators must provide off-host replication, retention, monitoring,
+and periodic restore drills according to their RPO and RTO. Process crashes and
+ordinary restarts remain covered by the synced ingest WAL independently of this
+backup path.
+
+## Deployment Security
+
+The gRPC services do not currently terminate TLS or authenticate callers.
+Production deployments must place the router and every shard on private
+networks and enforce authenticated TLS with a service mesh or reverse proxy.
+Never expose a shard port directly to an untrusted network. Destructive RPCs
+remain disabled by default, but ingest, query, export, reconciliation, and other
+administrative surfaces are otherwise unauthenticated.
+
+The shard binary requires a persistent `--data-dir`. An in-memory shard can only
+be started with the explicit `--ephemeral` flag and loses all records when the
+process exits.
+
 ## Performance
 
-Typical throughput on a 5-shard cluster (16 concurrent streams, batch size 5000):
+Release verification on an Apple M5 with 32 GB RAM, five persistent shards,
+16 concurrent streams, 5,000-record batches, and 10% overlap:
 
-| Workload | Records/sec | Batch Latency |
-|----------|-------------|---------------|
-| Pure ingest | ~500K | 8ms |
-| 10% overlap | ~410K | 12ms |
-| With conflicts | ~300K | 16ms |
+| Records | Records/sec | Stream Errors |
+|---------|-------------|---------------|
+| 10,000,000 | 50,598 | 0 |
+
+This is an end-to-end power-loss-durability measurement: records and cluster
+assignments are persisted and the RocksDB WAL is synchronously flushed before
+acknowledgement, and every record goes through entity resolution. Results depend
+on storage hardware and ontology complexity; rerun the command below on the
+release target rather than treating this number as a service-level guarantee.
 
 ## Development
 
 ```bash
-# Run tests
+# Fast correctness gate (unit and integration tests)
 cargo test
+
+# Compile examples, binaries, and benchmarks without executing benchmarks
+cargo check --all-targets --all-features
 
 # Run quick benchmarks (~30s)
 cargo bench --bench bench_quick
@@ -236,8 +439,24 @@ cargo bench --bench bench_quick
 
 # Format and lint
 cargo fmt
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+`cargo test --all-targets` executes Criterion benchmark binaries on some Cargo
+versions and is intentionally not the default correctness gate. Run benchmarks
+explicitly with `cargo bench --bench <name>`.
+
+### Test Strategy
+
+- Unit tests cover temporal algebra, matching, DSU behavior, indexes, and focused
+  persistence failure modes.
+- Integration tests exercise router and shard RPCs with temporary
+  `PersistentStore` databases, including restart, WAL, reconciliation, streaming,
+  reset, and rebalance behavior.
+- `cargo check --all-targets --all-features` compiles examples and benchmarks
+  without mixing performance workloads into the correctness suite.
+- `bench_quick` is the local performance smoke test. The distributed load test is
+  the release benchmark and must be run against persistent shards.
 
 ## Container Deployment
 
@@ -269,6 +488,9 @@ podman-compose logs -f router
 podman-compose run --rm loadtest
 
 # Stop and clean up
+podman-compose down
+
+# Explicitly delete all persistent shard volumes
 podman-compose down -v
 ```
 

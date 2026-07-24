@@ -1,5 +1,7 @@
 use std::fs;
+use std::path::PathBuf;
 
+use tonic::transport::Endpoint;
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::{
     ApplyOntologyRequest, ConstraintConfig, ConstraintKind, IdentityKeyConfig,
@@ -7,6 +9,7 @@ use unirust_rs::distributed::proto::{
     RecordIdentity, RecordInput,
 };
 use unirust_rs::distributed::DistributedOntologyConfig;
+use unirust_rs::transport_security::load_client_mtls;
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -23,7 +26,23 @@ async fn main() -> anyhow::Result<()> {
     let router = parse_arg("--router").unwrap_or_else(|| "http://127.0.0.1:50060".to_string());
     let ontology_path =
         parse_arg("--ontology").ok_or_else(|| anyhow::anyhow!("--ontology is required"))?;
-    let mut client = RouterServiceClient::connect(router).await?;
+    let tls_ca = parse_arg("--tls-ca").map(PathBuf::from);
+    let tls_cert = parse_arg("--tls-cert").map(PathBuf::from);
+    let tls_key = parse_arg("--tls-key").map(PathBuf::from);
+    let mtls = load_client_mtls(tls_ca.as_deref(), tls_cert.as_deref(), tls_key.as_deref())?;
+    if mtls.is_some() && router.starts_with("http://") {
+        anyhow::bail!("mTLS requires an https:// router address");
+    }
+    if mtls.is_none() && router.starts_with("https://") {
+        anyhow::bail!("https:// router addresses require mTLS certificate options");
+    }
+    let endpoint = Endpoint::from_shared(router)?;
+    let endpoint = if let Some(mtls) = mtls {
+        endpoint.tls_config(mtls)?
+    } else {
+        endpoint
+    };
+    let mut client = RouterServiceClient::new(endpoint.connect().await?);
 
     let ontology = load_ontology(ontology_path)?;
     client
@@ -80,7 +99,10 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     let response = client
-        .ingest_records(IngestRecordsRequest { records })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 0,
+            records,
+        })
         .await?
         .into_inner();
     println!("Assignments: {:?}", response.assignments);

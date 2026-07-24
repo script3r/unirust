@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -19,12 +20,17 @@ async fn spawn_shard(
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -107,7 +113,10 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
     ];
 
     let ingest_response = shard0
-        .ingest_records(IngestRecordsRequest { records })
+        .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
+            records,
+        })
         .await?
         .into_inner();
     assert_eq!(ingest_response.assignments.len(), 3);
@@ -154,6 +163,7 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
     shard1
         .import_records(ImportRecordsRequest {
             records: all_records,
+            internal_protocol_version: 3,
         })
         .await?;
 
@@ -179,6 +189,28 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
     for record_id in record_ids {
         assert!(exported_ids.contains(&record_id));
     }
+
+    let original = exported.records[0].clone();
+    let mut collision = original.clone();
+    collision.identity.as_mut().expect("exported identity").uid = "different-record".to_string();
+    let error = shard1
+        .import_records(ImportRecordsRequest {
+            records: vec![collision],
+            internal_protocol_version: 3,
+        })
+        .await
+        .expect_err("import must not overwrite an existing numeric record ID");
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+
+    let after_collision = shard1
+        .export_records(ExportRecordsRequest {
+            start_id: original.record_id,
+            end_id: original.record_id.saturating_add(1),
+            limit: 1,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(after_collision.records, vec![original]);
 
     Ok(())
 }

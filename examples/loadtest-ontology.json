@@ -1,0 +1,55 @@
+{
+  "identity_keys": [
+    {
+      "name": "user_upn_key",
+      "attributes": ["user_upn"]
+    },
+    {
+      "name": "user_identity",
+      "attributes": ["user_sid"]
+    },
+    {
+      "name": "session_identity",
+      "attributes": ["session_id"]
+    },
+    {
+      "name": "process_identity",
+      "attributes": ["process_id", "asset_id"]
+    },
+    {
+      "name": "connection_identity",
+      "attributes": ["flow_id"]
+    },
+    {
+      "name": "asset_hostname",
+      "attributes": ["hostname"]
+    },
+    {
+      "name": "asset_identity",
+      "attributes": ["asset_id"]
+    },
+    {
+      "name": "vuln_identity",
+      "attributes": ["cve_id", "asset_id"]
+    },
+    {
+      "name": "alert_identity",
+      "attributes": ["alert_id"]
+    },
+    {
+      "name": "file_identity",
+      "attributes": ["file_hash"]
+    }
+  ],
+  "strong_identifiers": [
+    "user_sid",
+    "session_id",
+    "process_hash",
+    "flow_id",
+    "asset_id",
+    "cve_id",
+    "alert_id",
+    "file_hash"
+  ],
+  "constraints": []
+}

@@ -215,7 +215,9 @@ pub fn generate_graph_visualizations(
             );
         }
         Err(_) => {
-            eprintln!("Warning: 'dot' command not found. Install Graphviz to generate PNG visualizations.");
+            eprintln!(
+                "Warning: 'dot' command not found. Install Graphviz to generate PNG visualizations."
+            );
         }
     }
 
@@ -236,7 +238,9 @@ pub fn generate_graph_visualizations(
             );
         }
         Err(_) => {
-            eprintln!("Warning: 'dot' command not found. Install Graphviz to generate SVG visualizations.");
+            eprintln!(
+                "Warning: 'dot' command not found. Install Graphviz to generate SVG visualizations."
+            );
         }
     }
 

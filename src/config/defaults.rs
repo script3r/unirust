@@ -21,6 +21,19 @@ pub const DEFAULT_SHARD_COUNT: usize = 5;
 /// Default router listen address
 pub const DEFAULT_ROUTER_ADDR: &str = "127.0.0.1:50060";
 
+/// Maximum time to establish a router-to-shard connection.
+pub const DEFAULT_SHARD_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum time for one router-to-shard RPC.
+pub const DEFAULT_SHARD_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// TCP keepalive interval for router-to-shard connections.
+pub const DEFAULT_SHARD_TCP_KEEPALIVE_SECS: u64 = 30;
+
+/// Automatic coordinated checkpoints are disabled until backup storage and an
+/// operator-selected RPO have been configured.
+pub const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 0;
+
 // =============================================================================
 // Storage Defaults (RocksDB)
 // =============================================================================
@@ -57,6 +70,12 @@ pub const DEFAULT_MAX_STALENESS_SECS: u64 = 60;
 /// Minimum interval between reconciles (seconds)
 /// Prevents reconciliation thrashing under high load.
 pub const DEFAULT_MIN_RECONCILE_INTERVAL_SECS: u64 = 5;
+
+/// Number of dirty identity keys that triggers reconciliation immediately.
+pub const DEFAULT_RECONCILE_KEY_COUNT_THRESHOLD: usize = 1_000;
+
+/// Ingest rate below which pending cross-shard work is reconciled while idle.
+pub const DEFAULT_RECONCILE_IDLE_INGEST_RATE: f64 = 1_000.0;
 
 // =============================================================================
 // Partitioning Defaults

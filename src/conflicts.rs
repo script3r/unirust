@@ -9,7 +9,7 @@ use crate::ontology::{Constraint, ConstraintViolation, IdentityKey, Ontology};
 use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 // use std::collections::HashSet;
@@ -35,7 +35,7 @@ impl Participants {
                 Participants::One(a) => {
                     *self = Participants::Many(vec![*a, b]);
                 }
-                Participants::Many(ref mut v) => {
+                Participants::Many(v) => {
                     v.push(b);
                 }
             },
@@ -44,7 +44,7 @@ impl Participants {
                     other_v.push(*a);
                     *self = Participants::Many(other_v);
                 }
-                Participants::Many(ref mut v) => {
+                Participants::Many(v) => {
                     v.append(&mut other_v);
                 }
             },
@@ -53,7 +53,7 @@ impl Participants {
 
     #[inline]
     fn sort_dedup(&mut self) {
-        if let Participants::Many(ref mut v) = self {
+        if let Participants::Many(v) = self {
             v.sort();
             v.dedup();
         }
@@ -73,6 +73,8 @@ struct ValueInterval {
     interval: Interval,
     participants: Participants,
 }
+
+type ConflictDescriptor = (RecordId, ValueId, Interval);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum EventKind {
@@ -414,28 +416,58 @@ impl ConflictDetector {
     fn detect_direct_conflicts(
         store: &dyn RecordStore,
         cluster: &crate::dsu::Cluster,
-        _ontology: &Ontology,
+        ontology: &Ontology,
     ) -> Result<Vec<DirectConflict>> {
         let mut conflicts = Vec::new();
 
-        // Group descriptors by attribute - only extract needed fields (no clone)
-        // Use (ValueId, Interval) tuple instead of full Descriptor
-        let mut descriptors_by_attr: HashMap<AttrId, Vec<(RecordId, ValueId, Interval)>> =
-            HashMap::new();
+        // A perspective-scoped constraint explicitly permits different perspectives
+        // to hold different values. A global Unique constraint, when both are
+        // configured, remains the stricter rule.
+        let mut perspective_scoped_attrs = HashSet::new();
+        let mut globally_unique_attrs = HashSet::new();
+        for constraint in &ontology.constraints {
+            match constraint {
+                Constraint::Unique { attribute, .. } => {
+                    globally_unique_attrs.insert(*attribute);
+                }
+                Constraint::UniqueWithinPerspective { attribute, .. } => {
+                    perspective_scoped_attrs.insert(*attribute);
+                }
+            }
+        }
+        perspective_scoped_attrs.retain(|attr| !globally_unique_attrs.contains(attr));
+
+        // Group descriptors by attribute, and by perspective only where required.
+        let mut descriptors_by_attr: HashMap<AttrId, Vec<ConflictDescriptor>> = HashMap::new();
+        let mut descriptors_by_attr_and_perspective: HashMap<
+            (AttrId, String),
+            Vec<ConflictDescriptor>,
+        > = HashMap::new();
 
         for record_id in &cluster.records {
             if let Some(record) = store.get_record(*record_id) {
                 for descriptor in &record.descriptors {
-                    descriptors_by_attr
-                        .entry(descriptor.attr)
-                        .or_default()
-                        .push((*record_id, descriptor.value, descriptor.interval));
+                    let entry = (*record_id, descriptor.value, descriptor.interval);
+                    if perspective_scoped_attrs.contains(&descriptor.attr) {
+                        descriptors_by_attr_and_perspective
+                            .entry((descriptor.attr, record.identity.perspective.clone()))
+                            .or_default()
+                            .push(entry);
+                    } else {
+                        descriptors_by_attr
+                            .entry(descriptor.attr)
+                            .or_default()
+                            .push(entry);
+                    }
                 }
             }
         }
 
-        // Check each attribute for conflicts
         for (attr, descriptors) in descriptors_by_attr {
+            let conflicts_for_attr = Self::detect_conflicts_for_attribute_fast(descriptors, attr)?;
+            conflicts.extend(conflicts_for_attr);
+        }
+        for ((attr, _perspective), descriptors) in descriptors_by_attr_and_perspective {
             let conflicts_for_attr = Self::detect_conflicts_for_attribute_fast(descriptors, attr)?;
             conflicts.extend(conflicts_for_attr);
         }
@@ -680,7 +712,7 @@ impl ConflictDetector {
             return intervals;
         }
 
-        intervals.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+        intervals.sort_by_key(|value| value.interval.start);
         let mut merged: Vec<ValueInterval> = Vec::with_capacity(intervals.len());
 
         for current in intervals {
@@ -858,7 +890,7 @@ impl ConflictDetector {
             return conflicts;
         }
 
-        conflicts.sort_by(|a, b| a.interval.start.cmp(&b.interval.start));
+        conflicts.sort_by_key(|conflict| conflict.interval.start);
         let mut merged: Vec<DirectConflict> = Vec::with_capacity(conflicts.len());
 
         for current in conflicts {
@@ -1381,13 +1413,23 @@ impl ConflictDetector {
         attribute: AttrId,
         name: &str,
     ) -> Result<Vec<ConstraintViolation>> {
+        Self::check_unique_constraint_for_records(store, &cluster.records, attribute, name, false)
+    }
+
+    fn check_unique_constraint_for_records(
+        store: &dyn RecordStore,
+        record_ids: &[RecordId],
+        attribute: AttrId,
+        name: &str,
+        within_perspective: bool,
+    ) -> Result<Vec<ConstraintViolation>> {
         let mut violations = Vec::new();
 
         // Group descriptors by value
         let mut descriptors_by_value: HashMap<ValueId, Vec<(RecordId, Descriptor)>> =
             HashMap::new();
 
-        for record_id in &cluster.records {
+        for record_id in record_ids {
             if let Some(record) = store.get_record(*record_id) {
                 for descriptor in &record.descriptors {
                     if descriptor.attr == attribute {
@@ -1422,8 +1464,13 @@ impl ConflictDetector {
                     participants.sort();
                     participants.dedup();
 
+                    let constraint = if within_perspective {
+                        Constraint::unique_within_perspective(attribute, name.to_string())
+                    } else {
+                        Constraint::unique(attribute, name.to_string())
+                    };
                     let violation = ConstraintViolation::new(
-                        Constraint::unique(attribute, name.to_string()),
+                        constraint,
                         overlap,
                         participants,
                         format!(
@@ -1446,9 +1493,23 @@ impl ConflictDetector {
         attribute: AttrId,
         name: &str,
     ) -> Result<Vec<ConstraintViolation>> {
-        // Similar to check_unique_constraint but filtered by perspective
-        // For now, we'll use the same logic
-        Self::check_unique_constraint(store, cluster, attribute, name)
+        let mut records_by_perspective: HashMap<String, Vec<RecordId>> = HashMap::new();
+        for record_id in &cluster.records {
+            if let Some(record) = store.get_record(*record_id) {
+                records_by_perspective
+                    .entry(record.identity.perspective)
+                    .or_default()
+                    .push(*record_id);
+            }
+        }
+
+        let mut violations = Vec::new();
+        for record_ids in records_by_perspective.values() {
+            violations.extend(Self::check_unique_constraint_for_records(
+                store, record_ids, attribute, name, true,
+            )?);
+        }
+        Ok(violations)
     }
 }
 
@@ -2353,6 +2414,98 @@ mod tests {
     }
 
     #[test]
+    fn direct_conflicts_respect_perspective_scoped_constraints() {
+        let mut store = Store::new();
+        let attr = store.interner_mut().intern_attr("source_code");
+        let value_a = store.interner_mut().intern_value("A");
+        let value_b = store.interner_mut().intern_value("B");
+        let interval = Interval::new(0, 100).unwrap();
+
+        store
+            .insert_record(Record::new(
+                RecordId(1),
+                RecordIdentity::new(
+                    "instrument".to_string(),
+                    "source_a".to_string(),
+                    "1".to_string(),
+                ),
+                vec![Descriptor::new(attr, value_a, interval)],
+            ))
+            .unwrap();
+        store
+            .insert_record(Record::new(
+                RecordId(2),
+                RecordIdentity::new(
+                    "instrument".to_string(),
+                    "source_b".to_string(),
+                    "2".to_string(),
+                ),
+                vec![Descriptor::new(attr, value_b, interval)],
+            ))
+            .unwrap();
+        let cluster =
+            crate::dsu::Cluster::new(ClusterId(1), RecordId(1), vec![RecordId(1), RecordId(2)]);
+
+        let mut scoped = Ontology::new();
+        scoped.add_constraint(Constraint::unique_within_perspective(
+            attr,
+            "source_code_per_source".to_string(),
+        ));
+        assert!(
+            ConflictDetector::detect_direct_conflicts(&store, &cluster, &scoped)
+                .unwrap()
+                .is_empty(),
+            "different perspectives may hold different values"
+        );
+
+        scoped.add_constraint(Constraint::unique(attr, "source_code_global".to_string()));
+        assert_eq!(
+            ConflictDetector::detect_direct_conflicts(&store, &cluster, &scoped)
+                .unwrap()
+                .len(),
+            1,
+            "a global constraint must override perspective scoping"
+        );
+    }
+
+    #[test]
+    fn perspective_scoped_constraint_still_conflicts_within_one_perspective() {
+        let mut store = Store::new();
+        let attr = store.interner_mut().intern_attr("source_code");
+        let value_a = store.interner_mut().intern_value("A");
+        let value_b = store.interner_mut().intern_value("B");
+        let interval = Interval::new(0, 100).unwrap();
+
+        for (id, value) in [(1, value_a), (2, value_b)] {
+            store
+                .insert_record(Record::new(
+                    RecordId(id),
+                    RecordIdentity::new(
+                        "instrument".to_string(),
+                        "source_a".to_string(),
+                        id.to_string(),
+                    ),
+                    vec![Descriptor::new(attr, value, interval)],
+                ))
+                .unwrap();
+        }
+        let cluster =
+            crate::dsu::Cluster::new(ClusterId(1), RecordId(1), vec![RecordId(1), RecordId(2)]);
+        let mut ontology = Ontology::new();
+        ontology.add_constraint(Constraint::unique_within_perspective(
+            attr,
+            "source_code_per_source".to_string(),
+        ));
+
+        assert_eq!(
+            ConflictDetector::detect_direct_conflicts(&store, &cluster, &ontology)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn test_can_handle_indirect_conflict() {
         // This test demonstrates indirect conflict handling with three entities:
         // 1. Two entities with same identity key (name=John, country=US) but different phone (555-1111, 555-2222)
@@ -2677,7 +2830,11 @@ mod tests {
 
                 // With the optimized linker, records with strong identifier conflicts are kept separate
                 // so there should be no indirect conflicts detected
-                assert_eq!(indirect_conflicts.len(), 0, "No indirect conflicts should be detected when records are kept separate due to strong identifier conflicts");
+                assert_eq!(
+                    indirect_conflicts.len(),
+                    0,
+                    "No indirect conflicts should be detected when records are kept separate due to strong identifier conflicts"
+                );
 
                 // Verify conflict details
                 for conflict in &indirect_conflicts {
@@ -3296,7 +3453,11 @@ mod tests {
             records,
             |_, clusters, observations| {
                 // Should have 2 separate clusters (entities should NOT be merged)
-                assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities with same email but different UIDs should not be merged");
+                assert_eq!(
+                    clusters.clusters.len(),
+                    2,
+                    "Should have 2 separate clusters - entities with same email but different UIDs should not be merged"
+                );
 
                 // Verify that the clusters contain the correct records
                 let mut found_entity1 = false;
@@ -3412,10 +3573,18 @@ mod tests {
             records,
             |_, clusters, observations| {
                 // Should have 2 separate clusters (entities should NOT be merged)
-                assert_eq!(clusters.clusters.len(), 2, "Should have 2 separate clusters - entities from different perspectives should not be merged");
+                assert_eq!(
+                    clusters.clusters.len(),
+                    2,
+                    "Should have 2 separate clusters - entities from different perspectives should not be merged"
+                );
 
                 // Should have NO conflict observations (different perspectives can have same unique values)
-                assert_eq!(observations.len(), 0, "Should have no conflict observations - entities from different perspectives can have the same unique identifier");
+                assert_eq!(
+                    observations.len(),
+                    0,
+                    "Should have no conflict observations - entities from different perspectives can have the same unique identifier"
+                );
             },
         );
     }

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -37,7 +37,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::sync::RwLock;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::shard_service_client::ShardServiceClient;
@@ -45,6 +45,7 @@ use unirust_rs::distributed::proto::{
     ApplyOntologyRequest, IdentityKeyConfig, IngestRecordsRequest, MetricsRequest, OntologyConfig,
     RecordDescriptor, RecordIdentity, RecordInput, StatsRequest,
 };
+use unirust_rs::transport_security::load_client_mtls;
 
 // =============================================================================
 // CONFIGURATION
@@ -63,6 +64,9 @@ pub struct LoadTestConfig {
     pub log_file: Option<PathBuf>,
     pub seed: u64,
     pub headless: bool,
+    pub tls_ca: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for LoadTestConfig {
@@ -79,7 +83,46 @@ impl Default for LoadTestConfig {
             log_file: None,
             seed: 42,
             headless: false,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         }
+    }
+}
+
+impl LoadTestConfig {
+    fn validate(&self) -> Result<()> {
+        if self.stream_count == 0 {
+            bail!("--streams must be greater than zero");
+        }
+        if self.batch_size == 0 {
+            bail!("--batch must be greater than zero");
+        }
+        for (name, value) in [
+            ("--overlap", self.overlap_probability),
+            ("--conflict", self.conflict_probability),
+            ("--cross-shard", self.cross_shard_probability),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                bail!("{name} must be between 0.0 and 1.0");
+            }
+        }
+        let tls_paths = [
+            self.tls_ca.as_ref(),
+            self.tls_cert.as_ref(),
+            self.tls_key.as_ref(),
+        ];
+        let configured = tls_paths.iter().filter(|path| path.is_some()).count();
+        if configured != 0 && configured != tls_paths.len() {
+            bail!("--tls-ca, --tls-cert, and --tls-key must be provided together");
+        }
+        if configured > 0 && self.router_addr.starts_with("http://") {
+            bail!("mTLS load tests require an https:// router address");
+        }
+        if configured == 0 && self.router_addr.starts_with("https://") {
+            bail!("https:// router addresses require mTLS certificate options");
+        }
+        Ok(())
     }
 }
 
@@ -140,6 +183,15 @@ fn parse_args() -> LoadTestConfig {
             "--headless" => {
                 config.headless = true;
             }
+            "--tls-ca" => {
+                config.tls_ca = args.next().map(PathBuf::from);
+            }
+            "--tls-cert" => {
+                config.tls_cert = args.next().map(PathBuf::from);
+            }
+            "--tls-key" => {
+                config.tls_key = args.next().map(PathBuf::from);
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -159,7 +211,7 @@ USAGE:
     unirust_loadtest [OPTIONS]
 
 OPTIONS:
-    -c, --count <N>       Total entities to generate (default: 20000000)
+    -c, --count <N>       Total records to generate (default: 20000000)
     -r, --router <ADDR>   Router gRPC address (default: http://127.0.0.1:50060)
     -s, --shards <ADDRS>  Comma-separated shard addresses for direct metrics
     --streams <N>         Number of concurrent streams (default: 32)
@@ -172,10 +224,13 @@ OPTIONS:
     --log <PATH>          Log file path (logs to file only)
     --seed <N>            Random seed for reproducibility (default: 42)
     --headless            Run without TUI (for automation/CI)
+    --tls-ca <PATH>       PEM CA used to verify router/shard certificates
+    --tls-cert <PATH>     PEM client certificate
+    --tls-key <PATH>      PEM client private key
     -h, --help            Print help
 
 EXAMPLES:
-    # Basic test with 100K entities
+    # Basic test with 100K records
     unirust_loadtest --count 100000 --router http://127.0.0.1:50060
 
     # Large scale with custom parallelism
@@ -372,7 +427,6 @@ fn build_ontology_config() -> OntologyConfig {
 
 /// Seed data for creating overlapping entities
 struct UserSeed {
-    uid: String,
     user_sid: String,
     user_upn: String,
     employee_id: String,
@@ -381,7 +435,6 @@ struct UserSeed {
 }
 
 struct AssetSeed {
-    uid: String,
     asset_id: String,
     hostname: String,
     ip_address: String,
@@ -391,7 +444,6 @@ struct AssetSeed {
 
 /// Generic entity seed for other types
 struct EntitySeed {
-    uid: String,
     #[allow(dead_code)]
     identity_attr: String,
     identity_value: String,
@@ -443,7 +495,7 @@ impl CyberEntityGenerator {
     ) -> Self {
         let total_weight: u32 = EntityType::all().iter().map(|e| e.weight()).sum();
         // Pool size determines cluster density: smaller pool = denser clusters
-        // For ~10 entities per cluster with 10% overlap, use pool_size ~= total_entities / 100
+        // For ~10 records per cluster with 10% overlap, use pool_size ~= total_records / 100
         let pool_size = 10_000; // Supports up to 1M entities with ~10 per cluster at 10% overlap
 
         Self {
@@ -569,7 +621,7 @@ impl CyberEntityGenerator {
     }
 
     /// Generate a user entity. Returns (uid, descriptors, perspective_override).
-    /// When overlapping, reuses UID from pool to create clusters.
+    /// When overlapping, reuses identity keys from the pool to create clusters.
     /// When conflicting, uses same perspective and different strong identifier.
     /// When cross-shard, uses different user_upn (partitioning key) but same user_sid
     /// (secondary identity key) to create cross-shard merge candidates.
@@ -614,7 +666,6 @@ impl CyberEntityGenerator {
             } else if is_overlap {
                 let idx = self.rng.random_range(0..self.user_pool.len());
                 // Clone seed values upfront to avoid borrow conflicts
-                let seed_uid = self.user_pool[idx].uid.clone();
                 let seed_user_sid = self.user_pool[idx].user_sid.clone();
                 let seed_user_upn = self.user_pool[idx].user_upn.clone();
                 let seed_employee_id = self.user_pool[idx].employee_id.clone();
@@ -640,9 +691,9 @@ impl CyberEntityGenerator {
                         Some(seed_perspective), // SAME perspective - required for conflict detection
                     )
                 } else {
-                    // Exact overlap - same cluster, no conflict
+                    // Same identity keys link a distinct source record into the cluster.
                     (
-                        seed_uid,
+                        self.next_uid(),
                         seed_user_sid,
                         seed_user_upn,
                         seed_employee_id,
@@ -661,7 +712,6 @@ impl CyberEntityGenerator {
 
                 if self.user_pool.len() < self.pool_size {
                     self.user_pool.push(UserSeed {
-                        uid: uid.clone(),
                         user_sid: user_sid.clone(),
                         user_upn: user_upn.clone(),
                         employee_id: employee_id.clone(),
@@ -716,14 +766,13 @@ impl CyberEntityGenerator {
 
         let (uid, session_id) = if is_overlap {
             let idx = self.rng.random_range(0..self.session_pool.len());
-            let seed = &self.session_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let session_id = self.session_pool[idx].identity_value.clone();
+            (self.next_uid(), session_id)
         } else {
             let uid = self.next_uid();
             let session_id = format!("SES-{:016X}", self.rng.random::<u64>());
             if self.session_pool.len() < self.pool_size {
                 self.session_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "session_id".to_string(),
                     identity_value: session_id.clone(),
                 });
@@ -778,14 +827,13 @@ impl CyberEntityGenerator {
 
         let (uid, process_hash) = if is_overlap {
             let idx = self.rng.random_range(0..self.process_pool.len());
-            let seed = &self.process_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let process_hash = self.process_pool[idx].identity_value.clone();
+            (self.next_uid(), process_hash)
         } else {
             let uid = self.next_uid();
             let process_hash = format!("{:064x}", self.rng.random::<u128>());
             if self.process_pool.len() < self.pool_size {
                 self.process_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "process_hash".to_string(),
                     identity_value: process_hash.clone(),
                 });
@@ -853,14 +901,13 @@ impl CyberEntityGenerator {
 
         let (uid, flow_id) = if is_overlap {
             let idx = self.rng.random_range(0..self.connection_pool.len());
-            let seed = &self.connection_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let flow_id = self.connection_pool[idx].identity_value.clone();
+            (self.next_uid(), flow_id)
         } else {
             let uid = self.next_uid();
             let flow_id = format!("FLOW-{:016X}", self.rng.random::<u64>());
             if self.connection_pool.len() < self.pool_size {
                 self.connection_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "flow_id".to_string(),
                     identity_value: flow_id.clone(),
                 });
@@ -938,7 +985,6 @@ impl CyberEntityGenerator {
         let (uid, asset_id, hostname, ip_address, os_type, perspective_override) = if is_overlap {
             let idx = self.rng.random_range(0..self.asset_pool.len());
             // Clone seed values upfront to avoid borrow conflicts
-            let seed_uid = self.asset_pool[idx].uid.clone();
             let seed_asset_id = self.asset_pool[idx].asset_id.clone();
             let seed_hostname = self.asset_pool[idx].hostname.clone();
             let seed_ip_address = self.asset_pool[idx].ip_address.clone();
@@ -960,7 +1006,7 @@ impl CyberEntityGenerator {
                 )
             } else {
                 (
-                    seed_uid,
+                    self.next_uid(),
                     seed_asset_id,
                     seed_hostname,
                     seed_ip_address,
@@ -990,7 +1036,6 @@ impl CyberEntityGenerator {
 
             if self.asset_pool.len() < self.pool_size {
                 self.asset_pool.push(AssetSeed {
-                    uid: uid.clone(),
                     asset_id: asset_id.clone(),
                     hostname: hostname.clone(),
                     ip_address: ip_address.clone(),
@@ -1052,26 +1097,17 @@ impl CyberEntityGenerator {
 
         let (uid, cve_id, severity, status) = if is_overlap {
             let idx = self.rng.random_range(0..self.vuln_pool.len());
-            let seed = &self.vuln_pool[idx];
+            let cve_id = self.vuln_pool[idx].identity_value.clone();
+            let uid = self.next_uid();
             if is_conflict {
                 let severities = ["Critical", "High", "Medium", "Low", "Info"];
                 let new_severity =
                     severities[self.rng.random_range(0..severities.len())].to_string();
                 let statuses = ["Open", "In Progress", "Remediated", "Accepted"];
                 let new_status = statuses[self.rng.random_range(0..statuses.len())].to_string();
-                (
-                    seed.uid.clone(),
-                    seed.identity_value.clone(),
-                    new_severity,
-                    new_status,
-                )
+                (uid, cve_id, new_severity, new_status)
             } else {
-                (
-                    seed.uid.clone(),
-                    seed.identity_value.clone(),
-                    "Medium".to_string(),
-                    "Open".to_string(),
-                )
+                (uid, cve_id, "Medium".to_string(), "Open".to_string())
             }
         } else {
             let uid = self.next_uid();
@@ -1087,7 +1123,6 @@ impl CyberEntityGenerator {
 
             if self.vuln_pool.len() < self.pool_size {
                 self.vuln_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "cve_id".to_string(),
                     identity_value: cve_id.clone(),
                 });
@@ -1143,14 +1178,13 @@ impl CyberEntityGenerator {
 
         let (uid, alert_id) = if is_overlap {
             let idx = self.rng.random_range(0..self.alert_pool.len());
-            let seed = &self.alert_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let alert_id = self.alert_pool[idx].identity_value.clone();
+            (self.next_uid(), alert_id)
         } else {
             let uid = self.next_uid();
             let alert_id = format!("ALERT-{:016X}", self.rng.random::<u64>());
             if self.alert_pool.len() < self.pool_size {
                 self.alert_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "alert_id".to_string(),
                     identity_value: alert_id.clone(),
                 });
@@ -1211,14 +1245,13 @@ impl CyberEntityGenerator {
 
         let (uid, file_hash) = if is_overlap {
             let idx = self.rng.random_range(0..self.file_pool.len());
-            let seed = &self.file_pool[idx];
-            (seed.uid.clone(), seed.identity_value.clone())
+            let file_hash = self.file_pool[idx].identity_value.clone();
+            (self.next_uid(), file_hash)
         } else {
             let uid = self.next_uid();
             let file_hash = format!("{:064x}", self.rng.random::<u128>());
             if self.file_pool.len() < self.pool_size {
                 self.file_pool.push(EntitySeed {
-                    uid: uid.clone(),
                     identity_attr: "file_hash".to_string(),
                     identity_value: file_hash.clone(),
                 });
@@ -1288,6 +1321,8 @@ pub struct StreamStats {
     pub records_sent: AtomicU64,
     pub records_acked: AtomicU64,
     pub last_latency_micros: AtomicU64,
+    pub latency_total_micros: AtomicU64,
+    pub successful_batches: AtomicU64,
     pub errors: AtomicU64,
 }
 
@@ -1311,9 +1346,9 @@ pub struct ShardStats {
 
 pub struct LoadTestMetrics {
     pub start_time: Instant,
-    pub total_entities: u64,
-    pub entities_sent: AtomicU64,
-    pub entities_acked: AtomicU64,
+    pub total_records: u64,
+    pub records_sent: AtomicU64,
+    pub records_acked: AtomicU64,
     pub cluster_count: AtomicU64,
     pub conflicts_detected: AtomicU64,
     pub merges_performed: AtomicU64,
@@ -1328,7 +1363,7 @@ pub struct LoadTestMetrics {
 }
 
 impl LoadTestMetrics {
-    pub fn new(stream_count: usize, shard_count: usize, total_entities: u64) -> Self {
+    pub fn new(stream_count: usize, shard_count: usize, total_records: u64) -> Self {
         let stream_stats = (0..stream_count).map(|_| StreamStats::default()).collect();
         let shard_stats = (0..shard_count)
             .map(|i| ShardStats {
@@ -1339,9 +1374,9 @@ impl LoadTestMetrics {
 
         Self {
             start_time: Instant::now(),
-            total_entities,
-            entities_sent: AtomicU64::new(0),
-            entities_acked: AtomicU64::new(0),
+            total_records,
+            records_sent: AtomicU64::new(0),
+            records_acked: AtomicU64::new(0),
             cluster_count: AtomicU64::new(0),
             conflicts_detected: AtomicU64::new(0),
             merges_performed: AtomicU64::new(0),
@@ -1360,16 +1395,16 @@ impl LoadTestMetrics {
     }
 
     pub fn progress(&self) -> f64 {
-        let acked = self.entities_acked.load(Ordering::Relaxed);
-        if self.total_entities == 0 {
+        let acked = self.records_acked.load(Ordering::Relaxed);
+        if self.total_records == 0 {
             1.0
         } else {
-            acked as f64 / self.total_entities as f64
+            acked as f64 / self.total_records as f64
         }
     }
 
     pub fn throughput(&self) -> f64 {
-        let acked = self.entities_acked.load(Ordering::Relaxed);
+        let acked = self.records_acked.load(Ordering::Relaxed);
         let elapsed = self.elapsed().as_secs_f64();
         if elapsed > 0.0 {
             acked as f64 / elapsed
@@ -1379,8 +1414,8 @@ impl LoadTestMetrics {
     }
 
     pub fn eta(&self) -> Option<Duration> {
-        let acked = self.entities_acked.load(Ordering::Relaxed);
-        let remaining = self.total_entities.saturating_sub(acked);
+        let acked = self.records_acked.load(Ordering::Relaxed);
+        let remaining = self.total_records.saturating_sub(acked);
         let throughput = self.throughput();
         if throughput > 0.0 && remaining > 0 {
             Some(Duration::from_secs_f64(remaining as f64 / throughput))
@@ -1389,12 +1424,40 @@ impl LoadTestMetrics {
         }
     }
 
+    fn successful_batches(&self) -> u64 {
+        self.stream_stats
+            .iter()
+            .map(|stream| stream.successful_batches.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn average_request_latency_millis(&self) -> f64 {
+        let total_micros: u64 = self
+            .stream_stats
+            .iter()
+            .map(|stream| stream.latency_total_micros.load(Ordering::Relaxed))
+            .sum();
+        let batches = self.successful_batches();
+        if batches == 0 {
+            0.0
+        } else {
+            total_micros as f64 / batches as f64 / 1000.0
+        }
+    }
+
+    fn request_errors(&self) -> u64 {
+        self.stream_stats
+            .iter()
+            .map(|stream| stream.errors.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Generate a detailed report for analysis
     pub fn generate_report(&self, config: &LoadTestConfig) -> String {
         let elapsed = self.elapsed();
         let elapsed_secs = elapsed.as_secs_f64();
-        let entities_sent = self.entities_sent.load(Ordering::Relaxed);
-        let entities_acked = self.entities_acked.load(Ordering::Relaxed);
+        let records_sent = self.records_sent.load(Ordering::Relaxed);
+        let records_acked = self.records_acked.load(Ordering::Relaxed);
         let cluster_count = self.cluster_count.load(Ordering::Relaxed);
         let conflicts = self.conflicts_detected.load(Ordering::Relaxed);
         let throughput = self.throughput();
@@ -1441,18 +1504,14 @@ impl LoadTestMetrics {
 
         // Summary
         report.push_str("## Summary\n");
-        report.push_str(&format!("  Entities sent:    {}\n", entities_sent));
-        report.push_str(&format!("  Entities acked:   {}\n", entities_acked));
+        report.push_str(&format!("  Records sent:     {}\n", records_sent));
+        report.push_str(&format!("  Records acked:    {}\n", records_acked));
         report.push_str(&format!("  Clusters:         {}\n", cluster_count));
         report.push_str(&format!("  Conflicts:        {}\n", conflicts));
         report.push_str(&format!("  Throughput:       {:.2} rec/sec\n", throughput));
         report.push_str(&format!(
-            "  Avg latency:      {:.2} ms/batch\n\n",
-            if throughput > 0.0 {
-                (config.batch_size as f64 / throughput) * 1000.0
-            } else {
-                0.0
-            }
+            "  Avg RPC latency:  {:.2} ms/request\n\n",
+            self.average_request_latency_millis()
         ));
 
         // Cross-shard reconciliation stats
@@ -1572,20 +1631,16 @@ impl LoadTestMetrics {
 
         // Performance metrics
         report.push_str("## Performance Analysis\n");
-        let entities_per_stream = entities_acked as f64 / config.stream_count as f64;
-        let batches_total = entities_acked as f64 / config.batch_size as f64;
-        let batch_latency_avg = if batches_total > 0.0 {
-            elapsed_secs * 1000.0 / batches_total
-        } else {
-            0.0
-        };
-        report.push_str(&format!("  Total batches:      {:.0}\n", batches_total));
+        let records_per_stream = records_acked as f64 / config.stream_count as f64;
+        let batches_total = self.successful_batches();
+        let batch_latency_avg = self.average_request_latency_millis();
+        report.push_str(&format!("  Successful batches: {}\n", batches_total));
         report.push_str(&format!(
-            "  Entities/stream:    {:.0}\n",
-            entities_per_stream
+            "  Records/stream:     {:.0}\n",
+            records_per_stream
         ));
         report.push_str(&format!(
-            "  Batch latency avg:  {:.2} ms\n",
+            "  RPC latency avg:    {:.2} ms\n",
             batch_latency_avg
         ));
         report.push_str(&format!(
@@ -1602,7 +1657,7 @@ impl LoadTestMetrics {
             report.push_str("    - Check disk I/O with iostat\n");
         }
         if batch_latency_avg > 500.0 {
-            report.push_str("  ⚠ Batch latency > 500ms - processing bottleneck\n");
+            report.push_str("  ⚠ RPC latency > 500ms - processing bottleneck\n");
             report.push_str("    - Check conflict detection overhead\n");
             report.push_str("    - Consider profiling with UNIRUST_PROFILE=1\n");
         }
@@ -1655,6 +1710,40 @@ fn write_report(config: &LoadTestConfig, metrics: &LoadTestMetrics) -> Result<Pa
 // PARALLEL STREAMING
 // =============================================================================
 
+async fn connect_channel(config: &LoadTestConfig, address: String) -> Result<Channel> {
+    let mtls = load_client_mtls(
+        config.tls_ca.as_deref(),
+        config.tls_cert.as_deref(),
+        config.tls_key.as_deref(),
+    )?;
+    let address = if address.starts_with("http://") || address.starts_with("https://") {
+        address
+    } else if mtls.is_some() {
+        format!("https://{address}")
+    } else {
+        format!("http://{address}")
+    };
+    if mtls.is_some() && address.starts_with("http://") {
+        bail!("mTLS requires an https:// endpoint");
+    }
+    if mtls.is_none() && address.starts_with("https://") {
+        bail!("https:// endpoints require mTLS certificate options");
+    }
+    let endpoint = Endpoint::from_shared(address)?;
+    let endpoint = if let Some(mtls) = mtls {
+        endpoint.tls_config(mtls)?
+    } else {
+        endpoint
+    };
+    Ok(endpoint.connect().await?)
+}
+
+async fn connect_router(config: &LoadTestConfig) -> Result<RouterServiceClient<Channel>> {
+    Ok(RouterServiceClient::new(
+        connect_channel(config, config.router_addr.clone()).await?,
+    ))
+}
+
 async fn run_parallel_streams(
     config: &LoadTestConfig,
     metrics: Arc<LoadTestMetrics>,
@@ -1663,7 +1752,6 @@ async fn run_parallel_streams(
 
     // Generator task
     let gen_config = config.clone();
-    let gen_metrics = metrics.clone();
     let gen_tx = tx.clone();
     let generator_handle = tokio::spawn(async move {
         let mut generator = CyberEntityGenerator::new(
@@ -1678,10 +1766,6 @@ async fn run_parallel_streams(
             let batch_size = gen_config.batch_size.min(remaining as usize);
             let batch = generator.generate_batch(batch_size);
             remaining -= batch_size as u64;
-            gen_metrics
-                .entities_sent
-                .fetch_add(batch_size as u64, Ordering::Relaxed);
-
             if gen_tx.send(batch).await.is_err() {
                 break; // Channel closed
             }
@@ -1693,10 +1777,10 @@ async fn run_parallel_streams(
         .map(|i| {
             let rx = rx.clone();
             let metrics = metrics.clone();
-            let router = config.router_addr.clone();
+            let connection_config = config.clone();
 
             tokio::spawn(async move {
-                let mut client = match RouterServiceClient::connect(router).await {
+                let mut client = match connect_router(&connection_config).await {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(stream = i, error = %e, "Failed to connect to router");
@@ -1712,7 +1796,7 @@ async fn run_parallel_streams(
                     metrics.stream_stats[i]
                         .records_sent
                         .fetch_add(batch_len as u64, Ordering::Relaxed);
-                    metrics.entities_sent.fetch_add(batch_len as u64, Ordering::Relaxed);
+                    metrics.records_sent.fetch_add(batch_len as u64, Ordering::Relaxed);
                     let start = Instant::now();
 
                     // Retry with exponential backoff
@@ -1730,21 +1814,38 @@ async fn run_parallel_streams(
 
                         match client
                             .ingest_records(IngestRecordsRequest {
+                                internal_protocol_version: 0,
                                 records: batch.clone(),
                             })
                             .await
                         {
                             Ok(response) => {
                                 let count = response.into_inner().assignments.len();
+                                if count != batch_len {
+                                    tracing::error!(
+                                        stream = i,
+                                        expected = batch_len,
+                                        acknowledged = count,
+                                        "Ingest returned an incomplete assignment set"
+                                    );
+                                    metrics.stream_stats[i]
+                                        .errors
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 metrics.stream_stats[i]
                                     .records_acked
                                     .fetch_add(count as u64, Ordering::Relaxed);
-                                metrics
-                                    .entities_acked
-                                    .fetch_add(count as u64, Ordering::Relaxed);
+                                metrics.records_acked.fetch_add(count as u64, Ordering::Relaxed);
+                                let latency_micros = start.elapsed().as_micros() as u64;
                                 metrics.stream_stats[i]
                                     .last_latency_micros
-                                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                    .store(latency_micros, Ordering::Relaxed);
+                                metrics.stream_stats[i]
+                                    .latency_total_micros
+                                    .fetch_add(latency_micros, Ordering::Relaxed);
+                                metrics.stream_stats[i]
+                                    .successful_batches
+                                    .fetch_add(1, Ordering::Relaxed);
                                 success = true;
                                 break;
                             }
@@ -1761,15 +1862,15 @@ async fn run_parallel_streams(
                         metrics.stream_stats[i]
                             .errors
                             .fetch_add(1, Ordering::Relaxed);
-                        // Still count for progress tracking
-                        metrics
-                            .entities_acked
-                            .fetch_add(batch_len as u64, Ordering::Relaxed);
                     }
                 }
             })
         })
         .collect();
+
+    // If every connection fails, dropping the original receiver lets the
+    // generator observe the closed channel instead of blocking forever.
+    drop(rx);
 
     // Wait for generator to finish
     let _ = generator_handle.await;
@@ -1798,16 +1899,15 @@ async fn poll_metrics_task(
     let mut interval = tokio::time::interval(Duration::from_millis(500));
 
     // Connect to router
-    let mut router_client = RouterServiceClient::connect(config.router_addr.clone())
-        .await
-        .ok();
+    let mut router_client = connect_router(config).await.ok();
 
     // Connect to shards
     let mut shard_clients: Vec<Option<ShardServiceClient<Channel>>> = Vec::new();
     for addr in &config.shard_addrs {
-        let client = ShardServiceClient::connect(format!("http://{}", addr))
+        let client = connect_channel(config, addr.clone())
             .await
-            .ok();
+            .ok()
+            .map(ShardServiceClient::new);
         shard_clients.push(client);
     }
 
@@ -1828,7 +1928,7 @@ async fn poll_metrics_task(
 
                 // Poll individual shards for detailed metrics
                 for (i, client_opt) in shard_clients.iter_mut().enumerate() {
-                    if let Some(ref mut client) = client_opt {
+                    if let Some(client) = client_opt {
                         if let Ok(response) = client.get_metrics(MetricsRequest {}).await {
                             let m = response.into_inner();
                             if i < metrics.shard_stats.len() {
@@ -1839,9 +1939,11 @@ async fn poll_metrics_task(
                                 if let Some(latency) = m.ingest_latency {
                                     shard.ingest_latency_total.store(latency.total_micros, Ordering::Relaxed);
                                     shard.ingest_latency_max.store(latency.max_micros, Ordering::Relaxed);
-                                    if latency.count > 0 {
+                                    if let Some(average) =
+                                        latency.total_micros.checked_div(latency.count)
+                                    {
                                         shard.ingest_latency_avg.store(
-                                            latency.total_micros / latency.count,
+                                            average,
                                             Ordering::Relaxed,
                                         );
                                     }
@@ -1970,7 +2072,7 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
 
     // Progress
     let progress = metrics.progress();
-    let acked = metrics.entities_acked.load(Ordering::Relaxed);
+    let acked = metrics.records_acked.load(Ordering::Relaxed);
     let eta_str = metrics
         .eta()
         .map(|d| format!("ETA: {}", format_duration(d)))
@@ -1996,17 +2098,10 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
         .split(chunks[3]);
 
     let throughput = metrics.throughput();
-    let avg_latency: u64 = metrics
-        .stream_stats
-        .iter()
-        .map(|s| s.last_latency_micros.load(Ordering::Relaxed))
-        .sum::<u64>()
-        / metrics.stream_stats.len().max(1) as u64;
-
     let throughput_text = format!(
         "Records/sec: {:.0}\nAvg Latency: {:.2} ms",
         throughput,
-        avg_latency as f64 / 1000.0
+        metrics.average_request_latency_millis()
     );
     let throughput_para = Paragraph::new(throughput_text)
         .style(Style::default().fg(Color::Green))
@@ -2038,13 +2133,14 @@ fn draw_ui(frame: &mut Frame, config: &LoadTestConfig, metrics: &LoadTestMetrics
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let sent = s.records_sent.load(Ordering::Relaxed);
             let acked = s.records_acked.load(Ordering::Relaxed);
             let latency = s.last_latency_micros.load(Ordering::Relaxed);
             let errors = s.errors.load(Ordering::Relaxed);
 
             Row::new(vec![
                 format!("#{}", i),
-                format!("{} sent", format_number(acked)),
+                format!("{} sent", format_number(sent)),
                 format!("{} ack", format_number(acked)),
                 format!("{:.1}ms", latency as f64 / 1000.0),
                 if errors > 0 {
@@ -2167,7 +2263,7 @@ async fn run_headless(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     println!(
-        "Running in headless mode - streaming {} entities...",
+        "Running in headless mode - streaming {} records...",
         config.count
     );
     let start = Instant::now();
@@ -2178,8 +2274,8 @@ async fn run_headless(
 
         // Print progress every 5 seconds
         if last_print.elapsed() >= Duration::from_secs(5) {
-            let sent = metrics.entities_sent.load(Ordering::Relaxed);
-            let acked = metrics.entities_acked.load(Ordering::Relaxed);
+            let sent = metrics.records_sent.load(Ordering::Relaxed);
+            let acked = metrics.records_acked.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
                 acked as f64 / elapsed
@@ -2214,6 +2310,7 @@ async fn run_headless(
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = parse_args();
+    config.validate()?;
 
     // Setup file logging if specified
     if let Some(log_path) = &config.log_file {
@@ -2236,7 +2333,7 @@ async fn main() -> Result<()> {
 
     // Set ontology on router first
     {
-        let mut client = RouterServiceClient::connect(config.router_addr.clone()).await?;
+        let mut client = connect_router(&config).await?;
         client
             .set_ontology(ApplyOntologyRequest {
                 config: Some(build_ontology_config()),
@@ -2251,6 +2348,7 @@ async fn main() -> Result<()> {
         if let Err(e) = run_parallel_streams(&stream_config, stream_metrics.clone()).await {
             tracing::error!(error = %e, "Streaming failed");
             *stream_metrics.error_message.write().await = Some(e.to_string());
+            stream_metrics.completed.store(true, Ordering::Relaxed);
         }
     });
 
@@ -2274,8 +2372,117 @@ async fn main() -> Result<()> {
     let _ = streaming_handle.await;
     let _ = metrics_handle.await;
 
-    // Generate and save report
-    write_report(&config, &metrics)?;
+    // Always preserve the diagnostic report, even when the run is incomplete.
+    let report_path = write_report(&config, &metrics)?;
+    if let Some(error) = metrics.error_message.read().await.clone() {
+        bail!(
+            "load test failed: {error}; report: {}",
+            report_path.display()
+        );
+    }
+
+    let sent = metrics.records_sent.load(Ordering::Relaxed);
+    let acked = metrics.records_acked.load(Ordering::Relaxed);
+    let errors = metrics.request_errors();
+    if errors > 0 || sent != config.count || acked != config.count {
+        bail!(
+            "load test incomplete: sent {sent}/{}, acknowledged {acked}/{}, request errors {errors}; report: {}",
+            config.count,
+            config.count,
+            report_path.display()
+        );
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn report_uses_single_record_counters_and_measured_rpc_latency() {
+        let config = LoadTestConfig {
+            count: 100,
+            stream_count: 1,
+            batch_size: 50,
+            ..LoadTestConfig::default()
+        };
+        let metrics = LoadTestMetrics::new(1, 0, config.count);
+        metrics.records_sent.store(100, Ordering::Relaxed);
+        metrics.records_acked.store(90, Ordering::Relaxed);
+        metrics.stream_stats[0]
+            .successful_batches
+            .store(2, Ordering::Relaxed);
+        metrics.stream_stats[0]
+            .latency_total_micros
+            .store(5_000, Ordering::Relaxed);
+
+        let report = metrics.generate_report(&config);
+
+        assert!(report.contains("Records sent:     100"));
+        assert!(report.contains("Records acked:    90"));
+        assert!(report.contains("Avg RPC latency:  2.50 ms/request"));
+        assert!(report.contains("Successful batches: 2"));
+        assert_eq!(metrics.progress(), 0.9);
+    }
+
+    #[test]
+    fn config_rejects_values_that_cannot_make_progress() {
+        let mut config = LoadTestConfig {
+            batch_size: 0,
+            ..LoadTestConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.batch_size = 5_000;
+        config.overlap_probability = 1.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn overlap_records_keep_source_identities_unique() {
+        let mut generator = CyberEntityGenerator::new(42, 1.0, 0.0, 0.0);
+        let records = generator
+            .generate_batch(2_000)
+            .into_iter()
+            .chain(generator.generate_batch(2_000))
+            .collect::<Vec<_>>();
+
+        let source_identities = records
+            .iter()
+            .map(|record| {
+                let identity = record.identity.as_ref().expect("generated identity");
+                (
+                    identity.entity_type.as_str(),
+                    identity.perspective.as_str(),
+                    identity.uid.as_str(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(source_identities.len(), records.len());
+    }
+
+    #[test]
+    fn deployment_ontology_matches_loadtest_ontology() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/loadtest-ontology.json");
+        let deployed: unirust_rs::distributed::DistributedOntologyConfig =
+            serde_json::from_slice(&std::fs::read(path).expect("deployment ontology"))
+                .expect("valid deployment ontology");
+        let generated = build_ontology_config();
+
+        assert_eq!(deployed.identity_keys.len(), generated.identity_keys.len());
+        for (deployed_key, generated_key) in
+            deployed.identity_keys.iter().zip(&generated.identity_keys)
+        {
+            assert_eq!(deployed_key.name, generated_key.name);
+            assert_eq!(deployed_key.attributes, generated_key.attributes);
+        }
+        assert_eq!(deployed.strong_identifiers, generated.strong_identifiers);
+        assert!(deployed.constraints.is_empty());
+        assert!(generated.constraints.is_empty());
+    }
 }

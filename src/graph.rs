@@ -1199,7 +1199,7 @@ fn key_attributes_for_type(ontology: &Ontology, entity_type: &str) -> (Vec<AttrI
     }
 
     let mut identity_keys = ontology.identity_keys_for_type(entity_type);
-    identity_keys.sort_by(|a, b| b.attributes.len().cmp(&a.attributes.len()));
+    identity_keys.sort_by_key(|key| std::cmp::Reverse(key.attributes.len()));
     if let Some(identity_key) = identity_keys.first() {
         return (identity_key.attributes.clone(), identity_key.name.clone());
     }

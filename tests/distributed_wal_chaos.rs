@@ -167,7 +167,7 @@ async fn wal_replay_skips_duplicate_records() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn wal_replay_quarantines_corrupt_file() -> anyhow::Result<()> {
+async fn corrupt_wal_fails_startup_and_preserves_evidence() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir)?;
@@ -175,11 +175,17 @@ async fn wal_replay_quarantines_corrupt_file() -> anyhow::Result<()> {
     let wal_path = data_dir.join("ingest_wal.bin");
     std::fs::write(&wal_path, b"\x00\xff\x00corrupt")?;
 
-    let (addr, handle) = spawn_shard_with_data_dir(0, data_dir.clone()).await?;
-    let mut client = ShardServiceClient::connect(format!("http://{}", addr)).await?;
-    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
+    let result = ShardNode::new_with_data_dir(
+        0,
+        support::build_iam_config(),
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.clone()),
+        false,
+        None,
+    );
 
-    assert_eq!(stats.record_count, 0);
+    let error = result.err().expect("corrupt WAL must fail shard startup");
+    assert!(error.to_string().contains("ingest WAL is corrupt"));
     assert!(!wal_path.exists());
 
     let corrupt_found = std::fs::read_dir(&data_dir)?
@@ -191,7 +197,5 @@ async fn wal_replay_quarantines_corrupt_file() -> anyhow::Result<()> {
                 .starts_with("ingest_wal.bin.corrupt")
         });
     assert!(corrupt_found);
-
-    handle.abort();
     Ok(())
 }

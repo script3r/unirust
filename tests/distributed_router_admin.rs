@@ -1,15 +1,17 @@
 use std::net::SocketAddr;
 
+use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use unirust_rs::distributed::proto::{
-    self, router_service_client::RouterServiceClient, shard_service_client::ShardServiceClient,
-    ApplyOntologyRequest, IngestRecordsRequest, RecordDescriptor,
-    RecordIdentity as ProtoRecordIdentity, RecordInput, RouterExportRecordsRequest,
-    RouterImportRecordsRequest, RouterRecordIdRangeRequest,
+    self, router_service_client::RouterServiceClient, ApplyOntologyRequest, IngestRecordsRequest,
+    RecordDescriptor, RecordIdentity as ProtoRecordIdentity, RecordInput,
+    RouterExportRecordsRequest, RouterImportRecordsRequest, RouterRecordIdRangeRequest,
 };
-use unirust_rs::distributed::{DistributedOntologyConfig, RouterNode, ShardNode};
+use unirust_rs::distributed::{
+    hash_record_to_shard, DistributedOntologyConfig, RouterNode, ShardNode,
+};
 use unirust_rs::{StreamingTuning, TuningProfile};
 
 mod support;
@@ -20,12 +22,17 @@ async fn spawn_shard(
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -88,7 +95,7 @@ fn record_input(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn router_admin_proxies_to_shards() -> anyhow::Result<()> {
+async fn router_admin_rejects_non_atomic_cross_shard_copy() -> anyhow::Result<()> {
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
 
@@ -105,25 +112,32 @@ async fn router_admin_proxies_to_shards() -> anyhow::Result<()> {
         })
         .await?;
 
-    let mut shard0 = ShardServiceClient::connect(format!("http://{}", shard0_addr)).await?;
-    shard0
+    let mut records = Vec::new();
+    for candidate in 0..1_000 {
+        let record = record_input(
+            candidate,
+            "person",
+            "crm",
+            &format!("admin-copy-{candidate}"),
+            vec![(
+                "email",
+                &format!("admin-copy-{candidate}@example.com"),
+                0,
+                10,
+            )],
+        );
+        if hash_record_to_shard(&config, &record, 2) == 0 {
+            records.push(record);
+        }
+        if records.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(records.len(), 2);
+    router
         .ingest_records(IngestRecordsRequest {
-            records: vec![
-                record_input(
-                    0,
-                    "person",
-                    "crm",
-                    "crm_001",
-                    vec![("email", "alice@example.com", 0, 10)],
-                ),
-                record_input(
-                    1,
-                    "person",
-                    "crm",
-                    "crm_002",
-                    vec![("email", "bob@example.com", 0, 10)],
-                ),
-            ],
+            internal_protocol_version: 3,
+            records,
         })
         .await?;
 
@@ -145,18 +159,21 @@ async fn router_admin_proxies_to_shards() -> anyhow::Result<()> {
         .into_inner();
     assert_eq!(export.records.len(), 2);
 
-    router
+    let error = router
         .import_records(RouterImportRecordsRequest {
             shard_id: 1,
             records: export.records,
         })
-        .await?;
+        .await
+        .expect_err("copying a reserved source identity to another shard must fail");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     let range = router
         .get_record_id_range(RouterRecordIdRangeRequest { shard_id: 1 })
         .await?
         .into_inner();
-    assert_eq!(range.record_count, 2);
+    assert!(range.empty);
+    assert_eq!(range.record_count, 0);
 
     Ok(())
 }

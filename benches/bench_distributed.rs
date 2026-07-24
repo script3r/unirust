@@ -387,7 +387,9 @@ fn bench_partitioned_ingest(c: &mut Criterion) {
                 (partitioned, indexed)
             },
             |(partitioned, indexed)| {
-                let results = partitioned.ingest_batch_with_partitions(indexed);
+                let results = partitioned
+                    .ingest_batch_with_partitions(indexed)
+                    .expect("partitioned ingest");
                 black_box(results);
             },
             BatchSize::LargeInput,
@@ -408,9 +410,11 @@ fn bench_shardnode_ingest(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(6));
 
-    std::env::set_var("UNIRUST_PARTITIONED", "1");
+    // SAFETY: benchmark configuration runs before this function creates any worker threads.
+    unsafe { std::env::set_var("UNIRUST_PARTITIONED", "1") };
     let partition_count = env_usize("UNIRUST_DIST_PARTITIONS", 8);
-    std::env::set_var("UNIRUST_PARTITION_COUNT", partition_count.to_string());
+    // SAFETY: benchmark configuration runs before this function creates any worker threads.
+    unsafe { std::env::set_var("UNIRUST_PARTITION_COUNT", partition_count.to_string()) };
 
     let count = env_u32("UNIRUST_DIST_RECORDS", 50_000);
     let overlap = env_f64("UNIRUST_DIST_OVERLAP", 0.05);
@@ -430,7 +434,10 @@ fn bench_shardnode_ingest(c: &mut Criterion) {
             |(rt, shard, records)| {
                 let response = rt.block_on(async {
                     shard
-                        .ingest_records(Request::new(proto::IngestRecordsRequest { records }))
+                        .ingest_records(Request::new(proto::IngestRecordsRequest {
+                            internal_protocol_version: 2,
+                            records,
+                        }))
                         .await
                         .expect("ingest")
                 });
@@ -450,9 +457,11 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(6));
 
-    std::env::set_var("UNIRUST_PARTITIONED", "1");
+    // SAFETY: benchmark configuration runs before this function creates any worker threads.
+    unsafe { std::env::set_var("UNIRUST_PARTITIONED", "1") };
     let partition_count = env_usize("UNIRUST_DIST_PARTITIONS", 8);
-    std::env::set_var("UNIRUST_PARTITION_COUNT", partition_count.to_string());
+    // SAFETY: benchmark configuration runs before this function creates any worker threads.
+    unsafe { std::env::set_var("UNIRUST_PARTITION_COUNT", partition_count.to_string()) };
 
     let total = env_u32("UNIRUST_DIST_STREAM_TOTAL", 20_000);
     let chunk = env_u32("UNIRUST_DIST_STREAM_CHUNK", 512).max(1);
@@ -479,6 +488,7 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
                         let batch = records[offset..end].to_vec();
                         let resp = shard
                             .ingest_records(Request::new(proto::IngestRecordsRequest {
+                                internal_protocol_version: 2,
                                 records: batch,
                             }))
                             .await

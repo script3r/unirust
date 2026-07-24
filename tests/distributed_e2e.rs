@@ -24,12 +24,17 @@ async fn spawn_shard(
 ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let shard = ShardNode::new(
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
         shard_id,
         config,
         StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
     )?;
     let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
         Server::builder()
             .add_service(proto::shard_service_server::ShardServiceServer::new(shard))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -203,6 +208,7 @@ async fn distributed_stream_and_query() -> anyhow::Result<()> {
 
     let response = client
         .ingest_records(IngestRecordsRequest {
+            internal_protocol_version: 3,
             records: vec![record_a.clone(), record_b.clone()],
         })
         .await?

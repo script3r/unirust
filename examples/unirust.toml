@@ -17,6 +17,8 @@ listen = "0.0.0.0:50061"
 id = 0
 # Data directory for persistence (comment out for in-memory only)
 # data_dir = "/var/lib/unirust/shard-0"
+# Checkpoint root on an independent volume (use a unique path per shard)
+# backup_dir = "/var/backups/unirust/shard-0"
 # Path to ontology configuration (JSON)
 # ontology = "/etc/unirust/ontology.json"
 # Run repair on startup (recovers from unclean shutdown)
@@ -36,6 +38,12 @@ shards = [
 # shards_file = "/etc/unirust/shards.txt"
 # Path to ontology configuration (JSON)
 # ontology = "/etc/unirust/ontology.json"
+# Router-to-shard failure bounds
+shard_connect_timeout_secs = 10
+shard_request_timeout_secs = 120
+shard_tcp_keepalive_secs = 30
+# Automatic coordinated checkpoint interval (0 disables)
+# checkpoint_interval_secs = 3600
 
 # Advanced storage tuning (RocksDB)
 # These settings control the underlying storage engine performance.

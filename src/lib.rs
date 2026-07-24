@@ -50,14 +50,13 @@ pub mod query;
 pub mod sharding;
 pub mod store;
 pub mod temporal;
+pub mod transport_security;
 pub mod utils;
 
 /// Test support utilities (also used by benchmarks and integration tests)
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support;
-
-use tracing::{error, warn};
 
 // ============================================================================
 // Public API - Core Types
@@ -78,7 +77,10 @@ pub use graph::KnowledgeGraph;
 pub use query::{QueryDescriptor, QueryMatch, QueryOutcome};
 
 // Storage (for custom backends)
-pub use persistence::PersistentStore;
+pub use persistence::{
+    read_cluster_checkpoint_manifest, restore_checkpoint, restore_checkpoint_for_shard,
+    ClusterCheckpointManifest, PersistentStore, CHECKPOINT_PROTOCOL_VERSION,
+};
 pub use store::{RecordStore, Store};
 
 // ============================================================================
@@ -272,8 +274,14 @@ impl Unirust {
         let use_persistent_dsu = self.tuning.use_persistent_dsu && db.is_some();
         let use_tiered_index = self.tuning.use_tiered_index && db.is_some();
 
-        if use_persistent_dsu || use_tiered_index {
-            let db = db.unwrap();
+        let mut linker = if use_persistent_dsu || use_tiered_index {
+            let db = db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("persistent linker backend requires a database"))?
+                .clone();
+            if !self.store.is_empty() {
+                persistence::clear_rebuildable_linker_state(&db)?;
+            }
             let dsu = if use_persistent_dsu {
                 let dsu_config = self.tuning.dsu_config.clone().unwrap_or_default();
                 dsu::DsuBackend::persistent(db.clone(), dsu_config)?
@@ -295,10 +303,16 @@ impl Unirust {
                 self.tuning.shard_id,
                 dsu,
                 index,
-            )
+            )?
         } else {
-            linker::StreamingLinker::new(self.store.as_ref(), &self.ontology, &self.tuning)
+            linker::StreamingLinker::new(self.store.as_ref(), &self.ontology, &self.tuning)?
+        };
+
+        if let Some(db) = db.as_ref() {
+            let persistence = LinkerStatePersistence::new(db);
+            linker.restore_cross_shard_merges(&persistence)?;
         }
+        Ok(linker)
     }
 
     // ========================================================================
@@ -320,6 +334,23 @@ impl Unirust {
     /// }
     /// ```
     pub fn ingest(&mut self, records: Vec<Record>) -> anyhow::Result<IngestResult> {
+        self.ingest_internal(records, false)
+    }
+
+    /// Ingest snapshots while preserving their explicit record IDs.
+    #[doc(hidden)]
+    pub fn ingest_with_explicit_ids(
+        &mut self,
+        records: Vec<Record>,
+    ) -> anyhow::Result<IngestResult> {
+        self.ingest_internal(records, true)
+    }
+
+    fn ingest_internal(
+        &mut self,
+        records: Vec<Record>,
+        preserve_record_ids: bool,
+    ) -> anyhow::Result<IngestResult> {
         self.clear_conflict_cache();
         self.clear_query_stats();
         if self.streaming.is_none() {
@@ -329,7 +360,11 @@ impl Unirust {
         // Stage all records and collect their IDs
         let mut staged_info: Vec<(RecordId, bool)> = Vec::with_capacity(records.len());
         for record in records {
-            let (record_id, inserted) = self.store.stage_record_if_absent(record)?;
+            let (record_id, inserted) = if preserve_record_ids {
+                self.store.stage_record_with_explicit_id_if_absent(record)?
+            } else {
+                self.store.stage_record_if_absent(record)?
+            };
             staged_info.push((record_id, inserted));
         }
 
@@ -343,7 +378,12 @@ impl Unirust {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("Streaming not initialized"))?;
 
-            // Get record references for parallel processing
+            let inserted_ids: Vec<_> = staged_info
+                .iter()
+                .filter_map(|(id, inserted)| inserted.then_some(*id))
+                .collect();
+            // In-memory stores can lend records directly. Persistent stores return
+            // owned records from their cache for the parallel extraction phase.
             let records_to_link: Vec<&Record> = staged_info
                 .iter()
                 .filter(|(_, inserted)| *inserted)
@@ -351,19 +391,43 @@ impl Unirust {
                 .collect();
 
             // Use parallel batch linking for large batches (>= 100 records)
-            if records_to_link.len() >= 100 {
-                let cluster_ids = streaming.link_records_batch_parallel_with_interner(
-                    &records_to_link,
-                    &self.ontology,
-                    self.store.interner(),
-                )?;
+            if inserted_ids.len() >= 100 {
+                let cluster_ids = if records_to_link.len() == inserted_ids.len() {
+                    streaming.link_records_batch_parallel_with_interner(
+                        &records_to_link,
+                        &self.ontology,
+                        self.store.interner(),
+                    )?
+                } else {
+                    let owned_records: Vec<Record> = inserted_ids
+                        .iter()
+                        .map(|id| {
+                            self.store.get_record(*id).ok_or_else(|| {
+                                anyhow::anyhow!("staged record {} is unavailable", id.0)
+                            })
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    let owned_refs: Vec<&Record> = owned_records.iter().collect();
+                    streaming.link_records_batch_parallel_with_interner(
+                        &owned_refs,
+                        &self.ontology,
+                        self.store.interner(),
+                    )?
+                };
+                if cluster_ids.len() != inserted_ids.len() {
+                    anyhow::bail!(
+                        "entity resolution returned {} assignments for {} records",
+                        cluster_ids.len(),
+                        inserted_ids.len()
+                    );
+                }
                 let mut cluster_id_iter = cluster_ids.into_iter();
 
                 for (record_id, inserted) in &staged_info {
                     let cluster_id = if *inserted {
                         cluster_id_iter
                             .next()
-                            .unwrap_or_else(|| streaming.cluster_id_for(*record_id))
+                            .ok_or_else(|| anyhow::anyhow!("missing cluster assignment"))?
                     } else {
                         streaming.cluster_id_for(*record_id)
                     };
@@ -408,22 +472,18 @@ impl Unirust {
             )?;
         }
 
-        // Flush all staged records to DB
-        if let Err(e) = self.store.flush_staged_records() {
-            error!(error = %e, "Failed to flush staged records");
-        }
+        // Do not acknowledge an ingest until its records and resolution state persist.
+        self.store.flush_staged_records()?;
 
         // Batch write all cluster assignments
         let batch_assignments: Vec<_> = assignments
             .iter()
             .map(|a| (a.record_id, a.cluster_id))
             .collect();
-        if let Err(e) = self.store.set_cluster_assignments_batch(&batch_assignments) {
-            error!(error = %e, "Failed to persist cluster assignments");
-        }
-        if let Err(e) = self.store.set_cluster_count(cluster_count) {
-            warn!(error = %e, "Failed to persist cluster count");
-        }
+        self.store
+            .set_cluster_assignments_batch(&batch_assignments)?;
+        self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
 
         // Summarize conflicts
         let conflicts = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
@@ -450,11 +510,13 @@ impl Unirust {
 
     /// Get all cluster assignments.
     pub fn clusters(&mut self) -> anyhow::Result<Clusters> {
-        if let Some(streaming) = &mut self.streaming {
-            Ok(streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?)
+        let clusters = if let Some(streaming) = &mut self.streaming {
+            streaming.clusters_with_conflict_splitting(self.store.as_ref(), &self.ontology)?
         } else {
-            linker::build_clusters(self.store.as_ref(), &self.ontology)
-        }
+            linker::build_clusters(self.store.as_ref(), &self.ontology)?
+        };
+        self.store.ensure_healthy()?;
+        Ok(clusters)
     }
 
     /// Export the knowledge graph.
@@ -462,12 +524,14 @@ impl Unirust {
         let clusters = self.clusters()?;
         let observations =
             conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
-        graph::export_graph(
+        let graph = graph::export_graph(
             self.store.as_ref(),
             &clusters,
             &observations,
             &self.ontology,
-        )
+        )?;
+        self.store.ensure_healthy()?;
+        Ok(graph)
     }
 
     /// Persist all state to disk (for persistent stores).
@@ -483,6 +547,7 @@ impl Unirust {
         }
         // Flush any staged records
         self.store.flush_staged_records()?;
+        self.store.sync()?;
         Ok(())
     }
 
@@ -528,6 +593,23 @@ impl Unirust {
     /// Get a record by ID.
     pub fn get_record(&self, id: RecordId) -> Option<Record> {
         self.store.get_record(id)
+    }
+
+    /// Get a record by its immutable source identity.
+    #[doc(hidden)]
+    pub fn get_record_by_identity(
+        &self,
+        identity: &RecordIdentity,
+    ) -> anyhow::Result<Option<Record>> {
+        let Some(record_id) = self.store.get_record_id_by_identity(identity) else {
+            self.store.ensure_healthy()?;
+            return Ok(None);
+        };
+        let record = self.store.get_record(record_id).ok_or_else(|| {
+            anyhow::anyhow!("identity index references missing record {}", record_id.0)
+        })?;
+        self.store.ensure_healthy()?;
+        Ok(Some(record))
     }
 
     /// Access the underlying store (for advanced use cases).
@@ -602,11 +684,42 @@ impl Unirust {
         self.store.len()
     }
 
+    #[doc(hidden)]
+    pub fn ensure_store_healthy(&self) -> anyhow::Result<()> {
+        self.store.ensure_healthy()
+    }
+
+    /// Durably clear the store and install a fresh ontology on the same handle.
+    #[doc(hidden)]
+    pub fn reset_with_ontology(&mut self, mut ontology: Ontology) -> anyhow::Result<()> {
+        self.store.reset_data()?;
+        ontology.intern_attributes(|name| self.store.intern_attr(name));
+        self.ontology = ontology;
+        self.streaming = None;
+        self.graph_state = None;
+        self.query_cache = std::sync::Mutex::new(None);
+        self.conflict_cache = std::sync::Mutex::new(None);
+        self.query_stats = std::sync::Mutex::new(query::QuerySelectivityStats::default());
+        Ok(())
+    }
+
     pub fn streaming_cluster_count(&self) -> Option<usize> {
         self.streaming
             .as_ref()
             .map(|streaming| streaming.cluster_count())
             .or_else(|| self.store.cluster_count())
+    }
+
+    /// Reconstruct the streaming linker before accepting live traffic.
+    ///
+    /// Persistent shards call this during startup so recovery cost and failures are
+    /// surfaced before the gRPC listener becomes ready.
+    #[doc(hidden)]
+    pub fn initialize_streaming(&mut self) -> anyhow::Result<()> {
+        if self.streaming.is_none() {
+            self.streaming = Some(self.create_streaming_linker()?);
+        }
+        Ok(())
     }
 
     /// Get the number of conflicts detected by the streaming linker
@@ -709,7 +822,12 @@ impl Unirust {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("Streaming not initialized"))?;
 
-            // Get record references for parallel processing
+            let inserted_ids: Vec<_> = staged_info
+                .iter()
+                .filter_map(|(id, inserted)| inserted.then_some(*id))
+                .collect();
+            // In-memory stores can lend records directly. Persistent stores return
+            // owned records from their cache for the parallel extraction phase.
             let records_to_link: Vec<&Record> = staged_info
                 .iter()
                 .filter(|(_, inserted)| *inserted)
@@ -717,19 +835,43 @@ impl Unirust {
                 .collect();
 
             // Use parallel batch linking for large batches (>= 100 records)
-            if records_to_link.len() >= 100 {
-                let cluster_ids = streaming.link_records_batch_parallel_with_interner(
-                    &records_to_link,
-                    &self.ontology,
-                    self.store.interner(),
-                )?;
+            if inserted_ids.len() >= 100 {
+                let cluster_ids = if records_to_link.len() == inserted_ids.len() {
+                    streaming.link_records_batch_parallel_with_interner(
+                        &records_to_link,
+                        &self.ontology,
+                        self.store.interner(),
+                    )?
+                } else {
+                    let owned_records: Vec<Record> = inserted_ids
+                        .iter()
+                        .map(|id| {
+                            self.store.get_record(*id).ok_or_else(|| {
+                                anyhow::anyhow!("staged record {} is unavailable", id.0)
+                            })
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    let owned_refs: Vec<&Record> = owned_records.iter().collect();
+                    streaming.link_records_batch_parallel_with_interner(
+                        &owned_refs,
+                        &self.ontology,
+                        self.store.interner(),
+                    )?
+                };
+                if cluster_ids.len() != inserted_ids.len() {
+                    anyhow::bail!(
+                        "entity resolution returned {} assignments for {} records",
+                        cluster_ids.len(),
+                        inserted_ids.len()
+                    );
+                }
                 let mut cluster_id_iter = cluster_ids.into_iter();
 
                 for (record_id, inserted) in &staged_info {
                     let cluster_id = if *inserted {
                         cluster_id_iter
                             .next()
-                            .unwrap_or_else(|| streaming.cluster_id_for(*record_id))
+                            .ok_or_else(|| anyhow::anyhow!("missing cluster assignment"))?
                     } else {
                         streaming.cluster_id_for(*record_id)
                     };
@@ -764,21 +906,17 @@ impl Unirust {
         };
 
         // Flush all staged records to DB in a single batch write
-        if let Err(e) = self.store.flush_staged_records() {
-            error!(error = %e, "Failed to flush staged records");
-        }
+        self.store.flush_staged_records()?;
 
         // Batch write all cluster assignments
         let batch_assignments: Vec<_> = assignments
             .iter()
             .map(|a| (a.record_id, a.cluster_id))
             .collect();
-        if let Err(e) = self.store.set_cluster_assignments_batch(&batch_assignments) {
-            error!(error = %e, "Failed to persist cluster assignments");
-        }
-        if let Err(e) = self.store.set_cluster_count(cluster_count) {
-            warn!(error = %e, "Failed to persist cluster count");
-        }
+        self.store
+            .set_cluster_assignments_batch(&batch_assignments)?;
+        self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
         self.invalidate_query_cache();
         Ok(assignments)
     }
@@ -807,9 +945,7 @@ impl Unirust {
                 } else {
                     streaming.cluster_id_for(record_id)
                 };
-                if let Err(e) = self.store.set_cluster_assignment(record_id, cluster_id) {
-                    error!(record_id = ?record_id, cluster_id = ?cluster_id, error = %e, "Failed to persist cluster assignment");
-                }
+                self.store.set_cluster_assignment(record_id, cluster_id)?;
                 let assignment = ClusterAssignment {
                     record_id,
                     cluster_id,
@@ -829,12 +965,8 @@ impl Unirust {
                 if inserted && !observations.is_empty() {
                     let summaries =
                         conflicts::summarize_conflicts(self.store.as_ref(), &observations);
-                    if let Err(e) = self
-                        .store
-                        .set_cluster_conflict_summaries(cluster_id, &summaries)
-                    {
-                        warn!(cluster_id = ?cluster_id, error = %e, "Failed to persist cluster conflict summaries");
-                    }
+                    self.store
+                        .set_cluster_conflict_summaries(cluster_id, &summaries)?;
                 }
                 updates.push(StreamedConflictUpdate {
                     assignment,
@@ -846,9 +978,8 @@ impl Unirust {
         };
 
         self.invalidate_query_cache();
-        if let Err(e) = self.store.set_cluster_count(cluster_count) {
-            warn!(cluster_count = cluster_count, error = %e, "Failed to persist cluster count");
-        }
+        self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
         Ok(updates)
     }
 
@@ -940,14 +1071,11 @@ impl Unirust {
         }
 
         // Flush all staged records in a single batch write
-        if let Err(e) = self.store.flush_staged_records() {
-            error!(error = %e, "Failed to flush staged records - data may be stale");
-        }
+        self.store.flush_staged_records()?;
 
         // Batch write all cluster assignments
-        if let Err(e) = self.store.set_cluster_assignments_batch(&assignments_batch) {
-            error!(error = %e, "Failed to persist cluster assignments batch");
-        }
+        self.store
+            .set_cluster_assignments_batch(&assignments_batch)?;
 
         // Final conflict detection and summary (once at end)
         if let Some(streaming) = self.streaming.as_mut() {
@@ -955,16 +1083,13 @@ impl Unirust {
             let observations =
                 conflicts::detect_conflicts(self.store.as_ref(), &clusters, &self.ontology)?;
             let summaries = conflicts::summarize_conflicts(self.store.as_ref(), &observations);
-            if let Err(e) = self.store.set_conflict_summaries(&summaries) {
-                warn!(error = %e, "Failed to persist conflict summaries");
-            }
+            self.store.set_conflict_summaries(&summaries)?;
             *self.conflict_cache.lock().unwrap() = Some(summaries);
         }
 
         self.invalidate_query_cache();
-        if let Err(e) = self.store.set_cluster_count(cluster_count) {
-            warn!(cluster_count = cluster_count, error = %e, "Failed to persist cluster count");
-        }
+        self.store.set_cluster_count(cluster_count)?;
+        self.store.sync()?;
         Ok(updates)
     }
 
@@ -999,7 +1124,7 @@ impl Unirust {
         }
         let cache = cache_guard.as_ref().expect("cache");
         let mut stats_guard = self.query_stats.lock().expect("query stats lock");
-        query::query_master_entities_with_cache_selective(
+        let outcome = query::query_master_entities_with_cache_selective(
             self.store.as_ref(),
             &cache.clusters,
             descriptors,
@@ -1008,7 +1133,9 @@ impl Unirust {
             &cache.cluster_keys,
             &cache.record_to_cluster,
             &mut stats_guard,
-        )
+        )?;
+        self.store.ensure_healthy()?;
+        Ok(outcome)
     }
 
     fn invalidate_query_cache(&self) {
@@ -1029,8 +1156,26 @@ impl Unirust {
         self.conflict_cache.lock().unwrap().clone()
     }
 
-    pub fn load_conflict_summaries(&self) -> Option<Vec<conflicts::ConflictSummary>> {
-        self.store.load_conflict_summaries()
+    pub fn load_conflict_summaries(
+        &self,
+    ) -> anyhow::Result<Option<Vec<conflicts::ConflictSummary>>> {
+        let summaries = self.store.load_conflict_summaries();
+        self.store.ensure_healthy()?;
+        Ok(summaries)
+    }
+
+    /// Persist the durable cross-shard conflict set.
+    pub fn persist_cross_shard_conflicts(
+        &mut self,
+        conflicts: &[sharding::CrossShardConflict],
+    ) -> anyhow::Result<()> {
+        self.store.set_cross_shard_conflicts(conflicts)?;
+        self.store.sync()
+    }
+
+    /// Load cross-shard conflicts recovered from persistent storage.
+    pub fn load_cross_shard_conflicts(&self) -> anyhow::Result<Vec<sharding::CrossShardConflict>> {
+        self.store.load_cross_shard_conflicts()
     }
 
     pub fn conflict_summary_count(&self) -> Option<usize> {
@@ -1041,11 +1186,15 @@ impl Unirust {
             .or_else(|| self.store.conflict_summary_count())
     }
 
-    pub fn set_conflict_cache(&mut self, summaries: Vec<conflicts::ConflictSummary>) {
-        if let Err(err) = self.store.set_conflict_summaries(&summaries) {
-            eprintln!("Failed to persist conflict summaries: {err}");
-        }
+    pub fn set_conflict_cache(
+        &mut self,
+        summaries: Vec<conflicts::ConflictSummary>,
+    ) -> anyhow::Result<()> {
+        self.store.ensure_healthy()?;
+        self.store.set_conflict_summaries(&summaries)?;
+        self.store.sync()?;
         *self.conflict_cache.lock().unwrap() = Some(summaries);
+        Ok(())
     }
 
     fn clear_conflict_cache(&self) {
@@ -1117,10 +1266,57 @@ impl Unirust {
             self.streaming = Some(self.create_streaming_linker()?);
         }
 
+        let (primary, secondary) = {
+            let streaming = self.streaming.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
+            })?;
+            (
+                streaming.resolve_global_cluster_id(primary),
+                streaming.resolve_global_cluster_id(secondary),
+            )
+        };
+        if primary == secondary {
+            return Ok(0);
+        }
+        if primary.to_u64() >= secondary.to_u64() {
+            anyhow::bail!(
+                "cross-shard merge must redirect cluster {} to lower canonical cluster {}",
+                secondary.to_u64(),
+                primary.to_u64()
+            );
+        }
+
+        if let Some(db) = self.store.shared_db() {
+            let persistence = LinkerStatePersistence::new(&db);
+            persistence.save_cross_shard_merge(secondary, primary)?;
+            self.store.sync()?;
+        }
         let streaming = self.streaming.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
         })?;
         Ok(streaming.apply_cross_shard_merge(primary, secondary))
+    }
+
+    /// Resolve a global cluster ID through durable cross-shard redirects.
+    pub fn resolve_global_cluster_id(&self, id: GlobalClusterId) -> Option<GlobalClusterId> {
+        self.streaming
+            .as_ref()
+            .map(|streaming| streaming.resolve_global_cluster_id(id))
+    }
+
+    /// Return the canonical global cluster ID for a record.
+    pub fn global_cluster_id_for_record(
+        &mut self,
+        record_id: RecordId,
+    ) -> anyhow::Result<GlobalClusterId> {
+        if self.streaming.is_none() {
+            self.streaming = Some(self.create_streaming_linker()?);
+        }
+        let streaming = self.streaming.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
+        })?;
+        let global_id = streaming.global_cluster_id_for(record_id);
+        Ok(streaming.resolve_global_cluster_id(global_id))
     }
 
     /// Get the number of cross-shard merge mappings tracked.
@@ -1192,7 +1388,18 @@ impl Unirust {
     /// This is a convenience method that flushes linker state and ensures
     /// all data is synced to disk. Call before shutdown for complete recovery.
     pub fn checkpoint_linker_state(&mut self) -> anyhow::Result<()> {
-        self.flush_linker_state()?;
+        self.initialize_streaming()?;
+        let db = self
+            .store
+            .shared_db()
+            .ok_or_else(|| anyhow::anyhow!("Persistence not available - use PersistentStore"))?;
+        let streaming = self
+            .streaming
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming initialization failed"))?;
+        streaming.flush_dsu()?;
+        let persistence = LinkerStatePersistence::new(&db);
+        streaming.flush_state(&persistence)?;
 
         // Also flush the underlying store to ensure staged records are persisted
         if let Err(e) = self.store.flush_staged_records() {
@@ -1200,6 +1407,176 @@ impl Unirust {
             return Err(anyhow::anyhow!("Failed to flush staged records: {}", e));
         }
 
+        self.store.sync()?;
+
         Ok(())
+    }
+
+    /// Flush the bounded amount of dirty state required for graceful process exit.
+    ///
+    /// Full linker-map snapshots grow with total record count and are not needed by
+    /// the authoritative record-scan recovery path.
+    #[doc(hidden)]
+    pub fn checkpoint_for_shutdown(&mut self) -> anyhow::Result<()> {
+        self.initialize_streaming()?;
+        let streaming = self
+            .streaming
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming initialization failed"))?;
+        streaming.flush_dsu()?;
+        self.store.flush_staged_records()?;
+        self.store.sync()
+    }
+}
+
+#[cfg(test)]
+mod persistence_error_tests {
+    use super::*;
+    use crate::model::{AttrId, RecordIdentity, StringInterner};
+    use crate::ontology::IdentityKey;
+    use crate::store::RecordStore;
+    use crate::temporal::Interval;
+
+    struct FailingStore {
+        inner: Store,
+        fail_flush: bool,
+        fail_sync: bool,
+    }
+
+    impl RecordStore for FailingStore {
+        fn add_record(&mut self, record: Record) -> anyhow::Result<RecordId> {
+            self.inner.add_record(record)
+        }
+
+        fn get_record(&self, id: RecordId) -> Option<Record> {
+            self.inner.get_record(id)
+        }
+
+        fn get_record_ref(&self, id: RecordId) -> Option<&Record> {
+            self.inner.get_record_ref(id)
+        }
+
+        fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
+            self.inner.get_record_id_by_identity(identity)
+        }
+
+        fn get_all_records(&self) -> Vec<Record> {
+            self.inner.get_all_records()
+        }
+
+        fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
+            self.inner.get_records_by_entity_type(entity_type)
+        }
+
+        fn get_records_by_perspective(&self, perspective: &str) -> Vec<Record> {
+            self.inner.get_records_by_perspective(perspective)
+        }
+
+        fn get_records_with_attribute(&self, attr: AttrId) -> Vec<Record> {
+            self.inner.get_records_with_attribute(attr)
+        }
+
+        fn get_records_in_interval(&self, interval: Interval) -> Vec<Record> {
+            self.inner.get_records_in_interval(interval)
+        }
+
+        fn interner(&self) -> &StringInterner {
+            self.inner.interner()
+        }
+
+        fn interner_mut(&mut self) -> &mut StringInterner {
+            self.inner.interner_mut()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+
+        fn records_in_id_range(
+            &self,
+            start: RecordId,
+            end: RecordId,
+            max_results: usize,
+        ) -> Vec<Record> {
+            self.inner.records_in_id_range(start, end, max_results)
+        }
+
+        fn record_id_bounds(&self) -> Option<(RecordId, RecordId)> {
+            self.inner.record_id_bounds()
+        }
+
+        fn flush_staged_records(&mut self) -> anyhow::Result<usize> {
+            if self.fail_flush {
+                anyhow::bail!("injected flush failure");
+            }
+            Ok(0)
+        }
+
+        fn sync(&self) -> anyhow::Result<()> {
+            if self.fail_sync {
+                anyhow::bail!("injected sync failure");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ingest_propagates_persistence_failure() {
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+        let mut engine = Unirust::with_store(
+            ontology,
+            FailingStore {
+                inner: Store::new(),
+                fail_flush: true,
+                fail_sync: false,
+            },
+        );
+        let email_attr = engine.intern_attr("email");
+        let email_value = engine.intern_value("alice@example.com");
+        let record = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".into(), "crm".into(), "alice-1".into()),
+            vec![Descriptor::new(
+                email_attr,
+                email_value,
+                Interval::new(0, 10).unwrap(),
+            )],
+        );
+
+        let error = engine.ingest(vec![record]).unwrap_err();
+        assert!(error.to_string().contains("injected flush failure"));
+    }
+
+    #[test]
+    fn ingest_propagates_stable_storage_sync_failure() {
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+        let mut engine = Unirust::with_store(
+            ontology,
+            FailingStore {
+                inner: Store::new(),
+                fail_flush: false,
+                fail_sync: true,
+            },
+        );
+        let email_attr = engine.intern_attr("email");
+        let email_value = engine.intern_value("alice@example.com");
+        let record = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".into(), "crm".into(), "alice-sync".into()),
+            vec![Descriptor::new(
+                email_attr,
+                email_value,
+                Interval::new(0, 10).unwrap(),
+            )],
+        );
+
+        let error = engine.ingest(vec![record]).unwrap_err();
+        assert!(error.to_string().contains("injected sync failure"));
     }
 }
