@@ -10,9 +10,15 @@ use crate::temporal::{is_overlapping, Interval};
 use crate::ClusterAssignment;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+
+fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
 
 /// A signature of identity key values for fast lookup.
 /// This is a 32-byte hash of the identity key's attribute-value pairs.
@@ -22,35 +28,15 @@ pub struct IdentityKeySignature(pub [u8; 32]);
 impl IdentityKeySignature {
     /// Create a new signature from identity key values.
     pub fn from_key_values(entity_type: &str, key_values: &[KeyValue]) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Use two hashers to fill 32 bytes
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-
-        entity_type.hash(&mut hasher1);
-        entity_type.hash(&mut hasher2);
-
-        for (i, kv) in key_values.iter().enumerate() {
-            kv.hash(&mut hasher1);
-            // Mix in index for hasher2 to get different bits
-            (kv, i).hash(&mut hasher2);
+        let mut hasher = Sha256::new();
+        hasher.update(b"unirust.identity-key.numeric.v1");
+        hash_length_prefixed(&mut hasher, entity_type.as_bytes());
+        hasher.update((key_values.len() as u64).to_be_bytes());
+        for key_value in key_values {
+            hasher.update(key_value.attr.0.to_be_bytes());
+            hasher.update(key_value.value.0.to_be_bytes());
         }
-
-        let h1 = hasher1.finish().to_le_bytes();
-        let h2 = hasher2.finish().to_le_bytes();
-
-        let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&h1);
-        bytes[8..16].copy_from_slice(&h2);
-        // Fill remaining with XOR variations
-        for i in 0..8 {
-            bytes[16 + i] = h1[i] ^ h2[7 - i];
-            bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
-        }
-
-        Self(bytes)
+        Self(hasher.finalize().into())
     }
 
     /// Create a signature from identity key values using the interner's string values.
@@ -60,35 +46,21 @@ impl IdentityKeySignature {
         key_values: &[KeyValue],
         interner: &dyn InternerLookup,
     ) -> Option<Self> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-
-        entity_type.hash(&mut hasher1);
-        entity_type.hash(&mut hasher2);
-
-        for (i, kv) in key_values.iter().enumerate() {
-            let attr = interner.get_attr_string(kv.attr)?;
-            let value = interner.get_value_string(kv.value)?;
-            attr.hash(&mut hasher1);
-            value.hash(&mut hasher1);
-            ((attr, value), i).hash(&mut hasher2);
+        let mut hasher = Sha256::new();
+        hasher.update(b"unirust.identity-key.text.v1");
+        hash_length_prefixed(&mut hasher, entity_type.as_bytes());
+        hasher.update((key_values.len() as u64).to_be_bytes());
+        for key_value in key_values {
+            hash_length_prefixed(
+                &mut hasher,
+                interner.get_attr_string(key_value.attr)?.as_bytes(),
+            );
+            hash_length_prefixed(
+                &mut hasher,
+                interner.get_value_string(key_value.value)?.as_bytes(),
+            );
         }
-
-        let h1 = hasher1.finish().to_le_bytes();
-        let h2 = hasher2.finish().to_le_bytes();
-
-        let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&h1);
-        bytes[8..16].copy_from_slice(&h2);
-        for i in 0..8 {
-            bytes[16 + i] = h1[i] ^ h2[7 - i];
-            bytes[24 + i] = h1[7 - i].wrapping_add(h2[i]);
-        }
-
-        Some(Self(bytes))
+        Some(Self(hasher.finalize().into()))
     }
 
     /// Convert to bytes for storage.
@@ -1131,6 +1103,28 @@ mod tests {
     use crate::model::{Descriptor, RecordIdentity};
     use crate::perf::ConcurrentInterner;
     use crate::Interval;
+
+    #[test]
+    fn text_identity_signature_has_a_stable_protocol_vector() {
+        let mut interner = StringInterner::new();
+        let attr = interner.intern_attr("email");
+        let value = interner.intern_value("alice@example.com");
+        let signature = IdentityKeySignature::from_key_values_with_interner(
+            "person",
+            &[KeyValue::new(attr, value)],
+            &interner,
+        )
+        .expect("signature");
+
+        assert_eq!(
+            signature.0,
+            [
+                0x82, 0xb4, 0x0d, 0xdb, 0x19, 0xe7, 0x35, 0xda, 0x21, 0x5e, 0xb6, 0xb4, 0x23, 0x4a,
+                0x0d, 0x7f, 0x1b, 0x83, 0xd6, 0x60, 0x06, 0xc0, 0x87, 0xb5, 0xc8, 0x10, 0x6b, 0xb8,
+                0x3d, 0x0c, 0x70, 0x41,
+            ]
+        );
+    }
 
     #[test]
     fn sharded_reconcile_matches_single_linker() {

@@ -58,6 +58,12 @@ pub const DEFAULT_MAX_STALENESS_SECS: u64 = 60;
 /// Prevents reconciliation thrashing under high load.
 pub const DEFAULT_MIN_RECONCILE_INTERVAL_SECS: u64 = 5;
 
+/// Number of dirty identity keys that triggers reconciliation immediately.
+pub const DEFAULT_RECONCILE_KEY_COUNT_THRESHOLD: usize = 1_000;
+
+/// Ingest rate below which pending cross-shard work is reconciled while idle.
+pub const DEFAULT_RECONCILE_IDLE_INGEST_RATE: f64 = 1_000.0;
+
 // =============================================================================
 // Partitioning Defaults
 // =============================================================================

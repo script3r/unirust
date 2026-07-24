@@ -225,6 +225,13 @@ error instead of accepting traffic with an unknown recovery gap. Cross-shard
 merge redirects are also persisted before acknowledgement and reloaded when the
 streaming linker is reconstructed.
 
+The tuple `(entity_type, perspective, uid)` identifies one immutable source
+record. Retrying that identity with the same descriptors is idempotent, including
+when descriptor order differs. Reusing it with different values or validity
+intervals is rejected instead of acknowledging data that would be discarded.
+Temporal revisions must use a new source-record UID; entity resolution links the
+snapshots through their configured identity keys.
+
 The shard reconstructs all derived linker state before opening its gRPC
 listener. Recovery currently scans all persisted records, so recovery time is
 O(record count). This is a correctness-first crash-recovery path, not a bounded

@@ -814,12 +814,13 @@ async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
         vec![("email", "overlap@example.com", 202401, 202404)],
     );
 
-    // Second record: same entity, email valid Feb-Apr (overlapping)
+    // Second source snapshot: same resolved entity, email valid Feb-Apr (overlapping).
+    // Source record identities are immutable, so each snapshot has its own UID.
     let feb_apr = record_input(
         1,
         "person",
         "crm",
-        "overlap_001",
+        "overlap_002",
         vec![("email", "overlap@example.com", 202402, 202405)],
     );
 
@@ -849,6 +850,27 @@ async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
         1,
         "entity found across full range"
     );
+
+    // The extension-only interval proves the second snapshot was persisted.
+    let extension_response = client
+        .query_entities(QueryEntitiesRequest {
+            descriptors: vec![ProtoQueryDescriptor {
+                attr: "email".to_string(),
+                value: "overlap@example.com".to_string(),
+            }],
+            start: 202404,
+            end: 202405,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        count_matches(&extension_response),
+        1,
+        "entity found in extension-only interval"
+    );
+
+    let stats = client.get_stats(StatsRequest {}).await?.into_inner();
+    assert_eq!(stats.record_count, 2, "both source snapshots persisted");
 
     Ok(())
 }

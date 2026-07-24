@@ -1,5 +1,5 @@
 use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity, StringInterner};
-use crate::store::{RecordStore, Store, StoreMetrics};
+use crate::store::{records_have_same_payload, RecordStore, Store, StoreMetrics};
 use anyhow::{anyhow, Result};
 use lru::LruCache;
 use rocksdb::{
@@ -390,6 +390,7 @@ impl PersistentStore {
     pub fn stage_record_if_absent(&mut self, mut record: Record) -> Result<(RecordId, bool)> {
         <Self as RecordStore>::ensure_healthy(self)?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
         <Self as RecordStore>::ensure_healthy(self)?;
@@ -401,6 +402,7 @@ impl PersistentStore {
             .get(&record.identity)
             .copied()
         {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
 
@@ -432,6 +434,7 @@ impl PersistentStore {
     ) -> Result<(RecordId, bool)> {
         <Self as RecordStore>::ensure_healthy(self)?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
         <Self as RecordStore>::ensure_healthy(self)?;
@@ -442,6 +445,7 @@ impl PersistentStore {
             .get(&record.identity)
             .copied()
         {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
         if self.get_record(record.id).is_some() {
@@ -464,6 +468,18 @@ impl PersistentStore {
             .map_err(|_| anyhow!("staged identities lock poisoned"))?
             .insert(identity, record_id);
         Ok((record_id, true))
+    }
+
+    fn ensure_idempotent_record(&self, existing_id: RecordId, incoming: &Record) -> Result<()> {
+        let existing = self
+            .get_record(existing_id)
+            .ok_or_else(|| anyhow!("identity index references a missing record"))?;
+        <Self as RecordStore>::ensure_healthy(self)?;
+        if records_have_same_payload(&existing, incoming) {
+            Ok(())
+        } else {
+            anyhow::bail!("source record identity already exists with a different payload")
+        }
     }
 
     /// Flush all staged records to the database in a single batch write.
@@ -679,6 +695,7 @@ impl RecordStore for PersistentStore {
     fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         self.ensure_healthy()?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
         self.ensure_healthy()?;
@@ -701,8 +718,14 @@ impl RecordStore for PersistentStore {
 
         for (idx, record) in records.into_iter().enumerate() {
             if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+                self.ensure_idempotent_record(existing, &record)?;
                 results.push((existing, false));
             } else if let Some(&new_record_index) = pending_identities.get(&record.identity) {
+                if !records_have_same_payload(&new_records[new_record_index], &record) {
+                    anyhow::bail!(
+                        "source record identity appears more than once with different payloads"
+                    );
+                }
                 results.push((RecordId(0), false));
                 pending_duplicates.push((idx, new_record_index));
             } else {
@@ -2854,6 +2877,50 @@ mod tests {
         let store = PersistentStore::open(path).unwrap();
         assert_eq!(store.len(), 1);
         assert_eq!(store.get_record_id_by_identity(&identity), Some(first.0));
+    }
+
+    #[test]
+    fn exhausted_record_id_sequence_survives_restart_without_wrapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+        let last_identity = RecordIdentity::new(
+            "person".to_string(),
+            "import".to_string(),
+            "last-id".to_string(),
+        );
+
+        {
+            let mut store = PersistentStore::open(path).unwrap();
+            let record = Record::new(RecordId(u32::MAX - 1), last_identity.clone(), Vec::new());
+            let (record_id, inserted) = store
+                .stage_record_with_explicit_id_if_absent(record)
+                .unwrap();
+            assert_eq!(record_id, RecordId(u32::MAX - 1));
+            assert!(inserted);
+            assert_eq!(store.flush_staged_records().unwrap(), 1);
+            store.sync().unwrap();
+        }
+
+        let mut store = PersistentStore::open(path).unwrap();
+        let next = Record::new(
+            RecordId(0),
+            RecordIdentity::new(
+                "person".to_string(),
+                "crm".to_string(),
+                "must-not-wrap".to_string(),
+            ),
+            Vec::new(),
+        );
+        let error = store
+            .add_record(next)
+            .expect_err("persisted record ID exhaustion must fail closed");
+        assert!(error.to_string().contains("record ID space exhausted"));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.get_record_id_by_identity(&last_identity),
+            Some(RecordId(u32::MAX - 1))
+        );
+        assert!(store.get_record(RecordId(0)).is_none());
     }
 
     #[test]

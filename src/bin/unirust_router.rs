@@ -2,7 +2,9 @@ use std::fs;
 
 use tonic::transport::Server;
 use unirust_rs::config::{normalize_shard_addrs, ConfigOverrides, RouterOverrides, UniConfig};
-use unirust_rs::distributed::{proto, DistributedOntologyConfig, RouterNode};
+use unirust_rs::distributed::{
+    proto, AdaptiveReconciliationConfig, DistributedOntologyConfig, RouterNode,
+};
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -131,12 +133,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Normalize shard addresses
     let shard_addrs = normalize_shard_addrs(&config.router.shards);
+    let reconciliation = AdaptiveReconciliationConfig {
+        key_count_threshold: config.reconciliation.key_count_threshold,
+        max_staleness: std::time::Duration::from_secs(config.reconciliation.max_staleness_secs),
+        idle_ingest_rate: config.reconciliation.idle_ingest_rate,
+        min_reconcile_interval: std::time::Duration::from_secs(
+            config.reconciliation.min_interval_secs,
+        ),
+    };
 
     // Create router node
     let router = if let Some(path) = &config.router.shards_file {
-        RouterNode::connect_from_file(path.to_str().unwrap(), ontology, config_version).await?
+        RouterNode::connect_from_file_with_reconciliation(
+            path,
+            ontology,
+            config_version,
+            reconciliation,
+        )
+        .await?
     } else {
-        RouterNode::connect_with_version(shard_addrs, ontology, config_version).await?
+        RouterNode::connect_with_version_and_reconciliation(
+            shard_addrs,
+            ontology,
+            config_version,
+            reconciliation,
+        )
+        .await?
     };
 
     println!("Unirust router listening on {}", config.router.listen);

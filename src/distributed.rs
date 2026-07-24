@@ -14,6 +14,7 @@ use anyhow::Result as AnyResult;
 use lru::LruCache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -682,72 +683,143 @@ fn proto_from_wal_input(input: WalRecordInput) -> proto::RecordInput {
     }
 }
 
+type CanonicalDescriptor = (String, String, i64, i64);
+
+fn validate_record_inputs(
+    records: &[proto::RecordInput],
+) -> Result<HashMap<RecordIdentity, Vec<CanonicalDescriptor>>, Status> {
+    let mut unique_records = HashMap::with_capacity(records.len());
+    for record in records {
+        let identity = record
+            .identity
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+        if identity.entity_type.is_empty()
+            || identity.perspective.is_empty()
+            || identity.uid.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "record identity fields must not be empty",
+            ));
+        }
+
+        let mut descriptors = Vec::with_capacity(record.descriptors.len());
+        for descriptor in &record.descriptors {
+            Interval::new(descriptor.start, descriptor.end)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            descriptors.push((
+                descriptor.attr.clone(),
+                descriptor.value.clone(),
+                descriptor.start,
+                descriptor.end,
+            ));
+        }
+        descriptors.sort_unstable();
+
+        let identity = RecordIdentity::new(
+            identity.entity_type.clone(),
+            identity.perspective.clone(),
+            identity.uid.clone(),
+        );
+        if let Some(previous) = unique_records.insert(identity, descriptors.clone()) {
+            if previous != descriptors {
+                return Err(Status::invalid_argument(
+                    "source record identity appears more than once with different payloads",
+                ));
+            }
+        }
+    }
+    Ok(unique_records)
+}
+
+fn hash_route_component(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
 fn hash_record_to_u64(config: &DistributedOntologyConfig, record: &proto::RecordInput) -> u64 {
     let identity = record.identity.as_ref();
-    let mut descriptors_by_attr: HashMap<&str, &str> = HashMap::new();
+    let mut descriptors_by_attr: HashMap<&str, Vec<&str>> = HashMap::new();
     for descriptor in &record.descriptors {
         descriptors_by_attr
             .entry(descriptor.attr.as_str())
-            .or_insert(descriptor.value.as_str());
+            .or_default()
+            .push(descriptor.value.as_str());
+    }
+    for values in descriptors_by_attr.values_mut() {
+        values.sort_unstable();
+        values.dedup();
     }
 
+    let mut hasher = Sha256::new();
     for key in &config.identity_keys {
-        let mut values = Vec::new();
-        let mut has_all = true;
-        for attr in &key.attributes {
-            if let Some(value) = descriptors_by_attr.get(attr.as_str()) {
-                values.push(*value);
-            } else {
-                has_all = false;
-                break;
-            }
-        }
-        if has_all {
-            let mut state = std::collections::hash_map::DefaultHasher::new();
+        let values = key
+            .attributes
+            .iter()
+            .map(|attribute| {
+                descriptors_by_attr
+                    .get(attribute.as_str())
+                    .and_then(|values| values.first())
+                    .copied()
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(values) = values {
+            hasher.update(b"unirust.identity-route.v1");
             if let Some(identity) = identity {
-                identity.entity_type.hash(&mut state);
+                hash_route_component(&mut hasher, &identity.entity_type);
             }
-            key.name.hash(&mut state);
-            for value in values {
-                value.hash(&mut state);
+            hash_route_component(&mut hasher, &key.name);
+            for (attribute, value) in key.attributes.iter().zip(values) {
+                hash_route_component(&mut hasher, attribute);
+                hash_route_component(&mut hasher, value);
             }
-            return state.finish();
+            let digest = hasher.finalize();
+            return u64::from_be_bytes(
+                digest[..8]
+                    .try_into()
+                    .expect("SHA-256 digest contains eight routing bytes"),
+            );
         }
     }
 
     for constraint in &config.constraints {
-        if let Some(value) = descriptors_by_attr.get(constraint.attribute.as_str()) {
-            let mut state = std::collections::hash_map::DefaultHasher::new();
+        if let Some(value) = descriptors_by_attr
+            .get(constraint.attribute.as_str())
+            .and_then(|values| values.first())
+        {
+            hasher.update(b"unirust.constraint-route.v1");
             if let Some(identity) = identity {
-                identity.entity_type.hash(&mut state);
+                hash_route_component(&mut hasher, &identity.entity_type);
                 if matches!(constraint.kind, ConstraintKind::UniqueWithinPerspective) {
-                    identity.perspective.hash(&mut state);
+                    hash_route_component(&mut hasher, &identity.perspective);
                 }
             }
-            constraint.name.hash(&mut state);
-            constraint.attribute.hash(&mut state);
-            value.hash(&mut state);
-            return state.finish();
+            hash_route_component(&mut hasher, &constraint.name);
+            hash_route_component(&mut hasher, &constraint.attribute);
+            hash_route_component(&mut hasher, value);
+            let digest = hasher.finalize();
+            return u64::from_be_bytes(
+                digest[..8]
+                    .try_into()
+                    .expect("SHA-256 digest contains eight routing bytes"),
+            );
         }
     }
 
-    let mut state = std::collections::hash_map::DefaultHasher::new();
+    hasher.update(b"unirust.source-route.v1");
     if let Some(identity) = identity {
-        identity.entity_type.hash(&mut state);
-        identity.perspective.hash(&mut state);
-        identity.uid.hash(&mut state);
+        hash_route_component(&mut hasher, &identity.entity_type);
+        hash_route_component(&mut hasher, &identity.perspective);
+        hash_route_component(&mut hasher, &identity.uid);
+    } else {
+        hasher.update(record.index.to_be_bytes());
     }
-    state.finish()
-}
-
-/// Mix hash bits for better distribution with small modulo values.
-/// Uses fibonacci hashing to reduce clustering.
-#[inline]
-fn mix_hash(hash: u64) -> u64 {
-    // Fibonacci hashing: multiply by golden ratio and take high bits
-    // This provides excellent distribution for small modulo values
-    const GOLDEN_RATIO: u64 = 0x9E3779B97F4A7C15;
-    hash.wrapping_mul(GOLDEN_RATIO)
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest contains eight routing bytes"),
+    )
 }
 
 pub fn hash_record_to_shard(
@@ -756,9 +828,7 @@ pub fn hash_record_to_shard(
     shard_count: usize,
 ) -> usize {
     let hash = hash_record_to_u64(config, record);
-    let mixed = mix_hash(hash);
-    // Use high bits which have better distribution after mixing
-    ((mixed >> 32) as usize) % shard_count
+    (hash % shard_count as u64) as usize
 }
 
 fn global_cluster_id_to_proto(id: GlobalClusterId) -> proto::GlobalClusterId {
@@ -1166,6 +1236,45 @@ impl ShardNode {
                 "persistent store is unhealthy; restart the shard: {err}"
             ))
         })
+    }
+
+    fn ensure_ingest_payloads_idempotent(
+        &self,
+        records: &[proto::RecordInput],
+    ) -> Result<(), Status> {
+        let unique_records = validate_record_inputs(records)?;
+        let unirust = read_unirust!(self);
+        for (identity, incoming_descriptors) in unique_records {
+            let Some(existing) = unirust
+                .get_record_by_identity(&identity)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?
+            else {
+                continue;
+            };
+
+            let mut existing_descriptors = Vec::with_capacity(existing.descriptors.len());
+            for descriptor in &existing.descriptors {
+                let attr = unirust.resolve_attr(descriptor.attr).ok_or_else(|| {
+                    Status::data_loss("stored record references an unknown attribute")
+                })?;
+                let value = unirust.resolve_value(descriptor.value).ok_or_else(|| {
+                    Status::data_loss("stored record references an unknown value")
+                })?;
+                existing_descriptors.push((
+                    attr,
+                    value,
+                    descriptor.interval.start,
+                    descriptor.interval.end,
+                ));
+            }
+            existing_descriptors.sort_unstable();
+            if existing_descriptors != incoming_descriptors {
+                return Err(Status::already_exists(
+                    "source record identity already exists with a different payload",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Build a record using the concurrent interner - NO LOCK REQUIRED!
@@ -1673,6 +1782,54 @@ fn process_ingest_batch(
     Ok(assignments)
 }
 
+fn build_global_conflict_summaries(
+    config: DistributedOntologyConfig,
+    snapshots: Vec<proto::RecordSnapshot>,
+) -> AnyResult<Vec<proto::ConflictSummary>> {
+    let mut store = crate::Store::new();
+    let ontology = config.build_ontology(&mut store);
+    let mut unirust = Unirust::with_store_and_tuning(
+        ontology,
+        store,
+        StreamingTuning::from_profile(crate::TuningProfile::Balanced),
+    );
+    let mut batch = Vec::with_capacity(1_000);
+
+    for snapshot in snapshots {
+        let identity = snapshot
+            .identity
+            .ok_or_else(|| anyhow::anyhow!("exported record is missing its identity"))?;
+        let mut descriptors = Vec::with_capacity(snapshot.descriptors.len());
+        for descriptor in snapshot.descriptors {
+            descriptors.push(crate::Descriptor::new(
+                unirust.intern_attr(&descriptor.attr),
+                unirust.intern_value(&descriptor.value),
+                Interval::new(descriptor.start, descriptor.end)?,
+            ));
+        }
+        batch.push(Record::new(
+            RecordId(0),
+            RecordIdentity::new(identity.entity_type, identity.perspective, identity.uid),
+            descriptors,
+        ));
+        if batch.len() == 1_000 {
+            unirust.stream_records(std::mem::take(&mut batch))?;
+        }
+    }
+    if !batch.is_empty() {
+        unirust.stream_records(batch)?;
+    }
+
+    let clusters = unirust.build_clusters()?;
+    let observations = unirust.detect_conflicts(&clusters)?;
+    let summaries = unirust
+        .summarize_conflicts(&observations)
+        .into_iter()
+        .map(to_proto_conflict_summary)
+        .collect::<Vec<_>>();
+    Ok(summaries)
+}
+
 fn load_persistent_state(
     path: &Path,
     fallback_config: DistributedOntologyConfig,
@@ -1812,6 +1969,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             None
         };
         self.ensure_store_healthy()?;
+        self.ensure_ingest_payloads_idempotent(&records)?;
 
         // Use partitioned processing for large batches (high-throughput mode)
         // Small batches use sequential path for correctness (query support)
@@ -1861,6 +2019,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 None
             };
             self.ensure_store_healthy()?;
+            self.ensure_ingest_payloads_idempotent(&chunk.records)?;
 
             // Use partitioned processing for large batches (high-throughput mode)
             // Small batches use sequential path for correctness
@@ -2898,6 +3057,8 @@ pub struct RouterNode {
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
     /// Latches closed if a distributed ontology mutation cannot be rolled back.
     cluster_consistent: Arc<AtomicBool>,
+    /// Authoritative conflict view rebuilt from a consistent all-shard record scan.
+    global_conflict_cache: Arc<parking_lot::RwLock<Option<Vec<proto::ConflictSummary>>>>,
 }
 
 impl RouterNode {
@@ -2913,6 +3074,33 @@ impl RouterNode {
         ontology_config: DistributedOntologyConfig,
         config_version: Option<String>,
     ) -> Result<Arc<Self>, Status> {
+        Self::connect_with_version_and_reconciliation(
+            shard_addrs,
+            ontology_config,
+            config_version,
+            AdaptiveReconciliationConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_with_version_and_reconciliation(
+        shard_addrs: Vec<String>,
+        ontology_config: DistributedOntologyConfig,
+        config_version: Option<String>,
+        reconciliation_config: AdaptiveReconciliationConfig,
+    ) -> Result<Arc<Self>, Status> {
+        if reconciliation_config.key_count_threshold == 0 {
+            return Err(Status::invalid_argument(
+                "reconciliation key_count_threshold must be greater than zero",
+            ));
+        }
+        if !reconciliation_config.idle_ingest_rate.is_finite()
+            || reconciliation_config.idle_ingest_rate < 0.0
+        {
+            return Err(Status::invalid_argument(
+                "reconciliation idle_ingest_rate must be finite and nonnegative",
+            ));
+        }
         let shard_count = shard_addrs.len();
         if shard_count == 0 {
             return Err(Status::invalid_argument(
@@ -2980,10 +3168,11 @@ impl RouterNode {
             metrics: Arc::new(PerfMetrics::new()),
             locality_index: Arc::new(StdRwLock::new(ClusterLocalityIndex::new())),
             reconciliation_coordinator: Arc::new(tokio::sync::Mutex::new(
-                ReconciliationCoordinator::new(AdaptiveReconciliationConfig::default()),
+                ReconciliationCoordinator::new(reconciliation_config),
             )),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             cluster_consistent: Arc::new(AtomicBool::new(true)),
+            global_conflict_cache: Arc::new(parking_lot::RwLock::new(None)),
         });
 
         // Start adaptive reconciliation without keeping the router alive forever.
@@ -2996,6 +3185,21 @@ impl RouterNode {
         path: impl AsRef<Path>,
         ontology_config: DistributedOntologyConfig,
         config_version: Option<String>,
+    ) -> Result<Arc<Self>, Status> {
+        Self::connect_from_file_with_reconciliation(
+            path,
+            ontology_config,
+            config_version,
+            AdaptiveReconciliationConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_from_file_with_reconciliation(
+        path: impl AsRef<Path>,
+        ontology_config: DistributedOntologyConfig,
+        config_version: Option<String>,
+        reconciliation_config: AdaptiveReconciliationConfig,
     ) -> Result<Arc<Self>, Status> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -3015,7 +3219,13 @@ impl RouterNode {
         if shard_addrs.is_empty() {
             return Err(Status::invalid_argument("no shard addresses found"));
         }
-        Self::connect_with_version(shard_addrs, ontology_config, config_version).await
+        Self::connect_with_version_and_reconciliation(
+            shard_addrs,
+            ontology_config,
+            config_version,
+            reconciliation_config,
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
@@ -3044,6 +3254,73 @@ impl RouterNode {
                  the intended configuration or recover the shard configurations offline",
             ))
         }
+    }
+
+    fn invalidate_global_conflict_cache(&self) {
+        *self.global_conflict_cache.write() = None;
+    }
+
+    async fn fetch_all_record_snapshots(&self) -> Result<Vec<proto::RecordSnapshot>, Status> {
+        let mut snapshots = Vec::new();
+        for (shard_id, client) in self.shard_clients.iter().enumerate() {
+            let mut client = client.clone();
+            let range = client
+                .get_record_id_range(Request::new(proto::RecordIdRangeRequest {}))
+                .await
+                .map_err(|err| Status::unavailable(err.to_string()))?
+                .into_inner();
+            if range.empty {
+                continue;
+            }
+            if range.max_id == u32::MAX {
+                return Err(Status::data_loss(format!(
+                    "shard {shard_id} contains reserved record ID {}",
+                    u32::MAX
+                )));
+            }
+
+            let mut start_id = 0;
+            loop {
+                let response = client
+                    .export_records(Request::new(proto::ExportRecordsRequest {
+                        start_id,
+                        end_id: 0,
+                        limit: 10_000,
+                    }))
+                    .await
+                    .map_err(|err| Status::unavailable(err.to_string()))?
+                    .into_inner();
+                snapshots.extend(response.records);
+                if !response.has_more {
+                    break;
+                }
+                if response.next_start_id == 0 || response.next_start_id <= start_id {
+                    return Err(Status::data_loss(format!(
+                        "shard {shard_id} returned a non-progressing record export cursor"
+                    )));
+                }
+                start_id = response.next_start_id;
+            }
+        }
+        Ok(snapshots)
+    }
+
+    async fn authoritative_conflict_summaries(
+        &self,
+    ) -> Result<Vec<proto::ConflictSummary>, Status> {
+        if let Some(cached) = self.global_conflict_cache.read().clone() {
+            return Ok(cached);
+        }
+
+        let snapshots = self.fetch_all_record_snapshots().await?;
+        let config = self.ontology_config.read().await.clone();
+        let summaries =
+            tokio::task::spawn_blocking(move || build_global_conflict_summaries(config, snapshots))
+                .await
+                .map_err(|err| Status::internal(format!("global conflict scan panicked: {err}")))?
+                .map_err(|err| Status::internal(err.to_string()))?;
+        *self.global_conflict_cache.write() = Some(summaries.clone());
+        Ok(summaries)
     }
 
     async fn fetch_boundary_metadata(&self) -> Result<Vec<proto::BoundaryMetadata>, Status> {
@@ -3494,6 +3771,7 @@ impl proto::router_service_server::RouterService for RouterNode {
                 }
             }
         }
+        self.invalidate_global_conflict_cache();
 
         for client in &self.shard_clients {
             let mut client = client.clone();
@@ -3538,6 +3816,8 @@ impl proto::router_service_server::RouterService for RouterNode {
         let batch = request.into_inner();
         let record_count = batch.records.len();
         let shard_count = self.shard_clients.len();
+        validate_record_inputs(&batch.records)?;
+        self.invalidate_global_conflict_cache();
 
         // ULTRA-FAST single-shard path: skip all hashing and sorting
         if shard_count == 1 {
@@ -3821,6 +4101,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_cluster_consistent()?;
         let request = request.into_inner();
+        self.invalidate_global_conflict_cache();
         let mut client = self.shard_client(request.shard_id)?;
         let response = client
             .import_records(Request::new(proto::ImportRecordsRequest {
@@ -3847,6 +4128,7 @@ impl proto::router_service_server::RouterService for RouterNode {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
         };
 
+        self.invalidate_global_conflict_cache();
         let shard_id = first.shard_id;
         let mut client = self.shard_client(shard_id)?;
         let (tx, rx) = mpsc::channel(4);
@@ -3929,18 +4211,20 @@ impl proto::router_service_server::RouterService for RouterNode {
         &self,
         request: Request<proto::ListConflictsRequest>,
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
-        let _mutation_guard = self.mutation_gate.read().await;
+        let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_cluster_consistent()?;
         let payload = request.into_inner();
-        let mut summaries = Vec::new();
-        for client in &self.shard_clients {
-            let mut client = client.clone();
-            let response = client
-                .list_conflicts(Request::new(payload.clone()))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?
-                .into_inner();
-            summaries.extend(response.conflicts);
+        let mut summaries = self.authoritative_conflict_summaries().await?;
+        if !payload.attribute.is_empty() {
+            summaries.retain(|summary| summary.attribute == payload.attribute);
+        }
+        if payload.end > payload.start {
+            let filter = Interval::new(payload.start, payload.end)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            summaries.retain(|summary| {
+                Interval::new(summary.start, summary.end)
+                    .is_ok_and(|interval| crate::temporal::is_overlapping(&interval, &filter))
+            });
         }
 
         summaries.sort_by(|a, b| {
@@ -3967,6 +4251,7 @@ impl proto::router_service_server::RouterService for RouterNode {
                         .collect::<Vec<_>>(),
                 ))
         });
+        summaries.dedup();
 
         Ok(Response::new(proto::ListConflictsResponse {
             conflicts: summaries,
@@ -3978,6 +4263,7 @@ impl proto::router_service_server::RouterService for RouterNode {
         _request: Request<proto::Empty>,
     ) -> Result<Response<proto::Empty>, Status> {
         let _mutation_guard = self.mutation_gate.write().await;
+        self.invalidate_global_conflict_cache();
         for client in &self.shard_clients {
             let mut client = client.clone();
             client.reset(Request::new(proto::Empty {})).await?;
@@ -4284,6 +4570,31 @@ mod wal_tests {
     }
 
     #[test]
+    fn source_routing_hash_is_stable_and_payload_independent() {
+        let config = DistributedOntologyConfig::empty();
+        let original = proto_from_wal_input(sample_wal_record());
+        assert_eq!(
+            hash_record_to_u64(&config, &original),
+            15_034_823_070_914_786_251
+        );
+
+        let mut changed_payload = original.clone();
+        changed_payload.descriptors.reverse();
+        changed_payload.descriptors[0].value = "changed@example.com".to_string();
+        assert_eq!(
+            hash_record_to_u64(&config, &original),
+            hash_record_to_u64(&config, &changed_payload),
+            "an immutable source identity must always route to the same shard"
+        );
+
+        changed_payload.identity.as_mut().expect("identity").uid = "different-source".to_string();
+        assert_ne!(
+            hash_record_to_u64(&config, &original),
+            hash_record_to_u64(&config, &changed_payload)
+        );
+    }
+
+    #[test]
     fn pending_wal_cannot_be_overwritten() {
         let temp_dir = tempfile::tempdir().expect("temporary WAL directory");
         let wal = IngestWal::new(temp_dir.path());
@@ -4344,5 +4655,53 @@ mod wal_tests {
         ShardService::health_check(&shard, Request::new(proto::HealthCheckRequest {}))
             .await
             .expect("health recovers after WAL clears");
+    }
+
+    #[tokio::test]
+    async fn conflicting_source_identity_is_rejected_before_wal_creation() {
+        use proto::shard_service_server::ShardService;
+
+        let temp_dir = tempfile::tempdir().expect("temporary shard directory");
+        let shard = ShardNode::new_with_data_dir(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+            Some(temp_dir.path().to_path_buf()),
+            false,
+            None,
+        )
+        .expect("persistent shard");
+        let original = proto_from_wal_input(sample_wal_record());
+        ShardService::ingest_records(
+            &shard,
+            Request::new(proto::IngestRecordsRequest {
+                records: vec![original.clone()],
+            }),
+        )
+        .await
+        .expect("initial ingest");
+
+        let mut conflicting = original;
+        conflicting.descriptors[0].value = "different@example.com".to_string();
+        let error = ShardService::ingest_records(
+            &shard,
+            Request::new(proto::IngestRecordsRequest {
+                records: vec![conflicting],
+            }),
+        )
+        .await
+        .expect_err("changed payload must be rejected");
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !shard.ingest_wal.as_ref().expect("ingest WAL").has_pending(),
+            "a deterministic validation error must not leave a recovery WAL"
+        );
+
+        let stats = ShardService::get_stats(&shard, Request::new(proto::StatsRequest {}))
+            .await
+            .expect("stats")
+            .into_inner();
+        assert_eq!(stats.record_count, 1);
+        shard.shutdown().await.expect("shutdown");
     }
 }

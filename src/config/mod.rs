@@ -202,8 +202,12 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReconciliationConfig {
+    /// Number of dirty identity keys that triggers reconciliation
+    pub key_count_threshold: usize,
     /// Maximum staleness before forced reconcile (seconds)
     pub max_staleness_secs: u64,
+    /// Ingest rate below which pending keys are reconciled while idle
+    pub idle_ingest_rate: f64,
     /// Minimum interval between reconciles (seconds)
     pub min_interval_secs: u64,
 }
@@ -211,7 +215,9 @@ pub struct ReconciliationConfig {
 impl Default for ReconciliationConfig {
     fn default() -> Self {
         Self {
+            key_count_threshold: DEFAULT_RECONCILE_KEY_COUNT_THRESHOLD,
             max_staleness_secs: DEFAULT_MAX_STALENESS_SECS,
+            idle_ingest_rate: DEFAULT_RECONCILE_IDLE_INGEST_RATE,
             min_interval_secs: DEFAULT_MIN_RECONCILE_INTERVAL_SECS,
         }
     }

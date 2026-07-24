@@ -591,6 +591,23 @@ impl Unirust {
         self.store.get_record(id)
     }
 
+    /// Get a record by its immutable source identity.
+    #[doc(hidden)]
+    pub fn get_record_by_identity(
+        &self,
+        identity: &RecordIdentity,
+    ) -> anyhow::Result<Option<Record>> {
+        let Some(record_id) = self.store.get_record_id_by_identity(identity) else {
+            self.store.ensure_healthy()?;
+            return Ok(None);
+        };
+        let record = self.store.get_record(record_id).ok_or_else(|| {
+            anyhow::anyhow!("identity index references missing record {}", record_id.0)
+        })?;
+        self.store.ensure_healthy()?;
+        Ok(Some(record))
+    }
+
     /// Access the underlying store (for advanced use cases).
     pub fn store(&self) -> &dyn RecordStore {
         self.store.as_ref()

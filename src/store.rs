@@ -295,7 +295,42 @@ pub struct Store {
     next_record_id: u32,
 }
 
+pub(crate) fn records_have_same_payload(left: &Record, right: &Record) -> bool {
+    if left.identity != right.identity || left.descriptors.len() != right.descriptors.len() {
+        return false;
+    }
+
+    let canonical_descriptors = |record: &Record| {
+        let mut descriptors = record
+            .descriptors
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.attr.0,
+                    descriptor.value.0,
+                    descriptor.interval.start,
+                    descriptor.interval.end,
+                )
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_unstable();
+        descriptors
+    };
+
+    canonical_descriptors(left) == canonical_descriptors(right)
+}
+
+fn ensure_idempotent_record(existing: &Record, incoming: &Record) -> Result<()> {
+    if records_have_same_payload(existing, incoming) {
+        Ok(())
+    } else {
+        anyhow::bail!("source record identity already exists with a different payload")
+    }
+}
+
 impl Store {
+    const EXHAUSTED_RECORD_ID: u32 = u32::MAX;
+
     /// Create a new store
     pub fn new() -> Self {
         Self {
@@ -331,15 +366,30 @@ impl Store {
         }
     }
 
+    fn allocate_record_id(&mut self) -> Result<RecordId> {
+        if self.next_record_id == Self::EXHAUSTED_RECORD_ID {
+            anyhow::bail!("record ID space exhausted");
+        }
+        let record_id = RecordId(self.next_record_id);
+        self.next_record_id += 1;
+        Ok(record_id)
+    }
+
+    fn advance_past_explicit_record_id(&mut self, record_id: RecordId) {
+        self.next_record_id = self.next_record_id.max(record_id.0.saturating_add(1));
+    }
+
     /// Prepare a record for persistence without storing it in memory.
     pub fn prepare_record(&mut self, record: &mut Record) -> Result<RecordId> {
         self.intern_record(record);
 
         if record.id.0 == 0 {
-            record.id = RecordId(self.next_record_id);
-            self.next_record_id += 1;
+            record.id = self.allocate_record_id()?;
         } else {
-            self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+            if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+                anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+            }
+            self.advance_past_explicit_record_id(record.id);
         }
 
         Ok(record.id)
@@ -348,7 +398,10 @@ impl Store {
     /// Prepare a record without treating ID zero as an allocation sentinel.
     pub fn prepare_record_with_explicit_id(&mut self, record: &mut Record) -> Result<RecordId> {
         self.intern_record(record);
-        self.next_record_id = self.next_record_id.max(record.id.0.saturating_add(1));
+        if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+            anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+        }
+        self.advance_past_explicit_record_id(record.id);
         Ok(record.id)
     }
 
@@ -369,8 +422,11 @@ impl Store {
     /// Insert a record with an explicit ID without assigning a new one.
     pub fn insert_record(&mut self, mut record: Record) -> Result<RecordId> {
         self.intern_record(&mut record);
+        if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+            anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+        }
 
-        self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+        self.advance_past_explicit_record_id(record.id);
 
         let record_id = record.id;
         let identity = record.identity.clone();
@@ -394,6 +450,11 @@ impl Store {
     /// Add a record if its identity is new; returns (id, inserted).
     pub fn add_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            let stored = self
+                .records
+                .get(&existing)
+                .ok_or_else(|| anyhow::anyhow!("identity index references a missing record"))?;
+            ensure_idempotent_record(stored, &record)?;
             return Ok((existing, false));
         }
         let id = self.add_record(record)?;
@@ -408,10 +469,12 @@ impl Store {
     pub fn add_record_raw(&mut self, mut record: Record) -> Result<RecordId> {
         // Assign record ID without interning
         if record.id.0 == 0 {
-            record.id = RecordId(self.next_record_id);
-            self.next_record_id += 1;
+            record.id = self.allocate_record_id()?;
         } else {
-            self.next_record_id = self.next_record_id.max(record.id.0 + 1);
+            if record.id.0 == Self::EXHAUSTED_RECORD_ID {
+                anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
+            }
+            self.advance_past_explicit_record_id(record.id);
         }
 
         let record_id = record.id;
@@ -429,6 +492,11 @@ impl Store {
     /// Used when records are pre-interned with an external interner.
     pub fn add_record_if_absent_raw(&mut self, record: Record) -> Result<(RecordId, bool)> {
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            let stored = self
+                .records
+                .get(&existing)
+                .ok_or_else(|| anyhow::anyhow!("identity index references a missing record"))?;
+            ensure_idempotent_record(stored, &record)?;
             return Ok((existing, false));
         }
         let id = self.add_record_raw(record)?;
@@ -689,6 +757,11 @@ impl RecordStore for Store {
         record: Record,
     ) -> Result<(RecordId, bool)> {
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
+            let stored = self
+                .records
+                .get(&existing)
+                .ok_or_else(|| anyhow::anyhow!("identity index references a missing record"))?;
+            ensure_idempotent_record(stored, &record)?;
             return Ok((existing, false));
         }
         if self.records.contains_key(&record.id) {
@@ -864,6 +937,81 @@ mod tests {
     }
 
     #[test]
+    fn record_id_allocation_fails_closed_at_u32_boundary() {
+        let mut store = Store::new();
+        store.set_next_record_id(u32::MAX - 1);
+
+        let last = Record::new(
+            RecordId(0),
+            RecordIdentity::new(
+                "person".to_string(),
+                "crm".to_string(),
+                "last-id".to_string(),
+            ),
+            vec![],
+        );
+        assert_eq!(store.add_record(last).unwrap(), RecordId(u32::MAX - 1));
+
+        let overflow = Record::new(
+            RecordId(0),
+            RecordIdentity::new(
+                "person".to_string(),
+                "crm".to_string(),
+                "overflow".to_string(),
+            ),
+            vec![],
+        );
+        let error = store
+            .add_record(overflow)
+            .expect_err("record IDs must never wrap");
+        assert!(error.to_string().contains("record ID space exhausted"));
+        assert_eq!(store.len(), 1);
+        assert!(store.get_record(RecordId(u32::MAX - 1)).is_some());
+        assert!(store.get_record(RecordId(0)).is_none());
+    }
+
+    #[test]
+    fn explicit_last_record_id_exhausts_future_allocation() {
+        let mut store = Store::new();
+        let explicit = Record::new(
+            RecordId(u32::MAX - 1),
+            RecordIdentity::new(
+                "person".to_string(),
+                "import".to_string(),
+                "max-id".to_string(),
+            ),
+            vec![],
+        );
+        store
+            .stage_record_with_explicit_id_if_absent(explicit)
+            .unwrap();
+
+        let next = Record::new(
+            RecordId(0),
+            RecordIdentity::new("person".to_string(), "crm".to_string(), "next".to_string()),
+            vec![],
+        );
+        let error = store
+            .add_record(next)
+            .expect_err("allocation after the maximum explicit ID must fail");
+        assert!(error.to_string().contains("record ID space exhausted"));
+
+        let reserved = Record::new(
+            RecordId(u32::MAX),
+            RecordIdentity::new(
+                "person".to_string(),
+                "import".to_string(),
+                "reserved".to_string(),
+            ),
+            vec![],
+        );
+        let error = store
+            .stage_record_with_explicit_id_if_absent(reserved)
+            .expect_err("the exhaustion sentinel must not be assignable");
+        assert!(error.to_string().contains("is reserved"));
+    }
+
+    #[test]
     fn test_add_records() {
         let mut store = Store::new();
 
@@ -897,6 +1045,56 @@ mod tests {
         let (second_id, inserted) = store.add_record_if_absent(record_b).unwrap();
         assert!(!inserted);
         assert_eq!(first_id, second_id);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn repeated_identity_requires_the_same_semantic_payload() {
+        let mut store = Store::new();
+        let email = store.intern_attr("email");
+        let phone = store.intern_attr("phone");
+        let email_value = store.intern_value("same@example.com");
+        let phone_value = store.intern_value("555-0100");
+        let interval = Interval::new(0, 10).unwrap();
+        let identity = RecordIdentity::new(
+            "person".to_string(),
+            "crm".to_string(),
+            "immutable-1".to_string(),
+        );
+        let first = Record::new(
+            RecordId(0),
+            identity.clone(),
+            vec![
+                Descriptor::new(email, email_value, interval),
+                Descriptor::new(phone, phone_value, interval),
+            ],
+        );
+        let reordered_retry = Record::new(
+            RecordId(0),
+            identity.clone(),
+            vec![
+                Descriptor::new(phone, phone_value, interval),
+                Descriptor::new(email, email_value, interval),
+            ],
+        );
+        let changed = Record::new(
+            RecordId(0),
+            identity,
+            vec![Descriptor::new(email, phone_value, interval)],
+        );
+
+        let (record_id, inserted) = store.add_record_if_absent(first).unwrap();
+        assert!(inserted);
+        let (retry_id, inserted) = store
+            .add_record_if_absent(reordered_retry)
+            .expect("descriptor ordering must not change payload identity");
+        assert_eq!(retry_id, record_id);
+        assert!(!inserted);
+
+        let error = store
+            .add_record_if_absent(changed)
+            .expect_err("changed payload must not be silently discarded");
+        assert!(error.to_string().contains("different payload"));
         assert_eq!(store.len(), 1);
     }
 
