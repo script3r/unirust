@@ -31,6 +31,87 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+fn config_env_path(key: &str) -> Option<&'static str> {
+    match key.to_ascii_uppercase().as_str() {
+        "PROFILE" => Some("profile"),
+        "SHARD_LISTEN" => Some("shard.listen"),
+        "SHARD_ID" => Some("shard.id"),
+        "SHARD_DATA_DIR" => Some("shard.data_dir"),
+        "SHARD_BACKUP_DIR" => Some("shard.backup_dir"),
+        "SHARD_ONTOLOGY" => Some("shard.ontology"),
+        "SHARD_REPAIR" => Some("shard.repair"),
+        "SHARD_CONFIG_VERSION" => Some("shard.config_version"),
+        "ROUTER_LISTEN" => Some("router.listen"),
+        "ROUTER_SHARDS_FILE" => Some("router.shards_file"),
+        "ROUTER_ONTOLOGY" => Some("router.ontology"),
+        "ROUTER_CONFIG_VERSION" => Some("router.config_version"),
+        "ROUTER_SHARD_CONNECT_TIMEOUT_SECS" => Some("router.shard_connect_timeout_secs"),
+        "ROUTER_SHARD_REQUEST_TIMEOUT_SECS" => Some("router.shard_request_timeout_secs"),
+        "ROUTER_SHARD_TCP_KEEPALIVE_SECS" => Some("router.shard_tcp_keepalive_secs"),
+        "ROUTER_CHECKPOINT_INTERVAL_SECS" => Some("router.checkpoint_interval_secs"),
+        "STORAGE_BLOCK_CACHE_MB" => Some("storage.block_cache_mb"),
+        "STORAGE_WRITE_BUFFER_MB" => Some("storage.write_buffer_mb"),
+        "STORAGE_RATE_LIMIT_MBPS" => Some("storage.rate_limit_mbps"),
+        "STORAGE_MAX_BACKGROUND_JOBS" => Some("storage.max_background_jobs"),
+        "RECONCILIATION_KEY_COUNT_THRESHOLD" => Some("reconciliation.key_count_threshold"),
+        "RECONCILIATION_MAX_STALENESS_SECS" => Some("reconciliation.max_staleness_secs"),
+        "RECONCILIATION_IDLE_INGEST_RATE" => Some("reconciliation.idle_ingest_rate"),
+        "RECONCILIATION_MIN_INTERVAL_SECS" => Some("reconciliation.min_interval_secs"),
+        // Parsed separately because the documented value is a comma-separated list.
+        "ROUTER_SHARDS" => None,
+        _ => None,
+    }
+}
+
+fn validate_config_environment() -> Result<(), ConfigError> {
+    const CONFIG_NAMESPACES: [&str; 4] = [
+        "UNIRUST_SHARD_",
+        "UNIRUST_ROUTER_",
+        "UNIRUST_STORAGE_",
+        "UNIRUST_RECONCILIATION_",
+    ];
+
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        let normalized = key.to_ascii_uppercase();
+        if CONFIG_NAMESPACES
+            .iter()
+            .any(|namespace| normalized.starts_with(namespace))
+            && normalized != "UNIRUST_ROUTER_SHARDS"
+            && config_env_path(normalized.trim_start_matches("UNIRUST_")).is_none()
+        {
+            return Err(ConfigError {
+                message: format!("unknown Unirust configuration variable {key}"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn router_shards_from_env() -> Result<Option<Vec<String>>, ConfigError> {
+    let Some(value) = std::env::var_os("UNIRUST_ROUTER_SHARDS") else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| ConfigError {
+        message: "UNIRUST_ROUTER_SHARDS must be valid UTF-8".to_string(),
+    })?;
+    let shards: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    if shards.is_empty() {
+        return Err(ConfigError {
+            message: "UNIRUST_ROUTER_SHARDS must contain at least one address".to_string(),
+        });
+    }
+    Ok(Some(shards))
+}
+
 /// Main configuration for unirust components.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,6 +138,7 @@ impl UniConfig {
         config_path: Option<&str>,
         overrides: ConfigOverrides,
     ) -> Result<Self, ConfigError> {
+        validate_config_environment()?;
         let mut figment = Figment::new().merge(Serialized::defaults(UniConfig::default()));
 
         // Layer 1: Config file (if provided)
@@ -65,7 +147,19 @@ impl UniConfig {
         }
 
         // Layer 2: Environment variables with UNIRUST_ prefix
-        figment = figment.merge(Env::prefixed("UNIRUST_").split("_"));
+        figment = figment.merge(
+            Env::prefixed("UNIRUST_")
+                .filter_map(|key| config_env_path(key.as_str()).map(Into::into)),
+        );
+        if let Some(shards) = router_shards_from_env()? {
+            figment = figment.merge(Serialized::defaults(ConfigOverrides {
+                router: Some(RouterOverrides {
+                    shards: Some(shards),
+                    ..RouterOverrides::default()
+                }),
+                ..ConfigOverrides::default()
+            }));
+        }
 
         // Layer 3: CLI overrides
         figment = figment.merge(Serialized::defaults(overrides));
@@ -365,5 +459,22 @@ mod tests {
 
         let profile: Profile = serde_json::from_str("\"low-latency\"").unwrap();
         assert_eq!(profile, Profile::LowLatency);
+    }
+
+    #[test]
+    fn test_config_env_paths_preserve_field_underscores() {
+        assert_eq!(
+            config_env_path("ROUTER_CHECKPOINT_INTERVAL_SECS"),
+            Some("router.checkpoint_interval_secs")
+        );
+        assert_eq!(
+            config_env_path("SHARD_BACKUP_DIR"),
+            Some("shard.backup_dir")
+        );
+        assert_eq!(
+            config_env_path("RECONCILIATION_KEY_COUNT_THRESHOLD"),
+            Some("reconciliation.key_count_threshold")
+        );
+        assert_eq!(config_env_path("ROUTER_UNKNOWN"), None);
     }
 }

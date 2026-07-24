@@ -138,7 +138,12 @@ write_buffer_mb = 256
 | `UNIRUST_PROFILE` | Tuning profile |
 | `UNIRUST_SHARD_LISTEN` | Shard listen address |
 | `UNIRUST_SHARD_ID` | Shard ID |
+| `UNIRUST_SHARD_DATA_DIR` | Persistent shard data directory |
+| `UNIRUST_SHARD_BACKUP_DIR` | External checkpoint root |
 | `UNIRUST_ROUTER_SHARDS` | Comma-separated shard addresses |
+| `UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS` | Coordinated checkpoint interval (`0` disables) |
+| `UNIRUST_ROUTER_SHARD_CONNECT_TIMEOUT_SECS` | Shard connection timeout |
+| `UNIRUST_ROUTER_SHARD_REQUEST_TIMEOUT_SECS` | Per-RPC shard timeout |
 
 ### Tuning Profiles
 
