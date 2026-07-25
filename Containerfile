@@ -31,6 +31,8 @@ RUN cargo build --release --locked --features test-support \
     --bin unirust_shard \
     --bin unirust_router \
     --bin unirust_healthcheck \
+    --bin unirust_backup \
+    --bin unirust_rebalance \
     --bin unirust_client \
     --bin unirust_loadtest
 
@@ -49,6 +51,8 @@ RUN useradd -m -u 1000 unirust
 COPY --from=builder /app/target/release/unirust_shard /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_router /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_healthcheck /usr/local/bin/
+COPY --from=builder /app/target/release/unirust_backup /usr/local/bin/
+COPY --from=builder /app/target/release/unirust_rebalance /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_client /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_loadtest /usr/local/bin/
 
@@ -81,6 +85,14 @@ case "$1" in
     loadtest)
         shift
         exec unirust_loadtest "$@"
+        ;;
+    backup)
+        shift
+        exec unirust_backup "$@"
+        ;;
+    rebalance)
+        shift
+        exec unirust_rebalance "$@"
         ;;
     *)
         exec "$@"

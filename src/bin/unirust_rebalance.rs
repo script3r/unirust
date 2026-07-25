@@ -1,11 +1,14 @@
+use std::path::PathBuf;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::shard_service_client::ShardServiceClient;
 use unirust_rs::distributed::proto::{
     ExportRecordsRequest, ImportRecordsChunk, ImportRecordsRequest, RecordIdRangeRequest,
     RouterExportRecordsRequest, RouterImportRecordsRequest, RouterRecordIdRangeRequest,
 };
+use unirust_rs::transport_security::load_client_mtls;
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -21,17 +24,39 @@ fn has_flag(flag: &str) -> bool {
     std::env::args().any(|arg| arg == flag)
 }
 
-fn normalize_addr(addr: impl AsRef<str>) -> String {
+fn normalize_addr(addr: impl AsRef<str>, mtls: bool) -> anyhow::Result<String> {
     let addr = addr.as_ref();
     if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
+        if mtls && addr.starts_with("http://") {
+            anyhow::bail!("mTLS rebalance connections require https:// endpoints");
+        }
+        if !mtls && addr.starts_with("https://") {
+            anyhow::bail!("https:// endpoints require --tls-ca, --tls-cert, and --tls-key");
+        }
+        Ok(addr.to_string())
+    } else if mtls {
+        Ok(format!("https://{addr}"))
     } else {
-        format!("http://{}", addr)
+        Ok(format!("http://{addr}"))
     }
+}
+
+async fn connect(addr: &str, mtls: Option<&ClientTlsConfig>) -> anyhow::Result<Channel> {
+    let endpoint = Endpoint::from_shared(normalize_addr(addr, mtls.is_some())?)?;
+    let endpoint = if let Some(mtls) = mtls {
+        endpoint.tls_config(mtls.clone())?
+    } else {
+        endpoint
+    };
+    Ok(endpoint.connect().await?)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let tls_ca = parse_arg("--tls-ca").map(PathBuf::from);
+    let tls_cert = parse_arg("--tls-cert").map(PathBuf::from);
+    let tls_key = parse_arg("--tls-key").map(PathBuf::from);
+    let mtls = load_client_mtls(tls_ca.as_deref(), tls_cert.as_deref(), tls_key.as_deref())?;
     let router = parse_arg("--router");
     if has_flag("--range") {
         let shard_arg = parse_arg("--shard");
@@ -41,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--shard-id is required with --router"))?
                 .parse()?;
-            let mut client = RouterServiceClient::connect(normalize_addr(router)).await?;
+            let channel = connect(&router, mtls.as_ref()).await?;
+            let mut client = RouterServiceClient::new(channel);
             client
                 .get_record_id_range(RouterRecordIdRangeRequest { shard_id })
                 .await?
@@ -50,7 +76,8 @@ async fn main() -> anyhow::Result<()> {
             let shard = shard_arg
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--shard is required for --range"))?;
-            let mut client = ShardServiceClient::connect(normalize_addr(shard)).await?;
+            let channel = connect(shard, mtls.as_ref()).await?;
+            let mut client = ShardServiceClient::new(channel);
             client
                 .get_record_id_range(RecordIdRangeRequest {})
                 .await?
@@ -105,19 +132,25 @@ async fn main() -> anyhow::Result<()> {
 
     let use_router = router.is_some();
     let mut router_client = if let Some(router) = router {
-        Some(RouterServiceClient::connect(normalize_addr(router)).await?)
+        Some(RouterServiceClient::new(
+            connect(&router, mtls.as_ref()).await?,
+        ))
     } else {
         None
     };
     let mut source_client = if use_router {
         None
     } else {
-        Some(ShardServiceClient::connect(normalize_addr(&source)).await?)
+        Some(ShardServiceClient::new(
+            connect(&source, mtls.as_ref()).await?,
+        ))
     };
     let mut target_client = if use_router {
         None
     } else {
-        Some(ShardServiceClient::connect(normalize_addr(&target)).await?)
+        Some(ShardServiceClient::new(
+            connect(&target, mtls.as_ref()).await?,
+        ))
     };
     let source_shard_id = if use_router {
         Some(source.parse::<u32>()?)

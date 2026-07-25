@@ -55,11 +55,27 @@ ENVIRONMENT:
     UNIRUST_ROUTER_SHARDS   Comma-separated shard addresses
     UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS
                             Automatic coordinated checkpoint interval
+    UNIRUST_ROUTER_TLS_CERT PEM server certificate
+    UNIRUST_ROUTER_TLS_KEY  PEM server private key
+    UNIRUST_ROUTER_TLS_CLIENT_CA
+                            PEM CA for required client certificates
+    UNIRUST_ROUTER_SHARD_TLS_CA
+                            PEM CA used to verify shards
+    UNIRUST_ROUTER_SHARD_TLS_CERT
+                            PEM client certificate presented to shards
+    UNIRUST_ROUTER_SHARD_TLS_KEY
+                            PEM router client private key
 
 CONFIG FILE (unirust.toml):
     [router]
     listen = "0.0.0.0:50060"
-    shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061", "shard-3:50061", "shard-4:50061"]
+    shards = ["https://shard-0:50061", "https://shard-1:50061"]
+    tls_cert = "/etc/unirust/tls/router.crt"
+    tls_key = "/etc/unirust/tls/router.key"
+    tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
+    shard_tls_ca = "/etc/unirust/tls/shards-ca.crt"
+    shard_tls_cert = "/etc/unirust/tls/router-client.crt"
+    shard_tls_key = "/etc/unirust/tls/router-client.key"
 "#
     );
 }

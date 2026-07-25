@@ -22,8 +22,9 @@ use unirust_rs::distributed::{
     IdentityKeyConfig, RouterNode, ShardNode,
 };
 use unirust_rs::{
-    read_cluster_checkpoint_manifest, restore_checkpoint, restore_checkpoint_for_shard,
-    StreamingTuning, TuningProfile,
+    export_cluster_backup, prune_verified_cluster_backups, read_cluster_checkpoint_manifest,
+    restore_checkpoint, restore_checkpoint_for_shard, verify_cluster_backup, StreamingTuning,
+    TuningProfile,
 };
 
 static PERSISTENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -168,6 +169,166 @@ async fn stop_shard(shard: ShardNode, handle: JoinHandle<()>) -> anyhow::Result<
     let _ = handle.await;
     drop(shard);
     sleep(Duration::from_millis(50)).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verified_export_survives_loss_of_checkpoint_volumes() -> anyhow::Result<()> {
+    use proto::router_service_server::RouterService;
+    use std::io::Write as _;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let data_volume = TempDir::new()?;
+    let checkpoint_volume = TempDir::new()?;
+    let off_host_volume = TempDir::new()?;
+    let checkpoint_roots = (0..2)
+        .map(|shard_id| checkpoint_volume.path().join(format!("shard-{shard_id}")))
+        .collect::<Vec<_>>();
+
+    let (addr0, shard0, handle0) = spawn_shard(
+        0,
+        data_volume.path().join("original-0"),
+        checkpoint_roots[0].clone(),
+        config(),
+    )
+    .await?;
+    let (addr1, shard1, handle1) = spawn_shard(
+        1,
+        data_volume.path().join("original-1"),
+        checkpoint_roots[1].clone(),
+        config(),
+    )
+    .await?;
+    let mut client0 = ShardServiceClient::connect(format!("http://{addr0}")).await?;
+    let mut client1 = ShardServiceClient::connect(format!("http://{addr1}")).await?;
+    let mut shard0_record = record(0, "shard-0@example.com");
+    shard0_record
+        .identity
+        .as_mut()
+        .expect("record identity")
+        .uid = "backup-source-0".to_string();
+    let mut shard1_record = record(1, "shard-1@example.com");
+    shard1_record
+        .identity
+        .as_mut()
+        .expect("record identity")
+        .uid = "backup-source-1".to_string();
+    client0
+        .ingest_records(IngestRecordsRequest {
+            records: vec![shard0_record],
+            internal_protocol_version: 3,
+        })
+        .await?;
+    client1
+        .ingest_records(IngestRecordsRequest {
+            records: vec![shard1_record],
+            internal_protocol_version: 3,
+        })
+        .await?;
+
+    let router = RouterNode::connect(
+        vec![format!("http://{addr0}"), format!("http://{addr1}")],
+        config(),
+    )
+    .await?;
+    let checkpoint = RouterService::checkpoint(
+        router.as_ref(),
+        Request::new(CheckpointRequest {
+            path: "off-host-generation".to_string(),
+            checkpoint_protocol_version: 0,
+            shard_count: 0,
+            finalize: false,
+        }),
+    )
+    .await?
+    .into_inner();
+    let checkpoint_paths = checkpoint
+        .paths
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let export_root = off_host_volume.path().join("exports");
+    std::fs::create_dir(&export_root)?;
+    let first_export = export_root.join("backup-a");
+    let manifest = export_cluster_backup(&checkpoint_paths, &first_export)?;
+    assert_eq!(manifest.generation(), "off-host-generation");
+    assert_eq!(manifest.shard_count(), 2);
+    assert_eq!(verify_cluster_backup(&first_export)?, manifest);
+
+    drop(client0);
+    drop(client1);
+    drop(router);
+    stop_shard(shard0, handle0).await?;
+    stop_shard(shard1, handle1).await?;
+    for root in &checkpoint_roots {
+        std::fs::remove_dir_all(root)?;
+    }
+
+    let restored0 = data_volume.path().join("restored-0");
+    let restored1 = data_volume.path().join("restored-1");
+    restore_checkpoint_for_shard(&first_export.join("shard-0"), &restored0, Some(0))?;
+    restore_checkpoint_for_shard(&first_export.join("shard-1"), &restored1, Some(1))?;
+    let recovery_backups = data_volume.path().join("recovery-backups");
+    let (restored_addr0, restored_shard0, restored_handle0) =
+        spawn_shard(0, restored0, recovery_backups.join("shard-0"), config()).await?;
+    let (restored_addr1, restored_shard1, restored_handle1) =
+        spawn_shard(1, restored1, recovery_backups.join("shard-1"), config()).await?;
+    let restored_router = RouterNode::connect(
+        vec![
+            format!("http://{restored_addr0}"),
+            format!("http://{restored_addr1}"),
+        ],
+        config(),
+    )
+    .await?;
+    let mut restored_client0 =
+        ShardServiceClient::connect(format!("http://{restored_addr0}")).await?;
+    let mut restored_client1 =
+        ShardServiceClient::connect(format!("http://{restored_addr1}")).await?;
+    assert_eq!(
+        restored_client0
+            .get_stats(StatsRequest {})
+            .await?
+            .into_inner()
+            .record_count,
+        1
+    );
+    assert_eq!(
+        restored_client1
+            .get_stats(StatsRequest {})
+            .await?
+            .into_inner()
+            .record_count,
+        1
+    );
+    drop(restored_client0);
+    drop(restored_client1);
+    drop(restored_router);
+    stop_shard(restored_shard0, restored_handle0).await?;
+    stop_shard(restored_shard1, restored_handle1).await?;
+
+    std::thread::sleep(Duration::from_millis(1));
+    let second_export = export_root.join("backup-b");
+    export_cluster_backup(&checkpoint_paths, &second_export)
+        .expect_err("deleted checkpoint volumes must not be exportable");
+    export_cluster_backup(
+        &[first_export.join("shard-0"), first_export.join("shard-1")],
+        &second_export,
+    )?;
+    let removed = prune_verified_cluster_backups(&export_root, 1)?;
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].file_name(), first_export.file_name());
+    assert!(second_export.is_dir());
+
+    let mut current = std::fs::OpenOptions::new()
+        .append(true)
+        .open(second_export.join("shard-0/CURRENT"))?;
+    current.write_all(b"tampered")?;
+    current.sync_all()?;
+    verify_cluster_backup(&second_export)
+        .expect_err("modified backup bytes must fail verification");
+    prune_verified_cluster_backups(&export_root, 1)
+        .expect_err("retention must fail closed when any backup is corrupt");
     Ok(())
 }
 

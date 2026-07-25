@@ -32,6 +32,7 @@
 //! - `checkpoint()` - Persist state to disk
 //! - `stats()` - Get metrics and statistics
 
+pub mod backup;
 pub mod coalescer;
 pub mod config;
 pub mod conflicts;
@@ -77,9 +78,14 @@ pub use graph::KnowledgeGraph;
 pub use query::{QueryDescriptor, QueryMatch, QueryOutcome};
 
 // Storage (for custom backends)
+pub use backup::{
+    export_cluster_backup, prune_verified_cluster_backups, verify_cluster_backup,
+    ClusterBackupManifest,
+};
 pub use persistence::{
     read_cluster_checkpoint_manifest, restore_checkpoint, restore_checkpoint_for_shard,
-    ClusterCheckpointManifest, PersistentStore, CHECKPOINT_PROTOCOL_VERSION,
+    verify_cluster_checkpoint, ClusterCheckpointManifest, PersistentStore,
+    CHECKPOINT_PROTOCOL_VERSION,
 };
 pub use store::{RecordStore, Store};
 

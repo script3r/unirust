@@ -58,6 +58,10 @@ ENVIRONMENT:
     UNIRUST_SHARD_DATA_DIR  Data directory
     UNIRUST_SHARD_BACKUP_DIR
                             Checkpoint root
+    UNIRUST_SHARD_TLS_CERT  PEM server certificate
+    UNIRUST_SHARD_TLS_KEY   PEM server private key
+    UNIRUST_SHARD_TLS_CLIENT_CA
+                            PEM CA for required client certificates
 
 CONFIG FILE (unirust.toml):
     profile = "billion-scale-high-performance"
@@ -67,6 +71,9 @@ CONFIG FILE (unirust.toml):
     id = 0
     data_dir = "/var/lib/unirust"
     backup_dir = "/var/backups/unirust/shard-0"
+    tls_cert = "/etc/unirust/tls/shard-0.crt"
+    tls_key = "/etc/unirust/tls/shard-0.key"
+    tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
 "#
     );
 }

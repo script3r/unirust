@@ -21,6 +21,10 @@ id = 0
 # backup_dir = "/var/backups/unirust/shard-0"
 # Path to ontology configuration (JSON)
 # ontology = "/etc/unirust/ontology.json"
+# Mutually authenticated TLS server credentials (all three are required together)
+# tls_cert = "/etc/unirust/tls/shard-0.crt"
+# tls_key = "/etc/unirust/tls/shard-0.key"
+# tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
 # Run repair on startup (recovers from unclean shutdown)
 repair = false
 
@@ -44,6 +48,14 @@ shard_request_timeout_secs = 120
 shard_tcp_keepalive_secs = 30
 # Automatic coordinated checkpoint interval (0 disables)
 # checkpoint_interval_secs = 3600
+# Mutually authenticated TLS for clients connecting to the router
+# tls_cert = "/etc/unirust/tls/router.crt"
+# tls_key = "/etc/unirust/tls/router.key"
+# tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
+# Router identity and trust for https:// shard addresses
+# shard_tls_ca = "/etc/unirust/tls/shards-ca.crt"
+# shard_tls_cert = "/etc/unirust/tls/router-client.crt"
+# shard_tls_key = "/etc/unirust/tls/router-client.key"
 
 # Advanced storage tuning (RocksDB)
 # These settings control the underlying storage engine performance.

@@ -296,6 +296,15 @@ pub fn read_cluster_checkpoint_manifest(checkpoint: &Path) -> Result<ClusterChec
     Ok(manifest)
 }
 
+/// Validate a committed cluster checkpoint and open its RocksDB contents
+/// read-only with paranoid checks.
+pub fn verify_cluster_checkpoint(checkpoint: &Path) -> Result<ClusterCheckpointManifest> {
+    let manifest = read_cluster_checkpoint_manifest(checkpoint)?;
+    let checkpoint = checkpoint.canonicalize()?;
+    validate_rocksdb_checkpoint(&checkpoint)?;
+    Ok(manifest)
+}
+
 /// Return the committed checkpoint provenance copied into a restored RocksDB
 /// data directory. A lone or corrupt marker is a recovery integrity failure,
 /// not an unrestored directory.
@@ -335,7 +344,7 @@ pub fn restore_checkpoint_for_shard(
     destination: &Path,
     expected_shard_id: Option<u32>,
 ) -> Result<()> {
-    let manifest = read_cluster_checkpoint_manifest(source)?;
+    let manifest = verify_cluster_checkpoint(source)?;
     if let Some(expected_shard_id) =
         expected_shard_id.filter(|expected| *expected != manifest.shard_id)
     {
@@ -347,7 +356,6 @@ pub fn restore_checkpoint_for_shard(
     }
 
     let source = source.canonicalize()?;
-    validate_rocksdb_checkpoint(&source)?;
 
     if destination.exists() {
         let metadata = fs::symlink_metadata(destination)?;
