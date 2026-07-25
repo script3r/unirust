@@ -1453,6 +1453,24 @@ impl RecordStore for PersistentStore {
         }
     }
 
+    fn try_for_each_record_ordered(&self, f: &mut dyn FnMut(Record) -> Result<()>) -> Result<()> {
+        self.ensure_healthy()?;
+        let records_cf = self
+            .db
+            .cf_handle(CF_RECORDS)
+            .ok_or_else(|| anyhow!("missing records column family"))?;
+        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
+            let (_key, value) = entry.inspect_err(|_| {
+                self.mark_read_fault();
+            })?;
+            let record = bincode::deserialize(&value).inspect_err(|_| {
+                self.mark_read_fault();
+            })?;
+            f(record)?;
+        }
+        self.ensure_healthy()
+    }
+
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_ENTITY_TYPE) {
             Some(cf) => cf,
@@ -3131,6 +3149,8 @@ pub mod linker_encoding {
 
     /// Prefix for durable cross-shard merge mappings.
     pub const CROSS_SHARD_MERGE_PREFIX: &[u8] = b"cross_shard_merge/";
+    pub const KEY_GLOBAL_CLUSTER_ID_SCHEME: &[u8] = b"global_cluster_id_scheme";
+    pub const STABLE_RECORD_ANCHOR_SCHEME: u8 = 1;
 
     pub fn encode_cross_shard_merge_key(secondary: GlobalClusterId) -> Vec<u8> {
         let mut key = Vec::with_capacity(CROSS_SHARD_MERGE_PREFIX.len() + 8);
@@ -3157,6 +3177,58 @@ impl<'a> LinkerStatePersistence<'a> {
     /// Create a new linker state persistence helper.
     pub fn new(db: &'a DB) -> Self {
         Self { db }
+    }
+
+    /// Prepare replay-stable global IDs, removing redirects from the old
+    /// allocation-order scheme if this database predates the scheme marker.
+    pub fn prepare_stable_global_cluster_ids(&self) -> Result<bool> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        match self
+            .db
+            .get_cf(&cf, linker_encoding::KEY_GLOBAL_CLUSTER_ID_SCHEME)?
+            .as_deref()
+        {
+            Some([linker_encoding::STABLE_RECORD_ANCHOR_SCHEME]) => return Ok(false),
+            Some(value) => {
+                anyhow::bail!("unsupported global cluster ID scheme marker: {:?}", value);
+            }
+            None => {}
+        }
+
+        let had_legacy_redirects = self
+            .db
+            .iterator_cf(
+                &cf,
+                IteratorMode::From(
+                    linker_encoding::CROSS_SHARD_MERGE_PREFIX,
+                    Direction::Forward,
+                ),
+            )
+            .next()
+            .transpose()?
+            .is_some_and(|(key, _)| key.starts_with(linker_encoding::CROSS_SHARD_MERGE_PREFIX));
+
+        let mut prefix_end = linker_encoding::CROSS_SHARD_MERGE_PREFIX.to_vec();
+        let last = prefix_end
+            .last_mut()
+            .ok_or_else(|| anyhow!("cross-shard merge prefix must not be empty"))?;
+        *last = last
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("cross-shard merge prefix has no upper bound"))?;
+
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(&cf, linker_encoding::CROSS_SHARD_MERGE_PREFIX, &prefix_end);
+        batch.put_cf(
+            &cf,
+            linker_encoding::KEY_GLOBAL_CLUSTER_ID_SCHEME,
+            [linker_encoding::STABLE_RECORD_ANCHOR_SCHEME],
+        );
+        self.db.write(batch)?;
+        self.db.flush_wal(true)?;
+        Ok(had_legacy_redirects)
     }
 
     /// Flush cluster ID mappings to the database.

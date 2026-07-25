@@ -288,18 +288,33 @@ Cross-shard copy imports therefore fail closed; online scale-out and scale-in
 require a future transactional relocation protocol or an offline rebuild.
 
 Cross-shard redirects are durably applied to every shard and are idempotent. If
-any shard fails while a reconciliation result is being applied, the router
-latches the cluster closed for ingest, query, and administrative traffic rather
-than serving a partially updated global view. Retrying `Reconcile` repairs the
-retained dirty keys in place. After a router or full-cluster restart, router
-startup performs that repair before returning a serviceable node and clears the
-dirty generation only after every shard converges.
+any shard fails, or the initiating request is cancelled, while a reconciliation
+result is being applied, the router latches the cluster closed for ingest, query,
+and administrative traffic rather than serving a partially updated global view.
+Retrying `Reconcile` repairs the retained dirty keys in place. After a router or
+full-cluster restart, router startup performs that repair before returning a
+serviceable node and clears the dirty generation only after every shard
+converges.
+
+Cluster-wide ontology replacement has the same fail-closed cancellation
+semantics. Readiness stays failed after an ambiguous partial update until
+`SetOntology` is retried with the intended configuration or every shard is
+recovered offline to one configuration. Router startup also rejects mismatched
+shard ontologies.
 
 The shard reconstructs all derived linker state before opening its gRPC
-listener. Recovery currently scans all persisted records, so recovery time is
-O(record count). This is a correctness-first crash-recovery path, not a bounded
-recovery-time guarantee. Measure restart time at the intended dataset size and
-set orchestration startup probes accordingly.
+listener. Recovery scans persisted records in ordered, bounded batches through
+the normal entity-resolution path, so recovery time remains O(record count).
+This is a correctness-first crash-recovery path, not a bounded recovery-time
+guarantee. Measure restart time at the intended dataset size and set
+orchestration startup probes accordingly.
+
+Global cluster IDs are anchored to durable record IDs so replay order cannot
+change cross-shard identity. On the first startup of a database created before
+this scheme marker existed, the shard atomically removes allocation-order
+redirects that cannot be trusted after replay; router startup reconstructs them
+from authoritative records before becoming ready. Upgrade every shard and the
+router together for this transition rather than mixing versions.
 
 `LinkerStateConfig` cache capacities are not enforced because the current LRU
 backend has no durable spill/read-through path. Evicting cluster IDs, strong-ID

@@ -316,6 +316,12 @@ impl Unirust {
 
         if let Some(db) = db.as_ref() {
             let persistence = LinkerStatePersistence::new(db);
+            if persistence.prepare_stable_global_cluster_ids()? {
+                tracing::warn!(
+                    "removed legacy allocation-order cross-shard redirects; \
+                     router reconciliation will rebuild them from durable records"
+                );
+            }
             linker.restore_cross_shard_merges(&persistence)?;
         }
         Ok(linker)

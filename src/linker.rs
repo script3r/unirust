@@ -415,6 +415,8 @@ pub struct StreamingLinker {
     next_cluster_id: u32,
     /// Global cluster IDs for cross-shard tracking (LRU-bounded when config provided)
     global_cluster_ids: LinkerState<RecordId, GlobalClusterId>,
+    /// Minimum durable record ID in each local cluster, independent of replay order.
+    global_cluster_anchors: LinkerState<RecordId, u32>,
     /// Shard ID for this linker (used in GlobalClusterId generation).
     shard_id: u16,
     /// Strong ID summaries for conflict detection (LRU-bounded when config provided)
@@ -548,6 +550,7 @@ impl StreamingLinker {
             cluster_ids,
             next_cluster_id: 0,
             global_cluster_ids,
+            global_cluster_anchors: LinkerState::unbounded(),
             shard_id,
             strong_id_summaries,
             tainted_identity_keys: FxHashSet::default(),
@@ -563,14 +566,27 @@ impl StreamingLinker {
         };
 
         if !store.is_empty() {
-            let mut record_ids: Vec<RecordId> = Vec::new();
-            store.for_each_record(&mut |record| {
-                record_ids.push(record.id);
-            });
-            record_ids.sort_by_key(|record_id| record_id.0);
-
-            for record_id in record_ids {
-                streamer.link_record(store, ontology, record_id)?;
+            const RECOVERY_BATCH_SIZE: usize = 4_096;
+            let mut batch = Vec::with_capacity(RECOVERY_BATCH_SIZE);
+            let mut link_batch = |batch: &mut Vec<Record>| -> Result<()> {
+                let records = batch.iter().collect::<Vec<_>>();
+                streamer.link_records_batch_parallel_with_interner(
+                    &records,
+                    ontology,
+                    store.interner(),
+                )?;
+                batch.clear();
+                Ok(())
+            };
+            store.try_for_each_record_ordered(&mut |record| {
+                batch.push(record);
+                if batch.len() == RECOVERY_BATCH_SIZE {
+                    link_batch(&mut batch)?;
+                }
+                Ok(())
+            })?;
+            if !batch.is_empty() {
+                link_batch(&mut batch)?;
             }
         }
 
@@ -632,6 +648,7 @@ impl StreamingLinker {
         let _guard = crate::profile::profile_scope("link_record");
         if !self.dsu.has_record(record_id)? {
             self.dsu.add_record(record_id)?;
+            self.global_cluster_anchors.insert(record_id, record_id.0);
         }
 
         // Try to get a reference first (avoids cloning), fall back to cloning if not available.
@@ -842,6 +859,7 @@ impl StreamingLinker {
                     cluster_ids,
                     next_cluster_id,
                     global_cluster_ids,
+                    global_cluster_anchors,
                     strong_id_summaries,
                     tainted_identity_keys,
                     record_perspectives,
@@ -934,6 +952,7 @@ impl StreamingLinker {
                         );
                         reconcile_global_cluster_ids(
                             global_cluster_ids,
+                            global_cluster_anchors,
                             cross_shard_merges,
                             boundary_signatures,
                             dirty_boundary_keys,
@@ -1112,6 +1131,7 @@ impl StreamingLinker {
         // Initialize record in DSU if needed
         if !self.dsu.has_record(record_id)? {
             self.dsu.add_record(record_id)?;
+            self.global_cluster_anchors.insert(record_id, record_id.0);
         }
 
         // Store perspective and summary
@@ -1158,6 +1178,7 @@ impl StreamingLinker {
 
             // Merge with candidates
             let mut root_a = self.dsu.find(record_id).unwrap_or(record_id);
+            let key_is_tainted = self.tainted_identity_keys.contains(&key_signature);
             for (candidate_id, candidate_interval) in candidates {
                 if candidate_id == record_id {
                     continue;
@@ -1168,6 +1189,33 @@ impl StreamingLinker {
 
                 let root_b = self.dsu.find(candidate_id).unwrap_or(candidate_id);
                 if root_a == root_b {
+                    continue;
+                }
+
+                let candidate_perspective = self.record_perspectives.get(&candidate_id);
+                let same_perspective_conflict = candidate_perspective
+                    .map(|perspective| {
+                        perspective == &extraction.perspective
+                            && same_perspective_conflict_for_clusters(
+                                &self.strong_id_summaries,
+                                root_a,
+                                root_b,
+                                perspective,
+                            )
+                    })
+                    .unwrap_or(false);
+                if same_perspective_conflict {
+                    self.metrics
+                        .conflicts_detected
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.tainted_identity_keys.insert(key_signature.clone());
+                    continue;
+                }
+                if key_is_tainted
+                    && candidate_perspective
+                        .map(|perspective| perspective != &extraction.perspective)
+                        .unwrap_or(false)
+                {
                     continue;
                 }
 
@@ -1204,6 +1252,7 @@ impl StreamingLinker {
                     );
                     reconcile_global_cluster_ids(
                         &mut self.global_cluster_ids,
+                        &mut self.global_cluster_anchors,
                         &mut self.cross_shard_merges,
                         &mut self.boundary_signatures,
                         &mut self.dirty_boundary_keys,
@@ -1316,8 +1365,11 @@ impl StreamingLinker {
         if let Some(global_id) = self.global_cluster_ids.get(&root) {
             return *global_id;
         }
-        let local_id = self.get_or_assign_cluster_id(root);
-        let global_id = GlobalClusterId::from_local(self.shard_id, local_id);
+        let local_id = self
+            .global_cluster_anchors
+            .get_copy(&root)
+            .unwrap_or(root.0);
+        let global_id = GlobalClusterId::new(self.shard_id, local_id, 0);
         self.global_cluster_ids.insert(root, global_id);
         global_id
     }
@@ -1774,8 +1826,12 @@ impl StreamingLinker {
     ) -> Result<usize> {
         let mappings = persistence.load_cross_shard_merges()?;
         let count = mappings.len();
-        for (secondary, primary) in mappings {
-            self.apply_cross_shard_merge(primary, secondary);
+        if !mappings.is_empty() {
+            let merges = mappings
+                .into_iter()
+                .map(|(secondary, primary)| (primary, secondary))
+                .collect::<Vec<_>>();
+            self.apply_cross_shard_merges(&merges);
         }
         Ok(count)
     }
@@ -2181,6 +2237,7 @@ fn reconcile_cluster_ids(
 #[allow(clippy::too_many_arguments)]
 fn reconcile_global_cluster_ids(
     global_cluster_ids: &mut LinkerState<RecordId, GlobalClusterId>,
+    global_cluster_anchors: &mut LinkerState<RecordId, u32>,
     cross_shard_merges: &mut HashMap<GlobalClusterId, GlobalClusterId>,
     boundary_signatures: &mut BTreeMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
     dirty_boundary_keys: &mut BTreeSet<ShardingKeySignature>,
@@ -2204,6 +2261,17 @@ fn reconcile_global_cluster_ids(
         current
     }
 
+    let anchor_a = global_cluster_anchors.get_copy(&root_a).unwrap_or(root_a.0);
+    let anchor_b = global_cluster_anchors.get_copy(&root_b).unwrap_or(root_b.0);
+    if root_a != new_root {
+        global_cluster_anchors.remove(&root_a);
+    }
+    if root_b != new_root {
+        global_cluster_anchors.remove(&root_b);
+    }
+    let stable_local_id = anchor_a.min(anchor_b);
+    global_cluster_anchors.insert(new_root, stable_local_id);
+
     let id_a = global_cluster_ids.get_copy(&root_a);
     let id_b = global_cluster_ids.get_copy(&root_b);
     if id_a.is_none() && id_b.is_none() {
@@ -2221,6 +2289,7 @@ fn reconcile_global_cluster_ids(
         .flatten()
         .flat_map(|id| [id, resolve(cross_shard_merges, id)])
         .collect::<Vec<_>>();
+    ids.push(GlobalClusterId::new(shard_id, stable_local_id, 0));
     ids.sort_by_key(GlobalClusterId::to_u64);
     ids.dedup();
     let canonical = ids

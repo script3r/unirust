@@ -14,14 +14,16 @@ use tonic::server::NamedService;
 use tonic::transport::Server;
 use tonic::Request;
 use unirust_rs::distributed::proto::{
-    self, shard_service_client::ShardServiceClient, ConfigVersionRequest, IngestRecordsRequest,
-    RecordDescriptor, RecordIdentity, RecordInput, StatsRequest,
+    self, shard_service_client::ShardServiceClient, ApplyOntologyRequest, ConfigVersionRequest,
+    IngestRecordsRequest, RecordDescriptor, RecordIdentity, RecordInput, StatsRequest,
 };
 use unirust_rs::distributed::{
     DistributedOntologyConfig, IdentityKeyConfig, RouterNode, ShardNode,
     DISTRIBUTED_PROTOCOL_VERSION,
 };
 use unirust_rs::{StreamingTuning, TuningProfile};
+
+mod support;
 
 static PERSISTENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const REPLICATION_TOKEN: &str = "42fd59df99d782a1e9d614e5f2f9d3a425da036468fceb91c0dd3bcc6bf3d729";
@@ -106,6 +108,27 @@ async fn spawn_failable_node(
             .expect("shard server");
     });
     Ok((addr, handle, fail))
+}
+
+async fn spawn_stalling_node(
+    node: ShardNode,
+    path: &'static str,
+) -> anyhow::Result<(SocketAddr, JoinHandle<()>, support::StallControls)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (service, controls) = support::stall_response(
+        proto::shard_service_server::ShardServiceServer::new(node),
+        path,
+        true,
+    );
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, handle, controls))
 }
 
 async fn stop_node(node: ShardNode, handle: JoinHandle<()>) -> anyhow::Result<()> {
@@ -332,6 +355,89 @@ async fn acknowledged_ingest_survives_primary_volume_loss_and_manual_failover() 
     drop(promoted_client);
     stop_node(promoted_node, promoted_handle).await?;
     assert!(!primary_data.exists());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_replica_response_latches_primary_closed() -> anyhow::Result<()> {
+    use proto::shard_service_server::ShardService;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let volumes = TempDir::new()?;
+    let replica_node = node(
+        volumes.path().join("replica-data"),
+        volumes.path().join("replica-backup"),
+    )?
+    .into_replica(REPLICATION_TOKEN.into())?;
+    let (replica_addr, replica_handle, controls) =
+        spawn_stalling_node(replica_node.clone(), "/unirust.ShardService/SetOntology").await?;
+    let mut replica_client = ShardServiceClient::connect(format!("http://{replica_addr}")).await?;
+    let primary_node = node(
+        volumes.path().join("primary-data"),
+        volumes.path().join("primary-backup"),
+    )?
+    .with_replica(replica_client.clone(), REPLICATION_TOKEN.into())
+    .await?;
+
+    let mut updated_config = config();
+    updated_config
+        .strong_identifiers
+        .push("employee_id".to_string());
+    let primary_service = primary_node.clone();
+    let update_task = tokio::spawn({
+        let updated_config = updated_config.clone();
+        async move {
+            ShardService::set_ontology(
+                &primary_service,
+                Request::new(ApplyOntologyRequest {
+                    config: Some(support::to_proto_config(&updated_config)),
+                }),
+            )
+            .await
+        }
+    });
+
+    controls
+        .wait_until_committed(Duration::from_secs(10))
+        .await?;
+    update_task.abort();
+    assert!(update_task
+        .await
+        .expect_err("primary update task must be cancelled")
+        .is_cancelled());
+    controls.release();
+
+    let health_error =
+        ShardService::health_check(&primary_node, Request::new(proto::HealthCheckRequest {}))
+            .await
+            .expect_err("an ambiguous replica response must latch the primary closed");
+    assert_eq!(health_error.code(), tonic::Code::FailedPrecondition);
+
+    let primary_config = ShardService::get_config_version(
+        &primary_node,
+        Request::new(ConfigVersionRequest {
+            include_durable_state_digest: false,
+        }),
+    )
+    .await?
+    .into_inner()
+    .ontology_config
+    .expect("primary ontology");
+    let replica_config = replica_client
+        .get_config_version(ConfigVersionRequest {
+            include_durable_state_digest: false,
+        })
+        .await?
+        .into_inner()
+        .ontology_config
+        .expect("replica ontology");
+    assert_eq!(primary_config, support::to_proto_config(&config()));
+    assert_eq!(replica_config, support::to_proto_config(&updated_config));
+
+    drop(replica_client);
+    primary_node.shutdown().await?;
+    drop(primary_node);
+    stop_node(replica_node, replica_handle).await?;
     Ok(())
 }
 

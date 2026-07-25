@@ -1137,6 +1137,11 @@ struct DurableMutationAttempt {
     armed: bool,
 }
 
+struct ConsistencyAttempt {
+    consistency: Arc<AtomicBool>,
+    armed: bool,
+}
+
 impl DurableMutationAttempt {
     fn new(consistency: Arc<AtomicBool>, armed: bool) -> Self {
         Self { consistency, armed }
@@ -1148,6 +1153,28 @@ impl DurableMutationAttempt {
 }
 
 impl Drop for DurableMutationAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consistency.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl ConsistencyAttempt {
+    fn new(consistency: Arc<AtomicBool>) -> Self {
+        Self {
+            consistency,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self) {
+        self.consistency.store(true, Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for ConsistencyAttempt {
     fn drop(&mut self) {
         if self.armed {
             self.consistency.store(false, Ordering::Release);
@@ -1215,6 +1242,10 @@ macro_rules! replicate_to_replica {
             None
         };
         $self.ensure_replication_consistent()?;
+        let replication_attempt = ReplicationAttempt::new(
+            $self.replication_consistent.clone(),
+            $self.replica_client.is_some(),
+        );
         let replica_response = if let Some(mut replica) = $self.replica_client.clone() {
             let token = $self.replication_token.as_deref().ok_or_else(|| {
                 Status::failed_precondition("primary replication token is missing")
@@ -1245,10 +1276,6 @@ macro_rules! replicate_to_replica {
         } else {
             None
         };
-        let replication_attempt = ReplicationAttempt::new(
-            $self.replication_consistent.clone(),
-            replica_response.is_some(),
-        );
         (replication_serial, replica_response, replication_attempt)
     }};
 }
@@ -2539,25 +2566,28 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, reserve_source_records, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         let targets = {
             let mut unirust = write_unirust!(self);
-            unirust
-                .store_mut()
-                .reserve_source_records(&reservations)
-                .map_err(|err| {
-                    if let Some(conflict) = err.downcast_ref::<SourceReservationError>() {
-                        match conflict {
-                            SourceReservationError::PayloadConflict => {
-                                Status::already_exists(conflict.to_string())
-                            }
-                            SourceReservationError::TargetConflict { .. } => {
-                                Status::failed_precondition(conflict.to_string())
-                            }
+            unirust.store_mut().reserve_source_records(&reservations)
+        };
+        let targets = match targets {
+            Ok(targets) => targets,
+            Err(err) => {
+                if let Some(conflict) = err.downcast_ref::<SourceReservationError>() {
+                    // The store validates the complete batch before its atomic write.
+                    local_attempt.finish();
+                    return Err(match conflict {
+                        SourceReservationError::PayloadConflict => {
+                            Status::already_exists(conflict.to_string())
                         }
-                    } else {
-                        Status::internal(err.to_string())
-                    }
-                })?
+                        SourceReservationError::TargetConflict { .. } => {
+                            Status::failed_precondition(conflict.to_string())
+                        }
+                    });
+                }
+                return Err(Status::internal(err.to_string()));
+            }
         };
         let reservations = indices
             .into_iter()
@@ -2570,6 +2600,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             )
             .collect();
         let response = proto::ReserveSourceRecordsResponse { reservations };
+        local_attempt.finish();
         replication_attempt.finish(
             replica_response
                 .as_ref()
@@ -2601,12 +2632,14 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, mark_source_reservations_backfilled, request);
+        let local_attempt = self.begin_durable_mutation();
         let mut unirust = write_unirust!(self);
         unirust
             .store_mut()
             .mark_source_reservation_backfill(request.protocol_version, request.shard_count)
             .map_err(|err| Status::internal(err.to_string()))?;
         let response = proto::MarkSourceReservationsBackfilledResponse {};
+        local_attempt.finish();
         replication_attempt.finish(
             replica_response
                 .as_ref()
@@ -4986,22 +5019,26 @@ impl RouterNode {
     async fn apply_reconciliation_result(
         &self,
         result: &crate::sharding::ReconciliationResult,
-    ) -> Result<(), Status> {
+    ) -> Result<u64, Status> {
+        let attempt = ConsistencyAttempt::new(self.reconciliation_consistent.clone());
         let outcome = self.apply_reconciliation_result_inner(result).await;
-        self.reconciliation_consistent
-            .store(outcome.is_ok(), Ordering::Release);
+        if outcome.is_ok() {
+            attempt.finish();
+        }
         outcome
     }
 
     async fn apply_reconciliation_result_inner(
         &self,
         result: &crate::sharding::ReconciliationResult,
-    ) -> Result<(), Status> {
+    ) -> Result<u64, Status> {
+        let mut records_updated = 0u64;
         for merges in result.merged_clusters.chunks(MERGE_APPLICATION_CHUNK) {
             for shard_id in 0..self.shard_clients.len() {
                 let shard_id = u16::try_from(shard_id)
                     .map_err(|_| Status::internal("shard index exceeds u16"))?;
-                self.apply_merges_to_shard(shard_id, merges).await?;
+                records_updated = records_updated
+                    .saturating_add(self.apply_merges_to_shard(shard_id, merges).await?);
             }
         }
 
@@ -5026,7 +5063,7 @@ impl RouterNode {
                     .await?;
             }
         }
-        Ok(())
+        Ok(records_updated)
     }
 
     /// Get read access to the cluster locality index.
@@ -5260,10 +5297,11 @@ impl RouterNode {
         let result = candidates.finish();
         reconcile_elapsed += reconcile_started.elapsed();
         let apply_started = Instant::now();
-        self.apply_reconciliation_result(&result).await?;
+        let records_updated = self.apply_reconciliation_result(&result).await?;
         tracing::info!(
             dirty_keys = keys.len(),
             merges = result.merges_performed,
+            records_updated,
             metadata_ms = metadata_elapsed.as_millis(),
             reconcile_ms = reconcile_elapsed.as_millis(),
             apply_ms = apply_started.elapsed().as_millis(),
@@ -5428,6 +5466,7 @@ impl proto::router_service_server::RouterService for RouterNode {
             }
         }
         self.invalidate_global_conflict_cache();
+        let consistency_attempt = ConsistencyAttempt::new(self.cluster_consistent.clone());
 
         for client in &self.shard_clients {
             let mut client = client.clone();
@@ -5447,17 +5486,17 @@ impl proto::router_service_server::RouterService for RouterNode {
                     }
                 }
                 if !rollback_complete {
-                    self.cluster_consistent.store(false, Ordering::Release);
                     return Err(Status::aborted(format!(
                         "ontology update failed and rollback was incomplete; cluster is blocked: \
                          {apply_error}"
                     )));
                 }
+                consistency_attempt.finish();
                 return Err(apply_error);
             }
         }
         *self.ontology_config.write().await = mapped;
-        self.cluster_consistent.store(true, Ordering::Release);
+        consistency_attempt.finish();
 
         Ok(Response::new(proto::ApplyOntologyResponse {}))
     }

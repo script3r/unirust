@@ -86,6 +86,19 @@ pub trait RecordStore: Send + Sync {
         }
     }
 
+    /// Apply a fallible function to every record in ascending record-ID order.
+    ///
+    /// Persistent implementations should stream their ordered keyspace instead
+    /// of materializing all records so linker recovery stays sequential.
+    fn try_for_each_record_ordered(&self, f: &mut dyn FnMut(Record) -> Result<()>) -> Result<()> {
+        let mut records = self.get_all_records();
+        records.sort_by_key(|record| record.id.0);
+        for record in records {
+            f(record)?;
+        }
+        Ok(())
+    }
+
     /// Get records for a specific entity type.
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record>;
 
