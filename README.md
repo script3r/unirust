@@ -337,10 +337,11 @@ deployment and cluster script use these semantic probes.
 Router-to-shard calls are bounded by configurable transport settings under
 `[router]`: `shard_connect_timeout_secs` (10 seconds by default),
 `shard_request_timeout_secs` (120 seconds), and
-`shard_tcp_keepalive_secs` (30 seconds). A deadline error is not proof that a
-mutation was rolled back; the shard may have committed just before the response
-was lost. Retry ingest with the same immutable source-record identity and
-payload so the operation is resolved idempotently.
+`shard_tcp_keepalive_secs` (30 seconds). A deadline error or client cancellation
+is not proof that a mutation was rolled back; an admitted ingest continues to a
+durable outcome after its caller disconnects. Retry ingest with the same
+immutable source-record identity and payload so the operation is resolved
+idempotently.
 
 ### Synchronous Replication
 

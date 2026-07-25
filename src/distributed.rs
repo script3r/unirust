@@ -10,7 +10,7 @@ use crate::persistence::{
     CHECKPOINT_PROTOCOL_VERSION,
 };
 use crate::query::{QueryDescriptor, QueryOutcome};
-use crate::sharding::{BloomFilter, IdentityKeySignature};
+use crate::sharding::{BloomFilter, IdentityKeySignature, ReconciliationCandidates};
 use crate::store::{SourceRecordReservation, SourceReservationError, StoreMetrics};
 use crate::temporal::Interval;
 use crate::{PersistentStore, StreamingTuning, Unirust};
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
@@ -1061,6 +1061,7 @@ pub struct ShardNode {
     checkpoint_root: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_wal_lock: Arc<Mutex<()>>,
+    ingest_commit_slots: Arc<Semaphore>,
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     ingest_worker_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -1409,6 +1410,7 @@ impl ShardNode {
                 checkpoint_root: Some(checkpoint_root),
                 ingest_wal,
                 ingest_wal_lock: Arc::new(Mutex::new(())),
+                ingest_commit_slots: Arc::new(Semaphore::new(1)),
                 mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
                 ingest_txs,
                 ingest_worker_handles: Arc::new(Mutex::new(ingest_worker_handles)),
@@ -1475,6 +1477,7 @@ impl ShardNode {
             checkpoint_root: None,
             ingest_wal,
             ingest_wal_lock: Arc::new(Mutex::new(())),
+            ingest_commit_slots: Arc::new(Semaphore::new(INGEST_QUEUE_CAPACITY)),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             ingest_txs,
             ingest_worker_handles: Arc::new(Mutex::new(ingest_worker_handles)),
@@ -1670,6 +1673,85 @@ impl ShardNode {
 
     fn begin_durable_mutation(&self) -> DurableMutationAttempt {
         DurableMutationAttempt::new(self.mutation_consistent.clone(), self.data_dir.is_some())
+    }
+
+    async fn commit_ingest_batch(
+        &self,
+        records: Vec<proto::RecordInput>,
+        operation: &'static str,
+    ) -> Result<Vec<proto::IngestAssignment>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        let start = Instant::now();
+        let record_count = records.len();
+        let _wal_guard = if self.ingest_wal.is_some() {
+            Some(self.ingest_wal_lock.lock().await)
+        } else {
+            None
+        };
+        self.ensure_store_healthy()?;
+        self.ensure_ingest_payloads_idempotent(&records)?;
+
+        let replication_request = proto::IngestRecordsRequest {
+            records: records.clone(),
+            internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+        };
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, ingest_records, replication_request);
+        let local_attempt = self.begin_durable_mutation();
+        let partitioned_arc = self.partitioned.read().clone();
+        let assignments = if let Some(partitioned) =
+            partitioned_arc.as_ref().filter(|_| records.len() >= 100)
+        {
+            dispatch_ingest_partitioned(
+                partitioned,
+                &self.concurrent_interner,
+                self.ingest_wal.as_deref(),
+                self.shard_id,
+                records,
+            )
+            .await?
+        } else {
+            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
+        };
+
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica.assignments == assignments),
+            operation,
+        )?;
+        self.metrics
+            .record_ingest(record_count, start.elapsed().as_micros() as u64);
+        Ok(assignments)
+    }
+
+    async fn await_ingest_commit(
+        &self,
+        records: Vec<proto::RecordInput>,
+        operation: &'static str,
+    ) -> Result<Vec<proto::IngestAssignment>, Status> {
+        let commit_slot = self
+            .ingest_commit_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("ingest commit queue is closed"))?;
+        let shard = self.clone();
+        tokio::spawn(async move {
+            let _commit_slot = commit_slot;
+            shard.commit_ingest_batch(records, operation).await
+        })
+        .await
+        .map_err(|error| {
+            if self.data_dir.is_some() {
+                self.mutation_consistent.store(false, Ordering::Release);
+            }
+            if self.replica_client.is_some() {
+                self.replication_consistent.store(false, Ordering::Release);
+            }
+            Status::internal(format!("ingest commit task failed: {error}"))
+        })?
     }
 
     fn authorize_mutation<T>(&self, request: &Request<T>) -> Result<(), Status> {
@@ -2646,56 +2728,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
         self.authorize_mutation(&request)?;
-        let _mutation_guard = self.mutation_gate.read().await;
-        let start = Instant::now();
         let request = request.into_inner();
         validate_distributed_protocol(request.internal_protocol_version)?;
-        let records = request.records;
-        let record_count = records.len();
-        let _wal_guard = if self.ingest_wal.is_some() {
-            Some(self.ingest_wal_lock.lock().await)
-        } else {
-            None
-        };
-        self.ensure_store_healthy()?;
-        self.ensure_ingest_payloads_idempotent(&records)?;
-
-        let replication_request = proto::IngestRecordsRequest {
-            records: records.clone(),
-            internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
-        };
-        let (_replication_serial, replica_response, replication_attempt) =
-            replicate_to_replica!(self, ingest_records, replication_request);
-        let local_attempt = self.begin_durable_mutation();
-        // Use partitioned processing for large batches (high-throughput mode)
-        // Small batches use sequential path for correctness (query support)
-        // Clone the Arc and release the lock before awaiting (guards aren't Send)
-        let partitioned_arc = self.partitioned.read().clone();
-        let use_partitioned = partitioned_arc.is_some() && records.len() >= 100;
-        let assignments = if use_partitioned {
-            dispatch_ingest_partitioned(
-                partitioned_arc.as_ref().unwrap(),
-                &self.concurrent_interner,
-                self.ingest_wal.as_deref(),
-                self.shard_id,
-                records,
-            )
-            .await?
-        } else {
-            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
-        };
-
-        self.metrics
-            .record_ingest(record_count, start.elapsed().as_micros() as u64);
-        local_attempt.finish();
-        let response = proto::IngestRecordsResponse { assignments };
-        replication_attempt.finish(
-            replica_response
-                .as_ref()
-                .is_none_or(|replica| replica == &response),
-            "record ingest",
-        )?;
-        Ok(Response::new(response))
+        let assignments = self
+            .await_ingest_commit(request.records, "record ingest")
+            .await?;
+        Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
 
     async fn ingest_records_stream(
@@ -2703,11 +2741,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
         request: Request<tonic::Streaming<proto::IngestRecordsChunk>>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
         self.authorize_mutation(&request)?;
-        let _mutation_guard = self.mutation_gate.read().await;
-        let start = Instant::now();
         let mut stream = request.into_inner();
         let mut assignments = Vec::new();
-        let mut record_count = 0usize;
 
         while let Some(chunk) = stream
             .message()
@@ -2718,52 +2753,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             validate_distributed_protocol(chunk.internal_protocol_version)?;
-            record_count += chunk.records.len();
-            let _wal_guard = if self.ingest_wal.is_some() {
-                Some(self.ingest_wal_lock.lock().await)
-            } else {
-                None
-            };
-            self.ensure_store_healthy()?;
-            self.ensure_ingest_payloads_idempotent(&chunk.records)?;
-
-            let replication_request = proto::IngestRecordsRequest {
-                records: chunk.records.clone(),
-                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
-            };
-            let (_replication_serial, replica_response, replication_attempt) =
-                replicate_to_replica!(self, ingest_records, replication_request);
-            let local_attempt = self.begin_durable_mutation();
-            // Use partitioned processing for large batches (high-throughput mode)
-            // Small batches use sequential path for correctness
-            // Clone the Arc and release the lock before awaiting (guards aren't Send)
-            let partitioned_arc = self.partitioned.read().clone();
-            let use_partitioned = partitioned_arc.is_some() && chunk.records.len() >= 100;
-            let batch_assignments = if use_partitioned {
-                dispatch_ingest_partitioned(
-                    partitioned_arc.as_ref().unwrap(),
-                    &self.concurrent_interner,
-                    self.ingest_wal.as_deref(),
-                    self.shard_id,
-                    chunk.records,
-                )
-                .await?
-            } else {
-                dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), chunk.records)
-                    .await?
-            };
-            replication_attempt.finish(
-                replica_response
-                    .as_ref()
-                    .is_none_or(|replica| replica.assignments == batch_assignments),
-                "streamed record ingest",
-            )?;
-            local_attempt.finish();
+            let batch_assignments = self
+                .await_ingest_commit(chunk.records, "streamed record ingest")
+                .await?;
             assignments.extend(batch_assignments);
         }
 
-        self.metrics
-            .record_ingest(record_count, start.elapsed().as_micros() as u64);
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
 
@@ -5245,18 +5240,25 @@ impl RouterNode {
     ) -> Result<crate::sharding::ReconciliationResult, Status> {
         use crate::sharding::IncrementalReconciler;
 
-        let metadata_started = Instant::now();
-        let mut reconciler = IncrementalReconciler::new();
+        let mut candidates = ReconciliationCandidates::default();
+        let mut metadata_elapsed = Duration::ZERO;
+        let mut reconcile_elapsed = Duration::ZERO;
         for chunk in keys.chunks(RECONCILIATION_KEY_CHUNK) {
+            let metadata_started = Instant::now();
+            let mut reconciler = IncrementalReconciler::new();
             for metadata in self.fetch_boundary_metadata(chunk).await? {
                 reconciler.add_shard_boundary(boundary_index_from_metadata(&metadata)?);
             }
+            metadata_elapsed += metadata_started.elapsed();
+
+            let reconcile_started = Instant::now();
+            let key_set = chunk.iter().copied().collect();
+            candidates.extend(reconciler.reconciliation_candidates(&key_set));
+            reconcile_elapsed += reconcile_started.elapsed();
         }
-        let metadata_elapsed = metadata_started.elapsed();
-        let key_set = keys.iter().copied().collect();
         let reconcile_started = Instant::now();
-        let result = reconciler.reconcile_keys(&key_set);
-        let reconcile_elapsed = reconcile_started.elapsed();
+        let result = candidates.finish();
+        reconcile_elapsed += reconcile_started.elapsed();
         let apply_started = Instant::now();
         self.apply_reconciliation_result(&result).await?;
         tracing::info!(
