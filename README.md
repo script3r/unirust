@@ -33,7 +33,7 @@ Unirust will:
 ### Installation
 
 ```bash
-git clone https://github.com/unirust/unirust.git
+git clone https://github.com/script3r/unirust.git
 cd unirust
 cargo build --release
 ```
@@ -42,13 +42,13 @@ cargo build --release
 
 ```bash
 # Start a single shard
-./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0
+./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --ephemeral
 
 # In another terminal, start the router
 ./target/release/unirust_router --listen 127.0.0.1:50060 --shards 127.0.0.1:50061
 ```
 
-### Multi-Shard Cluster (Production)
+### Local Multi-Shard Cluster
 
 ```bash
 # Use the cluster script
@@ -61,11 +61,11 @@ SHARDS=5 ONTOLOGY=/etc/unirust/ontology.json ./scripts/cluster.sh restart
 UNIRUST_CONFIRM_RESET=1 ./scripts/cluster.sh reset
 
 # Or start manually:
-./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0
-./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /data/shard1
-./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /data/shard2
-./target/release/unirust_shard --listen 127.0.0.1:50064 --shard-id 3 --data-dir /data/shard3
-./target/release/unirust_shard --listen 127.0.0.1:50065 --shard-id 4 --data-dir /data/shard4
+./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0 --backup-dir /backup/shard0
+./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /data/shard1 --backup-dir /backup/shard1
+./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /data/shard2 --backup-dir /backup/shard2
+./target/release/unirust_shard --listen 127.0.0.1:50064 --shard-id 3 --data-dir /data/shard3 --backup-dir /backup/shard3
+./target/release/unirust_shard --listen 127.0.0.1:50065 --shard-id 4 --data-dir /data/shard4 --backup-dir /backup/shard4
 
 ./target/release/unirust_router --listen 127.0.0.1:50060 \
   --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063,127.0.0.1:50064,127.0.0.1:50065
@@ -120,6 +120,7 @@ profile = "high-throughput"
 listen = "0.0.0.0:50061"
 id = 0
 data_dir = "/var/lib/unirust/shard-0"
+backup_dir = "/var/backups/unirust/shard-0"
 tls_cert = "/etc/unirust/tls/shard-0.crt"
 tls_key = "/etc/unirust/tls/shard-0.key"
 tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
@@ -350,6 +351,8 @@ the same committed checkpoint, or start with two empty volumes. Primary startup
 computes a SHA-256 digest over every logical RocksDB key/value pair on both
 nodes and refuses traffic unless their complete durable states match. Pairing
 startup is O(database size), so measure it against the production dataset.
+Set `UNIRUST_SHARD_REPLICA_REQUEST_TIMEOUT_SECS` above the measured worst-case
+pairing digest time.
 
 Generate a separate secret for each pair, store at least 32 random bytes in a
 file readable only by the service account, and mount the same content on both
@@ -531,9 +534,17 @@ plaintext replication by default; `--allow-insecure-replication` exists only
 for isolated development. Protect token files as credentials, rotate them by
 stopping and restarting both members, and use different tokens for every pair.
 
-The shard binary requires a persistent `--data-dir`. An in-memory shard can only
-be started with the explicit `--ephemeral` flag and loses all records when the
-process exits.
+The shard binary requires a persistent `--data-dir` and a non-overlapping
+`--backup-dir`. Mount them from independent storage: separate directory names
+alone do not protect against volume loss. An in-memory shard can only be started
+with the explicit `--ephemeral` flag and loses all records when the process
+exits. `--allow-colocated-checkpoints` is a development-only escape hatch and
+does not provide volume-loss recovery.
+
+Router and shard servers cap each encoded or decoded gRPC message at 4 MiB,
+limit each connection to 128 concurrent requests, and shed excess load. Use the
+streaming ingest, import, and export RPCs for larger transfers. Bound connection
+counts and request rates at the load balancer as well.
 
 ## Performance
 

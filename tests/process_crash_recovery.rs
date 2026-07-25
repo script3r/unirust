@@ -17,7 +17,12 @@ struct ShardProcess {
 }
 
 impl ShardProcess {
-    fn spawn(listen: SocketAddr, data_dir: &Path, ontology_path: &Path) -> anyhow::Result<Self> {
+    fn spawn(
+        listen: SocketAddr,
+        data_dir: &Path,
+        backup_dir: &Path,
+        ontology_path: &Path,
+    ) -> anyhow::Result<Self> {
         let child = Command::new(env!("CARGO_BIN_EXE_unirust_shard"))
             .args([
                 "--listen",
@@ -28,6 +33,10 @@ impl ShardProcess {
                 data_dir
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("data directory is not valid UTF-8"))?,
+                "--backup-dir",
+                backup_dir
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("backup directory is not valid UTF-8"))?,
                 "--ontology",
                 ontology_path
                     .to_str()
@@ -122,6 +131,7 @@ fn record(index: u32, uid: String, email: String) -> RecordInput {
 async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Result<()> {
     let temp_dir = tempdir()?;
     let data_dir = temp_dir.path().join("shard-data");
+    let backup_dir = temp_dir.path().join("shard-backup");
     let ontology_path = temp_dir.path().join("ontology.json");
     std::fs::write(
         &ontology_path,
@@ -129,7 +139,7 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
     )?;
 
     let first_addr = available_addr()?;
-    let mut process = ShardProcess::spawn(first_addr, &data_dir, &ontology_path)?;
+    let mut process = ShardProcess::spawn(first_addr, &data_dir, &backup_dir, &ontology_path)?;
     let mut client = wait_for_shard(first_addr, &mut process).await?;
 
     let records = (0..128)
@@ -164,7 +174,7 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
     process.kill_and_wait()?;
 
     let second_addr = available_addr()?;
-    let mut restarted = ShardProcess::spawn(second_addr, &data_dir, &ontology_path)?;
+    let mut restarted = ShardProcess::spawn(second_addr, &data_dir, &backup_dir, &ontology_path)?;
     let mut client = wait_for_shard(second_addr, &mut restarted).await?;
 
     let stats = client.get_stats(StatsRequest {}).await?.into_inner();
@@ -217,7 +227,7 @@ async fn acknowledged_ingest_survives_process_kill_and_restart() -> anyhow::Resu
 
         let third_addr = available_addr()?;
         let mut restarted_after_shutdown =
-            ShardProcess::spawn(third_addr, &data_dir, &ontology_path)?;
+            ShardProcess::spawn(third_addr, &data_dir, &backup_dir, &ontology_path)?;
         let mut client = wait_for_shard(third_addr, &mut restarted_after_shutdown).await?;
         let stats = client.get_stats(StatsRequest {}).await?.into_inner();
         assert_eq!(stats.record_count, 129);

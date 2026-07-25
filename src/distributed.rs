@@ -1056,6 +1056,7 @@ pub struct ShardNode {
     replica_client: Option<proto::shard_service_client::ShardServiceClient<Channel>>,
     replication_token: Option<String>,
     replication_consistent: Arc<AtomicBool>,
+    mutation_consistent: Arc<AtomicBool>,
     replication_gate: Arc<Mutex<()>>,
     /// Destructive RPCs are disabled unless explicitly enabled by the embedding process.
     allow_destructive_admin: bool,
@@ -1110,6 +1111,29 @@ struct IngestJob {
 struct ReplicationAttempt {
     consistency: Arc<AtomicBool>,
     armed: bool,
+}
+
+struct DurableMutationAttempt {
+    consistency: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl DurableMutationAttempt {
+    fn new(consistency: Arc<AtomicBool>, armed: bool) -> Self {
+        Self { consistency, armed }
+    }
+
+    fn finish(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DurableMutationAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consistency.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl ReplicationAttempt {
@@ -1376,6 +1400,7 @@ impl ShardNode {
                 replica_client: None,
                 replication_token: None,
                 replication_consistent: Arc::new(AtomicBool::new(true)),
+                mutation_consistent: Arc::new(AtomicBool::new(true)),
                 replication_gate: Arc::new(Mutex::new(())),
                 allow_destructive_admin: false,
                 cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(
@@ -1441,6 +1466,7 @@ impl ShardNode {
             replica_client: None,
             replication_token: None,
             replication_consistent: Arc::new(AtomicBool::new(true)),
+            mutation_consistent: Arc::new(AtomicBool::new(true)),
             replication_gate: Arc::new(Mutex::new(())),
             allow_destructive_admin: false,
             cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -1608,14 +1634,23 @@ impl ShardNode {
     }
 
     fn ensure_replication_consistent(&self) -> Result<(), Status> {
-        if self.replication_consistent.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(Status::failed_precondition(
+        if !self.mutation_consistent.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
+                "a durable mutation failed after it may have changed local state; traffic is \
+                 blocked until the shard restarts and recovers",
+            ));
+        }
+        if !self.replication_consistent.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
                 "primary and replica may have diverged; traffic is blocked until their complete \
                  durable states are reconciled",
-            ))
+            ));
         }
+        Ok(())
+    }
+
+    fn begin_durable_mutation(&self) -> DurableMutationAttempt {
+        DurableMutationAttempt::new(self.mutation_consistent.clone(), self.data_dir.is_some())
     }
 
     fn authorize_mutation<T>(&self, request: &Request<T>) -> Result<(), Status> {
@@ -1885,19 +1920,31 @@ impl ShardNode {
     }
 
     #[allow(clippy::result_large_err)]
-    fn build_import_records(
-        unirust: &mut Unirust,
+    fn validate_import_records(
+        unirust: &Unirust,
         snapshots: &[proto::RecordSnapshot],
-    ) -> Result<Vec<Record>, Status> {
-        let mut records = Vec::with_capacity(snapshots.len());
+    ) -> Result<Vec<usize>, Status> {
+        let mut records_to_build = Vec::with_capacity(snapshots.len());
         let mut batch_ids: HashMap<u32, &proto::RecordSnapshot> = HashMap::new();
         let mut batch_identities: HashMap<(String, String, String), u32> = HashMap::new();
 
-        for snapshot in snapshots {
+        for (index, snapshot) in snapshots.iter().enumerate() {
             let identity = snapshot
                 .identity
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+            if identity.entity_type.is_empty()
+                || identity.perspective.is_empty()
+                || identity.uid.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "record identity fields must not be empty",
+                ));
+            }
+            for descriptor in &snapshot.descriptors {
+                Interval::new(descriptor.start, descriptor.end)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            }
             if let Some(previous) = batch_ids.get(&snapshot.record_id) {
                 if **previous != *snapshot {
                     return Err(Status::already_exists(format!(
@@ -1943,6 +1990,27 @@ impl ShardNode {
                     existing_id.0, snapshot.record_id
                 )));
             }
+            records_to_build.push(index);
+        }
+        unirust
+            .ensure_store_healthy()
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        Ok(records_to_build)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn build_import_records(
+        unirust: &mut Unirust,
+        snapshots: &[proto::RecordSnapshot],
+        records_to_build: &[usize],
+    ) -> Result<Vec<Record>, Status> {
+        let mut records = Vec::with_capacity(records_to_build.len());
+        for &index in records_to_build {
+            let snapshot = &snapshots[index];
+            let identity = snapshot
+                .identity
+                .as_ref()
+                .ok_or_else(|| Status::internal("validated record identity is missing"))?;
             records.push(Self::build_record_with_id(
                 unirust,
                 snapshot.record_id,
@@ -1950,9 +2018,6 @@ impl ShardNode {
                 &snapshot.descriptors,
             )?);
         }
-        unirust
-            .ensure_store_healthy()
-            .map_err(|err| Status::failed_precondition(err.to_string()))?;
         Ok(records)
     }
 
@@ -2070,36 +2135,18 @@ async fn dispatch_ingest_records(
     }
 
     let worker_count = ingest_txs.len().max(1);
-    let mut batches = vec![Vec::new(); worker_count];
-    for record in records {
-        let idx = ingest_worker_index(&record, worker_count);
-        batches[idx].push(record);
-    }
-
-    let mut receivers = Vec::new();
-    for (idx, batch) in batches.into_iter().enumerate() {
-        if batch.is_empty() {
-            continue;
-        }
-        let (tx, rx) = oneshot::channel();
-        let job = IngestJob {
-            records: batch,
+    let worker_index = ingest_worker_index(&records[0], worker_count);
+    let (tx, rx) = oneshot::channel();
+    ingest_txs[worker_index]
+        .send(IngestJob {
+            records,
             respond_to: tx,
-        };
-        ingest_txs[idx]
-            .send(job)
-            .await
-            .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
-        receivers.push(rx);
-    }
-
-    let mut assignments = Vec::new();
-    for rx in receivers {
-        let batch_assignments = rx
-            .await
-            .map_err(|_| Status::internal("ingest worker dropped"))??;
-        assignments.extend(batch_assignments);
-    }
+        })
+        .await
+        .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
+    let mut assignments = rx
+        .await
+        .map_err(|_| Status::internal("ingest worker dropped"))??;
 
     if let Some(wal) = ingest_wal {
         wal.clear()?;
@@ -2500,6 +2547,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, set_ontology, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         if let Some(path) = &self.data_dir {
             // Must acquire write lock and drop old Unirust BEFORE opening new store
             // to release the RocksDB file lock
@@ -2563,6 +2611,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
 
         *config_guard = config;
+        local_attempt.finish();
         let response = proto::ApplyOntologyResponse {};
         replication_attempt.finish(
             replica_response
@@ -2598,6 +2647,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         };
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, ingest_records, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         // Use partitioned processing for large batches (high-throughput mode)
         // Small batches use sequential path for correctness (query support)
         // Clone the Arc and release the lock before awaiting (guards aren't Send)
@@ -2618,6 +2668,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         self.metrics
             .record_ingest(record_count, start.elapsed().as_micros() as u64);
+        local_attempt.finish();
         let response = proto::IngestRecordsResponse { assignments };
         replication_attempt.finish(
             replica_response
@@ -2663,6 +2714,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             };
             let (_replication_serial, replica_response, replication_attempt) =
                 replicate_to_replica!(self, ingest_records, replication_request);
+            let local_attempt = self.begin_durable_mutation();
             // Use partitioned processing for large batches (high-throughput mode)
             // Small batches use sequential path for correctness
             // Clone the Arc and release the lock before awaiting (guards aren't Send)
@@ -2687,6 +2739,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                     .is_none_or(|replica| replica.assignments == batch_assignments),
                 "streamed record ingest",
             )?;
+            local_attempt.finish();
             assignments.extend(batch_assignments);
         }
 
@@ -3217,13 +3270,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, import_records, request);
         let mut unirust = write_unirust!(self);
-        let records = Self::build_import_records(&mut unirust, &request.records)?;
+        let records_to_build = Self::validate_import_records(&unirust, &request.records)?;
+        let local_attempt = self.begin_durable_mutation();
+        let records =
+            Self::build_import_records(&mut unirust, &request.records, &records_to_build)?;
         unirust
             .ingest_with_explicit_ids(records)
             .map_err(|err| Status::internal(err.to_string()))?;
         let response = proto::ImportRecordsResponse {
             imported: request.records.len() as u64,
         };
+        local_attempt.finish();
         replication_attempt.finish(
             replica_response
                 .as_ref()
@@ -3258,13 +3315,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
             let (_replication_serial, replica_response, replication_attempt) =
                 replicate_to_replica!(self, import_records, replication_request);
             let mut unirust = write_unirust!(self);
-            let records = Self::build_import_records(&mut unirust, &chunk.records)?;
+            let records_to_build = Self::validate_import_records(&unirust, &chunk.records)?;
+            let local_attempt = self.begin_durable_mutation();
+            let records =
+                Self::build_import_records(&mut unirust, &chunk.records, &records_to_build)?;
             unirust
                 .ingest_with_explicit_ids(records)
                 .map_err(|err| Status::internal(err.to_string()))?;
             let response = proto::ImportRecordsResponse {
                 imported: chunk.records.len() as u64,
             };
+            local_attempt.finish();
             replication_attempt.finish(
                 replica_response
                     .as_ref()
@@ -3287,6 +3348,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let replication_request = request.clone();
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, list_conflicts, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         let mut summaries = if let Some(cache) = {
             let guard = read_unirust!(self);
             guard.cached_conflict_summaries()
@@ -3361,6 +3423,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map(to_proto_conflict_summary)
                 .collect(),
         };
+        local_attempt.finish();
         replication_attempt.finish(
             replica_response
                 .as_ref()
@@ -3389,6 +3452,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
                  reset or rebootstrap them together",
             ));
         }
+        let local_attempt = self.begin_durable_mutation();
         let config = self.ontology_config.lock().await.clone();
         {
             let mut guard = write_unirust!(self);
@@ -3412,6 +3476,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             *self.partitioned.write() = None;
         }
         self.cross_shard_conflicts.write().clear();
+        local_attempt.finish();
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -3520,9 +3585,15 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 "primary and secondary cluster IDs must differ",
             ));
         }
+        if primary_id.to_u64() >= secondary_id.to_u64() {
+            return Err(Status::invalid_argument(
+                "cross-shard merge must redirect the higher cluster ID to the lower canonical ID",
+            ));
+        }
 
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, apply_merge, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         // Get write lock on unirust
         let mut unirust = write_unirust!(self);
 
@@ -3539,6 +3610,9 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 error: err.to_string(),
             },
         };
+        if response.success {
+            local_attempt.finish();
+        }
         replication_attempt.finish(
             replica_response
                 .as_ref()
@@ -3724,6 +3798,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         let (_replication_serial, replica_response, replication_attempt) =
             replicate_to_replica!(self, store_cross_shard_conflicts, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         // Store conflicts - keep only those relevant to this shard
         let shard_id = self.shard_id as u16;
         let mut conflict_storage = self.cross_shard_conflicts.write();
@@ -3746,6 +3821,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
 
         let response = proto::StoreCrossShardConflictsResponse { stored_count };
+        local_attempt.finish();
         replication_attempt.finish(
             replica_response
                 .as_ref()
@@ -6221,6 +6297,57 @@ mod wal_tests {
             .into_inner();
         assert_eq!(stats.record_count, 1);
         shard.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn invalid_persistent_import_does_not_latch_shard_closed() {
+        use proto::shard_service_server::ShardService;
+
+        let temp_dir = tempfile::tempdir().expect("temporary shard directory");
+        let shard = ShardNode::new_with_data_dir(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+            Some(temp_dir.path().to_path_buf()),
+            false,
+            None,
+        )
+        .expect("persistent shard");
+        let error = ShardService::import_records(
+            &shard,
+            Request::new(proto::ImportRecordsRequest {
+                records: vec![proto::RecordSnapshot {
+                    record_id: 7,
+                    identity: Some(proto::RecordIdentity {
+                        entity_type: "person".to_string(),
+                        perspective: "crm".to_string(),
+                        uid: "invalid-import".to_string(),
+                    }),
+                    descriptors: vec![proto::RecordDescriptor {
+                        attr: "email".to_string(),
+                        value: "invalid@example.com".to_string(),
+                        start: 10,
+                        end: 10,
+                    }],
+                }],
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .expect_err("invalid import must fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        ShardService::health_check(&shard, Request::new(proto::HealthCheckRequest {}))
+            .await
+            .expect("fully validated client errors must not poison readiness");
+        shard.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn incomplete_durable_mutation_latches_consistency() {
+        let consistency = Arc::new(AtomicBool::new(true));
+        drop(DurableMutationAttempt::new(consistency.clone(), true));
+        assert!(!consistency.load(Ordering::Acquire));
     }
 
     #[tokio::test]

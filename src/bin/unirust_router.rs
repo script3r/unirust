@@ -7,6 +7,9 @@ use unirust_rs::distributed::{
 };
 use unirust_rs::transport_security::{load_client_mtls, load_server_mtls};
 
+const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 128;
+
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {
@@ -255,14 +258,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("Unirust router listening on {}", config.router.listen);
-    let mut server = Server::builder();
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
+        .load_shed(true);
     if let Some(server_mtls) = server_mtls {
         server = server.tls_config(server_mtls)?;
     }
     server
-        .add_service(proto::router_service_server::RouterServiceServer::new(
-            router,
-        ))
+        .add_service(
+            proto::router_service_server::RouterServiceServer::new(router)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(config.router.listen, shutdown_signal())
         .await?;
     if let Some(checkpoint_task) = checkpoint_task {

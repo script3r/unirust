@@ -9,8 +9,10 @@ ROUTER_PORT="${ROUTER_PORT:-50060}"
 ONTOLOGY="${ONTOLOGY:-$ROOT_DIR/examples/loadtest-ontology.json}"
 CONFIG_VERSION="${CONFIG_VERSION:-}"
 PROFILE="${PROFILE:-high-throughput}"
+CHECKPOINT_INTERVAL_SECS="${CHECKPOINT_INTERVAL_SECS:-3600}"
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-unirust}"
 VOLUME_PREFIX="${VOLUME_PREFIX:-unirust-data}"
+BACKUP_VOLUME_PREFIX="${BACKUP_VOLUME_PREFIX:-unirust-backup}"
 STOP_WAIT_SECS="${STOP_WAIT_SECS:-10}"
 UNIRUST_CONFIRM_RESET="${UNIRUST_CONFIRM_RESET:-0}"
 
@@ -61,11 +63,13 @@ start_cluster() {
       --network "$NETWORK" \
       --restart=unless-stopped \
       -v "${VOLUME_PREFIX}-shard-$i:/data" \
+      -v "${BACKUP_VOLUME_PREFIX}-shard-$i:/backup" \
       "${ontology_mount[@]}" \
       "$IMAGE" \
       shard \
       --shard-id "$i" \
       --data-dir /data \
+      --backup-dir /backup \
       --profile "$PROFILE" \
       "${ontology_args[@]}" \
       "${version_args[@]}"
@@ -90,12 +94,14 @@ start_cluster() {
     "$IMAGE" \
     router \
     --shards "$shard_list" \
+    --checkpoint-interval-secs "$CHECKPOINT_INTERVAL_SECS" \
     "${ontology_args[@]}" \
     "${version_args[@]}"
 
   echo "Cluster started."
   echo "Router listening on localhost:${ROUTER_PORT}"
   echo "Persistent volumes use prefix: ${VOLUME_PREFIX}-shard-"
+  echo "Checkpoint volumes use prefix: ${BACKUP_VOLUME_PREFIX}-shard-"
 }
 
 stop_cluster() {
@@ -125,11 +131,12 @@ reset_cluster() {
   fi
   stop_cluster
   while IFS= read -r volume; do
-    if [[ "$volume" == "${VOLUME_PREFIX}-shard-"* ]]; then
+    if [[ "$volume" == "${VOLUME_PREFIX}-shard-"* || "$volume" == "${BACKUP_VOLUME_PREFIX}-shard-"* ]]; then
       podman volume rm "$volume"
     fi
   done < <(podman volume ls --format "{{.Name}}")
   echo "Deleted persistent volumes with prefix: ${VOLUME_PREFIX}-shard-"
+  echo "Deleted checkpoint volumes with prefix: ${BACKUP_VOLUME_PREFIX}-shard-"
 }
 
 status_cluster() {

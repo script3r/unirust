@@ -8,6 +8,9 @@ use unirust_rs::distributed::{proto, DistributedOntologyConfig, ShardNode};
 use unirust_rs::transport_security::{load_client_mtls, load_replication_token, load_server_mtls};
 use unirust_rs::{restore_checkpoint_for_shard, StreamingTuning};
 
+const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 128;
+
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {
@@ -43,6 +46,8 @@ OPTIONS:
                             billion-scale-high-performance
         --repair            Run repair on startup
         --ephemeral         Allow an in-memory shard; all data is lost on process exit
+        --allow-colocated-checkpoints
+                            Permit checkpoints without an independent path (development only)
         --allow-destructive-admin
                             Enable destructive admin RPCs such as Reset
         --tls-cert <FILE>   PEM shard server certificate
@@ -274,6 +279,28 @@ async fn main() -> anyhow::Result<()> {
              explicitly for disposable development data)"
         );
     }
+    if let Some(data_dir) = config.shard.data_dir.as_deref() {
+        if !has_flag("--allow-colocated-checkpoints") {
+            let backup_dir = config.shard.backup_dir.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "persistent shards require --backup-dir on independent storage (or use \
+                     --allow-colocated-checkpoints explicitly for development)"
+                )
+            })?;
+            let data_dir = std::path::absolute(data_dir)?;
+            let backup_dir = std::path::absolute(backup_dir)?;
+            if data_dir == backup_dir
+                || data_dir.starts_with(&backup_dir)
+                || backup_dir.starts_with(&data_dir)
+            {
+                anyhow::bail!(
+                    "shard data and checkpoint paths must not overlap: data={}, backup={}",
+                    data_dir.display(),
+                    backup_dir.display()
+                );
+            }
+        }
+    }
     if let Some(source) = parse_arg("--restore-from") {
         let data_dir = config
             .shard
@@ -364,14 +391,18 @@ async fn main() -> anyhow::Result<()> {
         "Unirust shard {} listening on {}",
         config.shard.id, config.shard.listen
     );
-    let mut server = Server::builder();
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
+        .load_shed(true);
     if let Some(server_mtls) = server_mtls {
         server = server.tls_config(server_mtls)?;
     }
     server
-        .add_service(proto::shard_service_server::ShardServiceServer::new(
-            shard.clone(),
-        ))
+        .add_service(
+            proto::shard_service_server::ShardServiceServer::new(shard.clone())
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(config.shard.listen, shutdown_signal())
         .await?;
     shard.shutdown().await?;

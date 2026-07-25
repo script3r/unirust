@@ -165,6 +165,23 @@ fn record(index: u32) -> RecordInput {
     }
 }
 
+fn distinct_record(index: u32, source: u32) -> RecordInput {
+    RecordInput {
+        index,
+        identity: Some(RecordIdentity {
+            entity_type: "person".to_string(),
+            perspective: "crm".to_string(),
+            uid: format!("replicated-source-{source}"),
+        }),
+        descriptors: vec![RecordDescriptor {
+            attr: "email".to_string(),
+            value: format!("replicated-{source}@example.com"),
+            start: 0,
+            end: 100,
+        }],
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acknowledged_ingest_survives_primary_volume_loss_and_manual_failover() -> anyhow::Result<()>
 {
@@ -199,13 +216,15 @@ async fn acknowledged_ingest_survives_primary_volume_loss_and_manual_failover() 
     let response = RouterService::ingest_records(
         router.as_ref(),
         Request::new(IngestRecordsRequest {
-            records: vec![record(0)],
+            records: (0..128)
+                .map(|source| distinct_record(source, source))
+                .collect(),
             internal_protocol_version: 0,
         }),
     )
     .await?
     .into_inner();
-    assert_eq!(response.assignments.len(), 1);
+    assert_eq!(response.assignments.len(), 128);
 
     let mut primary_client = ShardServiceClient::connect(format!("http://{primary_addr}")).await?;
     let primary_stats = primary_client
@@ -216,7 +235,7 @@ async fn acknowledged_ingest_survives_primary_volume_loss_and_manual_failover() 
         .get_stats(StatsRequest {})
         .await?
         .into_inner();
-    assert_eq!(primary_stats.record_count, 1);
+    assert_eq!(primary_stats.record_count, 128);
     assert_eq!(primary_stats, replica_stats);
 
     let primary_config = primary_client
@@ -294,7 +313,7 @@ async fn acknowledged_ingest_survives_primary_volume_loss_and_manual_failover() 
     let retry = RouterService::ingest_records(
         promoted_router.as_ref(),
         Request::new(IngestRecordsRequest {
-            records: vec![record(1)],
+            records: vec![distinct_record(999, 0)],
             internal_protocol_version: 0,
         }),
     )
@@ -307,7 +326,7 @@ async fn acknowledged_ingest_survives_primary_volume_loss_and_manual_failover() 
         .get_stats(StatsRequest {})
         .await?
         .into_inner();
-    assert_eq!(promoted_stats.record_count, 1);
+    assert_eq!(promoted_stats.record_count, 128);
 
     drop(promoted_router);
     drop(promoted_client);

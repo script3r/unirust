@@ -4,7 +4,7 @@
 #
 # Usage:
 #   podman build -t unirust -f Containerfile .
-#   podman run --rm -p 50061:50061 -v unirust-data:/data unirust shard
+#   podman run --rm -p 50061:50061 -v unirust-data:/data -v unirust-backup:/backup unirust shard
 #   podman run --rm -p 50060:50060 unirust router --shards shard-0:50061
 #
 # Or use with compose.yaml for full cluster deployment
@@ -103,4 +103,4 @@ EOF
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["shard", "--shard-id", "0", "--data-dir", "/data"]
+CMD ["shard", "--shard-id", "0", "--data-dir", "/data", "--backup-dir", "/backup"]

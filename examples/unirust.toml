@@ -15,7 +15,7 @@ profile = "high-throughput"
 listen = "0.0.0.0:50061"
 # Shard ID (0-indexed, unique per shard)
 id = 0
-# Data directory for persistence (comment out for in-memory only)
+# Data directory for persistence (`--ephemeral` is required when omitted)
 # data_dir = "/var/lib/unirust/shard-0"
 # Checkpoint root on an independent volume (use a unique path per shard)
 # backup_dir = "/var/backups/unirust/shard-0"
