@@ -468,13 +468,20 @@ message BoundaryKeyEntries {
 
 message GetBoundaryMetadataRequest {
   uint64 since_version = 1;
+  // Return metadata only for these signatures. Empty requests return shard
+  // identity/version without materializing the full boundary index.
+  repeated IdentityKeySignature signatures = 2;
 }
 
 message GetBoundaryMetadataResponse {
   BoundaryMetadata metadata = 1;
 }
 
-message GetDirtyBoundaryKeysRequest {}
+message GetDirtyBoundaryKeysRequest {
+  // Exclusive lexicographic cursor over the 32-byte signature.
+  bytes after_signature = 1;
+  uint32 limit = 2;
+}
 
 message DirtyBoundaryKey {
   IdentityKeySignature signature = 1;
@@ -484,6 +491,8 @@ message DirtyBoundaryKey {
 message GetDirtyBoundaryKeysResponse {
   repeated DirtyBoundaryKey dirty_keys = 1;
   uint32 shard_id = 2;
+  bytes next_after_signature = 3;
+  bool has_more = 4;
 }
 
 message ClearDirtyKeysRequest {
@@ -520,6 +529,16 @@ message ApplyMergeRequest {
 message ApplyMergeResponse {
   bool success = 1;
   uint32 records_updated = 2;
+  string error = 3;
+}
+
+message ApplyMergesRequest {
+  repeated ClusterMerge merges = 1;
+}
+
+message ApplyMergesResponse {
+  bool success = 1;
+  uint64 records_updated = 2;
   string error = 3;
 }
 
@@ -592,6 +611,7 @@ service ShardService {
   // Cross-shard reconciliation
   rpc GetBoundaryMetadata(GetBoundaryMetadataRequest) returns (GetBoundaryMetadataResponse);
   rpc ApplyMerge(ApplyMergeRequest) returns (ApplyMergeResponse);
+  rpc ApplyMerges(ApplyMergesRequest) returns (ApplyMergesResponse);
   rpc GetDirtyBoundaryKeys(GetDirtyBoundaryKeysRequest) returns (GetDirtyBoundaryKeysResponse);
   rpc ClearDirtyKeys(ClearDirtyKeysRequest) returns (ClearDirtyKeysResponse);
 

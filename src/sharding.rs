@@ -22,7 +22,7 @@ fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 
 /// A signature of identity key values for fast lookup.
 /// This is a 32-byte hash of the identity key's attribute-value pairs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct IdentityKeySignature(pub [u8; 32]);
 
 impl IdentityKeySignature {

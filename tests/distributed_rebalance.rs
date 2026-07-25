@@ -114,7 +114,7 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
 
     let ingest_response = shard0
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
             records,
         })
         .await?
@@ -163,7 +163,7 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
     shard1
         .import_records(ImportRecordsRequest {
             records: all_records,
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await?;
 
@@ -196,7 +196,7 @@ async fn distributed_export_import_range() -> anyhow::Result<()> {
     let error = shard1
         .import_records(ImportRecordsRequest {
             records: vec![collision],
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await
         .expect_err("import must not overwrite an existing numeric record ID");

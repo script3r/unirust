@@ -216,13 +216,13 @@ async fn verified_export_survives_loss_of_checkpoint_volumes() -> anyhow::Result
     client0
         .ingest_records(IngestRecordsRequest {
             records: vec![shard0_record],
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await?;
     client1
         .ingest_records(IngestRecordsRequest {
             records: vec![shard1_record],
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await?;
 
@@ -349,7 +349,7 @@ async fn external_checkpoint_restores_a_lost_shard_volume() -> anyhow::Result<()
     client
         .ingest_records(IngestRecordsRequest {
             records: vec![record(0, "backup@example.com")],
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await?;
     let before = client.get_stats(StatsRequest {}).await?.into_inner();
@@ -391,7 +391,7 @@ async fn external_checkpoint_restores_a_lost_shard_volume() -> anyhow::Result<()
     client
         .ingest_records(IngestRecordsRequest {
             records: vec![record(1, "backup@example.com")],
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await?;
     let retry_stats = client.get_stats(StatsRequest {}).await?.into_inner();
@@ -400,7 +400,7 @@ async fn external_checkpoint_restores_a_lost_shard_volume() -> anyhow::Result<()
     let error = client
         .ingest_records(IngestRecordsRequest {
             records: vec![record(2, "changed@example.com")],
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
         })
         .await
         .expect_err("restored immutable source identity must reject a changed payload");

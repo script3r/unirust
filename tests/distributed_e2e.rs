@@ -208,7 +208,7 @@ async fn distributed_stream_and_query() -> anyhow::Result<()> {
 
     let response = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 4,
+            internal_protocol_version: 5,
             records: vec![record_a.clone(), record_b.clone()],
         })
         .await?

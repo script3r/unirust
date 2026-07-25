@@ -3221,15 +3221,27 @@ impl<'a> LinkerStatePersistence<'a> {
         secondary: GlobalClusterId,
         primary: GlobalClusterId,
     ) -> Result<()> {
+        self.save_cross_shard_merges(&[(secondary, primary)])
+    }
+
+    /// Persist cross-shard redirects in one RocksDB write batch.
+    pub fn save_cross_shard_merges(
+        &self,
+        merges: &[(GlobalClusterId, GlobalClusterId)],
+    ) -> Result<()> {
         let cf = self
             .db
             .cf_handle(linker_cf::METADATA)
             .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
-        self.db.put_cf(
-            &cf,
-            linker_encoding::encode_cross_shard_merge_key(secondary),
-            linker_encoding::encode_global_cluster_id(primary),
-        )?;
+        let mut batch = WriteBatch::default();
+        for (secondary, primary) in merges {
+            batch.put_cf(
+                &cf,
+                linker_encoding::encode_cross_shard_merge_key(*secondary),
+                linker_encoding::encode_global_cluster_id(*primary),
+            );
+        }
+        self.db.write(batch)?;
         Ok(())
     }
 
