@@ -12,6 +12,24 @@ fn read_nonempty(path: &Path, description: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Load a replication secret without retaining the raw file contents in
+/// process configuration or logs.
+pub fn load_replication_token(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let token = read_nonempty(path, "replication token")?;
+    if token.len() < 32 {
+        anyhow::bail!("replication token must contain at least 32 bytes");
+    }
+    let digest = Sha256::digest(token);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}")?;
+    }
+    Ok(encoded)
+}
+
 /// Load a server identity and require client certificates signed by `client_ca`.
 pub fn load_server_mtls(
     cert: Option<&Path>,

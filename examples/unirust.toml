@@ -25,6 +25,18 @@ id = 0
 # tls_cert = "/etc/unirust/tls/shard-0.crt"
 # tls_key = "/etc/unirust/tls/shard-0.key"
 # tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
+# Primary-only synchronous replica settings. Bootstrap both volumes from the
+# same committed checkpoint before enabling these options.
+# replica = "https://shard-0-replica:50061"
+# replication_token_file = "/etc/unirust/replication/shard-0.token"
+# replica_tls_ca = "/etc/unirust/tls/replicas-ca.crt"
+# replica_tls_cert = "/etc/unirust/tls/shard-0-primary.crt"
+# replica_tls_key = "/etc/unirust/tls/shard-0-primary.key"
+# On the passive process, omit `replica` and set:
+# replica_mode = true
+# Plaintext replication is rejected unless explicitly enabled for isolated
+# development:
+# allow_insecure_replication = false
 # Run repair on startup (recovers from unclean shutdown)
 repair = false
 

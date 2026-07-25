@@ -10,6 +10,7 @@ use rocksdb::{
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -416,6 +417,29 @@ const CF_INDEX_KEY_STATS: &str = "index_key_stats"; // Access statistics
 const CF_LINKER_CLUSTER_IDS: &str = "linker_cluster_ids";
 const CF_LINKER_GLOBAL_IDS: &str = "linker_global_ids";
 const CF_LINKER_METADATA: &str = "linker_metadata";
+
+const DURABLE_STATE_COLUMN_FAMILIES: &[&str] = &[
+    CF_RECORDS,
+    CF_METADATA,
+    CF_INTERNER,
+    CF_INDEX_ATTR_VALUE,
+    CF_INDEX_ENTITY_TYPE,
+    CF_INDEX_PERSPECTIVE,
+    CF_INDEX_TEMPORAL_BUCKET,
+    CF_INDEX_IDENTITY,
+    CF_CONFLICT_SUMMARIES,
+    CF_CLUSTER_ASSIGNMENTS,
+    CF_SOURCE_RESERVATIONS,
+    CF_DSU_PARENT,
+    CF_DSU_RANK,
+    CF_DSU_GUARDS,
+    CF_DSU_METADATA,
+    CF_INDEX_IDENTITY_KEYS,
+    CF_INDEX_KEY_STATS,
+    CF_LINKER_CLUSTER_IDS,
+    CF_LINKER_GLOBAL_IDS,
+    CF_LINKER_METADATA,
+];
 
 const RESET_DATA_CFS: &[&str] = &[
     CF_RECORDS,
@@ -2301,6 +2325,29 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
         ),
     ];
     Ok(DB::open_cf_descriptors(&base, path, cfs)?)
+}
+
+pub(crate) fn durable_state_digest(db: &DB) -> Result<[u8; 32]> {
+    fn update_field(digest: &mut Sha256, bytes: &[u8]) {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+
+    db.flush_wal(true)?;
+    let mut digest = Sha256::new();
+    digest.update(b"unirust-durable-state-v1");
+    for &name in DURABLE_STATE_COLUMN_FAMILIES {
+        update_field(&mut digest, name.as_bytes());
+        let cf = db
+            .cf_handle(name)
+            .ok_or_else(|| anyhow!("missing column family {name}"))?;
+        for entry in db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, value) = entry?;
+            update_field(&mut digest, &key);
+            update_field(&mut digest, &value);
+        }
+    }
+    Ok(digest.finalize().into())
 }
 
 fn encode_attr_value_index(attr: u32, value: u32, start: i64, end: i64, record_id: u32) -> Vec<u8> {

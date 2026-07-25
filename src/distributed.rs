@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 /// WAL record format for binary serialization.
@@ -67,7 +68,8 @@ struct IngestWal {
 const INGEST_WAL_MAGIC: &[u8; 8] = b"UNIRWAL\0";
 const INGEST_WAL_VERSION: u32 = 1;
 const INGEST_WAL_HEADER_LEN: usize = 24;
-pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 3;
+pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 4;
+const REPLICATION_TOKEN_HEADER: &str = "x-unirust-replication-token";
 
 #[allow(clippy::result_large_err)]
 fn validate_distributed_protocol(protocol_version: u32) -> Result<(), Status> {
@@ -1050,6 +1052,11 @@ pub struct ShardNode {
     ingest_worker_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     config_version: String,
     metrics: Arc<PerfMetrics>,
+    shard_role: proto::ShardRole,
+    replica_client: Option<proto::shard_service_client::ShardServiceClient<Channel>>,
+    replication_token: Option<String>,
+    replication_consistent: Arc<AtomicBool>,
+    replication_gate: Arc<Mutex<()>>,
     /// Destructive RPCs are disabled unless explicitly enabled by the embedding process.
     allow_destructive_admin: bool,
     /// Cross-shard conflicts detected during reconciliation.
@@ -1098,6 +1105,109 @@ macro_rules! read_unirust {
 struct IngestJob {
     records: Vec<proto::RecordInput>,
     respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
+}
+
+struct ReplicationAttempt {
+    consistency: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl ReplicationAttempt {
+    fn new(consistency: Arc<AtomicBool>, armed: bool) -> Self {
+        Self { consistency, armed }
+    }
+
+    fn finish(mut self, responses_match: bool, operation: &str) -> Result<(), Status> {
+        if !responses_match {
+            return Err(Status::data_loss(format!(
+                "primary and replica returned different results for {operation}; traffic is \
+                 blocked"
+            )));
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReplicationAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consistency.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn replication_error_is_ambiguous(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+            | tonic::Code::Internal
+            | tonic::Code::Unavailable
+            | tonic::Code::DataLoss
+    )
+}
+
+fn authenticated_replica_request<T>(
+    payload: T,
+    replication_token: &str,
+) -> Result<Request<T>, Status> {
+    let token = tonic::metadata::MetadataValue::try_from(replication_token)
+        .map_err(|_| Status::internal("replication token metadata is invalid"))?;
+    let mut request = Request::new(payload);
+    request
+        .metadata_mut()
+        .insert(REPLICATION_TOKEN_HEADER, token);
+    Ok(request)
+}
+
+macro_rules! replicate_to_replica {
+    ($self:expr, $method:ident, $payload:expr) => {{
+        $self.ensure_replication_consistent()?;
+        let replication_serial = if $self.replica_client.is_some() {
+            Some($self.replication_gate.lock().await)
+        } else {
+            None
+        };
+        $self.ensure_replication_consistent()?;
+        let replica_response = if let Some(mut replica) = $self.replica_client.clone() {
+            let token = $self.replication_token.as_deref().ok_or_else(|| {
+                Status::failed_precondition("primary replication token is missing")
+            })?;
+            let replica_request = authenticated_replica_request(($payload).clone(), token)?;
+            match replica.$method(replica_request).await {
+                Ok(response) => Some(response.into_inner()),
+                Err(error) => {
+                    if replication_error_is_ambiguous(error.code()) {
+                        $self.replication_consistent.store(false, Ordering::Release);
+                        return Err(Status::aborted(format!(
+                            "replica {operation} failed and may have committed; traffic is \
+                             blocked: {error}",
+                            operation = stringify!($method)
+                        )));
+                    }
+                    $self.replication_consistent.store(false, Ordering::Release);
+                    return Err(Status::new(
+                        error.code(),
+                        format!(
+                            "replica rejected {operation}: {}",
+                            error.message(),
+                            operation = stringify!($method)
+                        ),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let replication_attempt = ReplicationAttempt::new(
+            $self.replication_consistent.clone(),
+            replica_response.is_some(),
+        );
+        (replication_serial, replica_response, replication_attempt)
+    }};
 }
 
 impl ShardNode {
@@ -1262,6 +1372,11 @@ impl ShardNode {
                 ingest_worker_handles: Arc::new(Mutex::new(ingest_worker_handles)),
                 config_version,
                 metrics: Arc::new(PerfMetrics::new()),
+                shard_role: proto::ShardRole::Standalone,
+                replica_client: None,
+                replication_token: None,
+                replication_consistent: Arc::new(AtomicBool::new(true)),
+                replication_gate: Arc::new(Mutex::new(())),
                 allow_destructive_admin: false,
                 cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(
                     recovered_cross_shard_conflicts,
@@ -1322,6 +1437,11 @@ impl ShardNode {
             ingest_worker_handles: Arc::new(Mutex::new(ingest_worker_handles)),
             config_version,
             metrics: Arc::new(PerfMetrics::new()),
+            shard_role: proto::ShardRole::Standalone,
+            replica_client: None,
+            replication_token: None,
+            replication_consistent: Arc::new(AtomicBool::new(true)),
+            replication_gate: Arc::new(Mutex::new(())),
             allow_destructive_admin: false,
             cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
@@ -1334,6 +1454,198 @@ impl ShardNode {
     pub fn with_destructive_admin(mut self, allow: bool) -> Self {
         self.allow_destructive_admin = allow;
         self
+    }
+
+    /// Configure this persistent node as a passive replica. A replica can only
+    /// be targeted by a primary and is rejected as a router shard endpoint.
+    pub fn into_replica(mut self, replication_token: String) -> AnyResult<Self> {
+        if self.data_dir.is_none() {
+            anyhow::bail!("replica mode requires persistent shard storage");
+        }
+        if self.replica_client.is_some() {
+            anyhow::bail!("a replica cannot have another replica");
+        }
+        if replication_token.is_empty() {
+            anyhow::bail!("replica mode requires a nonempty replication token");
+        }
+        self.shard_role = proto::ShardRole::Replica;
+        self.replication_token = Some(replication_token);
+        Ok(self)
+    }
+
+    /// Attach a passive replica after proving that its topology, configuration,
+    /// restore provenance, and complete durable key/value state match.
+    pub async fn with_replica(
+        mut self,
+        mut replica: proto::shard_service_client::ShardServiceClient<Channel>,
+        replication_token: String,
+    ) -> Result<Self, Status> {
+        if self.data_dir.is_none() {
+            return Err(Status::failed_precondition(
+                "synchronous replication requires persistent primary storage",
+            ));
+        }
+        if self.shard_role != proto::ShardRole::Standalone || self.replica_client.is_some() {
+            return Err(Status::failed_precondition(
+                "replication can only be attached to a standalone shard",
+            ));
+        }
+        if replication_token.is_empty() {
+            return Err(Status::invalid_argument(
+                "replication requires a nonempty shared token",
+            ));
+        }
+        let health = replica
+            .health_check(Request::new(proto::HealthCheckRequest {}))
+            .await
+            .map_err(|error| Status::unavailable(format!("replica health check failed: {error}")))?
+            .into_inner();
+        if health.status != "ok" {
+            return Err(Status::unavailable(format!(
+                "replica reported unhealthy status {}",
+                health.status
+            )));
+        }
+        let request = authenticated_replica_request(
+            proto::ConfigVersionRequest {
+                include_durable_state_digest: true,
+            },
+            &replication_token,
+        )?;
+        let response = replica
+            .get_config_version(request)
+            .await
+            .map_err(|error| {
+                Status::new(
+                    error.code(),
+                    format!("replica configuration check failed: {}", error.message()),
+                )
+            })?
+            .into_inner();
+        validate_distributed_protocol(response.protocol_version)?;
+        validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
+        if proto::ShardRole::try_from(response.shard_role) != Ok(proto::ShardRole::Replica) {
+            return Err(Status::failed_precondition(
+                "configured replication target is not running in replica mode",
+            ));
+        }
+        if response.version != self.config_version {
+            return Err(Status::failed_precondition(format!(
+                "replica config version mismatch: primary {}, replica {}",
+                self.config_version, response.version
+            )));
+        }
+        let replica_ontology = response.ontology_config.ok_or_else(|| {
+            Status::failed_precondition("replica did not report its ontology configuration")
+        })?;
+        if map_proto_config(&replica_ontology) != *self.ontology_config.lock().await {
+            return Err(Status::failed_precondition(
+                "replica ontology does not match the primary",
+            ));
+        }
+        let local_restore = self
+            .restored_checkpoint
+            .as_ref()
+            .map(|manifest| (manifest.generation(), manifest.shard_count()));
+        let replica_restore = match (
+            response.restore_generation.is_empty(),
+            response.restore_shard_count,
+        ) {
+            (true, 0) => None,
+            (false, shard_count) if shard_count > 0 => {
+                Some((response.restore_generation.as_str(), shard_count))
+            }
+            _ => {
+                return Err(Status::data_loss(
+                    "replica reported incomplete restore checkpoint provenance",
+                ));
+            }
+        };
+        if local_restore != replica_restore {
+            return Err(Status::failed_precondition(
+                "primary and replica restore provenance do not match",
+            ));
+        }
+        let local_digest = self
+            .durable_state_digest()?
+            .ok_or_else(|| Status::failed_precondition("primary does not expose durable state"))?;
+        if response.durable_state_digest.as_slice() != local_digest {
+            return Err(Status::failed_precondition(
+                "replica durable state does not match the primary; bootstrap both from the same \
+                 checkpoint before enabling replication",
+            ));
+        }
+        let metadata = replica
+            .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
+                since_version: 0,
+            }))
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!("replica shard identity check failed: {error}"))
+            })?
+            .into_inner()
+            .metadata
+            .ok_or_else(|| Status::data_loss("replica returned no boundary metadata"))?;
+        if metadata.shard_id != self.shard_id {
+            return Err(Status::failed_precondition(format!(
+                "replica reports shard {}, primary is shard {}",
+                metadata.shard_id, self.shard_id
+            )));
+        }
+        self.replica_client = Some(replica);
+        self.replication_token = Some(replication_token);
+        self.shard_role = proto::ShardRole::Primary;
+        Ok(self)
+    }
+
+    fn durable_state_digest(&self) -> Result<Option<[u8; 32]>, Status> {
+        let db = read_unirust!(self).store().shared_db();
+        db.map(|db| {
+            crate::persistence::durable_state_digest(&db)
+                .map_err(|error| Status::internal(error.to_string()))
+        })
+        .transpose()
+    }
+
+    fn ensure_replication_consistent(&self) -> Result<(), Status> {
+        if self.replication_consistent.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "primary and replica may have diverged; traffic is blocked until their complete \
+                 durable states are reconciled",
+            ))
+        }
+    }
+
+    fn authorize_mutation<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let supplied = request
+            .metadata()
+            .get(REPLICATION_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok());
+        match self.shard_role {
+            proto::ShardRole::Replica => {
+                if supplied == self.replication_token.as_deref() {
+                    Ok(())
+                } else {
+                    Err(Status::permission_denied(
+                        "passive replicas only accept mutations forwarded by their primary",
+                    ))
+                }
+            }
+            proto::ShardRole::Standalone | proto::ShardRole::Primary => {
+                if supplied.is_some() {
+                    Err(Status::permission_denied(
+                        "replicated mutation metadata is only valid on a passive replica",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            proto::ShardRole::Unspecified => {
+                Err(Status::failed_precondition("shard role is not configured"))
+            }
+        }
     }
 
     /// Drain mutations and durably flush derived state before process exit.
@@ -1367,6 +1679,7 @@ impl ShardNode {
     }
 
     fn ensure_no_pending_ingest(&self) -> Result<(), Status> {
+        self.ensure_replication_consistent()?;
         if self
             .ingest_wal
             .as_ref()
@@ -1389,6 +1702,7 @@ impl ShardNode {
     }
 
     fn ensure_recovery_healthy(&self) -> Result<(), Status> {
+        self.ensure_replication_consistent()?;
         if self
             .ingest_wal
             .as_ref()
@@ -1408,6 +1722,7 @@ impl ShardNode {
     }
 
     fn ensure_store_healthy(&self) -> Result<(), Status> {
+        self.ensure_replication_consistent()?;
         let unirust = read_unirust!(self);
         unirust.ensure_store_healthy().map_err(|err| {
             Status::failed_precondition(format!(
@@ -2037,9 +2352,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ReserveSourceRecordsRequest>,
     ) -> Result<Response<proto::ReserveSourceRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_store_healthy()?;
         let request = request.into_inner();
+        let replication_request = request.clone();
         let mut reservations = Vec::with_capacity(request.reservations.len());
         let mut indices = Vec::with_capacity(request.reservations.len());
 
@@ -2072,6 +2389,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             });
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, reserve_source_records, replication_request);
         let targets = {
             let mut unirust = write_unirust!(self);
             unirust
@@ -2102,15 +2421,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 },
             )
             .collect();
-        Ok(Response::new(proto::ReserveSourceRecordsResponse {
-            reservations,
-        }))
+        let response = proto::ReserveSourceRecordsResponse { reservations };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "source reservation",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn mark_source_reservations_backfilled(
         &self,
         request: Request<proto::MarkSourceReservationsBackfilledRequest>,
     ) -> Result<Response<proto::MarkSourceReservationsBackfilledResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_store_healthy()?;
         let request = request.into_inner();
@@ -2126,24 +2451,33 @@ impl proto::shard_service_server::ShardService for ShardNode {
             ));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, mark_source_reservations_backfilled, request);
         let mut unirust = write_unirust!(self);
         unirust
             .store_mut()
             .mark_source_reservation_backfill(request.protocol_version, request.shard_count)
             .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(
-            proto::MarkSourceReservationsBackfilledResponse {},
-        ))
+        let response = proto::MarkSourceReservationsBackfilledResponse {};
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "source reservation migration marker",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn set_ontology(
         &self,
         request: Request<proto::ApplyOntologyRequest>,
     ) -> Result<Response<proto::ApplyOntologyResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
+        let request = request.into_inner();
+        let replication_request = request.clone();
         let config = request
-            .into_inner()
             .config
             .ok_or_else(|| Status::invalid_argument("ontology config is required"))?;
 
@@ -2164,6 +2498,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             )));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, set_ontology, replication_request);
         if let Some(path) = &self.data_dir {
             // Must acquire write lock and drop old Unirust BEFORE opening new store
             // to release the RocksDB file lock
@@ -2227,13 +2563,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
 
         *config_guard = config;
-        Ok(Response::new(proto::ApplyOntologyResponse {}))
+        let response = proto::ApplyOntologyResponse {};
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "ontology update",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn ingest_records(
         &self,
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         let start = Instant::now();
         let request = request.into_inner();
@@ -2248,6 +2592,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
         self.ensure_store_healthy()?;
         self.ensure_ingest_payloads_idempotent(&records)?;
 
+        let replication_request = proto::IngestRecordsRequest {
+            records: records.clone(),
+            internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+        };
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, ingest_records, replication_request);
         // Use partitioned processing for large batches (high-throughput mode)
         // Small batches use sequential path for correctness (query support)
         // Clone the Arc and release the lock before awaiting (guards aren't Send)
@@ -2268,13 +2618,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
         self.metrics
             .record_ingest(record_count, start.elapsed().as_micros() as u64);
-        Ok(Response::new(proto::IngestRecordsResponse { assignments }))
+        let response = proto::IngestRecordsResponse { assignments };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "record ingest",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn ingest_records_stream(
         &self,
         request: Request<tonic::Streaming<proto::IngestRecordsChunk>>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         let start = Instant::now();
         let mut stream = request.into_inner();
@@ -2299,6 +2657,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
             self.ensure_store_healthy()?;
             self.ensure_ingest_payloads_idempotent(&chunk.records)?;
 
+            let replication_request = proto::IngestRecordsRequest {
+                records: chunk.records.clone(),
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            };
+            let (_replication_serial, replica_response, replication_attempt) =
+                replicate_to_replica!(self, ingest_records, replication_request);
             // Use partitioned processing for large batches (high-throughput mode)
             // Small batches use sequential path for correctness
             // Clone the Arc and release the lock before awaiting (guards aren't Send)
@@ -2317,6 +2681,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), chunk.records)
                     .await?
             };
+            replication_attempt.finish(
+                replica_response
+                    .as_ref()
+                    .is_none_or(|replica| replica.assignments == batch_assignments),
+                "streamed record ingest",
+            )?;
             assignments.extend(batch_assignments);
         }
 
@@ -2499,6 +2869,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
         self.ensure_recovery_healthy()?;
+        if let Some(mut replica) = self.replica_client.clone() {
+            let response = replica
+                .health_check(Request::new(proto::HealthCheckRequest {}))
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!("replica health check failed: {error}"))
+                })?
+                .into_inner();
+            if response.status != "ok" {
+                return Err(Status::unavailable(format!(
+                    "replica reported unhealthy status {}",
+                    response.status
+                )));
+            }
+        }
         Ok(Response::new(proto::HealthCheckResponse {
             status: "ok".to_string(),
         }))
@@ -2506,8 +2891,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
     async fn get_config_version(
         &self,
-        _request: Request<proto::ConfigVersionRequest>,
+        request: Request<proto::ConfigVersionRequest>,
     ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        let include_durable_state_digest = request.get_ref().include_durable_state_digest;
+        if include_durable_state_digest && self.shard_role == proto::ShardRole::Replica {
+            self.authorize_mutation(&request)?;
+        }
+        let _mutation_guard = if include_durable_state_digest {
+            Some(self.mutation_gate.write().await)
+        } else {
+            None
+        };
         let ontology_config = self.ontology_config.lock().await;
         let source_reservation_backfill = read_unirust!(self)
             .store()
@@ -2534,6 +2928,14 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .as_ref()
                 .map(ClusterCheckpointManifest::shard_count)
                 .unwrap_or_default(),
+            shard_role: self.shard_role as i32,
+            durable_state_digest: if include_durable_state_digest {
+                self.durable_state_digest()?
+                    .map(|digest| digest.to_vec())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         }))
     }
 
@@ -2562,6 +2964,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::CheckpointRequest>,
     ) -> Result<Response<proto::CheckpointResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
@@ -2598,6 +3001,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             ));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, checkpoint, request);
         if request.finalize {
             commit_cluster_checkpoint(&target, &request.path, self.shard_id, request.shard_count)
                 .map_err(|err| Status::failed_precondition(err.to_string()))?;
@@ -2620,11 +3025,20 @@ impl proto::shard_service_server::ShardService for ShardNode {
             prepare_cluster_checkpoint(&target, &request.path, self.shard_id, request.shard_count)
                 .map_err(|err| Status::internal(err.to_string()))?;
         }
-        Ok(Response::new(proto::CheckpointResponse {
+        let response = proto::CheckpointResponse {
             paths: vec![target.to_string_lossy().to_string()],
             generation: request.path,
             committed: request.finalize,
-        }))
+        };
+        replication_attempt.finish(
+            replica_response.as_ref().is_none_or(|replica| {
+                replica.generation == response.generation
+                    && replica.committed == response.committed
+                    && replica.paths.len() == 1
+            }),
+            "checkpoint",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn get_record_id_range(
@@ -2792,6 +3206,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ImportRecordsRequest>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
@@ -2799,20 +3214,30 @@ impl proto::shard_service_server::ShardService for ShardNode {
         if request.records.is_empty() {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
         }
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, import_records, request);
         let mut unirust = write_unirust!(self);
         let records = Self::build_import_records(&mut unirust, &request.records)?;
         unirust
             .ingest_with_explicit_ids(records)
             .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(proto::ImportRecordsResponse {
+        let response = proto::ImportRecordsResponse {
             imported: request.records.len() as u64,
-        }))
+        };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "record import",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn import_records_stream(
         &self,
         request: Request<tonic::Streaming<proto::ImportRecordsChunk>>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let mut stream = request.into_inner();
@@ -2826,11 +3251,26 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             validate_distributed_protocol(chunk.internal_protocol_version)?;
+            let replication_request = proto::ImportRecordsRequest {
+                records: chunk.records.clone(),
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            };
+            let (_replication_serial, replica_response, replication_attempt) =
+                replicate_to_replica!(self, import_records, replication_request);
             let mut unirust = write_unirust!(self);
             let records = Self::build_import_records(&mut unirust, &chunk.records)?;
             unirust
                 .ingest_with_explicit_ids(records)
                 .map_err(|err| Status::internal(err.to_string()))?;
+            let response = proto::ImportRecordsResponse {
+                imported: chunk.records.len() as u64,
+            };
+            replication_attempt.finish(
+                replica_response
+                    .as_ref()
+                    .is_none_or(|replica| replica == &response),
+                "streamed record import",
+            )?;
             imported += chunk.records.len() as u64;
         }
         Ok(Response::new(proto::ImportRecordsResponse { imported }))
@@ -2840,9 +3280,13 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ListConflictsRequest>,
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
+        let replication_request = request.clone();
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, list_conflicts, replication_request);
         let mut summaries = if let Some(cache) = {
             let guard = read_unirust!(self);
             guard.cached_conflict_summaries()
@@ -2917,13 +3361,20 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map(to_proto_conflict_summary)
                 .collect(),
         };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "conflict materialization",
+        )?;
         Ok(Response::new(response))
     }
 
     async fn reset(
         &self,
-        _request: Request<proto::Empty>,
+        request: Request<proto::Empty>,
     ) -> Result<Response<proto::Empty>, Status> {
+        self.authorize_mutation(&request)?;
         if !self.allow_destructive_admin {
             return Err(Status::permission_denied(
                 "destructive reset RPC is disabled; stop the cluster and use the confirmed \
@@ -2932,6 +3383,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
+        if self.replica_client.is_some() {
+            return Err(Status::failed_precondition(
+                "online reset is disabled while replication is configured; stop both nodes and \
+                 reset or rebootstrap them together",
+            ));
+        }
         let config = self.ontology_config.lock().await.clone();
         {
             let mut guard = write_unirust!(self);
@@ -3031,9 +3488,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ApplyMergeRequest>,
     ) -> Result<Response<proto::ApplyMergeResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
+        let replication_request = req;
 
         let primary = req
             .primary
@@ -3062,26 +3521,31 @@ impl proto::shard_service_server::ShardService for ShardNode {
             ));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, apply_merge, replication_request);
         // Get write lock on unirust
         let mut unirust = write_unirust!(self);
 
         // Apply the merge via the streaming linker's DSU
-        let records_updated = match unirust.apply_cross_shard_merge(primary_id, secondary_id) {
-            Ok(count) => count,
-            Err(err) => {
-                return Ok(Response::new(proto::ApplyMergeResponse {
-                    success: false,
-                    records_updated: 0,
-                    error: err.to_string(),
-                }));
-            }
+        let response = match unirust.apply_cross_shard_merge(primary_id, secondary_id) {
+            Ok(records_updated) => proto::ApplyMergeResponse {
+                success: true,
+                records_updated: records_updated as u32,
+                error: String::new(),
+            },
+            Err(err) => proto::ApplyMergeResponse {
+                success: false,
+                records_updated: 0,
+                error: err.to_string(),
+            },
         };
-
-        Ok(Response::new(proto::ApplyMergeResponse {
-            success: true,
-            records_updated: records_updated as u32,
-            error: String::new(),
-        }))
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "cross-shard merge",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn get_dirty_boundary_keys(
@@ -3153,11 +3617,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ClearDirtyKeysRequest>,
     ) -> Result<Response<proto::ClearDirtyKeysResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
-        let mut unirust = write_unirust!(self);
-        let partitioned_guard = self.partitioned.read();
+        let replication_request = req.clone();
 
         let keys: Vec<crate::sharding::IdentityKeySignature> = req
             .keys
@@ -3173,6 +3637,10 @@ impl proto::shard_service_server::ShardService for ShardNode {
             })
             .collect();
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, clear_dirty_keys, replication_request);
+        let mut unirust = write_unirust!(self);
+        let partitioned_guard = self.partitioned.read();
         let keys_cleared = keys.len() as u32;
         unirust.clear_dirty_boundary_keys(&keys);
 
@@ -3181,18 +3649,25 @@ impl proto::shard_service_server::ShardService for ShardNode {
             partitioned.clear_dirty_boundary_keys(&keys);
         }
 
-        Ok(Response::new(proto::ClearDirtyKeysResponse {
-            keys_cleared,
-        }))
+        let response = proto::ClearDirtyKeysResponse { keys_cleared };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "dirty boundary key clear",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn store_cross_shard_conflicts(
         &self,
         request: Request<proto::StoreCrossShardConflictsRequest>,
     ) -> Result<Response<proto::StoreCrossShardConflictsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
+        let replication_request = req.clone();
         let conflicts: Vec<crate::sharding::CrossShardConflict> = req
             .conflicts
             .into_iter()
@@ -3247,6 +3722,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             })
             .collect::<Result<_, Status>>()?;
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, store_cross_shard_conflicts, replication_request);
         // Store conflicts - keep only those relevant to this shard
         let shard_id = self.shard_id as u16;
         let mut conflict_storage = self.cross_shard_conflicts.write();
@@ -3268,9 +3745,14 @@ impl proto::shard_service_server::ShardService for ShardNode {
             *conflict_storage = updated;
         }
 
-        Ok(Response::new(proto::StoreCrossShardConflictsResponse {
-            stored_count,
-        }))
+        let response = proto::StoreCrossShardConflictsResponse { stored_count };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "cross-shard conflict storage",
+        )?;
+        Ok(Response::new(response))
     }
 }
 
@@ -3568,12 +4050,36 @@ impl RouterNode {
         for (expected_shard_id, client) in shard_clients.iter().enumerate() {
             let mut client = client.clone();
             let response = client
-                .get_config_version(Request::new(proto::ConfigVersionRequest {}))
+                .get_config_version(Request::new(proto::ConfigVersionRequest {
+                    include_durable_state_digest: false,
+                }))
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?
                 .into_inner();
             validate_distributed_protocol(response.protocol_version)?;
             validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
+            match proto::ShardRole::try_from(response.shard_role) {
+                Ok(proto::ShardRole::Standalone | proto::ShardRole::Primary) => {}
+                Ok(proto::ShardRole::Replica) => {
+                    return Err(Status::failed_precondition(format!(
+                        "shard endpoint at index {expected_shard_id} is a passive replica; \
+                         promote it before routing traffic"
+                    )));
+                }
+                _ => {
+                    return Err(Status::data_loss(format!(
+                        "shard endpoint at index {expected_shard_id} reported an invalid role"
+                    )));
+                }
+            }
+            if !response.durable_state_digest.is_empty()
+                && response.durable_state_digest.len() != 32
+            {
+                return Err(Status::data_loss(format!(
+                    "shard endpoint at index {expected_shard_id} reported an invalid durable \
+                     state digest"
+                )));
+            }
             let shard_restore_state = match (
                 response.restore_generation.is_empty(),
                 response.restore_shard_count,
@@ -4913,6 +5419,8 @@ impl proto::router_service_server::RouterService for RouterNode {
                 .as_ref()
                 .map(|_| self.shard_clients.len() as u32)
                 .unwrap_or_default(),
+            shard_role: proto::ShardRole::Unspecified as i32,
+            durable_state_digest: Vec::new(),
         }))
     }
 
@@ -5683,7 +6191,7 @@ mod wal_tests {
         ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 4,
                 records: vec![original.clone()],
             }),
         )
@@ -5695,7 +6203,7 @@ mod wal_tests {
         let error = ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 4,
                 records: vec![conflicting],
             }),
         )

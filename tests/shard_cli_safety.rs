@@ -74,3 +74,77 @@ fn shard_binary_rejects_partial_mtls_configuration() {
         "unexpected stderr: {stderr}"
     );
 }
+
+#[test]
+fn shard_binary_rejects_replica_mode_without_a_token() {
+    let data = tempdir().expect("temporary data directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_unirust_shard"))
+        .env_clear()
+        .args([
+            "--data-dir",
+            data.path().to_str().expect("UTF-8 path"),
+            "--replica-mode",
+        ])
+        .output()
+        .expect("run shard binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("replication_token_file"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn shard_binary_rejects_short_replication_token() {
+    let data = tempdir().expect("temporary data directory");
+    let token_dir = tempdir().expect("temporary token directory");
+    let token = token_dir.path().join("replication.token");
+    std::fs::write(&token, b"too short").expect("write token");
+    let output = Command::new(env!("CARGO_BIN_EXE_unirust_shard"))
+        .env_clear()
+        .args([
+            "--data-dir",
+            data.path().to_str().expect("UTF-8 path"),
+            "--replica-mode",
+            "--allow-insecure-replication",
+            "--replication-token-file",
+            token.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run shard binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("replication token must contain at least 32 bytes"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn shard_binary_requires_mtls_for_replication_by_default() {
+    let data = tempdir().expect("temporary data directory");
+    let token_dir = tempdir().expect("temporary token directory");
+    let token = token_dir.path().join("replication.token");
+    std::fs::write(&token, [b'x'; 32]).expect("write token");
+    let output = Command::new(env!("CARGO_BIN_EXE_unirust_shard"))
+        .env_clear()
+        .args([
+            "--data-dir",
+            data.path().to_str().expect("UTF-8 path"),
+            "--replica-mode",
+            "--replication-token-file",
+            token.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run shard binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("replica mode requires shard server mTLS"),
+        "unexpected stderr: {stderr}"
+    );
+}

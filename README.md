@@ -152,6 +152,16 @@ write_buffer_mb = 256
 | `UNIRUST_SHARD_TLS_CERT` | Shard server certificate |
 | `UNIRUST_SHARD_TLS_KEY` | Shard server private key |
 | `UNIRUST_SHARD_TLS_CLIENT_CA` | CA for required shard client certificates |
+| `UNIRUST_SHARD_REPLICA` | Passive replica endpoint for this primary |
+| `UNIRUST_SHARD_REPLICA_MODE` | Run as a passive replica |
+| `UNIRUST_SHARD_REPLICATION_TOKEN_FILE` | Shared secret file for one replica pair |
+| `UNIRUST_SHARD_ALLOW_INSECURE_REPLICATION` | Permit plaintext replication for isolated development |
+| `UNIRUST_SHARD_REPLICA_CONNECT_TIMEOUT_SECS` | Replica connection timeout |
+| `UNIRUST_SHARD_REPLICA_REQUEST_TIMEOUT_SECS` | Per-RPC replica timeout |
+| `UNIRUST_SHARD_REPLICA_TCP_KEEPALIVE_SECS` | Replica TCP keepalive interval |
+| `UNIRUST_SHARD_REPLICA_TLS_CA` | CA used to verify the replica |
+| `UNIRUST_SHARD_REPLICA_TLS_CERT` | Primary certificate presented to the replica |
+| `UNIRUST_SHARD_REPLICA_TLS_KEY` | Primary client private key |
 | `UNIRUST_ROUTER_SHARDS` | Comma-separated shard addresses |
 | `UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS` | Coordinated checkpoint interval (`0` disables) |
 | `UNIRUST_ROUTER_SHARD_CONNECT_TIMEOUT_SECS` | Shard connection timeout |
@@ -331,6 +341,67 @@ mutation was rolled back; the shard may have committed just before the response
 was lost. Retry ingest with the same immutable source-record identity and
 payload so the operation is resolved idempotently.
 
+### Synchronous Replication
+
+A logical shard can run as one primary and one passive replica on distinct
+persistent volumes and failure domains. Both processes use the same shard ID,
+ontology, config version, and replication token. Bootstrap both volumes from
+the same committed checkpoint, or start with two empty volumes. Primary startup
+computes a SHA-256 digest over every logical RocksDB key/value pair on both
+nodes and refuses traffic unless their complete durable states match. Pairing
+startup is O(database size), so measure it against the production dataset.
+
+Generate a separate secret for each pair, store at least 32 random bytes in a
+file readable only by the service account, and mount the same content on both
+nodes. Start the passive replica first:
+
+```bash
+unirust_shard \
+  --shard-id 0 \
+  --data-dir /var/lib/unirust/shard-0-replica \
+  --backup-dir /var/backups/unirust/shard-0-replica \
+  --replica-mode \
+  --replication-token-file /etc/unirust/replication/shard-0.token \
+  --tls-cert /etc/unirust/tls/shard-0-replica.crt \
+  --tls-key /etc/unirust/tls/shard-0-replica.key \
+  --tls-client-ca /etc/unirust/tls/primaries-ca.crt
+```
+
+Then start the primary with its normal shard server credentials plus:
+
+```bash
+unirust_shard \
+  --shard-id 0 \
+  --data-dir /var/lib/unirust/shard-0-primary \
+  --backup-dir /var/backups/unirust/shard-0-primary \
+  --replica https://shard-0-replica:50061 \
+  --replication-token-file /etc/unirust/replication/shard-0.token \
+  --replica-tls-ca /etc/unirust/tls/replicas-ca.crt \
+  --replica-tls-cert /etc/unirust/tls/shard-0-primary.crt \
+  --replica-tls-key /etc/unirust/tls/shard-0-primary.key
+```
+
+Every durable mutation is applied to the replica first, then locally, under one
+per-pair serialization gate. The primary acknowledges only after both results
+match. An unavailable or ambiguous replica result latches the primary
+unhealthy and blocks reads and writes until operators reconcile the pair.
+Replication therefore protects acknowledged writes from one volume loss, but
+adds replica latency and requires both nodes to be available for writes.
+
+Failover is manual because Unirust does not implement leader election or
+quorum fencing:
+
+1. Prove the old primary is stopped or isolated from clients and the replica.
+2. Stop the passive process and restart its volume without `--replica-mode`.
+3. Point the router at the promoted endpoint and restart the router.
+4. Rebootstrap the old primary from a checkpoint of the promoted node before
+   attaching it as a new passive replica.
+
+Never serve the old primary and promoted replica simultaneously. Doing so can
+create split brain. Online reset is disabled while a primary has a replica;
+stop and rebootstrap both members together. Keep verified off-host backups for
+correlated failures, operator mistakes, and storage corruption.
+
 ### External Backups
 
 Configure each shard with a unique checkpoint root on storage outside its data
@@ -431,10 +502,10 @@ The built-in scheduler creates coordinated source checkpoints; it does not
 automatically run the export command. Schedule export and verification after
 checkpoint completion, monitor both, and run periodic restore drills. The
 destination filesystem must provide independent storage and encryption at rest.
-Unirust does not synchronously replicate live shard writes, so the recovery
-point for a lost volume remains the last successfully exported generation and
-acknowledged writes after it can be lost. Process crashes and ordinary restarts
-remain covered independently by the synced ingest and RocksDB WALs.
+Without an enabled synchronous replica, the recovery point for a lost volume
+remains the last successfully exported generation and acknowledged writes
+after it can be lost. Process crashes and ordinary restarts remain covered
+independently by the synced ingest and RocksDB WALs.
 
 ## Deployment Security
 
@@ -454,6 +525,11 @@ shard, or enforce equivalent authenticated TLS through a service mesh. Keep
 shard ports private and never expose plaintext gRPC to an untrusted network.
 The supplied Compose file is a local plaintext example and binds its router
 port to loopback only.
+
+Replication additionally uses a per-pair shared token. The shard binary rejects
+plaintext replication by default; `--allow-insecure-replication` exists only
+for isolated development. Protect token files as credentials, rotate them by
+stopping and restarting both members, and use different tokens for every pair.
 
 The shard binary requires a persistent `--data-dir`. An in-memory shard can only
 be started with the explicit `--ephemeral` flag and loses all records when the

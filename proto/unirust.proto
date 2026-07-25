@@ -255,7 +255,16 @@ message IngestRecordsFromUrlRequest {
 
 // --- Config Version ---
 
-message ConfigVersionRequest {}
+message ConfigVersionRequest {
+  bool include_durable_state_digest = 1;
+}
+
+enum ShardRole {
+  SHARD_ROLE_UNSPECIFIED = 0;
+  SHARD_ROLE_STANDALONE = 1;
+  SHARD_ROLE_PRIMARY = 2;
+  SHARD_ROLE_REPLICA = 3;
+}
 
 message ConfigVersionResponse {
   string version = 1;
@@ -267,6 +276,9 @@ message ConfigVersionResponse {
   // Empty/zero for a volume that has never been restored from a checkpoint.
   string restore_generation = 7;
   uint32 restore_shard_count = 8;
+  ShardRole shard_role = 9;
+  // SHA-256 over every logical RocksDB column-family key/value pair.
+  bytes durable_state_digest = 10;
 }
 
 // --- Durable Source Identity Reservation ---

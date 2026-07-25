@@ -44,6 +44,16 @@ fn config_env_path(key: &str) -> Option<&'static str> {
         "SHARD_TLS_CERT" => Some("shard.tls_cert"),
         "SHARD_TLS_KEY" => Some("shard.tls_key"),
         "SHARD_TLS_CLIENT_CA" => Some("shard.tls_client_ca"),
+        "SHARD_REPLICA" => Some("shard.replica"),
+        "SHARD_REPLICA_MODE" => Some("shard.replica_mode"),
+        "SHARD_ALLOW_INSECURE_REPLICATION" => Some("shard.allow_insecure_replication"),
+        "SHARD_REPLICATION_TOKEN_FILE" => Some("shard.replication_token_file"),
+        "SHARD_REPLICA_CONNECT_TIMEOUT_SECS" => Some("shard.replica_connect_timeout_secs"),
+        "SHARD_REPLICA_REQUEST_TIMEOUT_SECS" => Some("shard.replica_request_timeout_secs"),
+        "SHARD_REPLICA_TCP_KEEPALIVE_SECS" => Some("shard.replica_tcp_keepalive_secs"),
+        "SHARD_REPLICA_TLS_CA" => Some("shard.replica_tls_ca"),
+        "SHARD_REPLICA_TLS_CERT" => Some("shard.replica_tls_cert"),
+        "SHARD_REPLICA_TLS_KEY" => Some("shard.replica_tls_key"),
         "ROUTER_LISTEN" => Some("router.listen"),
         "ROUTER_SHARDS_FILE" => Some("router.shards_file"),
         "ROUTER_ONTOLOGY" => Some("router.ontology"),
@@ -193,6 +203,68 @@ impl UniConfig {
             ],
         )?;
         validate_mtls_group(
+            "shard-to-replica mTLS",
+            [
+                config.shard.replica_tls_ca.as_ref(),
+                config.shard.replica_tls_cert.as_ref(),
+                config.shard.replica_tls_key.as_ref(),
+            ],
+        )?;
+        if config.shard.replica_mode && config.shard.replica.is_some() {
+            return Err(ConfigError {
+                message: "a passive replica cannot configure another replica".to_string(),
+            });
+        }
+        if (config.shard.replica_mode || config.shard.replica.is_some())
+            && config.shard.data_dir.is_none()
+        {
+            return Err(ConfigError {
+                message: "shard replication requires persistent data_dir storage".to_string(),
+            });
+        }
+        if (config.shard.replica_mode || config.shard.replica.is_some())
+            && config.shard.replication_token_file.is_none()
+        {
+            return Err(ConfigError {
+                message: "shard replication requires replication_token_file".to_string(),
+            });
+        }
+        if config.shard.replica.is_some()
+            && config.shard.replica_tls_ca.is_none()
+            && !config.shard.allow_insecure_replication
+        {
+            return Err(ConfigError {
+                message: "primary-to-replica transport requires mTLS; use \
+                          allow_insecure_replication only for isolated development"
+                    .to_string(),
+            });
+        }
+        if config.shard.replica_mode
+            && config.shard.tls_cert.is_none()
+            && !config.shard.allow_insecure_replication
+        {
+            return Err(ConfigError {
+                message: "replica mode requires shard server mTLS; use \
+                          allow_insecure_replication only for isolated development"
+                    .to_string(),
+            });
+        }
+        if config.shard.replica.is_some()
+            && (config.shard.replica_connect_timeout_secs == 0
+                || config.shard.replica_request_timeout_secs == 0
+                || config.shard.replica_tcp_keepalive_secs == 0)
+        {
+            return Err(ConfigError {
+                message: "shard replica transport timeouts must be greater than zero".to_string(),
+            });
+        }
+        let replica_tls_configured = config.shard.replica_tls_ca.is_some();
+        if config.shard.replica.is_none() && replica_tls_configured {
+            return Err(ConfigError {
+                message: "shard replica TLS credentials require a replica endpoint".to_string(),
+            });
+        }
+        validate_mtls_group(
             "router mTLS",
             [
                 config.router.tls_cert.as_ref(),
@@ -277,6 +349,26 @@ pub struct ShardConfig {
     pub tls_key: Option<PathBuf>,
     /// PEM CA used to require and verify client certificates
     pub tls_client_ca: Option<PathBuf>,
+    /// Passive replica endpoint for synchronous mutation replication
+    pub replica: Option<String>,
+    /// Run as a passive replica that routers must not target
+    pub replica_mode: bool,
+    /// Permit a plaintext transport in isolated development only
+    pub allow_insecure_replication: bool,
+    /// File containing at least 32 bytes shared by one primary/replica pair
+    pub replication_token_file: Option<PathBuf>,
+    /// Maximum time to establish the replica connection
+    pub replica_connect_timeout_secs: u64,
+    /// Maximum time for one replica mutation
+    pub replica_request_timeout_secs: u64,
+    /// TCP keepalive interval for the replica connection
+    pub replica_tcp_keepalive_secs: u64,
+    /// PEM CA used to verify the replica server
+    pub replica_tls_ca: Option<PathBuf>,
+    /// PEM primary client certificate presented to the replica
+    pub replica_tls_cert: Option<PathBuf>,
+    /// PEM primary client private key
+    pub replica_tls_key: Option<PathBuf>,
 }
 
 impl Default for ShardConfig {
@@ -292,6 +384,16 @@ impl Default for ShardConfig {
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            replica: None,
+            replica_mode: false,
+            allow_insecure_replication: false,
+            replication_token_file: None,
+            replica_connect_timeout_secs: DEFAULT_SHARD_CONNECT_TIMEOUT_SECS,
+            replica_request_timeout_secs: DEFAULT_SHARD_REQUEST_TIMEOUT_SECS,
+            replica_tcp_keepalive_secs: DEFAULT_SHARD_TCP_KEEPALIVE_SECS,
+            replica_tls_ca: None,
+            replica_tls_cert: None,
+            replica_tls_key: None,
         }
     }
 }
@@ -437,6 +539,20 @@ pub struct ShardOverrides {
     pub tls_key: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_client_ca: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_insecure_replication: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replication_token_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_tls_ca: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_tls_cert: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_tls_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
