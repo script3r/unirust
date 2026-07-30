@@ -22,7 +22,7 @@ fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 
 /// A signature of identity key values for fast lookup.
 /// This is a 32-byte hash of the identity key's attribute-value pairs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct IdentityKeySignature(pub [u8; 32]);
 
 impl IdentityKeySignature {
@@ -473,6 +473,46 @@ pub struct ReconciliationResult {
     pub detected_conflicts: Vec<CrossShardConflict>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ReconciliationCandidates {
+    merges: Vec<(GlobalClusterId, GlobalClusterId)>,
+    keys_checked: usize,
+    keys_matched: usize,
+    merge_candidates: usize,
+    conflicts_blocked: usize,
+    detected_conflicts: Vec<CrossShardConflict>,
+}
+
+impl ReconciliationCandidates {
+    pub(crate) fn extend(&mut self, mut other: Self) {
+        self.merges.append(&mut other.merges);
+        self.keys_checked = self.keys_checked.saturating_add(other.keys_checked);
+        self.keys_matched = self.keys_matched.saturating_add(other.keys_matched);
+        self.merge_candidates = self.merge_candidates.saturating_add(other.merge_candidates);
+        self.conflicts_blocked = self
+            .conflicts_blocked
+            .saturating_add(other.conflicts_blocked);
+        self.detected_conflicts
+            .append(&mut other.detected_conflicts);
+    }
+
+    pub(crate) fn finish(self) -> ReconciliationResult {
+        let (merges, component_conflicts_blocked) =
+            canonicalize_merges(self.merges, &self.detected_conflicts);
+        ReconciliationResult {
+            merges_performed: merges.len(),
+            merged_clusters: merges,
+            keys_checked: self.keys_checked,
+            keys_matched: self.keys_matched,
+            merge_candidates: self.merge_candidates,
+            conflicts_blocked: self
+                .conflicts_blocked
+                .saturating_add(component_conflicts_blocked),
+            detected_conflicts: self.detected_conflicts,
+        }
+    }
+}
+
 /// Incremental reconciler for cross-shard cluster merges.
 ///
 /// Instead of loading all records from all shards (O(n)),
@@ -645,10 +685,15 @@ impl IncrementalReconciler {
     /// This is more efficient than full reconciliation when only a subset
     /// of keys have changed. Returns the reconciliation result.
     pub fn reconcile_keys(&mut self, keys: &HashSet<IdentityKeySignature>) -> ReconciliationResult {
-        if keys.is_empty() {
-            return ReconciliationResult::default();
-        }
+        let result = self.reconciliation_candidates(keys).finish();
+        self.pending_merges = result.merged_clusters.clone();
+        result
+    }
 
+    pub(crate) fn reconciliation_candidates(
+        &self,
+        keys: &HashSet<IdentityKeySignature>,
+    ) -> ReconciliationCandidates {
         let mut merges = Vec::new();
         let mut merge_candidates = 0;
         let mut conflicts_blocked = 0usize;
@@ -714,14 +759,8 @@ impl IncrementalReconciler {
             }
         }
 
-        let (merges, component_conflicts_blocked) =
-            canonicalize_merges(merges, &detected_conflicts);
-        conflicts_blocked = conflicts_blocked.saturating_add(component_conflicts_blocked);
-        self.pending_merges = merges.clone();
-
-        ReconciliationResult {
-            merges_performed: merges.len(),
-            merged_clusters: merges,
+        ReconciliationCandidates {
+            merges,
             keys_checked: keys.len(),
             keys_matched,
             merge_candidates,
@@ -1655,6 +1694,45 @@ mod tests {
         let (merges, blocked) = canonicalize_merges(vec![(a, b), (b, c)], &[conflict]);
         assert_eq!(merges, vec![(a, b)]);
         assert_eq!(blocked, 1);
+    }
+
+    #[test]
+    fn reconciliation_candidates_preserve_global_component_conflicts_across_batches() {
+        let a = GlobalClusterId::new(0, 10, 0);
+        let b = GlobalClusterId::new(1, 20, 0);
+        let c = GlobalClusterId::new(2, 30, 0);
+        let conflict = CrossShardConflict {
+            identity_key_signature: IdentityKeySignature::from_bytes([9; 32]),
+            cluster1: a,
+            cluster2: c,
+            interval: Interval::new(0, 100).unwrap(),
+            perspective_hash: 1,
+            strong_id_hash1: 2,
+            strong_id_hash2: 3,
+        };
+        let mut combined = ReconciliationCandidates::default();
+        combined.extend(ReconciliationCandidates {
+            merges: vec![(a, b)],
+            keys_checked: 1,
+            keys_matched: 1,
+            merge_candidates: 1,
+            ..ReconciliationCandidates::default()
+        });
+        combined.extend(ReconciliationCandidates {
+            merges: vec![(b, c)],
+            keys_checked: 2,
+            keys_matched: 2,
+            merge_candidates: 3,
+            conflicts_blocked: 1,
+            detected_conflicts: vec![conflict],
+        });
+
+        let result = combined.finish();
+        assert_eq!(result.merged_clusters, vec![(a, b)]);
+        assert_eq!(result.keys_checked, 3);
+        assert_eq!(result.keys_matched, 3);
+        assert_eq!(result.merge_candidates, 4);
+        assert_eq!(result.conflicts_blocked, 2);
     }
 
     #[test]

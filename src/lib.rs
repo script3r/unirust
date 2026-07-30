@@ -32,6 +32,7 @@
 //! - `checkpoint()` - Persist state to disk
 //! - `stats()` - Get metrics and statistics
 
+pub mod backup;
 pub mod coalescer;
 pub mod config;
 pub mod conflicts;
@@ -77,9 +78,14 @@ pub use graph::KnowledgeGraph;
 pub use query::{QueryDescriptor, QueryMatch, QueryOutcome};
 
 // Storage (for custom backends)
+pub use backup::{
+    export_cluster_backup, prune_verified_cluster_backups, verify_cluster_backup,
+    ClusterBackupManifest,
+};
 pub use persistence::{
     read_cluster_checkpoint_manifest, restore_checkpoint, restore_checkpoint_for_shard,
-    ClusterCheckpointManifest, PersistentStore, CHECKPOINT_PROTOCOL_VERSION,
+    verify_cluster_checkpoint, ClusterCheckpointManifest, PersistentStore,
+    CHECKPOINT_PROTOCOL_VERSION,
 };
 pub use store::{RecordStore, Store};
 
@@ -310,6 +316,12 @@ impl Unirust {
 
         if let Some(db) = db.as_ref() {
             let persistence = LinkerStatePersistence::new(db);
+            if persistence.prepare_stable_global_cluster_ids()? {
+                tracing::warn!(
+                    "removed legacy allocation-order cross-shard redirects; \
+                     router reconciliation will rebuild them from durable records"
+                );
+            }
             linker.restore_cross_shard_merges(&persistence)?;
         }
         Ok(linker)
@@ -1211,12 +1223,36 @@ impl Unirust {
         self.streaming.as_ref().map(|s| s.export_boundary_index())
     }
 
+    /// Export boundary metadata only for the requested signatures.
+    #[doc(hidden)]
+    pub fn export_boundary_index_for_signatures(
+        &self,
+        signatures: &std::collections::HashSet<sharding::IdentityKeySignature>,
+    ) -> Option<sharding::ClusterBoundaryIndex> {
+        self.streaming
+            .as_ref()
+            .map(|streaming| streaming.export_boundary_index_for_signatures(signatures))
+    }
+
     /// Get dirty boundary keys from the streaming linker.
     /// Returns keys that have been modified since last reconciliation.
     pub fn get_dirty_boundary_keys(
         &self,
-    ) -> Option<std::collections::HashSet<sharding::IdentityKeySignature>> {
+    ) -> Option<std::collections::BTreeSet<sharding::IdentityKeySignature>> {
         self.streaming.as_ref().map(|s| s.get_dirty_boundary_keys())
+    }
+
+    /// Return bounded ordered dirty-key candidates without cloning the full set.
+    #[doc(hidden)]
+    pub fn dirty_boundary_key_candidates(
+        &self,
+        after: Option<sharding::IdentityKeySignature>,
+        limit: usize,
+    ) -> Vec<sharding::IdentityKeySignature> {
+        self.streaming
+            .as_ref()
+            .map(|streaming| streaming.dirty_boundary_key_candidates(after, limit))
+            .unwrap_or_default()
     }
 
     /// Get dirty boundary key count.
@@ -1261,40 +1297,69 @@ impl Unirust {
         primary: GlobalClusterId,
         secondary: GlobalClusterId,
     ) -> anyhow::Result<usize> {
+        self.apply_cross_shard_merges(&[(primary, secondary)])
+    }
+
+    /// Apply a batch of canonical cross-shard redirects durably.
+    #[doc(hidden)]
+    pub fn apply_cross_shard_merges(
+        &mut self,
+        merges: &[(GlobalClusterId, GlobalClusterId)],
+    ) -> anyhow::Result<usize> {
         // Initialize streaming linker if not already done
         if self.streaming.is_none() {
             self.streaming = Some(self.create_streaming_linker()?);
         }
 
-        let (primary, secondary) = {
+        let normalized = {
             let streaming = self.streaming.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
             })?;
-            (
-                streaming.resolve_global_cluster_id(primary),
-                streaming.resolve_global_cluster_id(secondary),
-            )
+            let mut by_secondary = std::collections::HashMap::with_capacity(merges.len());
+            for (primary, secondary) in merges {
+                let primary = streaming.resolve_global_cluster_id(*primary);
+                let secondary = streaming.resolve_global_cluster_id(*secondary);
+                if primary == secondary {
+                    continue;
+                }
+                if primary.to_u64() >= secondary.to_u64() {
+                    anyhow::bail!(
+                        "cross-shard merge must redirect cluster {} to lower canonical cluster {}",
+                        secondary.to_u64(),
+                        primary.to_u64()
+                    );
+                }
+                if let Some(existing) = by_secondary.insert(secondary, primary) {
+                    if existing != primary {
+                        anyhow::bail!(
+                            "cross-shard merge batch redirects cluster {} to multiple primaries",
+                            secondary.to_u64()
+                        );
+                    }
+                }
+            }
+            by_secondary
+                .into_iter()
+                .map(|(secondary, primary)| (primary, secondary))
+                .collect::<Vec<_>>()
         };
-        if primary == secondary {
+        if normalized.is_empty() {
             return Ok(0);
-        }
-        if primary.to_u64() >= secondary.to_u64() {
-            anyhow::bail!(
-                "cross-shard merge must redirect cluster {} to lower canonical cluster {}",
-                secondary.to_u64(),
-                primary.to_u64()
-            );
         }
 
         if let Some(db) = self.store.shared_db() {
             let persistence = LinkerStatePersistence::new(&db);
-            persistence.save_cross_shard_merge(secondary, primary)?;
+            let durable_merges = normalized
+                .iter()
+                .map(|(primary, secondary)| (*secondary, *primary))
+                .collect::<Vec<_>>();
+            persistence.save_cross_shard_merges(&durable_merges)?;
             self.store.sync()?;
         }
         let streaming = self.streaming.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
         })?;
-        Ok(streaming.apply_cross_shard_merge(primary, secondary))
+        Ok(streaming.apply_cross_shard_merges(&normalized))
     }
 
     /// Resolve a global cluster ID through durable cross-shard redirects.

@@ -38,7 +38,7 @@ impl fmt::Display for ClusterId {
 /// - Tracking which shard owns a cluster
 /// - Detecting stale references after cross-shard merges
 /// - Efficient comparison and hashing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GlobalClusterId {
     /// The shard that owns this cluster
     pub shard_id: u16,

@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use unirust_rs::advanced::{ClusterId, GlobalClusterId, LinkerStateConfig};
 use unirust_rs::model::{Descriptor, Record, RecordIdentity};
 use unirust_rs::ontology::{IdentityKey, StrongIdentifier};
-use unirust_rs::persistence::linker_encoding;
+use unirust_rs::persistence::{linker_encoding, LinkerStatePersistence};
 use unirust_rs::temporal::Interval;
 use unirust_rs::test_support::{default_ontology, generate_dataset};
 use unirust_rs::{Ontology, PersistentStore, RecordId, StreamingTuning, Unirust};
@@ -343,6 +343,81 @@ fn cross_shard_merge_chain_is_persisted_as_direct_canonical_redirects() -> anyho
         assert_eq!(unirust.resolve_global_cluster_id(secondary), Some(primary));
     }
 
+    Ok(())
+}
+
+#[test]
+fn global_cluster_ids_are_stable_across_ingest_order() -> anyhow::Result<()> {
+    fn ingest_in_order(path: &std::path::Path, ids: &[u32]) -> anyhow::Result<GlobalClusterId> {
+        let store = PersistentStore::open(path)?;
+        let mut ontology = Ontology::new();
+        ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+        let mut tuning = StreamingTuning::balanced();
+        tuning.shard_id = 3;
+        let mut unirust = Unirust::with_store_and_tuning(ontology, store, tuning);
+        let email_attr = unirust.intern_attr("email");
+        let email_value = unirust.intern_value("shared@example.com");
+        let records = ids
+            .iter()
+            .map(|id| {
+                Record::new(
+                    RecordId(*id),
+                    RecordIdentity::new("person".to_string(), "crm".to_string(), id.to_string()),
+                    vec![Descriptor::new(
+                        email_attr,
+                        email_value,
+                        Interval::new(0, 10).expect("valid interval"),
+                    )],
+                )
+            })
+            .collect();
+        unirust.ingest_with_explicit_ids(records)?;
+        unirust.global_cluster_id_for_record(RecordId(ids[0]))
+    }
+
+    let first = tempdir()?;
+    let second = tempdir()?;
+    let forward = ingest_in_order(first.path(), &[10, 20])?;
+    let reverse = ingest_in_order(second.path(), &[20, 10])?;
+
+    assert_eq!(forward, GlobalClusterId::new(3, 10, 0));
+    assert_eq!(reverse, forward);
+
+    let store = PersistentStore::open(first.path())?;
+    let mut ontology = Ontology::new();
+    ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+    let mut tuning = StreamingTuning::balanced();
+    tuning.shard_id = 3;
+    let mut restarted = Unirust::with_store_and_tuning(ontology, store, tuning);
+    restarted.initialize_streaming()?;
+    assert_eq!(
+        restarted.global_cluster_id_for_record(RecordId(20))?,
+        forward
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_allocation_order_redirects_are_removed_before_recovery() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let legacy_primary = GlobalClusterId::new(0, 10, 0);
+    let legacy_secondary = GlobalClusterId::new(1, 20, 0);
+    {
+        let store = PersistentStore::open(dir.path())?;
+        LinkerStatePersistence::new(store.db())
+            .save_cross_shard_merge(legacy_secondary, legacy_primary)?;
+    }
+
+    let store = PersistentStore::open(dir.path())?;
+    let mut unirust = Unirust::with_store(default_ontology_for_empty_store(), store);
+    unirust.initialize_streaming()?;
+    assert_eq!(unirust.cross_shard_merge_count(), 0);
+
+    drop(unirust);
+    let store = PersistentStore::open(dir.path())?;
+    assert!(LinkerStatePersistence::new(store.db())
+        .load_cross_shard_merges()?
+        .is_empty());
     Ok(())
 }
 

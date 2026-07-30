@@ -101,7 +101,7 @@ services:
     volumes:
       - ./examples/loadtest-ontology.json:/etc/unirust/ontology.json:ro
     ports:
-      - "50060:50060"
+      - "127.0.0.1:50060:50060"
     depends_on:
       shard-0:
         condition: service_healthy

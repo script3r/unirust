@@ -529,8 +529,16 @@ impl Partition {
     /// Get the dirty boundary keys for adaptive reconciliation
     pub fn get_dirty_boundary_keys(
         &self,
-    ) -> std::collections::HashSet<crate::sharding::IdentityKeySignature> {
+    ) -> std::collections::BTreeSet<crate::sharding::IdentityKeySignature> {
         self.linker.get_dirty_boundary_keys()
+    }
+
+    pub fn dirty_boundary_key_candidates(
+        &self,
+        after: Option<crate::sharding::IdentityKeySignature>,
+        limit: usize,
+    ) -> Vec<crate::sharding::IdentityKeySignature> {
+        self.linker.dirty_boundary_key_candidates(after, limit)
     }
 
     /// Clear specific dirty boundary keys after reconciliation
@@ -1120,12 +1128,24 @@ impl ParallelPartitionedUnirust {
     /// Get all dirty boundary keys across all partitions
     pub fn get_all_dirty_boundary_keys(
         &self,
-    ) -> std::collections::HashSet<crate::sharding::IdentityKeySignature> {
-        let mut all_keys = std::collections::HashSet::new();
+    ) -> std::collections::BTreeSet<crate::sharding::IdentityKeySignature> {
+        let mut all_keys = std::collections::BTreeSet::new();
         for partition in &self.partitions {
             all_keys.extend(partition.lock().get_dirty_boundary_keys());
         }
         all_keys
+    }
+
+    pub fn dirty_boundary_key_candidates(
+        &self,
+        after: Option<crate::sharding::IdentityKeySignature>,
+        limit: usize,
+    ) -> Vec<crate::sharding::IdentityKeySignature> {
+        let mut candidates = std::collections::BTreeSet::new();
+        for partition in &self.partitions {
+            candidates.extend(partition.lock().dirty_boundary_key_candidates(after, limit));
+        }
+        candidates.into_iter().take(limit).collect()
     }
 
     /// Clear dirty boundary keys on all partitions

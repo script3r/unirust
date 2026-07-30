@@ -220,7 +220,7 @@ async fn cross_shard_conflict_detected_via_reconcile() -> anyhow::Result<()> {
 
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -251,7 +251,7 @@ async fn cross_shard_conflict_detected_via_reconcile() -> anyhow::Result<()> {
 
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -348,7 +348,7 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard0_rec1],
         })
         .await?;
@@ -368,7 +368,7 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard1_rec1],
         })
         .await?;
@@ -483,7 +483,7 @@ async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
 
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -514,7 +514,7 @@ async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
 
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -586,7 +586,7 @@ async fn cross_shard_merge_respects_strong_id_validity_intervals() -> anyhow::Re
 
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 0,
                 "instrument",
@@ -602,7 +602,7 @@ async fn cross_shard_merge_respects_strong_id_validity_intervals() -> anyhow::Re
         .await?;
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 1,
                 "instrument",
@@ -689,7 +689,7 @@ async fn cross_shard_reconciliation_preserves_identity_key_gaps() -> anyhow::Res
     // is valid only before and after the middle gap.
     let shard0_ingest = shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![
                 record_input(
                     0,
@@ -715,7 +715,7 @@ async fn cross_shard_reconciliation_preserves_identity_key_gaps() -> anyhow::Res
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 2,
                 "person",
@@ -797,14 +797,31 @@ async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<(
 
     router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record1, record2],
         })
         .await?;
 
-    // Get boundary metadata from shard
+    let dirty_keys = shard_client
+        .get_dirty_boundary_keys(proto::GetDirtyBoundaryKeysRequest {
+            after_signature: Vec::new(),
+            limit: 100,
+        })
+        .await?
+        .into_inner()
+        .dirty_keys;
+    let signatures = dirty_keys
+        .into_iter()
+        .filter_map(|dirty_key| dirty_key.signature)
+        .collect::<Vec<_>>();
+    assert!(!signatures.is_empty(), "expected dirty boundary keys");
+
+    // Boundary metadata is fetched only for the requested dirty signatures.
     let metadata_response = shard_client
-        .get_boundary_metadata(proto::GetBoundaryMetadataRequest { since_version: 0 })
+        .get_boundary_metadata(proto::GetBoundaryMetadataRequest {
+            since_version: 0,
+            signatures,
+        })
         .await?
         .into_inner();
 
@@ -832,7 +849,7 @@ async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<(
     Ok(())
 }
 
-/// Test dirty boundary keys also include exact temporal strong-ID observations.
+/// Test dirty boundary keys require a bounded metadata lookup for strong-ID observations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<()> {
     let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
@@ -882,22 +899,47 @@ async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<
 
     router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record1, record2],
         })
         .await?;
 
     // Get dirty boundary keys from shard
     let dirty_keys_response = shard_client
-        .get_dirty_boundary_keys(proto::GetDirtyBoundaryKeysRequest {})
+        .get_dirty_boundary_keys(proto::GetDirtyBoundaryKeysRequest {
+            after_signature: Vec::new(),
+            limit: 100,
+        })
         .await?
         .into_inner();
-
-    let exact_strong_ids = dirty_keys_response
+    assert!(
+        dirty_keys_response
+            .dirty_keys
+            .iter()
+            .all(|dirty_key| dirty_key.entries.is_empty()),
+        "dirty-key pages must not duplicate boundary metadata"
+    );
+    let signatures = dirty_keys_response
         .dirty_keys
         .iter()
-        .flat_map(|dirty_key| &dirty_key.entries)
-        .flat_map(|entry| &entry.strong_ids)
+        .filter_map(|dirty_key| dirty_key.signature.clone())
+        .collect::<Vec<_>>();
+    assert!(!signatures.is_empty(), "expected dirty boundary keys");
+
+    let metadata = shard_client
+        .get_boundary_metadata(proto::GetBoundaryMetadataRequest {
+            since_version: 0,
+            signatures,
+        })
+        .await?
+        .into_inner()
+        .metadata
+        .expect("metadata should exist");
+    let exact_strong_ids = metadata
+        .entries
+        .iter()
+        .flat_map(|key_entries| &key_entries.entries)
+        .flat_map(|entry| entry.strong_ids.iter())
         .collect::<Vec<_>>();
 
     assert!(
@@ -908,9 +950,87 @@ async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<
                 && strong_id.interval_start == 0
                 && strong_id.interval_end == 100
         }),
-        "expected exact temporal strong-ID dirty-key metadata; dirty keys: {:?}",
-        dirty_keys_response.dirty_keys
+        "expected exact temporal strong-ID boundary metadata; entries: {:?}",
+        metadata.entries
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dirty_boundary_keys_are_drained_in_bounded_pages() -> anyhow::Result<()> {
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let config = build_instrument_config();
+    let empty_config = DistributedOntologyConfig::empty();
+
+    let (shard0_addr, _shard0_handle) = spawn_shard(0, empty_config.clone()).await?;
+    let (router_addr, _router_handle) =
+        spawn_router(vec![shard0_addr], empty_config.clone()).await?;
+    let mut router_client = RouterServiceClient::connect(format!("http://{}", router_addr)).await?;
+    let mut shard_client = ShardServiceClient::connect(format!("http://{}", shard0_addr)).await?;
+
+    router_client
+        .set_ontology(ApplyOntologyRequest {
+            config: Some(to_proto_config(&config)),
+        })
+        .await?;
+
+    for index in 0..5 {
+        let isin = format!("PAGE{index:03}");
+        let uid1 = format!("page_{index}_a");
+        let uid2 = format!("page_{index}_b");
+        router_client
+            .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: 5,
+                records: vec![
+                    record_input(
+                        index * 2,
+                        "instrument",
+                        "page-test",
+                        &uid1,
+                        vec![("isin", &isin, 0, 100), ("country", "US", 0, 100)],
+                    ),
+                    record_input(
+                        index * 2 + 1,
+                        "instrument",
+                        "page-test",
+                        &uid2,
+                        vec![("isin", &isin, 0, 100), ("country", "US", 0, 100)],
+                    ),
+                ],
+            })
+            .await?;
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut after_signature = Vec::new();
+    loop {
+        let page = shard_client
+            .get_dirty_boundary_keys(proto::GetDirtyBoundaryKeysRequest {
+                after_signature: after_signature.clone(),
+                limit: 2,
+            })
+            .await?
+            .into_inner();
+        assert!(page.dirty_keys.len() <= 2);
+        if page.dirty_keys.is_empty() {
+            assert!(!page.has_more);
+            break;
+        }
+        for key in page.dirty_keys.into_iter().map(|dirty_key| {
+            assert!(dirty_key.entries.is_empty());
+            dirty_key.signature.expect("signature should exist")
+        }) {
+            assert!(seen.insert(key.signature), "duplicate dirty key");
+        }
+        if !page.has_more {
+            break;
+        }
+        assert_eq!(page.next_after_signature.len(), 32);
+        assert!(page.next_after_signature > after_signature);
+        after_signature = page.next_after_signature;
+    }
+    assert_eq!(seen.len(), 5);
 
     Ok(())
 }
@@ -1014,7 +1134,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![a1, a2],
         })
         .await?;
@@ -1046,7 +1166,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![b1, b2],
         })
         .await?;
@@ -1076,7 +1196,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
     );
     shard2_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![c1, c2],
         })
         .await?;
@@ -1201,7 +1321,7 @@ async fn peic_many_entities_claim_same_identifier_across_shards() -> anyhow::Res
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![a1, a2],
         })
         .await?;
@@ -1232,7 +1352,7 @@ async fn peic_many_entities_claim_same_identifier_across_shards() -> anyhow::Res
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![b1, b2],
         })
         .await?;
@@ -1329,7 +1449,7 @@ async fn temporal_overlap_conflict_across_shards() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![a1, a2],
         })
         .await?;
@@ -1359,7 +1479,7 @@ async fn temporal_overlap_conflict_across_shards() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![b1, b2],
         })
         .await?;
@@ -1453,7 +1573,7 @@ async fn late_arriving_data_triggers_conflict() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![initial1, initial2],
         })
         .await?;
@@ -1498,7 +1618,7 @@ async fn late_arriving_data_triggers_conflict() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![late1, late2],
         })
         .await?;
@@ -1622,7 +1742,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard0
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![a1, a2],
         })
         .await?;
@@ -1652,7 +1772,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard1
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![b1, b2],
         })
         .await?;
@@ -1682,7 +1802,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard2
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![c1, c2],
         })
         .await?;
@@ -1707,7 +1827,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard3
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![d1, d2],
         })
         .await?;
@@ -1810,7 +1930,7 @@ async fn different_perspectives_no_false_positive_conflict() -> anyhow::Result<(
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![msci1, msci2],
         })
         .await?;
@@ -1840,7 +1960,7 @@ async fn different_perspectives_no_false_positive_conflict() -> anyhow::Result<(
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![axioma1, axioma2],
         })
         .await?;

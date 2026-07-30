@@ -10,6 +10,7 @@ use rocksdb::{
     Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -296,6 +297,15 @@ pub fn read_cluster_checkpoint_manifest(checkpoint: &Path) -> Result<ClusterChec
     Ok(manifest)
 }
 
+/// Validate a committed cluster checkpoint and open its RocksDB contents
+/// read-only with paranoid checks.
+pub fn verify_cluster_checkpoint(checkpoint: &Path) -> Result<ClusterCheckpointManifest> {
+    let manifest = read_cluster_checkpoint_manifest(checkpoint)?;
+    let checkpoint = checkpoint.canonicalize()?;
+    validate_rocksdb_checkpoint(&checkpoint)?;
+    Ok(manifest)
+}
+
 /// Return the committed checkpoint provenance copied into a restored RocksDB
 /// data directory. A lone or corrupt marker is a recovery integrity failure,
 /// not an unrestored directory.
@@ -335,7 +345,7 @@ pub fn restore_checkpoint_for_shard(
     destination: &Path,
     expected_shard_id: Option<u32>,
 ) -> Result<()> {
-    let manifest = read_cluster_checkpoint_manifest(source)?;
+    let manifest = verify_cluster_checkpoint(source)?;
     if let Some(expected_shard_id) =
         expected_shard_id.filter(|expected| *expected != manifest.shard_id)
     {
@@ -347,7 +357,6 @@ pub fn restore_checkpoint_for_shard(
     }
 
     let source = source.canonicalize()?;
-    validate_rocksdb_checkpoint(&source)?;
 
     if destination.exists() {
         let metadata = fs::symlink_metadata(destination)?;
@@ -408,6 +417,29 @@ const CF_INDEX_KEY_STATS: &str = "index_key_stats"; // Access statistics
 const CF_LINKER_CLUSTER_IDS: &str = "linker_cluster_ids";
 const CF_LINKER_GLOBAL_IDS: &str = "linker_global_ids";
 const CF_LINKER_METADATA: &str = "linker_metadata";
+
+const DURABLE_STATE_COLUMN_FAMILIES: &[&str] = &[
+    CF_RECORDS,
+    CF_METADATA,
+    CF_INTERNER,
+    CF_INDEX_ATTR_VALUE,
+    CF_INDEX_ENTITY_TYPE,
+    CF_INDEX_PERSPECTIVE,
+    CF_INDEX_TEMPORAL_BUCKET,
+    CF_INDEX_IDENTITY,
+    CF_CONFLICT_SUMMARIES,
+    CF_CLUSTER_ASSIGNMENTS,
+    CF_SOURCE_RESERVATIONS,
+    CF_DSU_PARENT,
+    CF_DSU_RANK,
+    CF_DSU_GUARDS,
+    CF_DSU_METADATA,
+    CF_INDEX_IDENTITY_KEYS,
+    CF_INDEX_KEY_STATS,
+    CF_LINKER_CLUSTER_IDS,
+    CF_LINKER_GLOBAL_IDS,
+    CF_LINKER_METADATA,
+];
 
 const RESET_DATA_CFS: &[&str] = &[
     CF_RECORDS,
@@ -1421,6 +1453,24 @@ impl RecordStore for PersistentStore {
         }
     }
 
+    fn try_for_each_record_ordered(&self, f: &mut dyn FnMut(Record) -> Result<()>) -> Result<()> {
+        self.ensure_healthy()?;
+        let records_cf = self
+            .db
+            .cf_handle(CF_RECORDS)
+            .ok_or_else(|| anyhow!("missing records column family"))?;
+        for entry in self.db.iterator_cf(records_cf, IteratorMode::Start) {
+            let (_key, value) = entry.inspect_err(|_| {
+                self.mark_read_fault();
+            })?;
+            let record = bincode::deserialize(&value).inspect_err(|_| {
+                self.mark_read_fault();
+            })?;
+            f(record)?;
+        }
+        self.ensure_healthy()
+    }
+
     fn get_records_by_entity_type(&self, entity_type: &str) -> Vec<Record> {
         let cf = match self.db.cf_handle(CF_INDEX_ENTITY_TYPE) {
             Some(cf) => cf,
@@ -2295,6 +2345,29 @@ fn open_db(path: impl AsRef<Path>) -> Result<DB> {
     Ok(DB::open_cf_descriptors(&base, path, cfs)?)
 }
 
+pub(crate) fn durable_state_digest(db: &DB) -> Result<[u8; 32]> {
+    fn update_field(digest: &mut Sha256, bytes: &[u8]) {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+
+    db.flush_wal(true)?;
+    let mut digest = Sha256::new();
+    digest.update(b"unirust-durable-state-v1");
+    for &name in DURABLE_STATE_COLUMN_FAMILIES {
+        update_field(&mut digest, name.as_bytes());
+        let cf = db
+            .cf_handle(name)
+            .ok_or_else(|| anyhow!("missing column family {name}"))?;
+        for entry in db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, value) = entry?;
+            update_field(&mut digest, &key);
+            update_field(&mut digest, &value);
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
 fn encode_attr_value_index(attr: u32, value: u32, start: i64, end: i64, record_id: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + 4 + 8 + 8 + 4);
     key.extend_from_slice(&attr.to_be_bytes());
@@ -3076,6 +3149,8 @@ pub mod linker_encoding {
 
     /// Prefix for durable cross-shard merge mappings.
     pub const CROSS_SHARD_MERGE_PREFIX: &[u8] = b"cross_shard_merge/";
+    pub const KEY_GLOBAL_CLUSTER_ID_SCHEME: &[u8] = b"global_cluster_id_scheme";
+    pub const STABLE_RECORD_ANCHOR_SCHEME: u8 = 1;
 
     pub fn encode_cross_shard_merge_key(secondary: GlobalClusterId) -> Vec<u8> {
         let mut key = Vec::with_capacity(CROSS_SHARD_MERGE_PREFIX.len() + 8);
@@ -3102,6 +3177,58 @@ impl<'a> LinkerStatePersistence<'a> {
     /// Create a new linker state persistence helper.
     pub fn new(db: &'a DB) -> Self {
         Self { db }
+    }
+
+    /// Prepare replay-stable global IDs, removing redirects from the old
+    /// allocation-order scheme if this database predates the scheme marker.
+    pub fn prepare_stable_global_cluster_ids(&self) -> Result<bool> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        match self
+            .db
+            .get_cf(&cf, linker_encoding::KEY_GLOBAL_CLUSTER_ID_SCHEME)?
+            .as_deref()
+        {
+            Some([linker_encoding::STABLE_RECORD_ANCHOR_SCHEME]) => return Ok(false),
+            Some(value) => {
+                anyhow::bail!("unsupported global cluster ID scheme marker: {:?}", value);
+            }
+            None => {}
+        }
+
+        let had_legacy_redirects = self
+            .db
+            .iterator_cf(
+                &cf,
+                IteratorMode::From(
+                    linker_encoding::CROSS_SHARD_MERGE_PREFIX,
+                    Direction::Forward,
+                ),
+            )
+            .next()
+            .transpose()?
+            .is_some_and(|(key, _)| key.starts_with(linker_encoding::CROSS_SHARD_MERGE_PREFIX));
+
+        let mut prefix_end = linker_encoding::CROSS_SHARD_MERGE_PREFIX.to_vec();
+        let last = prefix_end
+            .last_mut()
+            .ok_or_else(|| anyhow!("cross-shard merge prefix must not be empty"))?;
+        *last = last
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("cross-shard merge prefix has no upper bound"))?;
+
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(&cf, linker_encoding::CROSS_SHARD_MERGE_PREFIX, &prefix_end);
+        batch.put_cf(
+            &cf,
+            linker_encoding::KEY_GLOBAL_CLUSTER_ID_SCHEME,
+            [linker_encoding::STABLE_RECORD_ANCHOR_SCHEME],
+        );
+        self.db.write(batch)?;
+        self.db.flush_wal(true)?;
+        Ok(had_legacy_redirects)
     }
 
     /// Flush cluster ID mappings to the database.
@@ -3166,15 +3293,27 @@ impl<'a> LinkerStatePersistence<'a> {
         secondary: GlobalClusterId,
         primary: GlobalClusterId,
     ) -> Result<()> {
+        self.save_cross_shard_merges(&[(secondary, primary)])
+    }
+
+    /// Persist cross-shard redirects in one RocksDB write batch.
+    pub fn save_cross_shard_merges(
+        &self,
+        merges: &[(GlobalClusterId, GlobalClusterId)],
+    ) -> Result<()> {
         let cf = self
             .db
             .cf_handle(linker_cf::METADATA)
             .ok_or_else(|| anyhow::anyhow!("Column family {} not found", linker_cf::METADATA))?;
-        self.db.put_cf(
-            &cf,
-            linker_encoding::encode_cross_shard_merge_key(secondary),
-            linker_encoding::encode_global_cluster_id(primary),
-        )?;
+        let mut batch = WriteBatch::default();
+        for (secondary, primary) in merges {
+            batch.put_cf(
+                &cf,
+                linker_encoding::encode_cross_shard_merge_key(*secondary),
+                linker_encoding::encode_global_cluster_id(*primary),
+            );
+        }
+        self.db.write(batch)?;
         Ok(())
     }
 

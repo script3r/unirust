@@ -134,6 +134,37 @@ async fn spawn_set_ontology_failing_shard(
     Ok((addr, handle))
 }
 
+async fn spawn_set_ontology_stalling_shard(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+) -> anyhow::Result<(SocketAddr, JoinHandle<()>, support::StallControls)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let data_dir = tempdir()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_dir.path().to_path_buf()),
+        false,
+        None,
+    )?;
+    let (service, controls) = support::stall_response(
+        proto::shard_service_server::ShardServiceServer::new(shard),
+        "/unirust.ShardService/SetOntology",
+        true,
+    );
+    let handle = tokio::spawn(async move {
+        let _data_dir = data_dir;
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, handle, controls))
+}
+
 async fn spawn_stoppable_shard(
     shard_id: u32,
     config: DistributedOntologyConfig,
@@ -277,7 +308,7 @@ async fn shard_recovery_after_restart() -> anyhow::Result<()> {
         .collect();
     client
         .ingest_records(proto::IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records,
         })
         .await?;
@@ -342,7 +373,7 @@ async fn router_handles_partial_shard_availability() -> anyhow::Result<()> {
     );
     let response = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record],
         })
         .await?
@@ -523,7 +554,7 @@ async fn destructive_reset_is_disabled_and_preserves_records_by_default() -> any
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 0,
                 "person",
@@ -603,7 +634,7 @@ async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<(
 
     let ingest_error = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 0,
                 "person",
@@ -617,6 +648,100 @@ async fn incomplete_ontology_update_blocks_cluster_traffic() -> anyhow::Result<(
     assert_eq!(ingest_error.code(), tonic::Code::FailedPrecondition);
     assert!(ingest_error.message().contains("cluster is blocked"));
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_ontology_update_blocks_traffic_until_retried() -> anyhow::Result<()> {
+    use proto::router_service_server::RouterService;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let empty = DistributedOntologyConfig::empty();
+    let intended = support::build_iam_config();
+    let (shard0_addr, shard0_handle, controls) =
+        spawn_set_ontology_stalling_shard(0, empty.clone()).await?;
+    let (shard1_addr, shard1_handle) = spawn_shard(1, empty.clone()).await?;
+    let router = RouterNode::connect(
+        vec![
+            format!("http://{shard0_addr}"),
+            format!("http://{shard1_addr}"),
+        ],
+        empty.clone(),
+    )
+    .await?;
+
+    let update_router = router.clone();
+    let update_task = tokio::spawn({
+        let intended = intended.clone();
+        async move {
+            RouterService::set_ontology(
+                update_router.as_ref(),
+                tonic::Request::new(ApplyOntologyRequest {
+                    config: Some(support::to_proto_config(&intended)),
+                }),
+            )
+            .await
+        }
+    });
+    controls
+        .wait_until_committed(Duration::from_secs(10))
+        .await?;
+    update_task.abort();
+    assert!(update_task
+        .await
+        .expect_err("ontology update task must be cancelled")
+        .is_cancelled());
+    controls.release();
+
+    let health_error = RouterService::health_check(
+        router.as_ref(),
+        tonic::Request::new(proto::HealthCheckRequest {}),
+    )
+    .await
+    .expect_err("router must fail closed after a cancelled partial ontology update");
+    assert_eq!(health_error.code(), tonic::Code::FailedPrecondition);
+
+    let mut shard0 = ShardServiceClient::connect(format!("http://{shard0_addr}")).await?;
+    let mut shard1 = ShardServiceClient::connect(format!("http://{shard1_addr}")).await?;
+    let shard0_config = shard0
+        .get_config_version(proto::ConfigVersionRequest {
+            include_durable_state_digest: false,
+        })
+        .await?
+        .into_inner()
+        .ontology_config
+        .expect("shard 0 ontology");
+    let shard1_config = shard1
+        .get_config_version(proto::ConfigVersionRequest {
+            include_durable_state_digest: false,
+        })
+        .await?
+        .into_inner()
+        .ontology_config
+        .expect("shard 1 ontology");
+    assert_eq!(shard0_config, support::to_proto_config(&intended));
+    assert_eq!(shard1_config, support::to_proto_config(&empty));
+
+    RouterService::set_ontology(
+        router.as_ref(),
+        tonic::Request::new(ApplyOntologyRequest {
+            config: Some(support::to_proto_config(&intended)),
+        }),
+    )
+    .await?;
+    RouterService::health_check(
+        router.as_ref(),
+        tonic::Request::new(proto::HealthCheckRequest {}),
+    )
+    .await?;
+
+    drop(shard0);
+    drop(shard1);
+    drop(router);
+    shard0_handle.abort();
+    shard1_handle.abort();
+    let _ = shard0_handle.await;
+    let _ = shard1_handle.await;
     Ok(())
 }
 
@@ -657,7 +782,7 @@ async fn ingest_operations_complete_before_shutdown() -> anyhow::Result<()> {
 
         let response = client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 5,
                 records,
             })
             .await?
@@ -708,7 +833,7 @@ async fn cluster_stats_reflect_all_shards() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records,
         })
         .await?;

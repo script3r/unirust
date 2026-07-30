@@ -26,7 +26,7 @@ use rayon::prelude::*;
 use rocksdb::DB;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -103,6 +103,23 @@ impl BoundaryData {
             .extend(other.perspective_strong_ids.clone());
         self.strong_ids.extend(other.strong_ids.iter().cloned());
         sort_dedup_boundary_strong_ids(&mut self.strong_ids);
+    }
+}
+
+fn register_boundary_data(
+    index: &mut crate::sharding::ClusterBoundaryIndex,
+    signature: ShardingKeySignature,
+    global_id: GlobalClusterId,
+    data: &BoundaryData,
+) {
+    for interval in &data.intervals {
+        index.register_boundary_key_with_conflict_data(
+            signature,
+            global_id,
+            *interval,
+            data.perspective_strong_ids.clone(),
+            data.strong_ids.clone(),
+        );
     }
 }
 
@@ -398,6 +415,8 @@ pub struct StreamingLinker {
     next_cluster_id: u32,
     /// Global cluster IDs for cross-shard tracking (LRU-bounded when config provided)
     global_cluster_ids: LinkerState<RecordId, GlobalClusterId>,
+    /// Minimum durable record ID in each local cluster, independent of replay order.
+    global_cluster_anchors: LinkerState<RecordId, u32>,
     /// Shard ID for this linker (used in GlobalClusterId generation).
     shard_id: u16,
     /// Strong ID summaries for conflict detection (LRU-bounded when config provided)
@@ -413,9 +432,9 @@ pub struct StreamingLinker {
     key_stats: FxHashMap<LinkerKeySignature, KeyStats>,
     /// Boundary keys for cross-shard reconciliation (deduplicated by key+cluster).
     /// Maps (signature, cluster) -> (interval, perspective_strong_ids) for that combination.
-    boundary_signatures: HashMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
+    boundary_signatures: BTreeMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
     /// Dirty boundary keys - signatures modified since last reconciliation.
-    dirty_boundary_keys: HashSet<ShardingKeySignature>,
+    dirty_boundary_keys: BTreeSet<ShardingKeySignature>,
     /// Cross-shard merge mappings: secondary -> primary.
     /// Used to redirect cluster ID lookups after cross-shard reconciliation.
     cross_shard_merges: HashMap<GlobalClusterId, GlobalClusterId>,
@@ -531,6 +550,7 @@ impl StreamingLinker {
             cluster_ids,
             next_cluster_id: 0,
             global_cluster_ids,
+            global_cluster_anchors: LinkerState::unbounded(),
             shard_id,
             strong_id_summaries,
             tainted_identity_keys: FxHashSet::default(),
@@ -538,22 +558,35 @@ impl StreamingLinker {
             pending_keys: FxHashSet::default(),
             tuning: tuning.clone(),
             key_stats: FxHashMap::default(),
-            boundary_signatures: HashMap::new(),
-            dirty_boundary_keys: HashSet::new(),
+            boundary_signatures: BTreeMap::new(),
+            dirty_boundary_keys: BTreeSet::new(),
             cross_shard_merges: HashMap::new(),
             metrics: LinkerMetrics::new(),
             partition_opts: None,
         };
 
         if !store.is_empty() {
-            let mut record_ids: Vec<RecordId> = Vec::new();
-            store.for_each_record(&mut |record| {
-                record_ids.push(record.id);
-            });
-            record_ids.sort_by_key(|record_id| record_id.0);
-
-            for record_id in record_ids {
-                streamer.link_record(store, ontology, record_id)?;
+            const RECOVERY_BATCH_SIZE: usize = 4_096;
+            let mut batch = Vec::with_capacity(RECOVERY_BATCH_SIZE);
+            let mut link_batch = |batch: &mut Vec<Record>| -> Result<()> {
+                let records = batch.iter().collect::<Vec<_>>();
+                streamer.link_records_batch_parallel_with_interner(
+                    &records,
+                    ontology,
+                    store.interner(),
+                )?;
+                batch.clear();
+                Ok(())
+            };
+            store.try_for_each_record_ordered(&mut |record| {
+                batch.push(record);
+                if batch.len() == RECOVERY_BATCH_SIZE {
+                    link_batch(&mut batch)?;
+                }
+                Ok(())
+            })?;
+            if !batch.is_empty() {
+                link_batch(&mut batch)?;
             }
         }
 
@@ -615,6 +648,7 @@ impl StreamingLinker {
         let _guard = crate::profile::profile_scope("link_record");
         if !self.dsu.has_record(record_id)? {
             self.dsu.add_record(record_id)?;
+            self.global_cluster_anchors.insert(record_id, record_id.0);
         }
 
         // Try to get a reference first (avoids cloning), fall back to cloning if not available.
@@ -825,6 +859,7 @@ impl StreamingLinker {
                     cluster_ids,
                     next_cluster_id,
                     global_cluster_ids,
+                    global_cluster_anchors,
                     strong_id_summaries,
                     tainted_identity_keys,
                     record_perspectives,
@@ -917,6 +952,7 @@ impl StreamingLinker {
                         );
                         reconcile_global_cluster_ids(
                             global_cluster_ids,
+                            global_cluster_anchors,
                             cross_shard_merges,
                             boundary_signatures,
                             dirty_boundary_keys,
@@ -1095,6 +1131,7 @@ impl StreamingLinker {
         // Initialize record in DSU if needed
         if !self.dsu.has_record(record_id)? {
             self.dsu.add_record(record_id)?;
+            self.global_cluster_anchors.insert(record_id, record_id.0);
         }
 
         // Store perspective and summary
@@ -1141,6 +1178,7 @@ impl StreamingLinker {
 
             // Merge with candidates
             let mut root_a = self.dsu.find(record_id).unwrap_or(record_id);
+            let key_is_tainted = self.tainted_identity_keys.contains(&key_signature);
             for (candidate_id, candidate_interval) in candidates {
                 if candidate_id == record_id {
                     continue;
@@ -1151,6 +1189,33 @@ impl StreamingLinker {
 
                 let root_b = self.dsu.find(candidate_id).unwrap_or(candidate_id);
                 if root_a == root_b {
+                    continue;
+                }
+
+                let candidate_perspective = self.record_perspectives.get(&candidate_id);
+                let same_perspective_conflict = candidate_perspective
+                    .map(|perspective| {
+                        perspective == &extraction.perspective
+                            && same_perspective_conflict_for_clusters(
+                                &self.strong_id_summaries,
+                                root_a,
+                                root_b,
+                                perspective,
+                            )
+                    })
+                    .unwrap_or(false);
+                if same_perspective_conflict {
+                    self.metrics
+                        .conflicts_detected
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.tainted_identity_keys.insert(key_signature.clone());
+                    continue;
+                }
+                if key_is_tainted
+                    && candidate_perspective
+                        .map(|perspective| perspective != &extraction.perspective)
+                        .unwrap_or(false)
+                {
                     continue;
                 }
 
@@ -1187,6 +1252,7 @@ impl StreamingLinker {
                     );
                     reconcile_global_cluster_ids(
                         &mut self.global_cluster_ids,
+                        &mut self.global_cluster_anchors,
                         &mut self.cross_shard_merges,
                         &mut self.boundary_signatures,
                         &mut self.dirty_boundary_keys,
@@ -1299,8 +1365,11 @@ impl StreamingLinker {
         if let Some(global_id) = self.global_cluster_ids.get(&root) {
             return *global_id;
         }
-        let local_id = self.get_or_assign_cluster_id(root);
-        let global_id = GlobalClusterId::from_local(self.shard_id, local_id);
+        let local_id = self
+            .global_cluster_anchors
+            .get_copy(&root)
+            .unwrap_or(root.0);
+        let global_id = GlobalClusterId::new(self.shard_id, local_id, 0);
         self.global_cluster_ids.insert(root, global_id);
         global_id
     }
@@ -1327,8 +1396,33 @@ impl StreamingLinker {
     }
 
     /// Get the set of dirty boundary keys (modified since last reconciliation).
-    pub fn get_dirty_boundary_keys(&self) -> HashSet<ShardingKeySignature> {
+    pub fn get_dirty_boundary_keys(&self) -> BTreeSet<ShardingKeySignature> {
         self.dirty_boundary_keys.clone()
+    }
+
+    /// Return the first ordered dirty signatures after an exclusive cursor.
+    pub fn dirty_boundary_key_candidates(
+        &self,
+        after: Option<ShardingKeySignature>,
+        limit: usize,
+    ) -> Vec<ShardingKeySignature> {
+        match after {
+            Some(cursor) => self
+                .dirty_boundary_keys
+                .range((
+                    std::ops::Bound::Excluded(cursor),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take(limit)
+                .copied()
+                .collect(),
+            None => self
+                .dirty_boundary_keys
+                .iter()
+                .take(limit)
+                .copied()
+                .collect(),
+        }
     }
 
     /// Get the count of dirty boundary keys.
@@ -1346,16 +1440,36 @@ impl StreamingLinker {
     /// Export boundary signatures to a ClusterBoundaryIndex.
     /// This can be used for cross-shard reconciliation.
     pub fn export_boundary_index(&self) -> crate::sharding::ClusterBoundaryIndex {
+        self.export_boundary_index_for_keys(None)
+    }
+
+    /// Export boundary metadata only for the requested signatures.
+    pub fn export_boundary_index_for_signatures(
+        &self,
+        signatures: &HashSet<ShardingKeySignature>,
+    ) -> crate::sharding::ClusterBoundaryIndex {
+        self.export_boundary_index_for_keys(Some(signatures))
+    }
+
+    fn export_boundary_index_for_keys(
+        &self,
+        signatures: Option<&HashSet<ShardingKeySignature>>,
+    ) -> crate::sharding::ClusterBoundaryIndex {
         let mut index = crate::sharding::ClusterBoundaryIndex::new_small(self.shard_id);
-        for ((sig, global_id), data) in &self.boundary_signatures {
-            for interval in &data.intervals {
-                index.register_boundary_key_with_conflict_data(
-                    *sig,
-                    *global_id,
-                    *interval,
-                    data.perspective_strong_ids.clone(),
-                    data.strong_ids.clone(),
-                );
+        if let Some(signatures) = signatures {
+            let first_cluster = GlobalClusterId::new(0, 0, 0);
+            let last_cluster = GlobalClusterId::new(u16::MAX, u32::MAX, u16::MAX);
+            for signature in signatures {
+                for ((signature, global_id), data) in self.boundary_signatures.range((
+                    std::ops::Bound::Included((*signature, first_cluster)),
+                    std::ops::Bound::Included((*signature, last_cluster)),
+                )) {
+                    register_boundary_data(&mut index, *signature, *global_id, data);
+                }
+            }
+        } else {
+            for ((signature, global_id), data) in &self.boundary_signatures {
+                register_boundary_data(&mut index, *signature, *global_id, data);
             }
         }
         index
@@ -1366,10 +1480,10 @@ impl StreamingLinker {
     pub fn drain_boundaries(&mut self) -> Vec<(ShardingKeySignature, GlobalClusterId, Interval)> {
         std::mem::take(&mut self.boundary_signatures)
             .into_iter()
-            .flat_map(|((sig, global_id), data)| {
+            .flat_map(|((signature, global_id), data)| {
                 data.intervals
                     .into_iter()
-                    .map(move |interval| (sig, global_id, interval))
+                    .map(move |interval| (signature, global_id, interval))
             })
             .collect()
     }
@@ -1396,8 +1510,6 @@ impl StreamingLinker {
             Some(sig) => sig,
             None => return,
         };
-        let key = (sharding_sig, global_id);
-
         // Compute perspective_strong_ids from the cluster's summary
         // Uses actual string values (via interner) for cross-shard consistency
         let perspective_strong_ids = self
@@ -1413,7 +1525,7 @@ impl StreamingLinker {
 
         // Merge intervals for the same (signature, cluster) combination
         self.boundary_signatures
-            .entry(key)
+            .entry((sharding_sig, global_id))
             .and_modify(|existing| {
                 existing.intervals.push(interval);
                 coalesce_boundary_intervals(&mut existing.intervals);
@@ -1438,36 +1550,48 @@ impl StreamingLinker {
         primary: GlobalClusterId,
         secondary: GlobalClusterId,
     ) -> usize {
-        // Record the merge mapping
-        self.cross_shard_merges.insert(secondary, primary);
+        self.apply_cross_shard_merges(&[(primary, secondary)])
+    }
 
-        // Update any existing boundary signatures that reference the secondary cluster
-        // Need to collect keys first to avoid borrow issues
-        let keys_to_update: Vec<_> = self
+    /// Apply canonical cross-shard redirects with one pass over local linker state.
+    pub fn apply_cross_shard_merges(
+        &mut self,
+        merges: &[(GlobalClusterId, GlobalClusterId)],
+    ) -> usize {
+        let redirects = merges
+            .iter()
+            .map(|(primary, secondary)| (*secondary, *primary))
+            .collect::<HashMap<_, _>>();
+        self.cross_shard_merges.extend(
+            redirects
+                .iter()
+                .map(|(secondary, primary)| (*secondary, *primary)),
+        );
+
+        let keys_to_update = self
             .boundary_signatures
             .keys()
-            .filter(|(_, gid)| *gid == secondary)
-            .cloned()
-            .collect();
-
-        for (sig, _) in keys_to_update {
-            if let Some(data) = self.boundary_signatures.remove(&(sig, secondary)) {
-                let new_key = (sig, primary);
-                // Merge with existing BoundaryData for primary if present
+            .filter_map(|(signature, cluster_id)| {
+                redirects
+                    .get(cluster_id)
+                    .map(|primary| (*signature, *cluster_id, *primary))
+            })
+            .collect::<Vec<_>>();
+        for (signature, secondary, primary) in keys_to_update {
+            if let Some(data) = self.boundary_signatures.remove(&(signature, secondary)) {
                 self.boundary_signatures
-                    .entry(new_key)
+                    .entry((signature, primary))
                     .and_modify(|existing| existing.merge_from(&data))
                     .or_insert(data);
-                // Mark this key as dirty for adaptive reconciliation
-                self.dirty_boundary_keys.insert(sig);
+                self.dirty_boundary_keys.insert(signature);
             }
         }
 
         // Update global_cluster_ids map: any root pointing to secondary should now point to primary
         let mut updated_count = 0;
         for (_root, global_id) in self.global_cluster_ids.iter_mut() {
-            if *global_id == secondary {
-                *global_id = primary;
+            if let Some(primary) = redirects.get(global_id) {
+                *global_id = *primary;
                 updated_count += 1;
             }
         }
@@ -1702,8 +1826,12 @@ impl StreamingLinker {
     ) -> Result<usize> {
         let mappings = persistence.load_cross_shard_merges()?;
         let count = mappings.len();
-        for (secondary, primary) in mappings {
-            self.apply_cross_shard_merge(primary, secondary);
+        if !mappings.is_empty() {
+            let merges = mappings
+                .into_iter()
+                .map(|(secondary, primary)| (primary, secondary))
+                .collect::<Vec<_>>();
+            self.apply_cross_shard_merges(&merges);
         }
         Ok(count)
     }
@@ -2109,9 +2237,10 @@ fn reconcile_cluster_ids(
 #[allow(clippy::too_many_arguments)]
 fn reconcile_global_cluster_ids(
     global_cluster_ids: &mut LinkerState<RecordId, GlobalClusterId>,
+    global_cluster_anchors: &mut LinkerState<RecordId, u32>,
     cross_shard_merges: &mut HashMap<GlobalClusterId, GlobalClusterId>,
-    boundary_signatures: &mut HashMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
-    dirty_boundary_keys: &mut HashSet<ShardingKeySignature>,
+    boundary_signatures: &mut BTreeMap<(ShardingKeySignature, GlobalClusterId), BoundaryData>,
+    dirty_boundary_keys: &mut BTreeSet<ShardingKeySignature>,
     shard_id: u16,
     root_a: RecordId,
     root_b: RecordId,
@@ -2132,6 +2261,17 @@ fn reconcile_global_cluster_ids(
         current
     }
 
+    let anchor_a = global_cluster_anchors.get_copy(&root_a).unwrap_or(root_a.0);
+    let anchor_b = global_cluster_anchors.get_copy(&root_b).unwrap_or(root_b.0);
+    if root_a != new_root {
+        global_cluster_anchors.remove(&root_a);
+    }
+    if root_b != new_root {
+        global_cluster_anchors.remove(&root_b);
+    }
+    let stable_local_id = anchor_a.min(anchor_b);
+    global_cluster_anchors.insert(new_root, stable_local_id);
+
     let id_a = global_cluster_ids.get_copy(&root_a);
     let id_b = global_cluster_ids.get_copy(&root_b);
     if id_a.is_none() && id_b.is_none() {
@@ -2149,6 +2289,7 @@ fn reconcile_global_cluster_ids(
         .flatten()
         .flat_map(|id| [id, resolve(cross_shard_merges, id)])
         .collect::<Vec<_>>();
+    ids.push(GlobalClusterId::new(shard_id, stable_local_id, 0));
     ids.sort_by_key(GlobalClusterId::to_u64);
     ids.dedup();
     let canonical = ids
@@ -2173,7 +2314,7 @@ fn reconcile_global_cluster_ids(
     let keys_to_update = boundary_signatures
         .keys()
         .filter(|(_, global_id)| ids.contains(global_id) && *global_id != canonical)
-        .cloned()
+        .copied()
         .collect::<Vec<_>>();
     for (signature, old_id) in keys_to_update {
         if let Some(data) = boundary_signatures.remove(&(signature, old_id)) {

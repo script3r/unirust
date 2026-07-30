@@ -103,11 +103,11 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        if request.uri().path() == "/unirust.ShardService/ApplyMerge"
+        if request.uri().path() == "/unirust.ShardService/ApplyMerges"
             && self.fail_next.swap(false, Ordering::AcqRel)
         {
             return Box::pin(async {
-                Ok(tonic::Status::unavailable("injected ApplyMerge failure").into_http())
+                Ok(tonic::Status::unavailable("injected ApplyMerges failure").into_http())
             });
         }
         Box::pin(self.inner.call(request))
@@ -209,6 +209,41 @@ async fn spawn_apply_merge_failing_shard_at(
             .expect("shard server");
     });
     Ok((addr, shard, handle))
+}
+
+async fn spawn_apply_merge_stalling_shard_at(
+    shard_id: u32,
+    config: DistributedOntologyConfig,
+    data_path: PathBuf,
+) -> anyhow::Result<(
+    SocketAddr,
+    ShardNode,
+    JoinHandle<()>,
+    support::StallControls,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let shard = ShardNode::new_with_data_dir(
+        shard_id,
+        config,
+        StreamingTuning::from_profile(TuningProfile::Balanced),
+        Some(data_path),
+        false,
+        None,
+    )?;
+    let (service, controls) = support::stall_response(
+        proto::shard_service_server::ShardServiceServer::new(shard.clone()),
+        "/unirust.ShardService/ApplyMerges",
+        true,
+    );
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("shard server");
+    });
+    Ok((addr, shard, handle, controls))
 }
 
 async fn spawn_ingest_failing_shard_at(
@@ -347,7 +382,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -374,7 +409,7 @@ async fn cross_shard_merge_persistent_store() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -424,7 +459,7 @@ async fn three_shard_singleton_merge_survives_full_restart() -> anyhow::Result<(
         let mut shard_client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
         shard_client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 5,
                 records: vec![record_input(
                     shard_id as u32,
                     "person",
@@ -534,7 +569,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
 
     let response = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![original.clone()],
         })
         .await?
@@ -544,7 +579,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
 
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![changed.clone()],
         })
         .await
@@ -581,7 +616,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
 
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![changed],
         })
         .await
@@ -591,7 +626,7 @@ async fn source_identity_reservation_survives_routing_change_and_restart() -> an
     original.index = 1;
     let retry = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![original],
         })
         .await?
@@ -658,13 +693,15 @@ async fn router_backfills_legacy_records_before_serving_ingest() -> anyhow::Resu
     let mut original_target_client =
         ShardServiceClient::connect(format!("http://{}", shard_addrs[original_target])).await?;
     let status_before = original_target_client
-        .get_config_version(proto::ConfigVersionRequest {})
+        .get_config_version(proto::ConfigVersionRequest {
+            include_durable_state_digest: false,
+        })
         .await?
         .into_inner();
     assert_eq!(status_before.source_reservation_backfill_version, 0);
     original_target_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![original],
         })
         .await?;
@@ -673,7 +710,9 @@ async fn router_backfills_legacy_records_before_serving_ingest() -> anyhow::Resu
     for shard_addr in &shard_addrs {
         let mut shard_client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
         let status = shard_client
-            .get_config_version(proto::ConfigVersionRequest {})
+            .get_config_version(proto::ConfigVersionRequest {
+                include_durable_state_digest: false,
+            })
             .await?
             .into_inner();
         assert_eq!(
@@ -686,7 +725,7 @@ async fn router_backfills_legacy_records_before_serving_ingest() -> anyhow::Resu
     let mut router_client = RouterServiceClient::connect(format!("http://{router_addr}")).await?;
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![changed],
         })
         .await
@@ -752,7 +791,7 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
 
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record.clone()],
         })
         .await
@@ -790,7 +829,7 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
     record.index = 1;
     let retry = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record.clone()],
         })
         .await?
@@ -803,7 +842,7 @@ async fn reserved_ingest_retries_after_target_failure_and_full_restart() -> anyh
     changed.descriptors[0].value = "changed-after-partial-failure@example.com".to_string();
     let error = router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![changed],
         })
         .await
@@ -836,7 +875,7 @@ async fn partial_reconciliation_blocks_traffic_and_recovers_after_full_restart(
     let mut client1 = ShardServiceClient::connect(format!("http://{addr1}")).await?;
     client0
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 0,
                 "person",
@@ -851,7 +890,7 @@ async fn partial_reconciliation_blocks_traffic_and_recovers_after_full_restart(
         .await?;
     client1
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 3,
+            internal_protocol_version: 5,
             records: vec![record_input(
                 1,
                 "person",
@@ -948,6 +987,94 @@ async fn partial_reconciliation_blocks_traffic_and_recovers_after_full_restart(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_partial_reconciliation_latches_router_closed() -> anyhow::Result<()> {
+    use proto::router_service_server::RouterService;
+
+    let _test_guard = PERSISTENT_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let config = build_email_config();
+    let (addr0, shard0, handle0) =
+        spawn_shard_at(0, config.clone(), root.path().join("cancel-shard-0")).await?;
+    let (addr1, shard1, handle1, controls) =
+        spawn_apply_merge_stalling_shard_at(1, config.clone(), root.path().join("cancel-shard-1"))
+            .await?;
+    let router = RouterNode::connect(
+        vec![format!("http://{addr0}"), format!("http://{addr1}")],
+        config,
+    )
+    .await?;
+
+    for (shard_addr, uid) in [(addr0, "cancel-merge-0"), (addr1, "cancel-merge-1")] {
+        let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
+        client
+            .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+                records: vec![record_input(
+                    0,
+                    "person",
+                    "hr",
+                    uid,
+                    vec![
+                        ("email", "cancel-merge@example.com", 0, 100),
+                        ("ssn", "1234", 0, 100),
+                    ],
+                )],
+            })
+            .await?;
+    }
+
+    let reconcile_router = router.clone();
+    let reconcile_task = tokio::spawn(async move {
+        RouterService::reconcile(
+            reconcile_router.as_ref(),
+            tonic::Request::new(proto::ReconcileRequest {
+                shard_metadata: Vec::new(),
+            }),
+        )
+        .await
+    });
+    controls
+        .wait_until_committed(Duration::from_secs(10))
+        .await?;
+    reconcile_task.abort();
+    assert!(reconcile_task
+        .await
+        .expect_err("reconciliation task must be cancelled")
+        .is_cancelled());
+    controls.release();
+
+    let blocked = RouterService::health_check(
+        router.as_ref(),
+        tonic::Request::new(proto::HealthCheckRequest {}),
+    )
+    .await
+    .expect_err("router must fail closed after cancellation during reconciliation apply");
+    assert_eq!(blocked.code(), tonic::Code::FailedPrecondition);
+
+    RouterService::reconcile(
+        router.as_ref(),
+        tonic::Request::new(proto::ReconcileRequest {
+            shard_metadata: Vec::new(),
+        }),
+    )
+    .await?;
+    RouterService::health_check(
+        router.as_ref(),
+        tonic::Request::new(proto::HealthCheckRequest {}),
+    )
+    .await?;
+
+    drop(router);
+    shard0.shutdown().await?;
+    shard1.shutdown().await?;
+    handle0.abort();
+    handle1.abort();
+    let _ = handle0.await;
+    let _ = handle1.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_reconciliation_can_be_retried_in_place() -> anyhow::Result<()> {
     use proto::router_service_server::RouterService;
 
@@ -968,7 +1095,7 @@ async fn partial_reconciliation_can_be_retried_in_place() -> anyhow::Result<()> 
         let mut client = ShardServiceClient::connect(format!("http://{shard_addr}")).await?;
         client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 5,
                 records: vec![record_input(
                     0,
                     "person",

@@ -10,7 +10,7 @@ use crate::persistence::{
     CHECKPOINT_PROTOCOL_VERSION,
 };
 use crate::query::{QueryDescriptor, QueryOutcome};
-use crate::sharding::{BloomFilter, IdentityKeySignature};
+use crate::sharding::{BloomFilter, IdentityKeySignature, ReconciliationCandidates};
 use crate::store::{SourceRecordReservation, SourceReservationError, StoreMetrics};
 use crate::temporal::Interval;
 use crate::{PersistentStore, StreamingTuning, Unirust};
@@ -31,9 +31,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 /// WAL record format for binary serialization.
@@ -67,7 +68,8 @@ struct IngestWal {
 const INGEST_WAL_MAGIC: &[u8; 8] = b"UNIRWAL\0";
 const INGEST_WAL_VERSION: u32 = 1;
 const INGEST_WAL_HEADER_LEN: usize = 24;
-pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 3;
+pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 5;
+const REPLICATION_TOKEN_HEADER: &str = "x-unirust-replication-token";
 
 #[allow(clippy::result_large_err)]
 fn validate_distributed_protocol(protocol_version: u32) -> Result<(), Status> {
@@ -926,6 +928,20 @@ fn global_cluster_id_to_proto(id: GlobalClusterId) -> proto::GlobalClusterId {
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn global_cluster_id_from_proto(
+    id: &proto::GlobalClusterId,
+    field: &str,
+) -> Result<GlobalClusterId, Status> {
+    Ok(GlobalClusterId::new(
+        u16::try_from(id.shard_id)
+            .map_err(|_| Status::invalid_argument(format!("{field} shard_id exceeds u16")))?,
+        id.local_id,
+        u16::try_from(id.version)
+            .map_err(|_| Status::invalid_argument(format!("{field} version exceeds u16")))?,
+    ))
+}
+
 fn cross_shard_conflict_to_proto(
     conflict: &crate::sharding::CrossShardConflict,
 ) -> proto::CrossShardConflict {
@@ -1045,11 +1061,18 @@ pub struct ShardNode {
     checkpoint_root: Option<PathBuf>,
     ingest_wal: Option<Arc<IngestWal>>,
     ingest_wal_lock: Arc<Mutex<()>>,
+    ingest_commit_slots: Arc<Semaphore>,
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
     ingest_txs: Vec<tokio::sync::mpsc::Sender<IngestJob>>,
     ingest_worker_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     config_version: String,
     metrics: Arc<PerfMetrics>,
+    shard_role: proto::ShardRole,
+    replica_client: Option<proto::shard_service_client::ShardServiceClient<Channel>>,
+    replication_token: Option<String>,
+    replication_consistent: Arc<AtomicBool>,
+    mutation_consistent: Arc<AtomicBool>,
+    replication_gate: Arc<Mutex<()>>,
     /// Destructive RPCs are disabled unless explicitly enabled by the embedding process.
     allow_destructive_admin: bool,
     /// Cross-shard conflicts detected during reconciliation.
@@ -1061,6 +1084,10 @@ pub struct ShardNode {
 const INGEST_QUEUE_CAPACITY: usize = 1024; // Increased from 128 for high-throughput
 const DEFAULT_INGEST_WORKERS: usize = 32; // Increased from 16 for high-throughput
 const EXPORT_DEFAULT_LIMIT: usize = 1000;
+const DIRTY_KEY_PAGE_LIMIT: usize = 50_000;
+const RECONCILIATION_KEY_CHUNK: usize = 10_000;
+const MERGE_APPLICATION_CHUNK: usize = 50_000;
+const CONFLICT_APPLICATION_CHUNK: usize = 10_000;
 
 /// Check if partitioned processing is enabled (default: true)
 /// Set UNIRUST_PARTITIONED=0 to disable
@@ -1098,6 +1125,159 @@ macro_rules! read_unirust {
 struct IngestJob {
     records: Vec<proto::RecordInput>,
     respond_to: oneshot::Sender<Result<Vec<proto::IngestAssignment>, Status>>,
+}
+
+struct ReplicationAttempt {
+    consistency: Arc<AtomicBool>,
+    armed: bool,
+}
+
+struct DurableMutationAttempt {
+    consistency: Arc<AtomicBool>,
+    armed: bool,
+}
+
+struct ConsistencyAttempt {
+    consistency: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl DurableMutationAttempt {
+    fn new(consistency: Arc<AtomicBool>, armed: bool) -> Self {
+        Self { consistency, armed }
+    }
+
+    fn finish(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DurableMutationAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consistency.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl ConsistencyAttempt {
+    fn new(consistency: Arc<AtomicBool>) -> Self {
+        Self {
+            consistency,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self) {
+        self.consistency.store(true, Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for ConsistencyAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consistency.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl ReplicationAttempt {
+    fn new(consistency: Arc<AtomicBool>, armed: bool) -> Self {
+        Self { consistency, armed }
+    }
+
+    fn finish(mut self, responses_match: bool, operation: &str) -> Result<(), Status> {
+        if !responses_match {
+            return Err(Status::data_loss(format!(
+                "primary and replica returned different results for {operation}; traffic is \
+                 blocked"
+            )));
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReplicationAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.consistency.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn replication_error_is_ambiguous(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+            | tonic::Code::Internal
+            | tonic::Code::Unavailable
+            | tonic::Code::DataLoss
+    )
+}
+
+fn authenticated_replica_request<T>(
+    payload: T,
+    replication_token: &str,
+) -> Result<Request<T>, Status> {
+    let token = tonic::metadata::MetadataValue::try_from(replication_token)
+        .map_err(|_| Status::internal("replication token metadata is invalid"))?;
+    let mut request = Request::new(payload);
+    request
+        .metadata_mut()
+        .insert(REPLICATION_TOKEN_HEADER, token);
+    Ok(request)
+}
+
+macro_rules! replicate_to_replica {
+    ($self:expr, $method:ident, $payload:expr) => {{
+        $self.ensure_replication_consistent()?;
+        let replication_serial = if $self.replica_client.is_some() {
+            Some($self.replication_gate.lock().await)
+        } else {
+            None
+        };
+        $self.ensure_replication_consistent()?;
+        let replication_attempt = ReplicationAttempt::new(
+            $self.replication_consistent.clone(),
+            $self.replica_client.is_some(),
+        );
+        let replica_response = if let Some(mut replica) = $self.replica_client.clone() {
+            let token = $self.replication_token.as_deref().ok_or_else(|| {
+                Status::failed_precondition("primary replication token is missing")
+            })?;
+            let replica_request = authenticated_replica_request(($payload).clone(), token)?;
+            match replica.$method(replica_request).await {
+                Ok(response) => Some(response.into_inner()),
+                Err(error) => {
+                    if replication_error_is_ambiguous(error.code()) {
+                        $self.replication_consistent.store(false, Ordering::Release);
+                        return Err(Status::aborted(format!(
+                            "replica {operation} failed and may have committed; traffic is \
+                             blocked: {error}",
+                            operation = stringify!($method)
+                        )));
+                    }
+                    $self.replication_consistent.store(false, Ordering::Release);
+                    return Err(Status::new(
+                        error.code(),
+                        format!(
+                            "replica rejected {operation}: {}",
+                            error.message(),
+                            operation = stringify!($method)
+                        ),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        (replication_serial, replica_response, replication_attempt)
+    }};
 }
 
 impl ShardNode {
@@ -1257,11 +1437,18 @@ impl ShardNode {
                 checkpoint_root: Some(checkpoint_root),
                 ingest_wal,
                 ingest_wal_lock: Arc::new(Mutex::new(())),
+                ingest_commit_slots: Arc::new(Semaphore::new(1)),
                 mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
                 ingest_txs,
                 ingest_worker_handles: Arc::new(Mutex::new(ingest_worker_handles)),
                 config_version,
                 metrics: Arc::new(PerfMetrics::new()),
+                shard_role: proto::ShardRole::Standalone,
+                replica_client: None,
+                replication_token: None,
+                replication_consistent: Arc::new(AtomicBool::new(true)),
+                mutation_consistent: Arc::new(AtomicBool::new(true)),
+                replication_gate: Arc::new(Mutex::new(())),
                 allow_destructive_admin: false,
                 cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(
                     recovered_cross_shard_conflicts,
@@ -1317,11 +1504,18 @@ impl ShardNode {
             checkpoint_root: None,
             ingest_wal,
             ingest_wal_lock: Arc::new(Mutex::new(())),
+            ingest_commit_slots: Arc::new(Semaphore::new(INGEST_QUEUE_CAPACITY)),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             ingest_txs,
             ingest_worker_handles: Arc::new(Mutex::new(ingest_worker_handles)),
             config_version,
             metrics: Arc::new(PerfMetrics::new()),
+            shard_role: proto::ShardRole::Standalone,
+            replica_client: None,
+            replication_token: None,
+            replication_consistent: Arc::new(AtomicBool::new(true)),
+            mutation_consistent: Arc::new(AtomicBool::new(true)),
+            replication_gate: Arc::new(Mutex::new(())),
             allow_destructive_admin: false,
             cross_shard_conflicts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
@@ -1334,6 +1528,287 @@ impl ShardNode {
     pub fn with_destructive_admin(mut self, allow: bool) -> Self {
         self.allow_destructive_admin = allow;
         self
+    }
+
+    /// Configure this persistent node as a passive replica. A replica can only
+    /// be targeted by a primary and is rejected as a router shard endpoint.
+    pub fn into_replica(mut self, replication_token: String) -> AnyResult<Self> {
+        if self.data_dir.is_none() {
+            anyhow::bail!("replica mode requires persistent shard storage");
+        }
+        if self.replica_client.is_some() {
+            anyhow::bail!("a replica cannot have another replica");
+        }
+        if replication_token.is_empty() {
+            anyhow::bail!("replica mode requires a nonempty replication token");
+        }
+        self.shard_role = proto::ShardRole::Replica;
+        self.replication_token = Some(replication_token);
+        Ok(self)
+    }
+
+    /// Attach a passive replica after proving that its topology, configuration,
+    /// restore provenance, and complete durable key/value state match.
+    pub async fn with_replica(
+        mut self,
+        mut replica: proto::shard_service_client::ShardServiceClient<Channel>,
+        replication_token: String,
+    ) -> Result<Self, Status> {
+        if self.data_dir.is_none() {
+            return Err(Status::failed_precondition(
+                "synchronous replication requires persistent primary storage",
+            ));
+        }
+        if self.shard_role != proto::ShardRole::Standalone || self.replica_client.is_some() {
+            return Err(Status::failed_precondition(
+                "replication can only be attached to a standalone shard",
+            ));
+        }
+        if replication_token.is_empty() {
+            return Err(Status::invalid_argument(
+                "replication requires a nonempty shared token",
+            ));
+        }
+        let health = replica
+            .health_check(Request::new(proto::HealthCheckRequest {}))
+            .await
+            .map_err(|error| Status::unavailable(format!("replica health check failed: {error}")))?
+            .into_inner();
+        if health.status != "ok" {
+            return Err(Status::unavailable(format!(
+                "replica reported unhealthy status {}",
+                health.status
+            )));
+        }
+        let request = authenticated_replica_request(
+            proto::ConfigVersionRequest {
+                include_durable_state_digest: true,
+            },
+            &replication_token,
+        )?;
+        let response = replica
+            .get_config_version(request)
+            .await
+            .map_err(|error| {
+                Status::new(
+                    error.code(),
+                    format!("replica configuration check failed: {}", error.message()),
+                )
+            })?
+            .into_inner();
+        validate_distributed_protocol(response.protocol_version)?;
+        validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
+        if proto::ShardRole::try_from(response.shard_role) != Ok(proto::ShardRole::Replica) {
+            return Err(Status::failed_precondition(
+                "configured replication target is not running in replica mode",
+            ));
+        }
+        if response.version != self.config_version {
+            return Err(Status::failed_precondition(format!(
+                "replica config version mismatch: primary {}, replica {}",
+                self.config_version, response.version
+            )));
+        }
+        let replica_ontology = response.ontology_config.ok_or_else(|| {
+            Status::failed_precondition("replica did not report its ontology configuration")
+        })?;
+        if map_proto_config(&replica_ontology) != *self.ontology_config.lock().await {
+            return Err(Status::failed_precondition(
+                "replica ontology does not match the primary",
+            ));
+        }
+        let local_restore = self
+            .restored_checkpoint
+            .as_ref()
+            .map(|manifest| (manifest.generation(), manifest.shard_count()));
+        let replica_restore = match (
+            response.restore_generation.is_empty(),
+            response.restore_shard_count,
+        ) {
+            (true, 0) => None,
+            (false, shard_count) if shard_count > 0 => {
+                Some((response.restore_generation.as_str(), shard_count))
+            }
+            _ => {
+                return Err(Status::data_loss(
+                    "replica reported incomplete restore checkpoint provenance",
+                ));
+            }
+        };
+        if local_restore != replica_restore {
+            return Err(Status::failed_precondition(
+                "primary and replica restore provenance do not match",
+            ));
+        }
+        let local_digest = self
+            .durable_state_digest()?
+            .ok_or_else(|| Status::failed_precondition("primary does not expose durable state"))?;
+        if response.durable_state_digest.as_slice() != local_digest {
+            return Err(Status::failed_precondition(
+                "replica durable state does not match the primary; bootstrap both from the same \
+                 checkpoint before enabling replication",
+            ));
+        }
+        let metadata = replica
+            .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
+                since_version: u64::MAX,
+                signatures: Vec::new(),
+            }))
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!("replica shard identity check failed: {error}"))
+            })?
+            .into_inner()
+            .metadata
+            .ok_or_else(|| Status::data_loss("replica returned no boundary metadata"))?;
+        if metadata.shard_id != self.shard_id {
+            return Err(Status::failed_precondition(format!(
+                "replica reports shard {}, primary is shard {}",
+                metadata.shard_id, self.shard_id
+            )));
+        }
+        self.replica_client = Some(replica);
+        self.replication_token = Some(replication_token);
+        self.shard_role = proto::ShardRole::Primary;
+        Ok(self)
+    }
+
+    fn durable_state_digest(&self) -> Result<Option<[u8; 32]>, Status> {
+        let db = read_unirust!(self).store().shared_db();
+        db.map(|db| {
+            crate::persistence::durable_state_digest(&db)
+                .map_err(|error| Status::internal(error.to_string()))
+        })
+        .transpose()
+    }
+
+    fn ensure_replication_consistent(&self) -> Result<(), Status> {
+        if !self.mutation_consistent.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
+                "a durable mutation failed after it may have changed local state; traffic is \
+                 blocked until the shard restarts and recovers",
+            ));
+        }
+        if !self.replication_consistent.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
+                "primary and replica may have diverged; traffic is blocked until their complete \
+                 durable states are reconciled",
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin_durable_mutation(&self) -> DurableMutationAttempt {
+        DurableMutationAttempt::new(self.mutation_consistent.clone(), self.data_dir.is_some())
+    }
+
+    async fn commit_ingest_batch(
+        &self,
+        records: Vec<proto::RecordInput>,
+        operation: &'static str,
+    ) -> Result<Vec<proto::IngestAssignment>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        let start = Instant::now();
+        let record_count = records.len();
+        let _wal_guard = if self.ingest_wal.is_some() {
+            Some(self.ingest_wal_lock.lock().await)
+        } else {
+            None
+        };
+        self.ensure_store_healthy()?;
+        self.ensure_ingest_payloads_idempotent(&records)?;
+
+        let replication_request = proto::IngestRecordsRequest {
+            records: records.clone(),
+            internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+        };
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, ingest_records, replication_request);
+        let local_attempt = self.begin_durable_mutation();
+        let partitioned_arc = self.partitioned.read().clone();
+        let assignments = if let Some(partitioned) =
+            partitioned_arc.as_ref().filter(|_| records.len() >= 100)
+        {
+            dispatch_ingest_partitioned(
+                partitioned,
+                &self.concurrent_interner,
+                self.ingest_wal.as_deref(),
+                self.shard_id,
+                records,
+            )
+            .await?
+        } else {
+            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
+        };
+
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica.assignments == assignments),
+            operation,
+        )?;
+        self.metrics
+            .record_ingest(record_count, start.elapsed().as_micros() as u64);
+        Ok(assignments)
+    }
+
+    async fn await_ingest_commit(
+        &self,
+        records: Vec<proto::RecordInput>,
+        operation: &'static str,
+    ) -> Result<Vec<proto::IngestAssignment>, Status> {
+        let commit_slot = self
+            .ingest_commit_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("ingest commit queue is closed"))?;
+        let shard = self.clone();
+        tokio::spawn(async move {
+            let _commit_slot = commit_slot;
+            shard.commit_ingest_batch(records, operation).await
+        })
+        .await
+        .map_err(|error| {
+            if self.data_dir.is_some() {
+                self.mutation_consistent.store(false, Ordering::Release);
+            }
+            if self.replica_client.is_some() {
+                self.replication_consistent.store(false, Ordering::Release);
+            }
+            Status::internal(format!("ingest commit task failed: {error}"))
+        })?
+    }
+
+    fn authorize_mutation<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let supplied = request
+            .metadata()
+            .get(REPLICATION_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok());
+        match self.shard_role {
+            proto::ShardRole::Replica => {
+                if supplied == self.replication_token.as_deref() {
+                    Ok(())
+                } else {
+                    Err(Status::permission_denied(
+                        "passive replicas only accept mutations forwarded by their primary",
+                    ))
+                }
+            }
+            proto::ShardRole::Standalone | proto::ShardRole::Primary => {
+                if supplied.is_some() {
+                    Err(Status::permission_denied(
+                        "replicated mutation metadata is only valid on a passive replica",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            proto::ShardRole::Unspecified => {
+                Err(Status::failed_precondition("shard role is not configured"))
+            }
+        }
     }
 
     /// Drain mutations and durably flush derived state before process exit.
@@ -1367,6 +1842,7 @@ impl ShardNode {
     }
 
     fn ensure_no_pending_ingest(&self) -> Result<(), Status> {
+        self.ensure_replication_consistent()?;
         if self
             .ingest_wal
             .as_ref()
@@ -1389,6 +1865,7 @@ impl ShardNode {
     }
 
     fn ensure_recovery_healthy(&self) -> Result<(), Status> {
+        self.ensure_replication_consistent()?;
         if self
             .ingest_wal
             .as_ref()
@@ -1408,6 +1885,7 @@ impl ShardNode {
     }
 
     fn ensure_store_healthy(&self) -> Result<(), Status> {
+        self.ensure_replication_consistent()?;
         let unirust = read_unirust!(self);
         unirust.ensure_store_healthy().map_err(|err| {
             Status::failed_precondition(format!(
@@ -1570,19 +2048,31 @@ impl ShardNode {
     }
 
     #[allow(clippy::result_large_err)]
-    fn build_import_records(
-        unirust: &mut Unirust,
+    fn validate_import_records(
+        unirust: &Unirust,
         snapshots: &[proto::RecordSnapshot],
-    ) -> Result<Vec<Record>, Status> {
-        let mut records = Vec::with_capacity(snapshots.len());
+    ) -> Result<Vec<usize>, Status> {
+        let mut records_to_build = Vec::with_capacity(snapshots.len());
         let mut batch_ids: HashMap<u32, &proto::RecordSnapshot> = HashMap::new();
         let mut batch_identities: HashMap<(String, String, String), u32> = HashMap::new();
 
-        for snapshot in snapshots {
+        for (index, snapshot) in snapshots.iter().enumerate() {
             let identity = snapshot
                 .identity
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("record identity is required"))?;
+            if identity.entity_type.is_empty()
+                || identity.perspective.is_empty()
+                || identity.uid.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "record identity fields must not be empty",
+                ));
+            }
+            for descriptor in &snapshot.descriptors {
+                Interval::new(descriptor.start, descriptor.end)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            }
             if let Some(previous) = batch_ids.get(&snapshot.record_id) {
                 if **previous != *snapshot {
                     return Err(Status::already_exists(format!(
@@ -1628,6 +2118,27 @@ impl ShardNode {
                     existing_id.0, snapshot.record_id
                 )));
             }
+            records_to_build.push(index);
+        }
+        unirust
+            .ensure_store_healthy()
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        Ok(records_to_build)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn build_import_records(
+        unirust: &mut Unirust,
+        snapshots: &[proto::RecordSnapshot],
+        records_to_build: &[usize],
+    ) -> Result<Vec<Record>, Status> {
+        let mut records = Vec::with_capacity(records_to_build.len());
+        for &index in records_to_build {
+            let snapshot = &snapshots[index];
+            let identity = snapshot
+                .identity
+                .as_ref()
+                .ok_or_else(|| Status::internal("validated record identity is missing"))?;
             records.push(Self::build_record_with_id(
                 unirust,
                 snapshot.record_id,
@@ -1635,9 +2146,6 @@ impl ShardNode {
                 &snapshot.descriptors,
             )?);
         }
-        unirust
-            .ensure_store_healthy()
-            .map_err(|err| Status::failed_precondition(err.to_string()))?;
         Ok(records)
     }
 
@@ -1755,36 +2263,18 @@ async fn dispatch_ingest_records(
     }
 
     let worker_count = ingest_txs.len().max(1);
-    let mut batches = vec![Vec::new(); worker_count];
-    for record in records {
-        let idx = ingest_worker_index(&record, worker_count);
-        batches[idx].push(record);
-    }
-
-    let mut receivers = Vec::new();
-    for (idx, batch) in batches.into_iter().enumerate() {
-        if batch.is_empty() {
-            continue;
-        }
-        let (tx, rx) = oneshot::channel();
-        let job = IngestJob {
-            records: batch,
+    let worker_index = ingest_worker_index(&records[0], worker_count);
+    let (tx, rx) = oneshot::channel();
+    ingest_txs[worker_index]
+        .send(IngestJob {
+            records,
             respond_to: tx,
-        };
-        ingest_txs[idx]
-            .send(job)
-            .await
-            .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
-        receivers.push(rx);
-    }
-
-    let mut assignments = Vec::new();
-    for rx in receivers {
-        let batch_assignments = rx
-            .await
-            .map_err(|_| Status::internal("ingest worker dropped"))??;
-        assignments.extend(batch_assignments);
-    }
+        })
+        .await
+        .map_err(|_| Status::unavailable("ingest queue unavailable"))?;
+    let mut assignments = rx
+        .await
+        .map_err(|_| Status::internal("ingest worker dropped"))??;
 
     if let Some(wal) = ingest_wal {
         wal.clear()?;
@@ -2037,9 +2527,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ReserveSourceRecordsRequest>,
     ) -> Result<Response<proto::ReserveSourceRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_store_healthy()?;
         let request = request.into_inner();
+        let replication_request = request.clone();
         let mut reservations = Vec::with_capacity(request.reservations.len());
         let mut indices = Vec::with_capacity(request.reservations.len());
 
@@ -2072,25 +2564,30 @@ impl proto::shard_service_server::ShardService for ShardNode {
             });
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, reserve_source_records, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         let targets = {
             let mut unirust = write_unirust!(self);
-            unirust
-                .store_mut()
-                .reserve_source_records(&reservations)
-                .map_err(|err| {
-                    if let Some(conflict) = err.downcast_ref::<SourceReservationError>() {
-                        match conflict {
-                            SourceReservationError::PayloadConflict => {
-                                Status::already_exists(conflict.to_string())
-                            }
-                            SourceReservationError::TargetConflict { .. } => {
-                                Status::failed_precondition(conflict.to_string())
-                            }
+            unirust.store_mut().reserve_source_records(&reservations)
+        };
+        let targets = match targets {
+            Ok(targets) => targets,
+            Err(err) => {
+                if let Some(conflict) = err.downcast_ref::<SourceReservationError>() {
+                    // The store validates the complete batch before its atomic write.
+                    local_attempt.finish();
+                    return Err(match conflict {
+                        SourceReservationError::PayloadConflict => {
+                            Status::already_exists(conflict.to_string())
                         }
-                    } else {
-                        Status::internal(err.to_string())
-                    }
-                })?
+                        SourceReservationError::TargetConflict { .. } => {
+                            Status::failed_precondition(conflict.to_string())
+                        }
+                    });
+                }
+                return Err(Status::internal(err.to_string()));
+            }
         };
         let reservations = indices
             .into_iter()
@@ -2102,15 +2599,22 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 },
             )
             .collect();
-        Ok(Response::new(proto::ReserveSourceRecordsResponse {
-            reservations,
-        }))
+        let response = proto::ReserveSourceRecordsResponse { reservations };
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "source reservation",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn mark_source_reservations_backfilled(
         &self,
         request: Request<proto::MarkSourceReservationsBackfilledRequest>,
     ) -> Result<Response<proto::MarkSourceReservationsBackfilledResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_store_healthy()?;
         let request = request.into_inner();
@@ -2126,24 +2630,35 @@ impl proto::shard_service_server::ShardService for ShardNode {
             ));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, mark_source_reservations_backfilled, request);
+        let local_attempt = self.begin_durable_mutation();
         let mut unirust = write_unirust!(self);
         unirust
             .store_mut()
             .mark_source_reservation_backfill(request.protocol_version, request.shard_count)
             .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(
-            proto::MarkSourceReservationsBackfilledResponse {},
-        ))
+        let response = proto::MarkSourceReservationsBackfilledResponse {};
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "source reservation migration marker",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn set_ontology(
         &self,
         request: Request<proto::ApplyOntologyRequest>,
     ) -> Result<Response<proto::ApplyOntologyResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
+        let request = request.into_inner();
+        let replication_request = request.clone();
         let config = request
-            .into_inner()
             .config
             .ok_or_else(|| Status::invalid_argument("ontology config is required"))?;
 
@@ -2164,6 +2679,9 @@ impl proto::shard_service_server::ShardService for ShardNode {
             )));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, set_ontology, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         if let Some(path) = &self.data_dir {
             // Must acquire write lock and drop old Unirust BEFORE opening new store
             // to release the RocksDB file lock
@@ -2227,47 +2745,27 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
 
         *config_guard = config;
-        Ok(Response::new(proto::ApplyOntologyResponse {}))
+        local_attempt.finish();
+        let response = proto::ApplyOntologyResponse {};
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "ontology update",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn ingest_records(
         &self,
         request: Request<proto::IngestRecordsRequest>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
-        let _mutation_guard = self.mutation_gate.read().await;
-        let start = Instant::now();
+        self.authorize_mutation(&request)?;
         let request = request.into_inner();
         validate_distributed_protocol(request.internal_protocol_version)?;
-        let records = request.records;
-        let record_count = records.len();
-        let _wal_guard = if self.ingest_wal.is_some() {
-            Some(self.ingest_wal_lock.lock().await)
-        } else {
-            None
-        };
-        self.ensure_store_healthy()?;
-        self.ensure_ingest_payloads_idempotent(&records)?;
-
-        // Use partitioned processing for large batches (high-throughput mode)
-        // Small batches use sequential path for correctness (query support)
-        // Clone the Arc and release the lock before awaiting (guards aren't Send)
-        let partitioned_arc = self.partitioned.read().clone();
-        let use_partitioned = partitioned_arc.is_some() && records.len() >= 100;
-        let assignments = if use_partitioned {
-            dispatch_ingest_partitioned(
-                partitioned_arc.as_ref().unwrap(),
-                &self.concurrent_interner,
-                self.ingest_wal.as_deref(),
-                self.shard_id,
-                records,
-            )
-            .await?
-        } else {
-            dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), records).await?
-        };
-
-        self.metrics
-            .record_ingest(record_count, start.elapsed().as_micros() as u64);
+        let assignments = self
+            .await_ingest_commit(request.records, "record ingest")
+            .await?;
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
 
@@ -2275,11 +2773,9 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<tonic::Streaming<proto::IngestRecordsChunk>>,
     ) -> Result<Response<proto::IngestRecordsResponse>, Status> {
-        let _mutation_guard = self.mutation_gate.read().await;
-        let start = Instant::now();
+        self.authorize_mutation(&request)?;
         let mut stream = request.into_inner();
         let mut assignments = Vec::new();
-        let mut record_count = 0usize;
 
         while let Some(chunk) = stream
             .message()
@@ -2290,38 +2786,12 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             validate_distributed_protocol(chunk.internal_protocol_version)?;
-            record_count += chunk.records.len();
-            let _wal_guard = if self.ingest_wal.is_some() {
-                Some(self.ingest_wal_lock.lock().await)
-            } else {
-                None
-            };
-            self.ensure_store_healthy()?;
-            self.ensure_ingest_payloads_idempotent(&chunk.records)?;
-
-            // Use partitioned processing for large batches (high-throughput mode)
-            // Small batches use sequential path for correctness
-            // Clone the Arc and release the lock before awaiting (guards aren't Send)
-            let partitioned_arc = self.partitioned.read().clone();
-            let use_partitioned = partitioned_arc.is_some() && chunk.records.len() >= 100;
-            let batch_assignments = if use_partitioned {
-                dispatch_ingest_partitioned(
-                    partitioned_arc.as_ref().unwrap(),
-                    &self.concurrent_interner,
-                    self.ingest_wal.as_deref(),
-                    self.shard_id,
-                    chunk.records,
-                )
-                .await?
-            } else {
-                dispatch_ingest_records(&self.ingest_txs, self.ingest_wal.as_deref(), chunk.records)
-                    .await?
-            };
+            let batch_assignments = self
+                .await_ingest_commit(chunk.records, "streamed record ingest")
+                .await?;
             assignments.extend(batch_assignments);
         }
 
-        self.metrics
-            .record_ingest(record_count, start.elapsed().as_micros() as u64);
         Ok(Response::new(proto::IngestRecordsResponse { assignments }))
     }
 
@@ -2499,6 +2969,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
         self.ensure_recovery_healthy()?;
+        if let Some(mut replica) = self.replica_client.clone() {
+            let response = replica
+                .health_check(Request::new(proto::HealthCheckRequest {}))
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!("replica health check failed: {error}"))
+                })?
+                .into_inner();
+            if response.status != "ok" {
+                return Err(Status::unavailable(format!(
+                    "replica reported unhealthy status {}",
+                    response.status
+                )));
+            }
+        }
         Ok(Response::new(proto::HealthCheckResponse {
             status: "ok".to_string(),
         }))
@@ -2506,8 +2991,17 @@ impl proto::shard_service_server::ShardService for ShardNode {
 
     async fn get_config_version(
         &self,
-        _request: Request<proto::ConfigVersionRequest>,
+        request: Request<proto::ConfigVersionRequest>,
     ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
+        let include_durable_state_digest = request.get_ref().include_durable_state_digest;
+        if include_durable_state_digest && self.shard_role == proto::ShardRole::Replica {
+            self.authorize_mutation(&request)?;
+        }
+        let _mutation_guard = if include_durable_state_digest {
+            Some(self.mutation_gate.write().await)
+        } else {
+            None
+        };
         let ontology_config = self.ontology_config.lock().await;
         let source_reservation_backfill = read_unirust!(self)
             .store()
@@ -2534,6 +3028,14 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .as_ref()
                 .map(ClusterCheckpointManifest::shard_count)
                 .unwrap_or_default(),
+            shard_role: self.shard_role as i32,
+            durable_state_digest: if include_durable_state_digest {
+                self.durable_state_digest()?
+                    .map(|digest| digest.to_vec())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         }))
     }
 
@@ -2562,6 +3064,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::CheckpointRequest>,
     ) -> Result<Response<proto::CheckpointResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
@@ -2598,6 +3101,8 @@ impl proto::shard_service_server::ShardService for ShardNode {
             ));
         }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, checkpoint, request);
         if request.finalize {
             commit_cluster_checkpoint(&target, &request.path, self.shard_id, request.shard_count)
                 .map_err(|err| Status::failed_precondition(err.to_string()))?;
@@ -2620,11 +3125,20 @@ impl proto::shard_service_server::ShardService for ShardNode {
             prepare_cluster_checkpoint(&target, &request.path, self.shard_id, request.shard_count)
                 .map_err(|err| Status::internal(err.to_string()))?;
         }
-        Ok(Response::new(proto::CheckpointResponse {
+        let response = proto::CheckpointResponse {
             paths: vec![target.to_string_lossy().to_string()],
             generation: request.path,
             committed: request.finalize,
-        }))
+        };
+        replication_attempt.finish(
+            replica_response.as_ref().is_none_or(|replica| {
+                replica.generation == response.generation
+                    && replica.committed == response.committed
+                    && replica.paths.len() == 1
+            }),
+            "checkpoint",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn get_record_id_range(
@@ -2792,6 +3306,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ImportRecordsRequest>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
@@ -2799,20 +3314,34 @@ impl proto::shard_service_server::ShardService for ShardNode {
         if request.records.is_empty() {
             return Ok(Response::new(proto::ImportRecordsResponse { imported: 0 }));
         }
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, import_records, request);
         let mut unirust = write_unirust!(self);
-        let records = Self::build_import_records(&mut unirust, &request.records)?;
+        let records_to_build = Self::validate_import_records(&unirust, &request.records)?;
+        let local_attempt = self.begin_durable_mutation();
+        let records =
+            Self::build_import_records(&mut unirust, &request.records, &records_to_build)?;
         unirust
             .ingest_with_explicit_ids(records)
             .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(proto::ImportRecordsResponse {
+        let response = proto::ImportRecordsResponse {
             imported: request.records.len() as u64,
-        }))
+        };
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "record import",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn import_records_stream(
         &self,
         request: Request<tonic::Streaming<proto::ImportRecordsChunk>>,
     ) -> Result<Response<proto::ImportRecordsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let mut stream = request.into_inner();
@@ -2826,11 +3355,30 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 continue;
             }
             validate_distributed_protocol(chunk.internal_protocol_version)?;
+            let replication_request = proto::ImportRecordsRequest {
+                records: chunk.records.clone(),
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            };
+            let (_replication_serial, replica_response, replication_attempt) =
+                replicate_to_replica!(self, import_records, replication_request);
             let mut unirust = write_unirust!(self);
-            let records = Self::build_import_records(&mut unirust, &chunk.records)?;
+            let records_to_build = Self::validate_import_records(&unirust, &chunk.records)?;
+            let local_attempt = self.begin_durable_mutation();
+            let records =
+                Self::build_import_records(&mut unirust, &chunk.records, &records_to_build)?;
             unirust
                 .ingest_with_explicit_ids(records)
                 .map_err(|err| Status::internal(err.to_string()))?;
+            let response = proto::ImportRecordsResponse {
+                imported: chunk.records.len() as u64,
+            };
+            local_attempt.finish();
+            replication_attempt.finish(
+                replica_response
+                    .as_ref()
+                    .is_none_or(|replica| replica == &response),
+                "streamed record import",
+            )?;
             imported += chunk.records.len() as u64;
         }
         Ok(Response::new(proto::ImportRecordsResponse { imported }))
@@ -2840,9 +3388,14 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ListConflictsRequest>,
     ) -> Result<Response<proto::ListConflictsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let request = request.into_inner();
+        let replication_request = request.clone();
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, list_conflicts, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         let mut summaries = if let Some(cache) = {
             let guard = read_unirust!(self);
             guard.cached_conflict_summaries()
@@ -2917,13 +3470,21 @@ impl proto::shard_service_server::ShardService for ShardNode {
                 .map(to_proto_conflict_summary)
                 .collect(),
         };
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "conflict materialization",
+        )?;
         Ok(Response::new(response))
     }
 
     async fn reset(
         &self,
-        _request: Request<proto::Empty>,
+        request: Request<proto::Empty>,
     ) -> Result<Response<proto::Empty>, Status> {
+        self.authorize_mutation(&request)?;
         if !self.allow_destructive_admin {
             return Err(Status::permission_denied(
                 "destructive reset RPC is disabled; stop the cluster and use the confirmed \
@@ -2932,6 +3493,13 @@ impl proto::shard_service_server::ShardService for ShardNode {
         }
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
+        if self.replica_client.is_some() {
+            return Err(Status::failed_precondition(
+                "online reset is disabled while replication is configured; stop both nodes and \
+                 reset or rebootstrap them together",
+            ));
+        }
+        let local_attempt = self.begin_durable_mutation();
         let config = self.ontology_config.lock().await.clone();
         {
             let mut guard = write_unirust!(self);
@@ -2955,6 +3523,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             *self.partitioned.write() = None;
         }
         self.cross_shard_conflicts.write().clear();
+        local_attempt.finish();
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -2964,17 +3533,25 @@ impl proto::shard_service_server::ShardService for ShardNode {
     ) -> Result<Response<proto::GetBoundaryMetadataResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
-        let since_version = request.into_inner().since_version;
+        let request = request.into_inner();
+        let mut signatures = std::collections::HashSet::with_capacity(request.signatures.len());
+        for signature in request.signatures {
+            let bytes = <[u8; 32]>::try_from(signature.signature.as_slice())
+                .map_err(|_| Status::invalid_argument("boundary signature must be 32 bytes"))?;
+            signatures.insert(IdentityKeySignature::from_bytes(bytes));
+        }
 
-        // Export boundary metadata from the streaming linker
         let unirust = read_unirust!(self);
-        let boundary_index = unirust.export_boundary_index();
+        let boundary_index = if signatures.is_empty() {
+            None
+        } else {
+            unirust.export_boundary_index_for_signatures(&signatures)
+        };
 
         let metadata = match boundary_index {
             Some(index) => {
                 let exported = index.export_metadata();
-                // Only return if version is newer than requested
-                if exported.version <= since_version {
+                if exported.version <= request.since_version {
                     proto::BoundaryMetadata {
                         shard_id: self.shard_id,
                         version: exported.version,
@@ -3031,9 +3608,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ApplyMergeRequest>,
     ) -> Result<Response<proto::ApplyMergeResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
+        let replication_request = req;
 
         let primary = req
             .primary
@@ -3042,110 +3621,204 @@ impl proto::shard_service_server::ShardService for ShardNode {
             .secondary
             .ok_or_else(|| Status::invalid_argument("secondary cluster ID is required"))?;
 
-        let primary_id = GlobalClusterId::new(
-            u16::try_from(primary.shard_id)
-                .map_err(|_| Status::invalid_argument("primary shard_id exceeds u16"))?,
-            primary.local_id,
-            u16::try_from(primary.version)
-                .map_err(|_| Status::invalid_argument("primary version exceeds u16"))?,
-        );
-        let secondary_id = GlobalClusterId::new(
-            u16::try_from(secondary.shard_id)
-                .map_err(|_| Status::invalid_argument("secondary shard_id exceeds u16"))?,
-            secondary.local_id,
-            u16::try_from(secondary.version)
-                .map_err(|_| Status::invalid_argument("secondary version exceeds u16"))?,
-        );
+        let primary_id = global_cluster_id_from_proto(&primary, "primary")?;
+        let secondary_id = global_cluster_id_from_proto(&secondary, "secondary")?;
         if primary_id == secondary_id {
             return Err(Status::invalid_argument(
                 "primary and secondary cluster IDs must differ",
             ));
         }
+        if primary_id.to_u64() >= secondary_id.to_u64() {
+            return Err(Status::invalid_argument(
+                "cross-shard merge must redirect the higher cluster ID to the lower canonical ID",
+            ));
+        }
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, apply_merge, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         // Get write lock on unirust
         let mut unirust = write_unirust!(self);
 
         // Apply the merge via the streaming linker's DSU
-        let records_updated = match unirust.apply_cross_shard_merge(primary_id, secondary_id) {
-            Ok(count) => count,
-            Err(err) => {
-                return Ok(Response::new(proto::ApplyMergeResponse {
-                    success: false,
-                    records_updated: 0,
-                    error: err.to_string(),
-                }));
-            }
+        let response = match unirust.apply_cross_shard_merge(primary_id, secondary_id) {
+            Ok(records_updated) => proto::ApplyMergeResponse {
+                success: true,
+                records_updated: records_updated as u32,
+                error: String::new(),
+            },
+            Err(err) => proto::ApplyMergeResponse {
+                success: false,
+                records_updated: 0,
+                error: err.to_string(),
+            },
         };
+        if response.success {
+            local_attempt.finish();
+        }
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "cross-shard merge",
+        )?;
+        Ok(Response::new(response))
+    }
 
-        Ok(Response::new(proto::ApplyMergeResponse {
-            success: true,
-            records_updated: records_updated as u32,
-            error: String::new(),
-        }))
+    async fn apply_merges(
+        &self,
+        request: Request<proto::ApplyMergesRequest>,
+    ) -> Result<Response<proto::ApplyMergesResponse>, Status> {
+        self.authorize_mutation(&request)?;
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
+        let req = request.into_inner();
+        let replication_request = req.clone();
+        let mut merges = Vec::with_capacity(req.merges.len());
+        let mut primaries_by_secondary = std::collections::HashMap::with_capacity(req.merges.len());
+        for merge in &req.merges {
+            let primary = merge
+                .primary
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("merge primary is required"))?;
+            let secondary = merge
+                .secondary
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("merge secondary is required"))?;
+            let primary = global_cluster_id_from_proto(primary, "primary")?;
+            let secondary = global_cluster_id_from_proto(secondary, "secondary")?;
+            if primary == secondary {
+                return Err(Status::invalid_argument(
+                    "primary and secondary cluster IDs must differ",
+                ));
+            }
+            if primary.to_u64() >= secondary.to_u64() {
+                return Err(Status::invalid_argument(
+                    "cross-shard merge must redirect the higher cluster ID to the lower canonical ID",
+                ));
+            }
+            if let Some(existing) = primaries_by_secondary.insert(secondary, primary) {
+                if existing != primary {
+                    return Err(Status::invalid_argument(
+                        "cross-shard merge batch redirects one secondary to multiple primaries",
+                    ));
+                }
+                continue;
+            }
+            merges.push((primary, secondary));
+        }
+
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, apply_merges, replication_request);
+        let local_attempt = self.begin_durable_mutation();
+        let mut unirust = write_unirust!(self);
+        let response = match unirust.apply_cross_shard_merges(&merges) {
+            Ok(records_updated) => proto::ApplyMergesResponse {
+                success: true,
+                records_updated: records_updated as u64,
+                error: String::new(),
+            },
+            Err(err) => proto::ApplyMergesResponse {
+                success: false,
+                records_updated: 0,
+                error: err.to_string(),
+            },
+        };
+        if response.success {
+            local_attempt.finish();
+        }
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "cross-shard merge batch",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn get_dirty_boundary_keys(
         &self,
-        _request: Request<proto::GetDirtyBoundaryKeysRequest>,
+        request: Request<proto::GetDirtyBoundaryKeysRequest>,
     ) -> Result<Response<proto::GetDirtyBoundaryKeysResponse>, Status> {
         let _mutation_guard = self.mutation_gate.read().await;
-        self.ensure_no_pending_ingest()?;
+        let _wal_guard = if self.ingest_wal.is_some() {
+            Some(self.ingest_wal_lock.lock().await)
+        } else {
+            None
+        };
+        if self
+            .ingest_wal
+            .as_ref()
+            .is_some_and(|wal| wal.has_pending())
+        {
+            return Err(Status::failed_precondition(
+                "ingest recovery is pending; restart the shard",
+            ));
+        }
+        self.ensure_store_healthy()?;
+        let request = request.into_inner();
+        let after_signature = if request.after_signature.is_empty() {
+            None
+        } else {
+            Some(
+                <[u8; 32]>::try_from(request.after_signature.as_slice())
+                    .map(IdentityKeySignature::from_bytes)
+                    .map_err(|_| Status::invalid_argument("dirty-key cursor must be 32 bytes"))?,
+            )
+        };
+        let limit = if request.limit == 0 {
+            DIRTY_KEY_PAGE_LIMIT
+        } else {
+            usize::try_from(request.limit)
+                .map_err(|_| Status::invalid_argument("dirty-key limit exceeds usize"))?
+        };
+        if limit > DIRTY_KEY_PAGE_LIMIT {
+            return Err(Status::invalid_argument(format!(
+                "dirty-key limit must not exceed {DIRTY_KEY_PAGE_LIMIT}"
+            )));
+        }
         let unirust = read_unirust!(self);
         let partitioned_guard = self.partitioned.read();
 
-        // Get dirty keys from both partitioned and non-partitioned paths
-        let mut all_dirty_keys = unirust.get_dirty_boundary_keys().unwrap_or_default();
-        let mut combined_index = unirust.export_boundary_index();
-
-        // Add dirty keys from partitioned processor
+        let candidate_limit = limit.saturating_add(1);
+        let mut all_dirty_keys = unirust
+            .dirty_boundary_key_candidates(after_signature, candidate_limit)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         if let Some(partitioned) = partitioned_guard.as_ref() {
-            all_dirty_keys.extend(partitioned.get_all_dirty_boundary_keys());
-            let partitioned_index = partitioned.export_boundary_index();
-            if let Some(ref mut index) = combined_index {
-                index.merge_from(&partitioned_index);
-            } else {
-                combined_index = Some(partitioned_index);
-            }
+            all_dirty_keys.extend(
+                partitioned.dirty_boundary_key_candidates(after_signature, candidate_limit),
+            );
         }
-
-        let mut dirty_key_entries = Vec::new();
-        if let Some(index) = combined_index {
-            for sig in &all_dirty_keys {
-                if let Some(entries) = index.get_boundaries(sig) {
-                    let proto_entries: Vec<proto::ClusterBoundaryEntry> = entries
-                        .iter()
-                        .map(|e| proto::ClusterBoundaryEntry {
-                            cluster_id: Some(proto::GlobalClusterId {
-                                shard_id: e.cluster_id.shard_id as u32,
-                                local_id: e.cluster_id.local_id,
-                                version: e.cluster_id.version as u32,
-                            }),
-                            interval_start: e.interval.start,
-                            interval_end: e.interval.end,
-                            shard_id: e.shard_id as u32,
-                            perspective_strong_ids: e.perspective_strong_ids.clone(),
-                            strong_ids: e
-                                .strong_ids
-                                .iter()
-                                .cloned()
-                                .map(boundary_strong_id_to_proto)
-                                .collect(),
-                        })
-                        .collect();
-
-                    dirty_key_entries.push(proto::DirtyBoundaryKey {
-                        signature: Some(proto::IdentityKeySignature {
-                            signature: sig.to_bytes().to_vec(),
-                        }),
-                        entries: proto_entries,
-                    });
-                }
-            }
+        let mut page = all_dirty_keys
+            .into_iter()
+            .take(candidate_limit)
+            .collect::<Vec<_>>();
+        let has_more = page.len() > limit;
+        if has_more {
+            page.pop();
         }
+        let next_after_signature = if has_more {
+            page.last()
+                .map_or_else(Vec::new, |signature| signature.to_bytes().to_vec())
+        } else {
+            Vec::new()
+        };
+        let dirty_keys = page
+            .into_iter()
+            .map(|signature| proto::DirtyBoundaryKey {
+                signature: Some(proto::IdentityKeySignature {
+                    signature: signature.to_bytes().to_vec(),
+                }),
+                entries: Vec::new(),
+            })
+            .collect();
 
         Ok(Response::new(proto::GetDirtyBoundaryKeysResponse {
-            dirty_keys: dirty_key_entries,
+            dirty_keys,
             shard_id: self.shard_id,
+            next_after_signature,
+            has_more,
         }))
     }
 
@@ -3153,11 +3826,11 @@ impl proto::shard_service_server::ShardService for ShardNode {
         &self,
         request: Request<proto::ClearDirtyKeysRequest>,
     ) -> Result<Response<proto::ClearDirtyKeysResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.read().await;
         self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
-        let mut unirust = write_unirust!(self);
-        let partitioned_guard = self.partitioned.read();
+        let replication_request = req.clone();
 
         let keys: Vec<crate::sharding::IdentityKeySignature> = req
             .keys
@@ -3173,6 +3846,10 @@ impl proto::shard_service_server::ShardService for ShardNode {
             })
             .collect();
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, clear_dirty_keys, replication_request);
+        let mut unirust = write_unirust!(self);
+        let partitioned_guard = self.partitioned.read();
         let keys_cleared = keys.len() as u32;
         unirust.clear_dirty_boundary_keys(&keys);
 
@@ -3181,18 +3858,25 @@ impl proto::shard_service_server::ShardService for ShardNode {
             partitioned.clear_dirty_boundary_keys(&keys);
         }
 
-        Ok(Response::new(proto::ClearDirtyKeysResponse {
-            keys_cleared,
-        }))
+        let response = proto::ClearDirtyKeysResponse { keys_cleared };
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "dirty boundary key clear",
+        )?;
+        Ok(Response::new(response))
     }
 
     async fn store_cross_shard_conflicts(
         &self,
         request: Request<proto::StoreCrossShardConflictsRequest>,
     ) -> Result<Response<proto::StoreCrossShardConflictsResponse>, Status> {
+        self.authorize_mutation(&request)?;
         let _mutation_guard = self.mutation_gate.write().await;
         self.ensure_no_pending_ingest()?;
         let req = request.into_inner();
+        let replication_request = req.clone();
         let conflicts: Vec<crate::sharding::CrossShardConflict> = req
             .conflicts
             .into_iter()
@@ -3247,6 +3931,9 @@ impl proto::shard_service_server::ShardService for ShardNode {
             })
             .collect::<Result<_, Status>>()?;
 
+        let (_replication_serial, replica_response, replication_attempt) =
+            replicate_to_replica!(self, store_cross_shard_conflicts, replication_request);
+        let local_attempt = self.begin_durable_mutation();
         // Store conflicts - keep only those relevant to this shard
         let shard_id = self.shard_id as u16;
         let mut conflict_storage = self.cross_shard_conflicts.write();
@@ -3268,9 +3955,15 @@ impl proto::shard_service_server::ShardService for ShardNode {
             *conflict_storage = updated;
         }
 
-        Ok(Response::new(proto::StoreCrossShardConflictsResponse {
-            stored_count,
-        }))
+        let response = proto::StoreCrossShardConflictsResponse { stored_count };
+        local_attempt.finish();
+        replication_attempt.finish(
+            replica_response
+                .as_ref()
+                .is_none_or(|replica| replica == &response),
+            "cross-shard conflict storage",
+        )?;
+        Ok(Response::new(response))
     }
 }
 
@@ -3391,8 +4084,11 @@ impl ReconciliationCoordinator {
     /// Take and clear dirty keys for reconciliation.
     fn take_dirty_keys(&mut self) -> Vec<crate::sharding::IdentityKeySignature> {
         self.oldest_dirty = None;
-        self.last_reconcile = Instant::now();
         self.dirty_keys.drain().map(|(k, _)| k).collect()
+    }
+
+    fn mark_reconciled(&mut self) {
+        self.last_reconcile = Instant::now();
     }
 
     /// Check if we should reconcile based on adaptive conditions.
@@ -3568,12 +4264,36 @@ impl RouterNode {
         for (expected_shard_id, client) in shard_clients.iter().enumerate() {
             let mut client = client.clone();
             let response = client
-                .get_config_version(Request::new(proto::ConfigVersionRequest {}))
+                .get_config_version(Request::new(proto::ConfigVersionRequest {
+                    include_durable_state_digest: false,
+                }))
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?
                 .into_inner();
             validate_distributed_protocol(response.protocol_version)?;
             validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
+            match proto::ShardRole::try_from(response.shard_role) {
+                Ok(proto::ShardRole::Standalone | proto::ShardRole::Primary) => {}
+                Ok(proto::ShardRole::Replica) => {
+                    return Err(Status::failed_precondition(format!(
+                        "shard endpoint at index {expected_shard_id} is a passive replica; \
+                         promote it before routing traffic"
+                    )));
+                }
+                _ => {
+                    return Err(Status::data_loss(format!(
+                        "shard endpoint at index {expected_shard_id} reported an invalid role"
+                    )));
+                }
+            }
+            if !response.durable_state_digest.is_empty()
+                && response.durable_state_digest.len() != 32
+            {
+                return Err(Status::data_loss(format!(
+                    "shard endpoint at index {expected_shard_id} reported an invalid durable \
+                     state digest"
+                )));
+            }
             let shard_restore_state = match (
                 response.restore_generation.is_empty(),
                 response.restore_shard_count,
@@ -3644,7 +4364,8 @@ impl RouterNode {
             );
             let metadata = client
                 .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
-                    since_version: 0,
+                    since_version: u64::MAX,
+                    signatures: Vec::new(),
                 }))
                 .await
                 .map_err(|err| Status::unavailable(err.to_string()))?
@@ -3803,60 +4524,17 @@ impl RouterNode {
     }
 
     async fn recover_dirty_reconciliation_on_startup(&self) -> Result<(), Status> {
-        let mut dirty_keys = std::collections::HashSet::new();
-        for (expected_shard_id, client) in self.shard_clients.iter().enumerate() {
-            let mut client = client.clone();
-            let response = client
-                .get_dirty_boundary_keys(Request::new(proto::GetDirtyBoundaryKeysRequest {}))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?
-                .into_inner();
-            if response.shard_id as usize != expected_shard_id {
-                return Err(Status::data_loss(format!(
-                    "dirty-key response from endpoint {expected_shard_id} reports shard {}",
-                    response.shard_id
-                )));
-            }
-            for dirty_key in response.dirty_keys {
-                let signature = dirty_key.signature.ok_or_else(|| {
-                    Status::data_loss("dirty-key response is missing a signature")
-                })?;
-                let signature = <[u8; 32]>::try_from(signature.signature.as_slice())
-                    .map_err(|_| Status::data_loss("dirty-key signature must be 32 bytes"))?;
-                dirty_keys.insert(IdentityKeySignature::from_bytes(signature));
-            }
-        }
+        let dirty_keys = self.fetch_dirty_boundary_keys(true).await?;
         if dirty_keys.is_empty() {
             return Ok(());
         }
 
-        let mut dirty_keys = dirty_keys.into_iter().collect::<Vec<_>>();
-        dirty_keys.sort_by_key(|signature| *signature.to_bytes());
         tracing::warn!(
             dirty_keys = dirty_keys.len(),
             "router startup is repairing retained cross-shard reconciliation work"
         );
         self.reconcile_dirty_keys(&dirty_keys).await?;
-
-        let keys = dirty_keys
-            .iter()
-            .map(|signature| proto::IdentityKeySignature {
-                signature: signature.to_bytes().to_vec(),
-            })
-            .collect::<Vec<_>>();
-        for (shard_id, client) in self.shard_clients.iter().enumerate() {
-            let mut client = client.clone();
-            client
-                .clear_dirty_keys(Request::new(proto::ClearDirtyKeysRequest {
-                    keys: keys.clone(),
-                }))
-                .await
-                .map_err(|err| {
-                    Status::unavailable(format!(
-                        "failed to clear recovered dirty keys on shard {shard_id}: {err}"
-                    ))
-                })?;
-        }
+        self.clear_dirty_boundary_keys(&dirty_keys).await?;
         Ok(())
     }
 
@@ -4160,17 +4838,36 @@ impl RouterNode {
         Ok(summaries)
     }
 
-    async fn fetch_boundary_metadata(&self) -> Result<Vec<proto::BoundaryMetadata>, Status> {
+    async fn fetch_boundary_metadata(
+        &self,
+        keys: &[IdentityKeySignature],
+    ) -> Result<Vec<proto::BoundaryMetadata>, Status> {
+        let signatures = keys
+            .iter()
+            .map(|signature| proto::IdentityKeySignature {
+                signature: signature.to_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let requests = self.shard_clients.iter().cloned().enumerate().map(
+            |(expected_shard_id, mut client)| {
+                let signatures = signatures.clone();
+                async move {
+                    let response = client
+                        .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
+                            since_version: 0,
+                            signatures,
+                        }))
+                        .await
+                        .map_err(|err| Status::unavailable(err.to_string()))?
+                        .into_inner();
+                    Ok::<_, Status>((expected_shard_id, response))
+                }
+            },
+        );
+        let responses = futures::future::join_all(requests).await;
         let mut metadata = Vec::with_capacity(self.shard_clients.len());
-        for (expected_shard_id, client) in self.shard_clients.iter().enumerate() {
-            let mut client = client.clone();
-            let response = client
-                .get_boundary_metadata(Request::new(proto::GetBoundaryMetadataRequest {
-                    since_version: 0,
-                }))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?
-                .into_inner();
+        for response in responses {
+            let (expected_shard_id, response) = response?;
             let shard_metadata = response
                 .metadata
                 .ok_or_else(|| Status::data_loss("shard returned no boundary metadata"))?;
@@ -4187,24 +4884,116 @@ impl RouterNode {
         Ok(metadata)
     }
 
-    async fn apply_merge_to_shard(
+    async fn fetch_dirty_boundary_keys(
+        &self,
+        fetch_all_pages: bool,
+    ) -> Result<Vec<IdentityKeySignature>, Status> {
+        let requests = self.shard_clients.iter().cloned().enumerate().map(
+            |(expected_shard_id, mut client)| async move {
+                let mut shard_keys = Vec::new();
+                let mut after_signature = Vec::new();
+                loop {
+                    let response = client
+                        .get_dirty_boundary_keys(Request::new(proto::GetDirtyBoundaryKeysRequest {
+                            after_signature: after_signature.clone(),
+                            limit: DIRTY_KEY_PAGE_LIMIT as u32,
+                        }))
+                        .await
+                        .map_err(|err| Status::unavailable(err.to_string()))?
+                        .into_inner();
+                    if response.shard_id as usize != expected_shard_id {
+                        return Err(Status::data_loss(format!(
+                            "dirty-key response from endpoint {expected_shard_id} reports shard {}",
+                            response.shard_id
+                        )));
+                    }
+                    for dirty_key in response.dirty_keys {
+                        if !dirty_key.entries.is_empty() {
+                            return Err(Status::data_loss(
+                                "dirty-key response unexpectedly included boundary metadata",
+                            ));
+                        }
+                        let signature = dirty_key.signature.ok_or_else(|| {
+                            Status::data_loss("dirty-key response is missing a signature")
+                        })?;
+                        let signature = <[u8; 32]>::try_from(signature.signature.as_slice())
+                            .map_err(|_| {
+                                Status::data_loss("dirty-key signature must be 32 bytes")
+                            })?;
+                        shard_keys.push(IdentityKeySignature::from_bytes(signature));
+                    }
+                    if !fetch_all_pages || !response.has_more {
+                        break;
+                    }
+                    if response.next_after_signature.len() != 32
+                        || response.next_after_signature <= after_signature
+                    {
+                        return Err(Status::data_loss(
+                            "shard returned a non-progressing dirty-key cursor",
+                        ));
+                    }
+                    after_signature = response.next_after_signature;
+                }
+                Ok::<_, Status>(shard_keys)
+            },
+        );
+        let responses = futures::future::join_all(requests).await;
+        let mut dirty_keys = std::collections::HashSet::new();
+        for shard_keys in responses {
+            dirty_keys.extend(shard_keys?);
+        }
+        let mut dirty_keys = dirty_keys.into_iter().collect::<Vec<_>>();
+        dirty_keys.sort_by_key(|signature| *signature.to_bytes());
+        Ok(dirty_keys)
+    }
+
+    async fn clear_dirty_boundary_keys(&self, keys: &[IdentityKeySignature]) -> Result<(), Status> {
+        for chunk in keys.chunks(RECONCILIATION_KEY_CHUNK) {
+            let keys = chunk
+                .iter()
+                .map(|signature| proto::IdentityKeySignature {
+                    signature: signature.to_bytes().to_vec(),
+                })
+                .collect::<Vec<_>>();
+            for (shard_id, client) in self.shard_clients.iter().enumerate() {
+                let mut client = client.clone();
+                client
+                    .clear_dirty_keys(Request::new(proto::ClearDirtyKeysRequest {
+                        keys: keys.clone(),
+                    }))
+                    .await
+                    .map_err(|err| {
+                        Status::unavailable(format!(
+                            "failed to clear reconciled dirty keys on shard {shard_id}: {err}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_merges_to_shard(
         &self,
         shard_id: u16,
-        primary: GlobalClusterId,
-        secondary: GlobalClusterId,
-    ) -> Result<u32, Status> {
+        merges: &[(GlobalClusterId, GlobalClusterId)],
+    ) -> Result<u64, Status> {
         let mut client = self.shard_client(u32::from(shard_id))?;
         let response = client
-            .apply_merge(Request::new(proto::ApplyMergeRequest {
-                primary: Some(global_cluster_id_to_proto(primary)),
-                secondary: Some(global_cluster_id_to_proto(secondary)),
+            .apply_merges(Request::new(proto::ApplyMergesRequest {
+                merges: merges
+                    .iter()
+                    .map(|(primary, secondary)| proto::ClusterMerge {
+                        primary: Some(global_cluster_id_to_proto(*primary)),
+                        secondary: Some(global_cluster_id_to_proto(*secondary)),
+                    })
+                    .collect(),
             }))
             .await
             .map_err(|err| Status::unavailable(err.to_string()))?
             .into_inner();
         if !response.success {
             return Err(Status::aborted(format!(
-                "shard {shard_id} rejected cross-shard merge: {}",
+                "shard {shard_id} rejected cross-shard merge batch: {}",
                 response.error
             )));
         }
@@ -4230,23 +5019,26 @@ impl RouterNode {
     async fn apply_reconciliation_result(
         &self,
         result: &crate::sharding::ReconciliationResult,
-    ) -> Result<(), Status> {
+    ) -> Result<u64, Status> {
+        let attempt = ConsistencyAttempt::new(self.reconciliation_consistent.clone());
         let outcome = self.apply_reconciliation_result_inner(result).await;
-        self.reconciliation_consistent
-            .store(outcome.is_ok(), Ordering::Release);
+        if outcome.is_ok() {
+            attempt.finish();
+        }
         outcome
     }
 
     async fn apply_reconciliation_result_inner(
         &self,
         result: &crate::sharding::ReconciliationResult,
-    ) -> Result<(), Status> {
-        for (primary, secondary) in &result.merged_clusters {
+    ) -> Result<u64, Status> {
+        let mut records_updated = 0u64;
+        for merges in result.merged_clusters.chunks(MERGE_APPLICATION_CHUNK) {
             for shard_id in 0..self.shard_clients.len() {
                 let shard_id = u16::try_from(shard_id)
                     .map_err(|_| Status::internal("shard index exceeds u16"))?;
-                self.apply_merge_to_shard(shard_id, *primary, *secondary)
-                    .await?;
+                records_updated = records_updated
+                    .saturating_add(self.apply_merges_to_shard(shard_id, merges).await?);
             }
         }
 
@@ -4266,9 +5058,12 @@ impl RouterNode {
             }
         }
         for (shard_id, conflicts) in conflicts_by_shard {
-            self.store_conflicts_on_shard(shard_id, conflicts).await?;
+            for chunk in conflicts.chunks(CONFLICT_APPLICATION_CHUNK) {
+                self.store_conflicts_on_shard(shard_id, chunk.to_vec())
+                    .await?;
+            }
         }
-        Ok(())
+        Ok(records_updated)
     }
 
     /// Get read access to the cluster locality index.
@@ -4392,74 +5187,24 @@ impl RouterNode {
     }
 
     async fn run_adaptive_reconciliation_once(&self) {
-        let poll_complete = {
+        let dirty_keys = {
             let _mutation_guard = self.mutation_gate.read().await;
             if self.ensure_ontology_consistent().is_err() {
                 return;
             }
-
-            // 1. Poll all shards for dirty boundary keys without pausing ingest.
-            let mut poll_complete = true;
-            for (expected_shard_id, client) in self.shard_clients.iter().enumerate() {
-                let mut client = client.clone();
-                match client
-                    .get_dirty_boundary_keys(Request::new(proto::GetDirtyBoundaryKeysRequest {}))
-                    .await
-                {
-                    Ok(response) => {
-                        let resp = response.into_inner();
-                        let shard_id = match u16::try_from(resp.shard_id) {
-                            Ok(shard_id) => shard_id,
-                            Err(_) => {
-                                tracing::error!(
-                                    shard_id = resp.shard_id,
-                                    "dirty-key response shard_id exceeds u16"
-                                );
-                                poll_complete = false;
-                                continue;
-                            }
-                        };
-                        if usize::from(shard_id) != expected_shard_id {
-                            tracing::error!(
-                                expected_shard_id,
-                                reported_shard_id = shard_id,
-                                "dirty-key response came from the wrong shard"
-                            );
-                            poll_complete = false;
-                            continue;
-                        }
-
-                        for dirty_key in resp.dirty_keys {
-                            let Some(sig_proto) = &dirty_key.signature else {
-                                tracing::error!("dirty-key response is missing a signature");
-                                poll_complete = false;
-                                continue;
-                            };
-                            let Ok(sig_bytes) =
-                                <[u8; 32]>::try_from(sig_proto.signature.as_slice())
-                            else {
-                                tracing::error!("dirty-key signature must be 32 bytes");
-                                poll_complete = false;
-                                continue;
-                            };
-                            let sig = IdentityKeySignature::from_bytes(sig_bytes);
-                            let mut coordinator = self.reconciliation_coordinator.lock().await;
-                            coordinator.add_dirty_keys_from_shard(shard_id, vec![sig]);
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to poll shard dirty keys");
-                        poll_complete = false;
-                    }
+            match self.fetch_dirty_boundary_keys(false).await {
+                Ok(dirty_keys) => dirty_keys,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to poll shard dirty keys");
+                    return;
                 }
             }
-            poll_complete
         };
-        if !poll_complete {
-            return;
+        if !dirty_keys.is_empty() {
+            let mut coordinator = self.reconciliation_coordinator.lock().await;
+            coordinator.add_dirty_keys_from_shard(0, dirty_keys);
         }
 
-        // 2. Check if we should reconcile
         let should_run = {
             let coordinator = self.reconciliation_coordinator.lock().await;
             let ingest_rate = self.current_ingest_rate();
@@ -4471,56 +5216,56 @@ impl RouterNode {
             // Pause router-mediated ingest while refetching metadata, applying merges,
             // and clearing exactly the reconciled dirty-key generation.
             let _mutation_guard = self.mutation_gate.write().await;
+            let reconciliation_started = Instant::now();
             if self.ensure_ontology_consistent().is_err() {
                 return;
             }
-            // 3. Take dirty keys and perform targeted reconciliation
-            let dirty_keys = {
+            {
                 let mut coordinator = self.reconciliation_coordinator.lock().await;
-                coordinator.take_dirty_keys()
+                coordinator.take_dirty_keys();
+            }
+            let dirty_keys = match self.fetch_dirty_boundary_keys(true).await {
+                Ok(dirty_keys) => dirty_keys,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "adaptive reconciliation failed to refetch authoritative dirty keys"
+                    );
+                    return;
+                }
             };
-
-            if !dirty_keys.is_empty() {
-                let result = match self.reconcile_dirty_keys(&dirty_keys).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::error!(
-                            error = %err,
-                            "adaptive reconciliation failed; shard dirty keys retained"
-                        );
-                        return;
-                    }
-                };
-
-                // Update metrics
-                if result.conflicts_blocked > 0 {
-                    self.metrics
-                        .cross_shard_conflicts
-                        .fetch_add(result.conflicts_blocked as u64, Ordering::Relaxed);
+            let result = match self.reconcile_dirty_keys(&dirty_keys).await {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "adaptive reconciliation failed; shard dirty keys retained"
+                    );
+                    return;
                 }
-
-                // 4. Clear dirty keys on shards
-                let proto_keys: Vec<proto::IdentityKeySignature> = dirty_keys
-                    .iter()
-                    .map(|sig| proto::IdentityKeySignature {
-                        signature: sig.to_bytes().to_vec(),
-                    })
-                    .collect();
-
-                for client in &self.shard_clients {
-                    let mut client = client.clone();
-                    if let Err(err) = client
-                        .clear_dirty_keys(Request::new(proto::ClearDirtyKeysRequest {
-                            keys: proto_keys.clone(),
-                        }))
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to clear reconciled dirty keys; retry is safe"
-                        );
-                    }
-                }
+            };
+            if let Err(err) = self.clear_dirty_boundary_keys(&dirty_keys).await {
+                tracing::error!(
+                    error = %err,
+                    "adaptive reconciliation failed to clear dirty keys; retry is safe"
+                );
+                return;
+            }
+            tracing::info!(
+                dirty_keys = dirty_keys.len(),
+                merges = result.merges_performed,
+                conflicts_blocked = result.conflicts_blocked,
+                elapsed_ms = reconciliation_started.elapsed().as_millis(),
+                "adaptive cross-shard reconciliation completed"
+            );
+            self.reconciliation_coordinator
+                .lock()
+                .await
+                .mark_reconciled();
+            if result.conflicts_blocked > 0 {
+                self.metrics
+                    .cross_shard_conflicts
+                    .fetch_add(result.conflicts_blocked as u64, Ordering::Relaxed);
             }
         }
     }
@@ -4532,14 +5277,36 @@ impl RouterNode {
     ) -> Result<crate::sharding::ReconciliationResult, Status> {
         use crate::sharding::IncrementalReconciler;
 
-        let mut reconciler = IncrementalReconciler::new();
-        for metadata in self.fetch_boundary_metadata().await? {
-            reconciler.add_shard_boundary(boundary_index_from_metadata(&metadata)?);
-        }
+        let mut candidates = ReconciliationCandidates::default();
+        let mut metadata_elapsed = Duration::ZERO;
+        let mut reconcile_elapsed = Duration::ZERO;
+        for chunk in keys.chunks(RECONCILIATION_KEY_CHUNK) {
+            let metadata_started = Instant::now();
+            let mut reconciler = IncrementalReconciler::new();
+            for metadata in self.fetch_boundary_metadata(chunk).await? {
+                reconciler.add_shard_boundary(boundary_index_from_metadata(&metadata)?);
+            }
+            metadata_elapsed += metadata_started.elapsed();
 
-        let key_set: std::collections::HashSet<_> = keys.iter().copied().collect();
-        let result = reconciler.reconcile_keys(&key_set);
-        self.apply_reconciliation_result(&result).await?;
+            let reconcile_started = Instant::now();
+            let key_set = chunk.iter().copied().collect();
+            candidates.extend(reconciler.reconciliation_candidates(&key_set));
+            reconcile_elapsed += reconcile_started.elapsed();
+        }
+        let reconcile_started = Instant::now();
+        let result = candidates.finish();
+        reconcile_elapsed += reconcile_started.elapsed();
+        let apply_started = Instant::now();
+        let records_updated = self.apply_reconciliation_result(&result).await?;
+        tracing::info!(
+            dirty_keys = keys.len(),
+            merges = result.merges_performed,
+            records_updated,
+            metadata_ms = metadata_elapsed.as_millis(),
+            reconcile_ms = reconcile_elapsed.as_millis(),
+            apply_ms = apply_started.elapsed().as_millis(),
+            "cross-shard reconciliation phase timings"
+        );
         Ok(result)
     }
 
@@ -4699,6 +5466,7 @@ impl proto::router_service_server::RouterService for RouterNode {
             }
         }
         self.invalidate_global_conflict_cache();
+        let consistency_attempt = ConsistencyAttempt::new(self.cluster_consistent.clone());
 
         for client in &self.shard_clients {
             let mut client = client.clone();
@@ -4718,17 +5486,17 @@ impl proto::router_service_server::RouterService for RouterNode {
                     }
                 }
                 if !rollback_complete {
-                    self.cluster_consistent.store(false, Ordering::Release);
                     return Err(Status::aborted(format!(
                         "ontology update failed and rollback was incomplete; cluster is blocked: \
                          {apply_error}"
                     )));
                 }
+                consistency_attempt.finish();
                 return Err(apply_error);
             }
         }
         *self.ontology_config.write().await = mapped;
-        self.cluster_consistent.store(true, Ordering::Release);
+        consistency_attempt.finish();
 
         Ok(Response::new(proto::ApplyOntologyResponse {}))
     }
@@ -4913,6 +5681,8 @@ impl proto::router_service_server::RouterService for RouterNode {
                 .as_ref()
                 .map(|_| self.shard_clients.len() as u32)
                 .unwrap_or_default(),
+            shard_role: proto::ShardRole::Unspecified as i32,
+            durable_state_digest: Vec::new(),
         }))
     }
 
@@ -5282,15 +6052,9 @@ impl proto::router_service_server::RouterService for RouterNode {
                  metadata from its configured shards",
             ));
         }
-        let shard_metadata = self.fetch_boundary_metadata().await?;
-
-        let mut reconciler = crate::sharding::IncrementalReconciler::new();
-        for metadata in &shard_metadata {
-            reconciler.add_shard_boundary(boundary_index_from_metadata(metadata)?);
-        }
-
-        let result = reconciler.reconcile();
-        self.apply_reconciliation_result(&result).await?;
+        let dirty_keys = self.fetch_dirty_boundary_keys(true).await?;
+        let result = self.reconcile_dirty_keys(&dirty_keys).await?;
+        self.clear_dirty_boundary_keys(&dirty_keys).await?;
 
         if result.conflicts_blocked > 0 {
             self.metrics.cross_shard_conflicts.fetch_add(
@@ -5683,7 +6447,7 @@ mod wal_tests {
         ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 5,
                 records: vec![original.clone()],
             }),
         )
@@ -5695,7 +6459,7 @@ mod wal_tests {
         let error = ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 3,
+                internal_protocol_version: 5,
                 records: vec![conflicting],
             }),
         )
@@ -5713,6 +6477,57 @@ mod wal_tests {
             .into_inner();
         assert_eq!(stats.record_count, 1);
         shard.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn invalid_persistent_import_does_not_latch_shard_closed() {
+        use proto::shard_service_server::ShardService;
+
+        let temp_dir = tempfile::tempdir().expect("temporary shard directory");
+        let shard = ShardNode::new_with_data_dir(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+            Some(temp_dir.path().to_path_buf()),
+            false,
+            None,
+        )
+        .expect("persistent shard");
+        let error = ShardService::import_records(
+            &shard,
+            Request::new(proto::ImportRecordsRequest {
+                records: vec![proto::RecordSnapshot {
+                    record_id: 7,
+                    identity: Some(proto::RecordIdentity {
+                        entity_type: "person".to_string(),
+                        perspective: "crm".to_string(),
+                        uid: "invalid-import".to_string(),
+                    }),
+                    descriptors: vec![proto::RecordDescriptor {
+                        attr: "email".to_string(),
+                        value: "invalid@example.com".to_string(),
+                        start: 10,
+                        end: 10,
+                    }],
+                }],
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .expect_err("invalid import must fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        ShardService::health_check(&shard, Request::new(proto::HealthCheckRequest {}))
+            .await
+            .expect("fully validated client errors must not poison readiness");
+        shard.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn incomplete_durable_mutation_latches_consistency() {
+        let consistency = Arc::new(AtomicBool::new(true));
+        drop(DurableMutationAttempt::new(consistency.clone(), true));
+        assert!(!consistency.load(Ordering::Acquire));
     }
 
     #[tokio::test]

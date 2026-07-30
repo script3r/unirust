@@ -33,7 +33,7 @@ Unirust will:
 ### Installation
 
 ```bash
-git clone https://github.com/unirust/unirust.git
+git clone https://github.com/script3r/unirust.git
 cd unirust
 cargo build --release
 ```
@@ -42,13 +42,13 @@ cargo build --release
 
 ```bash
 # Start a single shard
-./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0
+./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --ephemeral
 
 # In another terminal, start the router
 ./target/release/unirust_router --listen 127.0.0.1:50060 --shards 127.0.0.1:50061
 ```
 
-### Multi-Shard Cluster (Production)
+### Local Multi-Shard Cluster
 
 ```bash
 # Use the cluster script
@@ -61,11 +61,11 @@ SHARDS=5 ONTOLOGY=/etc/unirust/ontology.json ./scripts/cluster.sh restart
 UNIRUST_CONFIRM_RESET=1 ./scripts/cluster.sh reset
 
 # Or start manually:
-./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0
-./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /data/shard1
-./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /data/shard2
-./target/release/unirust_shard --listen 127.0.0.1:50064 --shard-id 3 --data-dir /data/shard3
-./target/release/unirust_shard --listen 127.0.0.1:50065 --shard-id 4 --data-dir /data/shard4
+./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /data/shard0 --backup-dir /backup/shard0
+./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /data/shard1 --backup-dir /backup/shard1
+./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /data/shard2 --backup-dir /backup/shard2
+./target/release/unirust_shard --listen 127.0.0.1:50064 --shard-id 3 --data-dir /data/shard3 --backup-dir /backup/shard3
+./target/release/unirust_shard --listen 127.0.0.1:50065 --shard-id 4 --data-dir /data/shard4 --backup-dir /backup/shard4
 
 ./target/release/unirust_router --listen 127.0.0.1:50060 \
   --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063,127.0.0.1:50064,127.0.0.1:50065
@@ -120,10 +120,20 @@ profile = "high-throughput"
 listen = "0.0.0.0:50061"
 id = 0
 data_dir = "/var/lib/unirust/shard-0"
+backup_dir = "/var/backups/unirust/shard-0"
+tls_cert = "/etc/unirust/tls/shard-0.crt"
+tls_key = "/etc/unirust/tls/shard-0.key"
+tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
 
 [router]
 listen = "0.0.0.0:50060"
-shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061"]
+shards = ["https://shard-0:50061", "https://shard-1:50061", "https://shard-2:50061"]
+tls_cert = "/etc/unirust/tls/router.crt"
+tls_key = "/etc/unirust/tls/router.key"
+tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
+shard_tls_ca = "/etc/unirust/tls/shards-ca.crt"
+shard_tls_cert = "/etc/unirust/tls/router-client.crt"
+shard_tls_key = "/etc/unirust/tls/router-client.key"
 
 [storage]
 block_cache_mb = 1024
@@ -140,10 +150,29 @@ write_buffer_mb = 256
 | `UNIRUST_SHARD_ID` | Shard ID |
 | `UNIRUST_SHARD_DATA_DIR` | Persistent shard data directory |
 | `UNIRUST_SHARD_BACKUP_DIR` | External checkpoint root |
+| `UNIRUST_SHARD_TLS_CERT` | Shard server certificate |
+| `UNIRUST_SHARD_TLS_KEY` | Shard server private key |
+| `UNIRUST_SHARD_TLS_CLIENT_CA` | CA for required shard client certificates |
+| `UNIRUST_SHARD_REPLICA` | Passive replica endpoint for this primary |
+| `UNIRUST_SHARD_REPLICA_MODE` | Run as a passive replica |
+| `UNIRUST_SHARD_REPLICATION_TOKEN_FILE` | Shared secret file for one replica pair |
+| `UNIRUST_SHARD_ALLOW_INSECURE_REPLICATION` | Permit plaintext replication for isolated development |
+| `UNIRUST_SHARD_REPLICA_CONNECT_TIMEOUT_SECS` | Replica connection timeout |
+| `UNIRUST_SHARD_REPLICA_REQUEST_TIMEOUT_SECS` | Per-RPC replica timeout |
+| `UNIRUST_SHARD_REPLICA_TCP_KEEPALIVE_SECS` | Replica TCP keepalive interval |
+| `UNIRUST_SHARD_REPLICA_TLS_CA` | CA used to verify the replica |
+| `UNIRUST_SHARD_REPLICA_TLS_CERT` | Primary certificate presented to the replica |
+| `UNIRUST_SHARD_REPLICA_TLS_KEY` | Primary client private key |
 | `UNIRUST_ROUTER_SHARDS` | Comma-separated shard addresses |
 | `UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS` | Coordinated checkpoint interval (`0` disables) |
 | `UNIRUST_ROUTER_SHARD_CONNECT_TIMEOUT_SECS` | Shard connection timeout |
 | `UNIRUST_ROUTER_SHARD_REQUEST_TIMEOUT_SECS` | Per-RPC shard timeout |
+| `UNIRUST_ROUTER_TLS_CERT` | Router server certificate |
+| `UNIRUST_ROUTER_TLS_KEY` | Router server private key |
+| `UNIRUST_ROUTER_TLS_CLIENT_CA` | CA for required router client certificates |
+| `UNIRUST_ROUTER_SHARD_TLS_CA` | CA used to verify shard certificates |
+| `UNIRUST_ROUTER_SHARD_TLS_CERT` | Router certificate presented to shards |
+| `UNIRUST_ROUTER_SHARD_TLS_KEY` | Router client private key |
 
 ### Tuning Profiles
 
@@ -259,18 +288,33 @@ Cross-shard copy imports therefore fail closed; online scale-out and scale-in
 require a future transactional relocation protocol or an offline rebuild.
 
 Cross-shard redirects are durably applied to every shard and are idempotent. If
-any shard fails while a reconciliation result is being applied, the router
-latches the cluster closed for ingest, query, and administrative traffic rather
-than serving a partially updated global view. Retrying `Reconcile` repairs the
-retained dirty keys in place. After a router or full-cluster restart, router
-startup performs that repair before returning a serviceable node and clears the
-dirty generation only after every shard converges.
+any shard fails, or the initiating request is cancelled, while a reconciliation
+result is being applied, the router latches the cluster closed for ingest, query,
+and administrative traffic rather than serving a partially updated global view.
+Retrying `Reconcile` repairs the retained dirty keys in place. After a router or
+full-cluster restart, router startup performs that repair before returning a
+serviceable node and clears the dirty generation only after every shard
+converges.
+
+Cluster-wide ontology replacement has the same fail-closed cancellation
+semantics. Readiness stays failed after an ambiguous partial update until
+`SetOntology` is retried with the intended configuration or every shard is
+recovered offline to one configuration. Router startup also rejects mismatched
+shard ontologies.
 
 The shard reconstructs all derived linker state before opening its gRPC
-listener. Recovery currently scans all persisted records, so recovery time is
-O(record count). This is a correctness-first crash-recovery path, not a bounded
-recovery-time guarantee. Measure restart time at the intended dataset size and
-set orchestration startup probes accordingly.
+listener. Recovery scans persisted records in ordered, bounded batches through
+the normal entity-resolution path, so recovery time remains O(record count).
+This is a correctness-first crash-recovery path, not a bounded recovery-time
+guarantee. Measure restart time at the intended dataset size and set
+orchestration startup probes accordingly.
+
+Global cluster IDs are anchored to durable record IDs so replay order cannot
+change cross-shard identity. On the first startup of a database created before
+this scheme marker existed, the shard atomically removes allocation-order
+redirects that cannot be trusted after replay; router startup reconstructs them
+from authoritative records before becoming ready. Upgrade every shard and the
+router together for this transition rather than mixing versions.
 
 `LinkerStateConfig` cache capacities are not enforced because the current LRU
 backend has no durable spill/read-through path. Evicting cluster IDs, strong-ID
@@ -308,10 +352,74 @@ deployment and cluster script use these semantic probes.
 Router-to-shard calls are bounded by configurable transport settings under
 `[router]`: `shard_connect_timeout_secs` (10 seconds by default),
 `shard_request_timeout_secs` (120 seconds), and
-`shard_tcp_keepalive_secs` (30 seconds). A deadline error is not proof that a
-mutation was rolled back; the shard may have committed just before the response
-was lost. Retry ingest with the same immutable source-record identity and
-payload so the operation is resolved idempotently.
+`shard_tcp_keepalive_secs` (30 seconds). A deadline error or client cancellation
+is not proof that a mutation was rolled back; an admitted ingest continues to a
+durable outcome after its caller disconnects. Retry ingest with the same
+immutable source-record identity and payload so the operation is resolved
+idempotently.
+
+### Synchronous Replication
+
+A logical shard can run as one primary and one passive replica on distinct
+persistent volumes and failure domains. Both processes use the same shard ID,
+ontology, config version, and replication token. Bootstrap both volumes from
+the same committed checkpoint, or start with two empty volumes. Primary startup
+computes a SHA-256 digest over every logical RocksDB key/value pair on both
+nodes and refuses traffic unless their complete durable states match. Pairing
+startup is O(database size), so measure it against the production dataset.
+Set `UNIRUST_SHARD_REPLICA_REQUEST_TIMEOUT_SECS` above the measured worst-case
+pairing digest time.
+
+Generate a separate secret for each pair, store at least 32 random bytes in a
+file readable only by the service account, and mount the same content on both
+nodes. Start the passive replica first:
+
+```bash
+unirust_shard \
+  --shard-id 0 \
+  --data-dir /var/lib/unirust/shard-0-replica \
+  --backup-dir /var/backups/unirust/shard-0-replica \
+  --replica-mode \
+  --replication-token-file /etc/unirust/replication/shard-0.token \
+  --tls-cert /etc/unirust/tls/shard-0-replica.crt \
+  --tls-key /etc/unirust/tls/shard-0-replica.key \
+  --tls-client-ca /etc/unirust/tls/primaries-ca.crt
+```
+
+Then start the primary with its normal shard server credentials plus:
+
+```bash
+unirust_shard \
+  --shard-id 0 \
+  --data-dir /var/lib/unirust/shard-0-primary \
+  --backup-dir /var/backups/unirust/shard-0-primary \
+  --replica https://shard-0-replica:50061 \
+  --replication-token-file /etc/unirust/replication/shard-0.token \
+  --replica-tls-ca /etc/unirust/tls/replicas-ca.crt \
+  --replica-tls-cert /etc/unirust/tls/shard-0-primary.crt \
+  --replica-tls-key /etc/unirust/tls/shard-0-primary.key
+```
+
+Every durable mutation is applied to the replica first, then locally, under one
+per-pair serialization gate. The primary acknowledges only after both results
+match. An unavailable or ambiguous replica result latches the primary
+unhealthy and blocks reads and writes until operators reconcile the pair.
+Replication therefore protects acknowledged writes from one volume loss, but
+adds replica latency and requires both nodes to be available for writes.
+
+Failover is manual because Unirust does not implement leader election or
+quorum fencing:
+
+1. Prove the old primary is stopped or isolated from clients and the replica.
+2. Stop the passive process and restart its volume without `--replica-mode`.
+3. Point the router at the promoted endpoint and restart the router.
+4. Rebootstrap the old primary from a checkpoint of the promoted node before
+   attaching it as a new passive replica.
+
+Never serve the old primary and promoted replica simultaneously. Doing so can
+create split brain. Online reset is disabled while a primary has a replica;
+stop and rebootstrap both members together. Keep verified off-host backups for
+correlated failures, operator mistakes, and storage corruption.
 
 ### External Backups
 
@@ -381,27 +489,78 @@ generation and shard count, then verifies the topology, ontology, and protocol
 versions before accepting traffic. Mixed restored/unrestored volumes and
 different committed generations fail closed.
 
-The built-in scheduler only creates local coordinated checkpoints. Unirust does
-not replicate, encrypt, transfer, retain, or verify off-host backups. Without
-storage-layer replication, the recovery point is the last completed coordinated
-checkpoint, so acknowledged writes after it can be lost in a volume failure.
-Production operators must provide off-host replication, retention, monitoring,
-and periodic restore drills according to their RPO and RTO. Process crashes and
-ordinary restarts remain covered by the synced ingest WAL independently of this
-backup path.
+Export a complete committed generation to storage mounted from another failure
+domain. All shard checkpoint paths must be accessible to the export process:
+
+```bash
+unirust_backup export \
+  --destination /mnt/off-host/unirust/backup-2026-07-24T1300Z \
+  --checkpoint /var/backups/unirust/shard-0/backup-2026-07-24T1300Z \
+  --checkpoint /var/backups/unirust/shard-1/backup-2026-07-24T1300Z \
+  --checkpoint /var/backups/unirust/shard-2/backup-2026-07-24T1300Z
+
+unirust_backup verify \
+  --backup /mnt/off-host/unirust/backup-2026-07-24T1300Z
+```
+
+Export validates that every shard is present exactly once and belongs to the
+same generation and topology. It copies into a sibling staging directory,
+records every file length and SHA-256 digest in a binary manifest, opens every
+copied RocksDB checkpoint read-only with paranoid checks, syncs the tree, and
+publishes it with one rename. Verification rejects modified, missing, extra, or
+symlinked content. Restore from the exported `shard-0`, `shard-1`, and
+`shard-2` directories, not from the deleted local checkpoint roots.
+
+Retention only removes generations after every entry in its root verifies:
+
+```bash
+unirust_backup prune --root /mnt/off-host/unirust --retain 14
+```
+
+The built-in scheduler creates coordinated source checkpoints; it does not
+automatically run the export command. Schedule export and verification after
+checkpoint completion, monitor both, and run periodic restore drills. The
+destination filesystem must provide independent storage and encryption at rest.
+Without an enabled synchronous replica, the recovery point for a lost volume
+remains the last successfully exported generation and acknowledged writes
+after it can be lost. Process crashes and ordinary restarts remain covered
+independently by the synced ingest and RocksDB WALs.
 
 ## Deployment Security
 
-The gRPC services do not currently terminate TLS or authenticate callers.
-Production deployments must place the router and every shard on private
-networks and enforce authenticated TLS with a service mesh or reverse proxy.
-Never expose a shard port directly to an untrusted network. Destructive RPCs
-remain disabled by default, but ingest, query, export, reconciliation, and other
-administrative surfaces are otherwise unauthenticated.
+Router and shard binaries support mutually authenticated TLS. Each server
+requires its certificate, private key, and client CA as an all-or-none group.
+The router-to-shard client likewise requires a CA, client certificate, and
+private key together, and secured shard addresses must use `https://`. Startup
+fails closed for partial certificate groups, unreadable or empty PEM files,
+plaintext endpoints paired with TLS configuration, or HTTPS endpoints without
+explicit trust configuration. Certificate SANs must match the endpoint host.
 
-The shard binary requires a persistent `--data-dir`. An in-memory shard can only
-be started with the explicit `--ephemeral` flag and loses all records when the
-process exits.
+Client tools use `--tls-ca`, `--tls-cert`, and `--tls-key`; the semantic health
+probe uses `--ca-cert`, `--client-cert`, and `--client-key`. All three options
+are required together. Certificate rotation currently requires a process
+restart. Production deployments must enable native mTLS on the router and every
+shard, or enforce equivalent authenticated TLS through a service mesh. Keep
+shard ports private and never expose plaintext gRPC to an untrusted network.
+The supplied Compose file is a local plaintext example and binds its router
+port to loopback only.
+
+Replication additionally uses a per-pair shared token. The shard binary rejects
+plaintext replication by default; `--allow-insecure-replication` exists only
+for isolated development. Protect token files as credentials, rotate them by
+stopping and restarting both members, and use different tokens for every pair.
+
+The shard binary requires a persistent `--data-dir` and a non-overlapping
+`--backup-dir`. Mount them from independent storage: separate directory names
+alone do not protect against volume loss. An in-memory shard can only be started
+with the explicit `--ephemeral` flag and loses all records when the process
+exits. `--allow-colocated-checkpoints` is a development-only escape hatch and
+does not provide volume-loss recovery.
+
+Router and shard servers cap each encoded or decoded gRPC message at 4 MiB,
+limit each connection to 128 concurrent requests, and shed excess load. Use the
+streaming ingest, import, and export RPCs for larger transfers. Bound connection
+counts and request rates at the load balancer as well.
 
 ## Performance
 

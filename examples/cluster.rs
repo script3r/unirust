@@ -27,9 +27,9 @@
 //! SHARDS=3 ./scripts/cluster.sh start
 //!
 //! # Option 2: Start manually
-//! ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /tmp/shard0
-//! ./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /tmp/shard1
-//! ./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /tmp/shard2
+//! ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /tmp/shard0 --backup-dir /tmp/shard0-backup
+//! ./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /tmp/shard1 --backup-dir /tmp/shard1-backup
+//! ./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /tmp/shard2 --backup-dir /tmp/shard2-backup
 //! ./target/release/unirust_router --listen 127.0.0.1:50060 \
 //!     --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063
 //! ```
@@ -73,13 +73,13 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  SHARDS=3 ./scripts/cluster.sh start\n");
             eprintln!("Or manually:");
             eprintln!(
-                "  ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /tmp/shard0"
+                "  ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /tmp/shard0 --backup-dir /tmp/shard0-backup"
             );
             eprintln!(
-                "  ./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /tmp/shard1"
+                "  ./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /tmp/shard1 --backup-dir /tmp/shard1-backup"
             );
             eprintln!(
-                "  ./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /tmp/shard2"
+                "  ./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /tmp/shard2 --backup-dir /tmp/shard2-backup"
             );
             eprintln!("  ./target/release/unirust_router --listen 127.0.0.1:50060 \\");
             eprintln!("      --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063");

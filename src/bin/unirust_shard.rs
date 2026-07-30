@@ -1,10 +1,15 @@
 use std::fs;
 
-use tonic::transport::Server;
+use std::time::Duration;
+
+use tonic::transport::{Endpoint, Server};
 use unirust_rs::config::{ConfigOverrides, Profile, ShardOverrides, UniConfig};
 use unirust_rs::distributed::{proto, DistributedOntologyConfig, ShardNode};
-use unirust_rs::transport_security::load_server_mtls;
+use unirust_rs::transport_security::{load_client_mtls, load_replication_token, load_server_mtls};
 use unirust_rs::{restore_checkpoint_for_shard, StreamingTuning};
+
+const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 128;
 
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
@@ -41,12 +46,26 @@ OPTIONS:
                             billion-scale-high-performance
         --repair            Run repair on startup
         --ephemeral         Allow an in-memory shard; all data is lost on process exit
+        --allow-colocated-checkpoints
+                            Permit checkpoints without an independent path (development only)
         --allow-destructive-admin
                             Enable destructive admin RPCs such as Reset
         --tls-cert <FILE>   PEM shard server certificate
         --tls-key <FILE>    PEM shard server private key
         --tls-client-ca <FILE>
                             PEM CA used to require router client certificates
+        --replica <URI>     Passive replica endpoint for synchronous replication
+        --replica-mode      Run as a passive replica; routers reject this endpoint
+        --allow-insecure-replication
+                            Permit plaintext replication for isolated development
+        --replication-token-file <FILE>
+                            Shared secret file (at least 32 bytes) for this replica pair
+        --replica-tls-ca <FILE>
+                            PEM CA used to verify the replica
+        --replica-tls-cert <FILE>
+                            PEM primary client certificate presented to the replica
+        --replica-tls-key <FILE>
+                            PEM primary client private key
         --config-version    Config version for compatibility checking
     -h, --help              Print help
 
@@ -58,6 +77,23 @@ ENVIRONMENT:
     UNIRUST_SHARD_DATA_DIR  Data directory
     UNIRUST_SHARD_BACKUP_DIR
                             Checkpoint root
+    UNIRUST_SHARD_TLS_CERT  PEM server certificate
+    UNIRUST_SHARD_TLS_KEY   PEM server private key
+    UNIRUST_SHARD_TLS_CLIENT_CA
+                            PEM CA for required client certificates
+    UNIRUST_SHARD_REPLICA   Passive replica endpoint
+    UNIRUST_SHARD_REPLICA_MODE
+                            Run as a passive replica
+    UNIRUST_SHARD_ALLOW_INSECURE_REPLICATION
+                            Permit plaintext replication for isolated development
+    UNIRUST_SHARD_REPLICATION_TOKEN_FILE
+                            Shared secret file for the primary/replica pair
+    UNIRUST_SHARD_REPLICA_TLS_CA
+                            PEM CA used to verify the replica
+    UNIRUST_SHARD_REPLICA_TLS_CERT
+                            PEM primary certificate presented to the replica
+    UNIRUST_SHARD_REPLICA_TLS_KEY
+                            PEM primary client private key
 
 CONFIG FILE (unirust.toml):
     profile = "billion-scale-high-performance"
@@ -67,6 +103,14 @@ CONFIG FILE (unirust.toml):
     id = 0
     data_dir = "/var/lib/unirust"
     backup_dir = "/var/backups/unirust/shard-0"
+    tls_cert = "/etc/unirust/tls/shard-0.crt"
+    tls_key = "/etc/unirust/tls/shard-0.key"
+    tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
+    replica = "https://shard-0-replica:50061"
+    replication_token_file = "/etc/unirust/replication/shard-0.token"
+    replica_tls_ca = "/etc/unirust/tls/replicas-ca.crt"
+    replica_tls_cert = "/etc/unirust/tls/shard-0-primary.crt"
+    replica_tls_key = "/etc/unirust/tls/shard-0-primary.key"
 "#
     );
 }
@@ -166,6 +210,27 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = parse_arg("--tls-client-ca") {
         shard_overrides.tls_client_ca = Some(path.into());
     }
+    if let Some(replica) = parse_arg("--replica") {
+        shard_overrides.replica = Some(replica);
+    }
+    if has_flag("--replica-mode") {
+        shard_overrides.replica_mode = Some(true);
+    }
+    if has_flag("--allow-insecure-replication") {
+        shard_overrides.allow_insecure_replication = Some(true);
+    }
+    if let Some(path) = parse_arg("--replication-token-file") {
+        shard_overrides.replication_token_file = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--replica-tls-ca") {
+        shard_overrides.replica_tls_ca = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--replica-tls-cert") {
+        shard_overrides.replica_tls_cert = Some(path.into());
+    }
+    if let Some(path) = parse_arg("--replica-tls-key") {
+        shard_overrides.replica_tls_key = Some(path.into());
+    }
 
     if shard_overrides.listen.is_some()
         || shard_overrides.id.is_some()
@@ -176,6 +241,13 @@ async fn main() -> anyhow::Result<()> {
         || shard_overrides.tls_cert.is_some()
         || shard_overrides.tls_key.is_some()
         || shard_overrides.tls_client_ca.is_some()
+        || shard_overrides.replica.is_some()
+        || shard_overrides.replica_mode.is_some()
+        || shard_overrides.allow_insecure_replication.is_some()
+        || shard_overrides.replication_token_file.is_some()
+        || shard_overrides.replica_tls_ca.is_some()
+        || shard_overrides.replica_tls_cert.is_some()
+        || shard_overrides.replica_tls_key.is_some()
     {
         overrides.shard = Some(shard_overrides);
     }
@@ -190,11 +262,44 @@ async fn main() -> anyhow::Result<()> {
         config.shard.tls_key.as_deref(),
         config.shard.tls_client_ca.as_deref(),
     )?;
+    let replica_mtls = load_client_mtls(
+        config.shard.replica_tls_ca.as_deref(),
+        config.shard.replica_tls_cert.as_deref(),
+        config.shard.replica_tls_key.as_deref(),
+    )?;
+    let replication_token = config
+        .shard
+        .replication_token_file
+        .as_deref()
+        .map(load_replication_token)
+        .transpose()?;
     if config.shard.data_dir.is_none() && !has_flag("--ephemeral") {
         anyhow::bail!(
             "persistent shard storage is required; configure --data-dir (or use --ephemeral \
              explicitly for disposable development data)"
         );
+    }
+    if let Some(data_dir) = config.shard.data_dir.as_deref() {
+        if !has_flag("--allow-colocated-checkpoints") {
+            let backup_dir = config.shard.backup_dir.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "persistent shards require --backup-dir on independent storage (or use \
+                     --allow-colocated-checkpoints explicitly for development)"
+                )
+            })?;
+            let data_dir = std::path::absolute(data_dir)?;
+            let backup_dir = std::path::absolute(backup_dir)?;
+            if data_dir == backup_dir
+                || data_dir.starts_with(&backup_dir)
+                || backup_dir.starts_with(&data_dir)
+            {
+                anyhow::bail!(
+                    "shard data and checkpoint paths must not overlap: data={}, backup={}",
+                    data_dir.display(),
+                    backup_dir.display()
+                );
+            }
+        }
     }
     if let Some(source) = parse_arg("--restore-from") {
         let data_dir = config
@@ -222,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
     let config_version = parse_arg("--config-version").or(config.shard.config_version.clone());
 
     // Create shard node
-    let shard = ShardNode::new_with_storage_paths(
+    let mut shard = ShardNode::new_with_storage_paths(
         config.shard.id as u32,
         ontology,
         tuning,
@@ -230,21 +335,74 @@ async fn main() -> anyhow::Result<()> {
         config.shard.backup_dir.clone(),
         config.shard.repair,
         config_version,
-    )?
-    .with_destructive_admin(has_flag("--allow-destructive-admin"));
+    )?;
+    if config.shard.replica_mode {
+        shard = shard.into_replica(
+            replication_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("replica mode requires a replication token"))?,
+        )?;
+    }
+    if let Some(replica) = &config.shard.replica {
+        let replica = if replica.starts_with("http://") || replica.starts_with("https://") {
+            replica.clone()
+        } else if replica_mtls.is_some() {
+            format!("https://{replica}")
+        } else {
+            format!("http://{replica}")
+        };
+        let uses_https = replica.starts_with("https://");
+        let endpoint = Endpoint::from_shared(replica)?
+            .connect_timeout(Duration::from_secs(
+                config.shard.replica_connect_timeout_secs,
+            ))
+            .timeout(Duration::from_secs(
+                config.shard.replica_request_timeout_secs,
+            ))
+            .tcp_keepalive(Some(Duration::from_secs(
+                config.shard.replica_tcp_keepalive_secs,
+            )));
+        let endpoint = match (replica_mtls, uses_https) {
+            (Some(tls), true) => endpoint.tls_config(tls)?,
+            (Some(_), false) => {
+                anyhow::bail!("shard-to-replica mTLS requires an https:// replica endpoint");
+            }
+            (None, true) => {
+                anyhow::bail!(
+                    "https:// replica endpoints require explicit replica TLS certificate \
+                     configuration"
+                );
+            }
+            (None, false) => endpoint,
+        };
+        let channel = endpoint.connect().await?;
+        shard = shard
+            .with_replica(
+                proto::shard_service_client::ShardServiceClient::new(channel),
+                replication_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("replication requires a shared token"))?,
+            )
+            .await?;
+    }
+    let shard = shard.with_destructive_admin(has_flag("--allow-destructive-admin"));
 
     println!(
         "Unirust shard {} listening on {}",
         config.shard.id, config.shard.listen
     );
-    let mut server = Server::builder();
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
+        .load_shed(true);
     if let Some(server_mtls) = server_mtls {
         server = server.tls_config(server_mtls)?;
     }
     server
-        .add_service(proto::shard_service_server::ShardServiceServer::new(
-            shard.clone(),
-        ))
+        .add_service(
+            proto::shard_service_server::ShardServiceServer::new(shard.clone())
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(config.shard.listen, shutdown_signal())
         .await?;
     shard.shutdown().await?;

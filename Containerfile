@@ -4,7 +4,7 @@
 #
 # Usage:
 #   podman build -t unirust -f Containerfile .
-#   podman run --rm -p 50061:50061 -v unirust-data:/data unirust shard
+#   podman run --rm -p 50061:50061 -v unirust-data:/data -v unirust-backup:/backup unirust shard
 #   podman run --rm -p 50060:50060 unirust router --shards shard-0:50061
 #
 # Or use with compose.yaml for full cluster deployment
@@ -17,6 +17,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    libclang-dev \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +32,8 @@ RUN cargo build --release --locked --features test-support \
     --bin unirust_shard \
     --bin unirust_router \
     --bin unirust_healthcheck \
+    --bin unirust_backup \
+    --bin unirust_rebalance \
     --bin unirust_client \
     --bin unirust_loadtest
 
@@ -49,6 +52,8 @@ RUN useradd -m -u 1000 unirust
 COPY --from=builder /app/target/release/unirust_shard /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_router /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_healthcheck /usr/local/bin/
+COPY --from=builder /app/target/release/unirust_backup /usr/local/bin/
+COPY --from=builder /app/target/release/unirust_rebalance /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_client /usr/local/bin/
 COPY --from=builder /app/target/release/unirust_loadtest /usr/local/bin/
 
@@ -82,6 +87,14 @@ case "$1" in
         shift
         exec unirust_loadtest "$@"
         ;;
+    backup)
+        shift
+        exec unirust_backup "$@"
+        ;;
+    rebalance)
+        shift
+        exec unirust_rebalance "$@"
+        ;;
     *)
         exec "$@"
         ;;
@@ -91,4 +104,4 @@ EOF
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["shard", "--shard-id", "0", "--data-dir", "/data"]
+CMD ["shard", "--shard-id", "0", "--data-dir", "/data", "--backup-dir", "/backup"]

@@ -26,6 +26,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: cargo package
         run: cargo package --locked
+      - name: Build production image
+        run: docker build --file Containerfile --tag unirust-release .
       - name: cargo publish
         run: cargo publish --locked
         env:

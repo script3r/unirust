@@ -7,6 +7,9 @@ use unirust_rs::distributed::{
 };
 use unirust_rs::transport_security::{load_client_mtls, load_server_mtls};
 
+const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 128;
+
 fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {
@@ -55,11 +58,27 @@ ENVIRONMENT:
     UNIRUST_ROUTER_SHARDS   Comma-separated shard addresses
     UNIRUST_ROUTER_CHECKPOINT_INTERVAL_SECS
                             Automatic coordinated checkpoint interval
+    UNIRUST_ROUTER_TLS_CERT PEM server certificate
+    UNIRUST_ROUTER_TLS_KEY  PEM server private key
+    UNIRUST_ROUTER_TLS_CLIENT_CA
+                            PEM CA for required client certificates
+    UNIRUST_ROUTER_SHARD_TLS_CA
+                            PEM CA used to verify shards
+    UNIRUST_ROUTER_SHARD_TLS_CERT
+                            PEM client certificate presented to shards
+    UNIRUST_ROUTER_SHARD_TLS_KEY
+                            PEM router client private key
 
 CONFIG FILE (unirust.toml):
     [router]
     listen = "0.0.0.0:50060"
-    shards = ["shard-0:50061", "shard-1:50061", "shard-2:50061", "shard-3:50061", "shard-4:50061"]
+    shards = ["https://shard-0:50061", "https://shard-1:50061"]
+    tls_cert = "/etc/unirust/tls/router.crt"
+    tls_key = "/etc/unirust/tls/router.key"
+    tls_client_ca = "/etc/unirust/tls/clients-ca.crt"
+    shard_tls_ca = "/etc/unirust/tls/shards-ca.crt"
+    shard_tls_cert = "/etc/unirust/tls/router-client.crt"
+    shard_tls_key = "/etc/unirust/tls/router-client.key"
 "#
     );
 }
@@ -239,14 +258,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("Unirust router listening on {}", config.router.listen);
-    let mut server = Server::builder();
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
+        .load_shed(true);
     if let Some(server_mtls) = server_mtls {
         server = server.tls_config(server_mtls)?;
     }
     server
-        .add_service(proto::router_service_server::RouterServiceServer::new(
-            router,
-        ))
+        .add_service(
+            proto::router_service_server::RouterServiceServer::new(router)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(config.router.listen, shutdown_signal())
         .await?;
     if let Some(checkpoint_task) = checkpoint_task {
