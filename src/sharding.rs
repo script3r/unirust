@@ -132,9 +132,7 @@ impl BloomFilter {
 
     /// Clear all bits.
     pub fn clear(&mut self) {
-        for word in &mut self.bits {
-            *word = 0;
-        }
+        self.bits.fill(0);
     }
 
     fn hash_with_seed(&self, key: &IdentityKeySignature, seed: usize) -> u64 {
@@ -476,6 +474,8 @@ pub struct ReconciliationResult {
 #[derive(Debug, Default)]
 pub(crate) struct ReconciliationCandidates {
     merges: Vec<(GlobalClusterId, GlobalClusterId)>,
+    observations: HashMap<GlobalClusterId, HashSet<BoundaryStrongId>>,
+    merge_signatures: HashMap<(GlobalClusterId, GlobalClusterId), IdentityKeySignature>,
     keys_checked: usize,
     keys_matched: usize,
     merge_candidates: usize,
@@ -484,8 +484,37 @@ pub(crate) struct ReconciliationCandidates {
 }
 
 impl ReconciliationCandidates {
+    pub(crate) fn cluster_ids(&self) -> Vec<GlobalClusterId> {
+        let mut clusters = self
+            .merges
+            .iter()
+            .flat_map(|(left, right)| [*left, *right])
+            .collect::<Vec<_>>();
+        clusters.sort_by_key(GlobalClusterId::to_u64);
+        clusters.dedup();
+        clusters
+    }
+
+    pub(crate) fn add_observations(
+        &mut self,
+        cluster: GlobalClusterId,
+        observations: Vec<BoundaryStrongId>,
+    ) {
+        self.observations
+            .entry(cluster)
+            .or_default()
+            .extend(observations);
+    }
+
     pub(crate) fn extend(&mut self, mut other: Self) {
         self.merges.append(&mut other.merges);
+        for (cluster, observations) in other.observations {
+            self.observations
+                .entry(cluster)
+                .or_default()
+                .extend(observations);
+        }
+        self.merge_signatures.extend(other.merge_signatures);
         self.keys_checked = self.keys_checked.saturating_add(other.keys_checked);
         self.keys_matched = self.keys_matched.saturating_add(other.keys_matched);
         self.merge_candidates = self.merge_candidates.saturating_add(other.merge_candidates);
@@ -496,9 +525,15 @@ impl ReconciliationCandidates {
             .append(&mut other.detected_conflicts);
     }
 
-    pub(crate) fn finish(self) -> ReconciliationResult {
-        let (merges, component_conflicts_blocked) =
-            canonicalize_merges(self.merges, &self.detected_conflicts);
+    pub(crate) fn finish(mut self) -> ReconciliationResult {
+        let (merges, component_conflicts_blocked, component_conflicts) =
+            canonicalize_merges_with_observations(
+                self.merges,
+                &self.detected_conflicts,
+                self.observations,
+                &self.merge_signatures,
+            );
+        self.detected_conflicts.extend(component_conflicts);
         ReconciliationResult {
             merges_performed: merges.len(),
             merged_clusters: merges,
@@ -555,82 +590,17 @@ impl IncrementalReconciler {
         usize,
         Vec<CrossShardConflict>,
     ) {
-        let mut merges = Vec::new();
-        let mut merge_candidates = 0;
-        let mut conflicts_blocked = 0usize;
-        let mut detected_conflicts = Vec::new();
-
-        // Build a map of all signatures to their entries across all shards
-        let mut all_entries: HashMap<IdentityKeySignature, Vec<&BoundaryEntry>> = HashMap::new();
-
-        for boundary in &self.shard_boundaries {
-            for (sig, entries) in &boundary.boundary_keys {
-                all_entries.entry(*sig).or_default().extend(entries.iter());
-            }
-        }
-
-        // Find signatures that appear in multiple shards
-        for (sig, entries) in all_entries {
-            if entries.len() < 2 {
-                continue;
-            }
-
-            // Group by shard and find overlapping intervals
-            let mut shard_entries: HashMap<u16, Vec<&BoundaryEntry>> = HashMap::new();
-            for entry in &entries {
-                shard_entries.entry(entry.shard_id).or_default().push(entry);
-            }
-
-            // If entries exist in multiple shards, check for temporal overlap
-            if shard_entries.len() > 1 {
-                let entries_vec: Vec<_> = entries.iter().collect();
-                for i in 0..entries_vec.len() {
-                    for j in (i + 1)..entries_vec.len() {
-                        let e1 = entries_vec[i];
-                        let e2 = entries_vec[j];
-
-                        // Only merge if from different shards and intervals overlap
-                        if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval)
-                        {
-                            merge_candidates += 1;
-
-                            // Check for same-perspective conflicts before proposing merge
-                            if let Some(conflict_detail) = detect_cross_shard_conflict(e1, e2) {
-                                // Record the conflict and skip this merge
-                                conflicts_blocked += 1;
-
-                                detected_conflicts.push(CrossShardConflict {
-                                    identity_key_signature: sig,
-                                    cluster1: e1.cluster_id,
-                                    cluster2: e2.cluster_id,
-                                    interval: conflict_detail.interval,
-                                    perspective_hash: conflict_detail.perspective_hash,
-                                    strong_id_hash1: conflict_detail.strong_id_hash1,
-                                    strong_id_hash2: conflict_detail.strong_id_hash2,
-                                });
-                                continue;
-                            }
-
-                            // Merge into the lower shard_id for consistency
-                            let (primary, secondary) = if e1.shard_id < e2.shard_id {
-                                (e1.cluster_id, e2.cluster_id)
-                            } else {
-                                (e2.cluster_id, e1.cluster_id)
-                            };
-                            merges.push((primary, secondary));
-                        }
-                    }
-                }
-            }
-        }
-
-        let (merges, component_conflicts_blocked) =
-            canonicalize_merges(merges, &detected_conflicts);
+        let keys = self
+            .shard_boundaries
+            .iter()
+            .flat_map(|boundary| boundary.boundary_keys.keys().copied())
+            .collect();
+        let result = self.reconciliation_candidates(&keys).finish();
         (
-            merges,
-            merge_candidates,
-            conflicts_blocked.saturating_add(component_conflicts_blocked),
-            detected_conflicts,
+            result.merged_clusters,
+            result.merge_candidates,
+            result.conflicts_blocked,
+            result.detected_conflicts,
         )
     }
 
@@ -699,6 +669,8 @@ impl IncrementalReconciler {
         let mut conflicts_blocked = 0usize;
         let mut keys_matched = 0;
         let mut detected_conflicts = Vec::new();
+        let mut observations: HashMap<GlobalClusterId, HashSet<BoundaryStrongId>> = HashMap::new();
+        let mut merge_signatures = HashMap::new();
 
         // For each dirty key, collect entries from all shards
         for sig in keys {
@@ -753,7 +725,22 @@ impl IncrementalReconciler {
                         } else {
                             (e2.cluster_id, e1.cluster_id)
                         };
+                        if primary == secondary {
+                            continue;
+                        }
+                        for entry in [e1, e2] {
+                            observations
+                                .entry(entry.cluster_id)
+                                .or_default()
+                                .extend(entry.strong_ids.iter().cloned());
+                        }
                         merges.push((primary, secondary));
+                        let edge = if primary.to_u64() < secondary.to_u64() {
+                            (primary, secondary)
+                        } else {
+                            (secondary, primary)
+                        };
+                        merge_signatures.insert(edge, *sig);
                     }
                 }
             }
@@ -761,6 +748,8 @@ impl IncrementalReconciler {
 
         ReconciliationCandidates {
             merges,
+            observations,
+            merge_signatures,
             keys_checked: keys.len(),
             keys_matched,
             merge_candidates,
@@ -779,10 +768,26 @@ impl IncrementalReconciler {
     }
 }
 
+#[cfg(test)]
 fn canonicalize_merges(
     merges: Vec<(GlobalClusterId, GlobalClusterId)>,
     conflicts: &[CrossShardConflict],
 ) -> (Vec<(GlobalClusterId, GlobalClusterId)>, usize) {
+    let (merges, blocked, _) =
+        canonicalize_merges_with_observations(merges, conflicts, HashMap::new(), &HashMap::new());
+    (merges, blocked)
+}
+
+fn canonicalize_merges_with_observations(
+    merges: Vec<(GlobalClusterId, GlobalClusterId)>,
+    conflicts: &[CrossShardConflict],
+    mut observations: HashMap<GlobalClusterId, HashSet<BoundaryStrongId>>,
+    merge_signatures: &HashMap<(GlobalClusterId, GlobalClusterId), IdentityKeySignature>,
+) -> (
+    Vec<(GlobalClusterId, GlobalClusterId)>,
+    usize,
+    Vec<CrossShardConflict>,
+) {
     fn find(parent: &mut [usize], mut index: usize) -> usize {
         while parent[index] != index {
             parent[index] = parent[parent[index]];
@@ -842,6 +847,17 @@ fn canonicalize_merges(
         .map(|node| blocked_by_node.remove(node).unwrap_or_default())
         .collect::<Vec<_>>();
     let mut component_conflicts_blocked = 0usize;
+    let mut component_observations = nodes
+        .iter()
+        .map(|node| {
+            observations
+                .remove(node)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut component_conflicts = Vec::new();
 
     for (left, right) in edges {
         let mut left_root = find(&mut parent, node_index[&left]);
@@ -855,6 +871,28 @@ fn canonicalize_merges(
             component_conflicts_blocked = component_conflicts_blocked.saturating_add(1);
             continue;
         }
+        // A bridge may carry no strong ID of its own. Validate accumulated
+        // observations before joining components, including across key chunks.
+        let conflict = component_observations[left_root].iter().find_map(|left| {
+            component_observations[right_root]
+                .iter()
+                .find_map(|right| detect_strong_id_conflict(left, right))
+        });
+        if let Some(conflict) = conflict {
+            component_conflicts_blocked = component_conflicts_blocked.saturating_add(1);
+            if let Some(signature) = merge_signatures.get(&(left, right)) {
+                component_conflicts.push(CrossShardConflict {
+                    identity_key_signature: *signature,
+                    cluster1: nodes[left_root],
+                    cluster2: nodes[right_root],
+                    interval: conflict.interval,
+                    perspective_hash: conflict.perspective_hash,
+                    strong_id_hash1: conflict.strong_id_hash1,
+                    strong_id_hash2: conflict.strong_id_hash2,
+                });
+            }
+            continue;
+        }
         if nodes[left_root].to_u64() > nodes[right_root].to_u64() {
             std::mem::swap(&mut left_root, &mut right_root);
         }
@@ -863,6 +901,8 @@ fn canonicalize_merges(
         members[left_root].extend(right_members);
         let right_blocked = std::mem::take(&mut blocked[right_root]);
         blocked[left_root].extend(right_blocked);
+        let right_observations = std::mem::take(&mut component_observations[right_root]);
+        component_observations[left_root].extend(right_observations);
     }
 
     let mut canonical = Vec::new();
@@ -882,7 +922,7 @@ fn canonicalize_merges(
         }
     }
     canonical.sort_by_key(|(primary, secondary)| (primary.to_u64(), secondary.to_u64()));
-    (canonical, component_conflicts_blocked)
+    (canonical, component_conflicts_blocked, component_conflicts)
 }
 
 impl Default for IncrementalReconciler {
@@ -913,6 +953,34 @@ fn stable_boundary_hash(domain: &[u8], values: &[&str]) -> u64 {
     )
 }
 
+fn detect_strong_id_conflict(
+    left: &BoundaryStrongId,
+    right: &BoundaryStrongId,
+) -> Option<ConflictDetail> {
+    if left.perspective != right.perspective
+        || left.attribute != right.attribute
+        || left.value == right.value
+    {
+        return None;
+    }
+    let interval = crate::temporal::intersect(&left.interval, &right.interval)?;
+    Some(ConflictDetail {
+        perspective_hash: stable_boundary_hash(
+            b"unirust.boundary-perspective.v1",
+            &[&left.perspective],
+        ),
+        strong_id_hash1: stable_boundary_hash(
+            b"unirust.boundary-strong-id.v1",
+            &[&left.attribute, &left.value],
+        ),
+        strong_id_hash2: stable_boundary_hash(
+            b"unirust.boundary-strong-id.v1",
+            &[&right.attribute, &right.value],
+        ),
+        interval,
+    })
+}
+
 /// Check if two boundary entries have conflicting strong IDs.
 ///
 /// Two entries conflict if they share a perspective (same key in perspective_strong_ids)
@@ -922,7 +990,7 @@ fn stable_boundary_hash(domain: &[u8], values: &[&str]) -> u64 {
 ///
 /// Returns `Some(ConflictDetail)` if a conflict is found, `None` otherwise.
 fn detect_cross_shard_conflict(e1: &BoundaryEntry, e2: &BoundaryEntry) -> Option<ConflictDetail> {
-    if !e1.strong_ids.is_empty() && !e2.strong_ids.is_empty() {
+    if !e1.strong_ids.is_empty() || !e2.strong_ids.is_empty() {
         for strong_id_1 in &e1.strong_ids {
             for strong_id_2 in &e2.strong_ids {
                 if strong_id_1.perspective != strong_id_2.perspective
@@ -1725,6 +1793,7 @@ mod tests {
             merge_candidates: 3,
             conflicts_blocked: 1,
             detected_conflicts: vec![conflict],
+            ..ReconciliationCandidates::default()
         });
 
         let result = combined.finish();
@@ -1733,6 +1802,41 @@ mod tests {
         assert_eq!(result.keys_matched, 3);
         assert_eq!(result.merge_candidates, 4);
         assert_eq!(result.conflicts_blocked, 2);
+    }
+
+    #[test]
+    fn exact_component_guards_survive_metadata_chunks_and_allow_adjacent_values() {
+        let a = GlobalClusterId::new(0, 0, 0);
+        let b = GlobalClusterId::new(1, 0, 0);
+        let c = GlobalClusterId::new(2, 0, 0);
+        let signature = IdentityKeySignature::from_bytes([7; 32]);
+        for (second_start, expected_merges) in [(25, 1), (50, 2)] {
+            let observation = |value: &str, start, end| BoundaryStrongId {
+                perspective: "hr".into(),
+                attribute: "ssn".into(),
+                value: value.into(),
+                interval: Interval::new(start, end).unwrap(),
+            };
+            let mut combined = ReconciliationCandidates::default();
+            combined.extend(ReconciliationCandidates {
+                merges: vec![(a, b)],
+                observations: HashMap::from([(a, HashSet::from([observation("111", 0, 50)]))]),
+                merge_signatures: HashMap::from([((a, b), signature)]),
+                ..ReconciliationCandidates::default()
+            });
+            combined.extend(ReconciliationCandidates {
+                merges: vec![(b, c)],
+                observations: HashMap::from([(
+                    c,
+                    HashSet::from([observation("222", second_start, 100)]),
+                )]),
+                merge_signatures: HashMap::from([((b, c), signature)]),
+                ..ReconciliationCandidates::default()
+            });
+            let result = combined.finish();
+            assert_eq!(result.merges_performed, expected_merges);
+            assert_eq!(result.detected_conflicts.len(), 2 - expected_merges);
+        }
     }
 
     #[test]

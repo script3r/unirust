@@ -200,6 +200,8 @@ pub struct Unirust {
     streaming: Option<linker::StreamingLinker>,
     graph_state: Option<graph::IncrementalKnowledgeGraph>,
     query_cache: std::sync::Mutex<Option<QueryCache>>,
+    cluster_key_cache:
+        std::sync::Mutex<Option<std::collections::HashMap<model::ClusterId, graph::ClusterKey>>>,
     conflict_cache: std::sync::Mutex<Option<Vec<conflicts::ConflictSummary>>>,
     query_stats: std::sync::Mutex<query::QuerySelectivityStats>,
     tuning: StreamingTuning,
@@ -237,6 +239,7 @@ impl Unirust {
             streaming: None,
             graph_state: None,
             query_cache: std::sync::Mutex::new(None),
+            cluster_key_cache: std::sync::Mutex::new(None),
             conflict_cache: std::sync::Mutex::new(None),
             query_stats: std::sync::Mutex::new(query::QuerySelectivityStats::default()),
             tuning: StreamingTuning::default(),
@@ -265,6 +268,7 @@ impl Unirust {
             streaming: None,
             graph_state: None,
             query_cache: std::sync::Mutex::new(None),
+            cluster_key_cache: std::sync::Mutex::new(None),
             conflict_cache: std::sync::Mutex::new(None),
             query_stats: std::sync::Mutex::new(query::QuerySelectivityStats::default()),
             tuning,
@@ -285,9 +289,9 @@ impl Unirust {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("persistent linker backend requires a database"))?
                 .clone();
-            if !self.store.is_empty() {
-                persistence::clear_rebuildable_linker_state(&db)?;
-            }
+            // Even an empty record store can contain derived writes from an
+            // interrupted first ingest. Recovery always starts from durable records.
+            persistence::clear_rebuildable_linker_state(&db)?;
             let dsu = if use_persistent_dsu {
                 let dsu_config = self.tuning.dsu_config.clone().unwrap_or_default();
                 dsu::DsuBackend::persistent(db.clone(), dsu_config)?
@@ -358,7 +362,34 @@ impl Unirust {
         self.ingest_internal(records, true)
     }
 
+    fn run_ingest_batch<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let result = operation(self);
+        if result.is_err() {
+            let abort_result = self.store.discard_staged_records();
+            // Linking can mutate derived state before a later record or disk write
+            // fails. Rebuild from committed records before reusing that state.
+            self.streaming = None;
+            self.graph_state = None;
+            self.invalidate_query_cache();
+            self.clear_conflict_cache();
+            self.clear_query_stats();
+            abort_result?;
+        }
+        result
+    }
+
     fn ingest_internal(
+        &mut self,
+        records: Vec<Record>,
+        preserve_record_ids: bool,
+    ) -> anyhow::Result<IngestResult> {
+        self.run_ingest_batch(|engine| engine.ingest_batch_inner(records, preserve_record_ids))
+    }
+
+    fn ingest_batch_inner(
         &mut self,
         records: Vec<Record>,
         preserve_record_ids: bool,
@@ -813,6 +844,13 @@ impl Unirust {
         &mut self,
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<ClusterAssignment>> {
+        self.run_ingest_batch(|engine| engine.stream_records_inner(records))
+    }
+
+    fn stream_records_inner(
+        &mut self,
+        records: Vec<Record>,
+    ) -> anyhow::Result<Vec<ClusterAssignment>> {
         self.clear_conflict_cache();
         self.clear_query_stats();
         if self.streaming.is_none() {
@@ -938,6 +976,13 @@ impl Unirust {
         &mut self,
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedConflictUpdate>> {
+        self.run_ingest_batch(|engine| engine.stream_records_with_conflicts_inner(records))
+    }
+
+    fn stream_records_with_conflicts_inner(
+        &mut self,
+        records: Vec<Record>,
+    ) -> anyhow::Result<Vec<StreamedConflictUpdate>> {
         self.clear_conflict_cache();
         self.clear_query_stats();
         if self.streaming.is_none() {
@@ -951,13 +996,12 @@ impl Unirust {
             })?;
 
             for record in records {
-                let (record_id, inserted) = self.store.add_record_if_absent(record)?;
+                let (record_id, inserted) = self.store.stage_record_if_absent(record)?;
                 let cluster_id = if inserted {
                     streaming.link_record(self.store.as_ref(), &self.ontology, record_id)?
                 } else {
                     streaming.cluster_id_for(record_id)
                 };
-                self.store.set_cluster_assignment(record_id, cluster_id)?;
                 let assignment = ClusterAssignment {
                     record_id,
                     cluster_id,
@@ -974,12 +1018,6 @@ impl Unirust {
                 } else {
                     Vec::new()
                 };
-                if inserted && !observations.is_empty() {
-                    let summaries =
-                        conflicts::summarize_conflicts(self.store.as_ref(), &observations);
-                    self.store
-                        .set_cluster_conflict_summaries(cluster_id, &summaries)?;
-                }
                 updates.push(StreamedConflictUpdate {
                     assignment,
                     observations,
@@ -989,6 +1027,20 @@ impl Unirust {
             streaming.cluster_count()
         };
 
+        self.store.flush_staged_records()?;
+        let assignments = updates
+            .iter()
+            .map(|update| (update.assignment.record_id, update.assignment.cluster_id))
+            .collect::<Vec<_>>();
+        self.store.set_cluster_assignments_batch(&assignments)?;
+        for update in &updates {
+            if !update.observations.is_empty() {
+                let summaries =
+                    conflicts::summarize_conflicts(self.store.as_ref(), &update.observations);
+                self.store
+                    .set_cluster_conflict_summaries(update.assignment.cluster_id, &summaries)?;
+            }
+        }
         self.invalidate_query_cache();
         self.store.set_cluster_count(cluster_count)?;
         self.store.sync()?;
@@ -1006,6 +1058,13 @@ impl Unirust {
 
     /// Stream records and incrementally update the knowledge graph.
     pub fn stream_records_update_graph(
+        &mut self,
+        records: Vec<Record>,
+    ) -> anyhow::Result<Vec<StreamedGraphUpdate>> {
+        self.run_ingest_batch(|engine| engine.stream_records_update_graph_inner(records))
+    }
+
+    fn stream_records_update_graph_inner(
         &mut self,
         records: Vec<Record>,
     ) -> anyhow::Result<Vec<StreamedGraphUpdate>> {
@@ -1120,6 +1179,50 @@ impl Unirust {
         descriptors: &[query::QueryDescriptor],
         interval: Interval,
     ) -> anyhow::Result<query::QueryOutcome> {
+        if let Some(streaming) = &self.streaming {
+            let Some(first) = descriptors.first() else {
+                return Ok(query::QueryOutcome::Matches(Vec::new()));
+            };
+            let mut roots = std::collections::HashSet::new();
+            let mut clusters = dsu::Clusters::new();
+            for (record_id, _) in
+                self.store
+                    .get_records_with_value_in_interval(first.attr, first.value, interval)
+            {
+                let root = streaming.root_for_record(record_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "query candidate {} has not completed entity resolution",
+                        record_id.0
+                    )
+                })?;
+                if roots.insert(root) {
+                    clusters.add_cluster(streaming.cluster_for_record(record_id).ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "query candidate {} has no cluster membership",
+                                record_id.0
+                            )
+                        },
+                    )?);
+                }
+            }
+            // Ingest already established authoritative membership. Only master
+            // candidate entities, instead of replaying the complete store per write.
+            let golden = query::build_golden_cache(self.store.as_ref(), &clusters);
+            let keys = self.query_cluster_keys_for(streaming, &clusters)?;
+            let membership = query::build_record_to_cluster_map(&clusters);
+            let outcome = query::query_master_entities_with_cache(
+                self.store.as_ref(),
+                &clusters,
+                descriptors,
+                interval,
+                &golden,
+                &keys,
+                &membership,
+            )?;
+            self.store.ensure_healthy()?;
+            return Ok(outcome);
+        }
         let mut cache_guard = self.query_cache.lock().expect("query cache lock");
         if cache_guard.is_none() {
             let clusters = self.build_clusters()?;
@@ -1150,7 +1253,232 @@ impl Unirust {
         Ok(outcome)
     }
 
+    /// Resolve query text without allocating interner IDs or changing durable state.
+    pub fn lookup_query_descriptor(
+        &self,
+        attr: &str,
+        value: &str,
+    ) -> Option<query::QueryDescriptor> {
+        Some(query::QueryDescriptor {
+            attr: self.store.lookup_attr(attr)?,
+            value: self.store.lookup_value(value)?,
+        })
+    }
+
+    /// Return candidate fragments before applying cross-shard query conjunction.
+    /// Explicit global IDs hydrate all local members of those canonical entities.
+    #[doc(hidden)]
+    pub fn query_entity_fragments(
+        &self,
+        descriptors: &[query::QueryDescriptor],
+        interval: Interval,
+        global_ids: &[GlobalClusterId],
+        strong_ids_only: bool,
+    ) -> anyhow::Result<Vec<query::EntityFragment>> {
+        let recovered;
+        let streaming = if let Some(streaming) = &self.streaming {
+            streaming
+        } else {
+            let db = self.store.shared_db();
+            if let Some(db) = db.as_ref() {
+                let persistence = LinkerStatePersistence::new(db);
+                // Fresh and reset stores have no marker or redirects. Anchored
+                // IDs are safe there without writing migration metadata.
+                if !persistence.has_stable_global_cluster_ids()?
+                    && !persistence.load_cross_shard_merges()?.is_empty()
+                {
+                    anyhow::bail!(
+                        "initialize_streaming is required before querying legacy global cluster IDs"
+                    );
+                }
+            }
+            // Queries can run concurrently through &self. Recovery here must not
+            // clear or write the shared persistent DSU, index, or scheme markers.
+            let mut linker =
+                linker::StreamingLinker::new(self.store.as_ref(), &self.ontology, &self.tuning)?;
+            if let Some(db) = db.as_ref() {
+                linker.restore_cross_shard_merges(&LinkerStatePersistence::new(db))?;
+            }
+            recovered = linker;
+            &recovered
+        };
+        if global_ids.is_empty() {
+            let mut candidates: std::collections::HashMap<GlobalClusterId, Vec<Vec<Interval>>> =
+                std::collections::HashMap::new();
+            for (index, descriptor) in descriptors.iter().enumerate() {
+                for (record_id, matched_interval) in self.store.get_records_with_value_in_interval(
+                    descriptor.attr,
+                    descriptor.value,
+                    interval,
+                ) {
+                    let global_id = streaming
+                        .global_cluster_id_for_readonly(record_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "query candidate {} has not completed entity resolution",
+                                record_id.0
+                            )
+                        })?;
+                    if let Some(overlap) = temporal::intersect(&matched_interval, &interval) {
+                        candidates
+                            .entry(global_id)
+                            .or_insert_with(|| vec![Vec::new(); descriptors.len()])[index]
+                            .push(overlap);
+                    }
+                }
+            }
+            self.store.ensure_healthy()?;
+            return Ok(candidates
+                .into_iter()
+                .map(|(global_id, mut descriptor_intervals)| {
+                    for intervals in &mut descriptor_intervals {
+                        *intervals = query::coalesce_intervals(intervals);
+                    }
+                    query::EntityFragment {
+                        global_id,
+                        descriptor_intervals,
+                        golden: Vec::new(),
+                        strong_ids: Vec::new(),
+                        cluster_key: None,
+                        cluster_key_identity: None,
+                    }
+                })
+                .collect());
+        }
+        let clusters = streaming.clusters_for_global_ids(global_ids);
+        let mut fragments = Vec::with_capacity(clusters.len());
+        for cluster in clusters {
+            let global_id = streaming
+                .global_cluster_id_for_readonly(cluster.root)
+                .ok_or_else(|| anyhow::anyhow!("query cluster has no global identity"))?;
+            let mut descriptor_intervals = vec![Vec::new(); descriptors.len()];
+            let mut values: std::collections::BTreeMap<(String, String), Vec<Interval>> =
+                std::collections::BTreeMap::new();
+            let mut strong_ids = std::collections::HashSet::new();
+            for &record_id in &cluster.records {
+                let record = self.store.get_record(record_id).ok_or_else(|| {
+                    anyhow::anyhow!("query cluster member {} is unavailable", record_id.0)
+                })?;
+                let strong_attrs = self
+                    .ontology
+                    .strong_identifiers_for_type(&record.identity.entity_type);
+                for descriptor in &record.descriptors {
+                    let is_strong = strong_attrs
+                        .iter()
+                        .any(|strong| strong.attribute == descriptor.attr);
+                    if strong_ids_only && !is_strong {
+                        continue;
+                    }
+                    let attr = self
+                        .store
+                        .resolve_attr(descriptor.attr)
+                        .ok_or_else(|| anyhow::anyhow!("query attribute ID cannot be resolved"))?;
+                    let value = self
+                        .store
+                        .resolve_value(descriptor.value)
+                        .ok_or_else(|| anyhow::anyhow!("query value ID cannot be resolved"))?;
+                    if is_strong {
+                        strong_ids.insert(sharding::BoundaryStrongId {
+                            perspective: record.identity.perspective.clone(),
+                            attribute: attr.clone(),
+                            value: value.clone(),
+                            interval: descriptor.interval,
+                        });
+                    }
+                    if strong_ids_only {
+                        continue;
+                    }
+                    if let Some(overlap) = temporal::intersect(&descriptor.interval, &interval) {
+                        for (index, query) in descriptors.iter().enumerate() {
+                            if query.attr == descriptor.attr && query.value == descriptor.value {
+                                descriptor_intervals[index].push(overlap);
+                            }
+                        }
+                        values.entry((attr, value)).or_default().push(overlap);
+                    }
+                }
+            }
+            let golden = values
+                .into_iter()
+                .flat_map(|((attr, value), intervals)| {
+                    query::coalesce_intervals(&intervals)
+                        .into_iter()
+                        .map(move |interval| graph::GoldenDescriptor {
+                            attr: attr.clone(),
+                            value: value.clone(),
+                            interval,
+                        })
+                })
+                .collect();
+            for intervals in &mut descriptor_intervals {
+                *intervals = query::coalesce_intervals(intervals);
+            }
+            let cluster_id = cluster.id;
+            let key = if strong_ids_only {
+                None
+            } else {
+                self.query_cluster_keys_for(
+                    streaming,
+                    &dsu::Clusters {
+                        clusters: vec![cluster],
+                    },
+                )?
+                .remove(&cluster_id)
+            };
+            fragments.push(query::EntityFragment {
+                global_id,
+                descriptor_intervals,
+                golden,
+                cluster_key: key.as_ref().map(|key| key.value.clone()),
+                cluster_key_identity: key.map(|key| key.identity_key),
+                strong_ids: strong_ids.into_iter().collect(),
+            });
+        }
+        self.store.ensure_healthy()?;
+        Ok(fragments)
+    }
+
+    fn query_cluster_keys_for(
+        &self,
+        streaming: &linker::StreamingLinker,
+        clusters: &dsu::Clusters,
+    ) -> anyhow::Result<std::collections::HashMap<model::ClusterId, graph::ClusterKey>> {
+        if graph::cluster_keys_are_candidate_local(&self.ontology) {
+            return Ok(query::build_cluster_key_cache(
+                self.store.as_ref(),
+                clusters,
+                &self.ontology,
+            ));
+        }
+        // Composite labels use the shortest globally unique prefix. Preserve their
+        // collision scope while mastering golden data only for query candidates.
+        let mut cache = self
+            .cluster_key_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cluster key cache lock poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(query::build_cluster_key_cache(
+                self.store.as_ref(),
+                &streaming.clusters_readonly()?,
+                &self.ontology,
+            ));
+        }
+        Ok(clusters
+            .clusters
+            .iter()
+            .filter_map(|cluster| {
+                cache
+                    .as_ref()?
+                    .get(&cluster.id)
+                    .map(|key| (cluster.id, key.clone()))
+            })
+            .collect())
+    }
+
     fn invalidate_query_cache(&self) {
+        if let Ok(mut guard) = self.cluster_key_cache.lock() {
+            *guard = None;
+        }
         if let Ok(mut guard) = self.query_cache.lock() {
             *guard = None;
         }
@@ -1436,6 +1764,9 @@ impl Unirust {
     /// Call this after enable_streaming() to recover cluster ID mappings.
     /// Returns the number of cluster_ids restored, or an error if persistence is not available.
     pub fn restore_linker_state(&mut self) -> anyhow::Result<usize> {
+        // Restored IDs can differ from record-scan allocation order, including
+        // when only part of the snapshot loads before an error.
+        self.invalidate_query_cache();
         let streaming = self.streaming.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Streaming not initialized - call enable_streaming() first")
         })?;

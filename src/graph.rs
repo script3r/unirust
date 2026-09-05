@@ -834,6 +834,19 @@ pub fn golden_for_cluster(
     golden
 }
 
+/// Single-token labels cannot change their prefix length when other clusters
+/// appear. Composite labels need the full collision group to keep stable keys.
+pub(crate) fn cluster_keys_are_candidate_local(ontology: &Ontology) -> bool {
+    ontology
+        .identity_keys
+        .iter()
+        .all(|key| key.attributes.len() <= 1 && key.attribute_names.len() <= 1)
+        && ontology
+            .entity_types
+            .values()
+            .all(|entity| entity.key_attributes.len() <= 1)
+}
+
 pub fn cluster_keys_for_clusters(
     store: &dyn RecordStore,
     clusters: &Clusters,
@@ -1215,6 +1228,30 @@ mod tests {
     use crate::ontology::{IdentityKey, Ontology};
     use crate::store::Store;
     use crate::temporal::Interval;
+
+    #[test]
+    fn candidate_local_keys_require_single_attribute_identity_and_entity_keys() {
+        let mut ontology = Ontology::new();
+        assert!(cluster_keys_are_candidate_local(&ontology));
+        ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+        assert!(cluster_keys_are_candidate_local(&ontology));
+        ontology.add_identity_key(IdentityKey::from_names(vec!["name", "email"], "name_email"));
+        assert!(!cluster_keys_are_candidate_local(&ontology));
+        ontology.identity_keys.clear();
+        ontology.add_identity_key(IdentityKey::new(
+            vec![AttrId(0), AttrId(1)],
+            "composite".into(),
+        ));
+        assert!(!cluster_keys_are_candidate_local(&ontology));
+        ontology.identity_keys.clear();
+        ontology.add_entity_type(crate::ontology::EntityType::with_key_attributes(
+            "person".into(),
+            vec![AttrId(0), AttrId(1)],
+            vec![AttrId(0), AttrId(1)],
+            false,
+        ));
+        assert!(!cluster_keys_are_candidate_local(&ontology));
+    }
 
     #[test]
     fn test_same_as_edge_creation() {

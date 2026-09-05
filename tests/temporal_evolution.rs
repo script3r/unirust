@@ -229,19 +229,19 @@ async fn incremental_ingestion_equals_batch_ingestion() -> anyhow::Result<()> {
     // Ingest incrementally
     client_inc
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_c1.clone()],
         })
         .await?;
     client_inc
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_c2.clone()],
         })
         .await?;
     client_inc
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_c3.clone()],
         })
         .await?;
@@ -249,7 +249,7 @@ async fn incremental_ingestion_equals_batch_ingestion() -> anyhow::Result<()> {
     // Batch: Ingest all 3 at once
     client_batch
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_c1, record_c2, record_c3],
         })
         .await?;
@@ -370,7 +370,8 @@ async fn ingestion_order_independence() -> anyhow::Result<()> {
         for &idx in order {
             client
                 .ingest_records(IngestRecordsRequest {
-                    internal_protocol_version: 5,
+                    internal_protocol_version:
+                        unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                     records: vec![records[idx].clone()],
                 })
                 .await?;
@@ -447,19 +448,19 @@ async fn temporal_descriptor_evolution() -> anyhow::Result<()> {
     // Ingest over time
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![jan],
         })
         .await?;
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![feb],
         })
         .await?;
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![mar],
         })
         .await?;
@@ -572,7 +573,7 @@ async fn attribute_value_changes_over_time() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![initial, with_secondary],
         })
         .await?;
@@ -652,7 +653,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
     );
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![crm_record],
         })
         .await?;
@@ -683,7 +684,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
     );
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![erp_record],
         })
         .await?;
@@ -720,7 +721,7 @@ async fn multi_perspective_incremental_merge() -> anyhow::Result<()> {
     );
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![hr_record],
         })
         .await?;
@@ -768,7 +769,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
     // First ingestion
     let resp1 = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record.clone()],
         })
         .await?
@@ -778,7 +779,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
     // Second ingestion (identical)
     let resp2 = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record.clone()],
         })
         .await?
@@ -794,7 +795,7 @@ async fn idempotent_re_ingestion() -> anyhow::Result<()> {
     // Third ingestion
     let resp3 = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record],
         })
         .await?
@@ -847,13 +848,13 @@ async fn overlapping_temporal_ranges_extend_validity() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![jan_mar],
         })
         .await?;
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![feb_apr],
         })
         .await?;
@@ -932,7 +933,7 @@ async fn temporal_gap_between_records() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![q1, q3],
         })
         .await?;
@@ -1084,7 +1085,8 @@ async fn same_cluster_regardless_of_insertion_order() -> anyhow::Result<()> {
         for &idx in order {
             let resp = client
                 .ingest_records(IngestRecordsRequest {
-                    internal_protocol_version: 5,
+                    internal_protocol_version:
+                        unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                     records: vec![records[idx].clone()],
                 })
                 .await?
@@ -1159,7 +1161,7 @@ async fn batch_ingestion_consistent_cluster() -> anyhow::Result<()> {
 
     let batch_resp = batch_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: records.clone(),
         })
         .await?
@@ -1186,7 +1188,7 @@ async fn batch_ingestion_consistent_cluster() -> anyhow::Result<()> {
     for record in &records {
         let resp = seq_client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 5,
+                internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                 records: vec![record.clone()],
             })
             .await?
@@ -1271,7 +1273,8 @@ async fn independent_entities_stay_separate_any_order() -> anyhow::Result<()> {
         for &idx in order {
             client
                 .ingest_records(IngestRecordsRequest {
-                    internal_protocol_version: 5,
+                    internal_protocol_version:
+                        unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                     records: vec![records[idx].clone()],
                 })
                 .await?;
@@ -1358,7 +1361,7 @@ async fn late_arrival_merges_into_existing_cluster() -> anyhow::Result<()> {
 
     let resp1 = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![rec1, rec2],
         })
         .await?
@@ -1385,7 +1388,7 @@ async fn late_arrival_merges_into_existing_cluster() -> anyhow::Result<()> {
 
     let resp2 = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![late_rec],
         })
         .await?

@@ -13,6 +13,21 @@ pub struct QueryDescriptor {
     pub value: ValueId,
 }
 
+/// A shard's contribution to a canonical entity. Descriptor intervals are
+/// aligned with the request; conjunction is evaluated after global assembly.
+#[derive(Debug, Clone)]
+pub struct EntityFragment {
+    pub global_id: crate::model::GlobalClusterId,
+    pub descriptor_intervals: Vec<Vec<Interval>>,
+    /// Raw, coalesced attribute observations. Trim conflicting values only
+    /// after every shard's contribution has been assembled by the router.
+    pub golden: Vec<GoldenDescriptor>,
+    /// Complete temporal guards, including observations outside a query window.
+    pub strong_ids: Vec<crate::sharding::BoundaryStrongId>,
+    pub cluster_key: Option<String>,
+    pub cluster_key_identity: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QuerySelectivity {
     count: u64,
@@ -339,7 +354,7 @@ pub fn query_master_entities_with_cache_selective(
     Ok(QueryOutcome::Matches(matches))
 }
 
-fn intersect_interval_sets(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
+pub(crate) fn intersect_interval_sets(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
     let mut overlaps = Vec::new();
 
     for interval_a in a {
@@ -353,7 +368,7 @@ fn intersect_interval_sets(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
     coalesce_intervals(&overlaps)
 }
 
-fn coalesce_intervals(intervals: &[Interval]) -> Vec<Interval> {
+pub(crate) fn coalesce_intervals(intervals: &[Interval]) -> Vec<Interval> {
     if intervals.is_empty() {
         return Vec::new();
     }
@@ -476,7 +491,7 @@ pub fn build_record_to_cluster_map(
     map
 }
 
-fn filter_golden_for_interval(
+pub(crate) fn filter_golden_for_interval(
     golden: &[GoldenDescriptor],
     interval: Interval,
 ) -> Vec<GoldenDescriptor> {

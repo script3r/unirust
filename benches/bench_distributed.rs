@@ -410,12 +410,6 @@ fn bench_shardnode_ingest(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(6));
 
-    // SAFETY: benchmark configuration runs before this function creates any worker threads.
-    unsafe { std::env::set_var("UNIRUST_PARTITIONED", "1") };
-    let partition_count = env_usize("UNIRUST_DIST_PARTITIONS", 8);
-    // SAFETY: benchmark configuration runs before this function creates any worker threads.
-    unsafe { std::env::set_var("UNIRUST_PARTITION_COUNT", partition_count.to_string()) };
-
     let count = env_u32("UNIRUST_DIST_RECORDS", 50_000);
     let overlap = env_f64("UNIRUST_DIST_OVERLAP", 0.05);
     let config = default_dist_config();
@@ -424,18 +418,28 @@ fn bench_shardnode_ingest(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("batch", count), |b| {
         b.iter_batched(
             || {
+                let data_dir = tempfile::tempdir().expect("persistent benchmark directory");
                 let rt = Runtime::new().expect("runtime");
                 let shard = rt.block_on(async {
-                    ShardNode::new(0, config.clone(), StreamingTuning::default()).expect("shard")
+                    ShardNode::new_with_data_dir(
+                        0,
+                        config.clone(),
+                        StreamingTuning::default(),
+                        Some(data_dir.path().to_path_buf()),
+                        false,
+                        None,
+                    )
+                    .expect("persistent shard")
                 });
                 let records = generate_proto_batch(1, count, overlap, 45);
-                (rt, shard, records)
+                (rt, shard, records, data_dir)
             },
-            |(rt, shard, records)| {
+            |(rt, shard, records, _data_dir)| {
                 let response = rt.block_on(async {
                     shard
                         .ingest_records(Request::new(proto::IngestRecordsRequest {
-                            internal_protocol_version: 2,
+                            internal_protocol_version:
+                                unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                             records,
                         }))
                         .await
@@ -457,12 +461,6 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(6));
 
-    // SAFETY: benchmark configuration runs before this function creates any worker threads.
-    unsafe { std::env::set_var("UNIRUST_PARTITIONED", "1") };
-    let partition_count = env_usize("UNIRUST_DIST_PARTITIONS", 8);
-    // SAFETY: benchmark configuration runs before this function creates any worker threads.
-    unsafe { std::env::set_var("UNIRUST_PARTITION_COUNT", partition_count.to_string()) };
-
     let total = env_u32("UNIRUST_DIST_STREAM_TOTAL", 20_000);
     let chunk = env_u32("UNIRUST_DIST_STREAM_CHUNK", 512).max(1);
     let overlap = env_f64("UNIRUST_DIST_OVERLAP", 0.05);
@@ -472,14 +470,23 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("chunked", chunk), |b| {
         b.iter_batched(
             || {
+                let data_dir = tempfile::tempdir().expect("persistent benchmark directory");
                 let rt = Runtime::new().expect("runtime");
                 let shard = rt.block_on(async {
-                    ShardNode::new(0, config.clone(), StreamingTuning::default()).expect("shard")
+                    ShardNode::new_with_data_dir(
+                        0,
+                        config.clone(),
+                        StreamingTuning::default(),
+                        Some(data_dir.path().to_path_buf()),
+                        false,
+                        None,
+                    )
+                    .expect("persistent shard")
                 });
                 let records = generate_proto_batch(1, total, overlap, 46);
-                (rt, shard, records)
+                (rt, shard, records, data_dir)
             },
-            |(rt, shard, records)| {
+            |(rt, shard, records, _data_dir)| {
                 let response = rt.block_on(async {
                     let mut offset = 0usize;
                     let mut assignments = Vec::new();
@@ -488,7 +495,8 @@ fn bench_shardnode_streaming_simulated(c: &mut Criterion) {
                         let batch = records[offset..end].to_vec();
                         let resp = shard
                             .ingest_records(Request::new(proto::IngestRecordsRequest {
-                                internal_protocol_version: 2,
+                                internal_protocol_version:
+                                    unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                                 records: batch,
                             }))
                             .await

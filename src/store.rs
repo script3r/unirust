@@ -141,6 +141,16 @@ pub trait RecordStore: Send + Sync {
     /// Get a mutable reference to the string interner.
     fn interner_mut(&mut self) -> &mut StringInterner;
 
+    /// Look up a string without allocating an ID or mutating the store.
+    fn lookup_attr(&self, attr: &str) -> Option<AttrId> {
+        self.interner().get_attr_id(attr)
+    }
+
+    /// Look up a string without allocating an ID or mutating the store.
+    fn lookup_value(&self, value: &str) -> Option<ValueId> {
+        self.interner().get_value_id(value)
+    }
+
     /// Intern an attribute string.
     fn intern_attr(&mut self, attr: &str) -> AttrId {
         self.interner_mut().intern_attr(attr)
@@ -291,6 +301,12 @@ pub trait RecordStore: Send + Sync {
         Ok(0)
     }
 
+    /// Abandon records staged by a failed ingest before they can be committed by
+    /// a later request. Implementations without staging have nothing to discard.
+    fn discard_staged_records(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Make all completed writes durable on stable storage.
     ///
     /// In-memory stores have nothing to synchronize. Persistent implementations
@@ -355,6 +371,8 @@ pub struct Store {
     temporal_index: TemporalIndex,
     /// Next available record ID
     next_record_id: u32,
+    /// Inserts made through staging remain removable until the batch commits.
+    staged_record_ids: Vec<RecordId>,
 }
 
 pub(crate) fn records_have_same_payload(left: &Record, right: &Record) -> bool {
@@ -404,6 +422,7 @@ impl Store {
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
             next_record_id: 0,
+            staged_record_ids: Vec::new(),
         }
     }
 
@@ -418,6 +437,7 @@ impl Store {
             attribute_value_index: AttributeValueIndex::new(),
             temporal_index: TemporalIndex::new(),
             next_record_id,
+            staged_record_ids: Vec::new(),
         }
     }
 
@@ -473,6 +493,9 @@ impl Store {
 
     /// Add a single record to the store and return its assigned ID.
     pub fn add_record(&mut self, mut record: Record) -> Result<RecordId> {
+        if record.id.0 != 0 && self.records.contains_key(&record.id) {
+            anyhow::bail!("record ID {} already exists", record.id.0);
+        }
         let record_id = self.prepare_record(&mut record)?;
 
         let identity = record.identity.clone();
@@ -487,6 +510,9 @@ impl Store {
 
     /// Insert a record with an explicit ID without assigning a new one.
     pub fn insert_record(&mut self, mut record: Record) -> Result<RecordId> {
+        if self.records.contains_key(&record.id) {
+            anyhow::bail!("record ID {} already exists", record.id.0);
+        }
         self.intern_record(&mut record);
         if record.id.0 == Self::EXHAUSTED_RECORD_ID {
             anyhow::bail!("record ID {} is reserved", Self::EXHAUSTED_RECORD_ID);
@@ -884,6 +910,40 @@ impl RecordStore for Store {
         Store::add_record_if_absent(self, record)
     }
 
+    fn stage_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        let (id, inserted) = self.add_record_if_absent(record)?;
+        if inserted {
+            self.staged_record_ids.push(id);
+        }
+        Ok((id, inserted))
+    }
+
+    fn flush_staged_records(&mut self) -> Result<usize> {
+        let count = self.staged_record_ids.len();
+        self.staged_record_ids.clear();
+        Ok(count)
+    }
+
+    fn discard_staged_records(&mut self) -> Result<()> {
+        if self.staged_record_ids.is_empty() {
+            return Ok(());
+        }
+        for id in self.staged_record_ids.drain(..) {
+            if let Some(record) = self.records.remove(&id) {
+                self.identity_index.remove(&record.identity);
+            }
+        }
+        // Abort is an exceptional path; rebuilding avoids retaining index entries
+        // for records whose staging never committed.
+        self.attribute_value_index = AttributeValueIndex::new();
+        self.temporal_index = TemporalIndex::new();
+        for record in self.records.values() {
+            self.attribute_value_index.add_record(record);
+            self.temporal_index.add_record(record);
+        }
+        Ok(())
+    }
+
     fn stage_record_with_explicit_id_if_absent(
         &mut self,
         record: Record,
@@ -900,6 +960,7 @@ impl RecordStore for Store {
             anyhow::bail!("record ID {} already exists", record.id.0);
         }
         let id = self.insert_record(record)?;
+        self.staged_record_ids.push(id);
         Ok((id, true))
     }
 }
@@ -1066,6 +1127,37 @@ mod tests {
         let store = Store::new();
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn aborted_staging_removes_records_and_secondary_indexes() {
+        let mut store = Store::new();
+        let attr = store.interner_mut().intern_attr("email");
+        let value = store.interner_mut().intern_value("shared@example.com");
+        let interval = Interval::new(0, 10).unwrap();
+        let make_record = |source: &str| {
+            Record::new(
+                RecordId(0),
+                RecordIdentity::new("person".into(), "crm".into(), source.into()),
+                vec![Descriptor::new(attr, value, interval)],
+            )
+        };
+        let committed = store.add_record(make_record("committed")).unwrap();
+        let (pending, _) = store
+            .stage_record_if_absent(make_record("pending"))
+            .unwrap();
+        assert_eq!(store.get_records_in_interval(interval).len(), 2);
+        store.discard_staged_records().unwrap();
+        assert!(store.get_record(pending).is_none());
+        assert_eq!(store.get_records_in_interval(interval).len(), 1);
+        assert_eq!(store.get_records_with_attribute(attr)[0].id, committed);
+        let (retried, inserted) = store
+            .stage_record_if_absent(make_record("pending"))
+            .unwrap();
+        assert!(inserted);
+        store.flush_staged_records().unwrap();
+        store.discard_staged_records().unwrap();
+        assert!(store.get_record(retried).is_some());
     }
 
     #[test]

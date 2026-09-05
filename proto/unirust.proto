@@ -102,6 +102,41 @@ message QueryEntitiesResponse {
   }
 }
 
+// Internal, candidate-based entity query. Empty clusters requests the union of
+// descriptor candidates; nonempty clusters hydrates every local entity fragment.
+message QueryEntityFragmentsRequest {
+  repeated QueryDescriptor descriptors = 1;
+  int64 start = 2;
+  int64 end = 3;
+  repeated GlobalClusterId clusters = 4;
+  uint32 protocol_version = 5;
+  // Reconciliation needs exact component guards but no golden payload.
+  bool strong_ids_only = 6;
+}
+
+message QueryInterval {
+  int64 start = 1;
+  int64 end = 2;
+}
+
+message QueryDescriptorIntervals {
+  repeated QueryInterval intervals = 1;
+}
+
+message EntityFragment {
+  GlobalClusterId cluster = 1;
+  repeated QueryDescriptorIntervals descriptor_intervals = 2;
+  // Raw attribute intervals; the router performs global golden conflict trimming.
+  repeated GoldenDescriptor golden = 3;
+  string cluster_key = 4;
+  string cluster_key_identity = 5;
+  repeated BoundaryStrongId strong_ids = 6;
+}
+
+message QueryEntityFragmentsResponse {
+  repeated EntityFragment fragments = 1;
+}
+
 // --- Conflicts ---
 
 message RecordRef {
@@ -270,6 +305,7 @@ message ConfigVersionResponse {
   string version = 1;
   OntologyConfig ontology_config = 2;
   uint32 protocol_version = 3;
+  // Durable reservation-format marker, independent of the live wire protocol.
   uint32 source_reservation_backfill_version = 4;
   uint32 source_reservation_shard_count = 5;
   uint32 checkpoint_protocol_version = 6;
@@ -279,6 +315,7 @@ message ConfigVersionResponse {
   ShardRole shard_role = 9;
   // SHA-256 over every logical RocksDB column-family key/value pair.
   bytes durable_state_digest = 10;
+  uint32 query_fragment_protocol_version = 11;
 }
 
 // --- Durable Source Identity Reservation ---
@@ -589,6 +626,7 @@ service ShardService {
   rpc IngestRecordsStream(stream IngestRecordsChunk) returns (IngestRecordsResponse);
   rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
+  rpc QueryEntityFragments(QueryEntityFragmentsRequest) returns (QueryEntityFragmentsResponse);
   rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse);
 
   // Stats and health

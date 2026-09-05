@@ -36,6 +36,26 @@ use tracing::{debug, instrument, warn};
 /// 32 candidates covers 95%+ of queries based on production workload analysis
 type CandidateVec = SmallVec<[(RecordId, Interval); 32]>;
 
+struct StoreLookup<'a>(&'a dyn RecordStore);
+
+impl InternerLookup for StoreLookup<'_> {
+    fn get_attr_string(&self, id: crate::model::AttrId) -> Option<String> {
+        self.0.resolve_attr(id)
+    }
+
+    fn get_value_string(&self, id: crate::model::ValueId) -> Option<String> {
+        self.0.resolve_value(id)
+    }
+}
+
+fn candidate_scan_limit(tuning: &crate::StreamingTuning) -> usize {
+    if tuning.adaptive_candidate_cap && tuning.adaptive_high_cap > 0 {
+        tuning.adaptive_high_cap
+    } else {
+        tuning.candidate_cap.max(1)
+    }
+}
+
 /// Data stored for boundary signatures to support cross-shard conflict detection.
 #[derive(Debug, Clone)]
 struct BoundaryData {
@@ -385,15 +405,6 @@ impl<'a, K, V> Iterator for LinkerStateIterMut<'a, K, V> {
     }
 }
 
-/// Represents the resolution of a conflict.
-#[derive(Debug, Clone)]
-enum ConflictResolution {
-    /// Conflict can be resolved by choosing the specified record as winner.
-    Resolvable(()),
-    /// Conflict cannot be resolved and should prevent merging.
-    Unresolvable,
-}
-
 /// Public function to build clusters using streaming semantics.
 pub fn build_clusters(store: &dyn RecordStore, ontology: &Ontology) -> Result<Clusters> {
     build_clusters_streaming(store, ontology)
@@ -421,6 +432,9 @@ pub struct StreamingLinker {
     shard_id: u16,
     /// Strong ID summaries for conflict detection (LRU-bounded when config provided)
     strong_id_summaries: LinkerState<RecordId, StrongIdSummary>,
+    /// Root aliases and member lists let queries hydrate only candidate clusters.
+    member_roots: FxHashMap<RecordId, RecordId>,
+    cluster_members: FxHashMap<RecordId, Vec<RecordId>>,
     /// Use FxHashSet for faster hashing (non-cryptographic, perfect for internal keys)
     tainted_identity_keys: FxHashSet<LinkerKeySignature>,
     /// Record perspectives for same-perspective conflict detection (LRU-bounded when config provided)
@@ -526,8 +540,9 @@ impl StreamingLinker {
         tuning: &crate::StreamingTuning,
         shard_id: u16,
         dsu: DsuBackend,
-        identity_index: IndexBackend,
+        mut identity_index: IndexBackend,
     ) -> Result<Self> {
+        identity_index.clear()?;
         // These mappings and summaries affect resolution correctness. The bounded
         // backend cannot be enabled until evictions have a durable spill/read-through
         // path; silently dropping an old entry can split clusters after enough ingest.
@@ -553,6 +568,8 @@ impl StreamingLinker {
             global_cluster_anchors: LinkerState::unbounded(),
             shard_id,
             strong_id_summaries,
+            member_roots: FxHashMap::default(),
+            cluster_members: FxHashMap::default(),
             tainted_identity_keys: FxHashSet::default(),
             record_perspectives,
             pending_keys: FxHashSet::default(),
@@ -573,7 +590,7 @@ impl StreamingLinker {
                 streamer.link_records_batch_parallel_with_interner(
                     &records,
                     ontology,
-                    store.interner(),
+                    &StoreLookup(store),
                 )?;
                 batch.clear();
                 Ok(())
@@ -633,7 +650,7 @@ impl StreamingLinker {
         ontology: &Ontology,
         record_id: RecordId,
     ) -> Result<ClusterId> {
-        self.link_record_with_interner(store, store.interner(), ontology, record_id)
+        self.link_record_with_interner(store, &StoreLookup(store), ontology, record_id)
     }
 
     /// Link a newly added record with an explicit interner for boundary tracking.
@@ -650,6 +667,7 @@ impl StreamingLinker {
             self.dsu.add_record(record_id)?;
             self.global_cluster_anchors.insert(record_id, record_id.0);
         }
+        self.register_cluster_member(record_id)?;
 
         // Try to get a reference first (avoids cloning), fall back to cloning if not available.
         let record_owned;
@@ -695,12 +713,6 @@ impl StreamingLinker {
                 let interval = *interval; // deref for use below
                 let key_signature = LinkerKeySignature::new(entity_type, key_values);
 
-                // Fast path: skip if key is already known to be tainted (O(1) set lookup).
-                // We already added to pending_keys when first tainted, no need to re-add.
-                if self.tainted_identity_keys.contains(&key_signature) {
-                    continue;
-                }
-
                 // Create identity key signature for bloom filter and scan cache lookups
                 let identity_sig = IdentityKeySignature::from_key_values(entity_type, key_values);
 
@@ -740,7 +752,7 @@ impl StreamingLinker {
                         } = self;
 
                         metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
-                        let max_tree_nodes = tuning.adaptive_high_cap;
+                        let max_tree_nodes = candidate_scan_limit(tuning);
                         let (candidates_slice, is_hot) = identity_index
                             .find_matching_clusters_overlapping_limited(
                                 dsu,
@@ -748,8 +760,23 @@ impl StreamingLinker {
                                 key_values,
                                 interval,
                                 max_tree_nodes,
-                            );
-                        let candidates: CandidateVec = candidates_slice.iter().copied().collect();
+                            )?;
+                        let candidates: CandidateVec = if is_hot {
+                            identity_index
+                                .find_matching_clusters_overlapping_limited(
+                                    dsu,
+                                    entity_type,
+                                    key_values,
+                                    interval,
+                                    usize::MAX,
+                                )?
+                                .0
+                                .iter()
+                                .copied()
+                                .collect()
+                        } else {
+                            candidates_slice.iter().copied().collect()
+                        };
                         // Cache the result for future lookups
                         if let Some(opts) = partition_opts {
                             opts.cache_candidates(&identity_sig, candidates.to_vec());
@@ -766,17 +793,9 @@ impl StreamingLinker {
                     );
                 }
 
-                // If the tree query hit the limit, mark as hot and skip.
+                // Candidate volume is independent of strong-identifier conflicts.
                 if is_hot || candidate_len > self.tuning.hot_key_threshold {
                     self.metrics.hot_key_exits.fetch_add(1, Ordering::Relaxed);
-                    // Avoid redundant clone: only clone if we need both sets
-                    if self.tuning.deferred_reconciliation {
-                        self.tainted_identity_keys.insert(key_signature.clone());
-                        self.pending_keys.insert(key_signature);
-                    } else {
-                        self.tainted_identity_keys.insert(key_signature);
-                    }
-                    continue;
                 }
 
                 // === SPER OPTIMIZATION: Stochastic candidate sampling ===
@@ -861,6 +880,8 @@ impl StreamingLinker {
                     global_cluster_ids,
                     global_cluster_anchors,
                     strong_id_summaries,
+                    member_roots,
+                    cluster_members,
                     tainted_identity_keys,
                     record_perspectives,
                     boundary_signatures,
@@ -943,6 +964,13 @@ impl StreamingLinker {
                     {
                         metrics.merges_performed.fetch_add(1, Ordering::Relaxed);
                         let new_root = dsu.find(record_id).unwrap_or(record_id);
+                        reconcile_cluster_members(
+                            member_roots,
+                            cluster_members,
+                            root_a,
+                            root_b,
+                            new_root,
+                        );
                         reconcile_cluster_ids(
                             cluster_ids,
                             next_cluster_id,
@@ -968,7 +996,7 @@ impl StreamingLinker {
                             root_a,
                             root_b,
                             new_root,
-                        );
+                        )?;
                         // Invalidate cache on merge - candidates changed
                         if let Some(opts) = partition_opts {
                             opts.on_cluster_merge(root_a, root_b);
@@ -996,8 +1024,12 @@ impl StreamingLinker {
             }
         }
 
-        self.identity_index
-            .add_record_with_cached_keys(record_id, root, entity_type, cached_keys);
+        self.identity_index.add_record_with_cached_keys(
+            record_id,
+            root,
+            entity_type,
+            cached_keys,
+        )?;
 
         self.metrics.records_linked.fetch_add(1, Ordering::Relaxed);
         Ok(self.get_or_assign_cluster_id(root))
@@ -1133,6 +1165,7 @@ impl StreamingLinker {
             self.dsu.add_record(record_id)?;
             self.global_cluster_anchors.insert(record_id, record_id.0);
         }
+        self.register_cluster_member(record_id)?;
 
         // Store perspective and summary
         self.record_perspectives
@@ -1145,13 +1178,8 @@ impl StreamingLinker {
 
         // Process each key
         for (key_signature, key_values, interval, guard_reason) in extraction.keys {
-            // Skip tainted keys
-            if self.tainted_identity_keys.contains(&key_signature) {
-                continue;
-            }
-
             // Find candidates and merge
-            let max_tree_nodes = self.tuning.adaptive_high_cap;
+            let max_tree_nodes = candidate_scan_limit(&self.tuning);
             let (candidates_slice, is_hot) = self
                 .identity_index
                 .find_matching_clusters_overlapping_limited(
@@ -1160,20 +1188,27 @@ impl StreamingLinker {
                     &key_values,
                     interval,
                     max_tree_nodes,
-                );
-            let candidates: CandidateVec = candidates_slice.iter().copied().collect();
+                )?;
+            let candidates: CandidateVec = if is_hot {
+                self.identity_index
+                    .find_matching_clusters_overlapping_limited(
+                        &mut self.dsu,
+                        entity_type,
+                        &key_values,
+                        interval,
+                        usize::MAX,
+                    )?
+                    .0
+                    .iter()
+                    .copied()
+                    .collect()
+            } else {
+                candidates_slice.iter().copied().collect()
+            };
             let candidate_len = candidates.len();
 
-            // Handle hot keys
             if is_hot || candidate_len > self.tuning.hot_key_threshold {
                 self.metrics.hot_key_exits.fetch_add(1, Ordering::Relaxed);
-                if self.tuning.deferred_reconciliation {
-                    self.tainted_identity_keys.insert(key_signature.clone());
-                    self.pending_keys.insert(key_signature);
-                } else {
-                    self.tainted_identity_keys.insert(key_signature);
-                }
-                continue;
             }
 
             // Merge with candidates
@@ -1243,6 +1278,13 @@ impl StreamingLinker {
                         .merges_performed
                         .fetch_add(1, Ordering::Relaxed);
                     let new_root = self.dsu.find(record_id).unwrap_or(record_id);
+                    reconcile_cluster_members(
+                        &mut self.member_roots,
+                        &mut self.cluster_members,
+                        root_a,
+                        root_b,
+                        new_root,
+                    );
                     reconcile_cluster_ids(
                         &mut self.cluster_ids,
                         &mut self.next_cluster_id,
@@ -1273,7 +1315,7 @@ impl StreamingLinker {
                         root_a,
                         root_b,
                         new_root,
-                    );
+                    )?;
                     root_a = new_root;
                 }
             }
@@ -1318,33 +1360,42 @@ impl StreamingLinker {
             }
         }
 
-        self.identity_index
-            .add_record_with_cached_keys(record.id, root, entity_type, cached_keys);
+        self.identity_index.add_record_with_cached_keys(
+            record.id,
+            root,
+            entity_type,
+            cached_keys,
+        )?;
 
         Ok(())
     }
 
-    /// Get clusters from the streaming DSU state.
+    /// Enumerate authoritative local membership, including persistent DSU backends.
     pub fn clusters(&mut self) -> Clusters {
-        self.dsu.get_clusters().unwrap_or_else(|_| Clusters {
-            clusters: Vec::new(),
-        })
+        let members = self
+            .cluster_members
+            .iter()
+            .map(|(root, records)| (*root, records.clone()))
+            .collect::<Vec<_>>();
+        Clusters {
+            clusters: members
+                .into_iter()
+                .map(|(root, records)| {
+                    let id = self.get_or_assign_cluster_id(root);
+                    crate::dsu::Cluster::new(id, root, records)
+                })
+                .collect(),
+        }
     }
 
-    /// Get clusters from the streaming DSU state, applying conflict splitting heuristics.
+    /// Finish deferred linking and enumerate clusters guarded at merge time.
     pub fn clusters_with_conflict_splitting(
         &mut self,
         store: &dyn RecordStore,
         ontology: &Ontology,
     ) -> Result<Clusters> {
         self.reconcile_pending(store, ontology)?;
-        let clusters = self.dsu.get_clusters()?;
-
-        if should_apply_conflict_splitting(store, ontology) {
-            split_clusters_with_unresolvable_conflicts(store, ontology, clusters)
-        } else {
-            Ok(clusters)
-        }
+        Ok(self.clusters())
     }
 
     fn get_or_assign_cluster_id(&mut self, root: RecordId) -> ClusterId {
@@ -1377,6 +1428,72 @@ impl StreamingLinker {
     pub fn cluster_id_for(&mut self, record_id: RecordId) -> ClusterId {
         let root = self.dsu.find(record_id).unwrap_or(record_id);
         self.get_or_assign_cluster_id(root)
+    }
+
+    fn register_cluster_member(&mut self, record_id: RecordId) -> Result<()> {
+        if !self.member_roots.contains_key(&record_id) {
+            let root = self.dsu.find(record_id)?;
+            self.member_roots.insert(record_id, root);
+            self.cluster_members
+                .entry(root)
+                .or_default()
+                .push(record_id);
+        }
+        Ok(())
+    }
+
+    /// Resolve a tracked record without mutating DSU caches or enumerating records.
+    pub fn root_for_record(&self, record_id: RecordId) -> Option<RecordId> {
+        let mut root = *self.member_roots.get(&record_id)?;
+        while let Some(&parent) = self.member_roots.get(&root) {
+            if parent == root {
+                break;
+            }
+            root = parent;
+        }
+        Some(root)
+    }
+
+    /// Read authoritative membership for one local cluster.
+    pub fn cluster_for_record(&self, record_id: RecordId) -> Option<crate::dsu::Cluster> {
+        let root = self.root_for_record(record_id)?;
+        let id = *self.cluster_ids.peek(&root)?;
+        let members = self.cluster_members.get(&root)?.clone();
+        Some(crate::dsu::Cluster::new(id, root, members))
+    }
+
+    /// Read all authoritative memberships without replaying records or assigning
+    /// new IDs. Missing IDs indicate inconsistent state and must not hide clusters.
+    pub fn clusters_readonly(&self) -> Result<Clusters> {
+        let clusters = self
+            .cluster_members
+            .iter()
+            .map(|(root, records)| {
+                let id = self.cluster_ids.peek(root).copied().ok_or_else(|| {
+                    anyhow::anyhow!("cluster ID is unavailable for tracked root {}", root.0)
+                })?;
+                Ok(crate::dsu::Cluster::new(id, *root, records.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Clusters { clusters })
+    }
+
+    /// Read a local cluster's canonical global ID without allocating an assignment.
+    pub fn global_cluster_id_for_readonly(&self, record_id: RecordId) -> Option<GlobalClusterId> {
+        let root = self.root_for_record(record_id)?;
+        let id = self
+            .global_cluster_ids
+            .peek(&root)
+            .copied()
+            .unwrap_or_else(|| {
+                let anchor = self
+                    .global_cluster_anchors
+                    .peek(&root)
+                    .copied()
+                    .unwrap_or(root.0);
+                GlobalClusterId::new(self.shard_id, anchor, 0)
+            });
+        Some(self.resolve_global_cluster_id(id))
     }
 
     /// Get the global cluster ID for a record.
@@ -1640,7 +1757,7 @@ impl StreamingLinker {
         for key_signature in pending {
             let candidates = self
                 .identity_index
-                .find_matching_records(key_signature.entity_type(), key_signature.key_values())
+                .find_matching_records(key_signature.entity_type(), key_signature.key_values())?
                 .to_vec();
             if candidates.len() < 2 {
                 continue;
@@ -1761,6 +1878,24 @@ impl StreamingLinker {
                             .merges_performed
                             .fetch_add(1, Ordering::Relaxed);
                         let new_root = self.dsu.find(*record_id).unwrap_or(*record_id);
+                        reconcile_cluster_members(
+                            &mut self.member_roots,
+                            &mut self.cluster_members,
+                            root_a,
+                            root_b,
+                            new_root,
+                        );
+                        reconcile_global_cluster_ids(
+                            &mut self.global_cluster_ids,
+                            &mut self.global_cluster_anchors,
+                            &mut self.cross_shard_merges,
+                            &mut self.boundary_signatures,
+                            &mut self.dirty_boundary_keys,
+                            self.shard_id,
+                            root_a,
+                            root_b,
+                            new_root,
+                        );
                         reconcile_cluster_ids(
                             &mut self.cluster_ids,
                             &mut self.next_cluster_id,
@@ -1780,7 +1915,7 @@ impl StreamingLinker {
                             root_a,
                             root_b,
                             new_root,
-                        );
+                        )?;
                     }
                     compared = compared.saturating_add(1);
                 }
@@ -2345,68 +2480,6 @@ fn reconcile_cluster_summaries(
     summaries.insert(new_root, merged);
 }
 
-/// Check for strong identifier conflicts.
-/// The interval parameter is currently unused; overlap checks are derived
-/// from descriptor intervals directly.
-fn check_strong_identifier_conflict(
-    store: &dyn RecordStore,
-    ontology: &Ontology,
-    record_a: RecordId,
-    record_b: RecordId,
-    _interval: Interval,
-) -> Option<ConflictResolution> {
-    let record_a = store.get_record(record_a)?;
-    let record_b = store.get_record(record_b)?;
-
-    // Check strong identifiers for conflicts
-    for strong_id in ontology.strong_identifiers_for_type(&record_a.identity.entity_type) {
-        let descriptor_a = get_strong_identifier_descriptor(&record_a, strong_id);
-        let descriptor_b = get_strong_identifier_descriptor(&record_b, strong_id);
-
-        // Only check for conflicts if both records have values for this strong identifier
-        if let (Some(desc_a), Some(desc_b)) = (descriptor_a, descriptor_b) {
-            if desc_a.value != desc_b.value {
-                // Check if the conflicting values have overlapping temporal intervals
-                if temporal_intervals_overlap(&desc_a.interval, &desc_b.interval) {
-                    // Conflict detected: same attribute, different values, overlapping time
-                    // Use perspective weights to determine resolution
-                    let weight_a = ontology.get_perspective_weight(&record_a.identity.perspective);
-                    let weight_b = ontology.get_perspective_weight(&record_b.identity.perspective);
-
-                    if weight_a != weight_b {
-                        return Some(ConflictResolution::Resolvable(()));
-                    }
-                    // Equal weights - check if there are other resolution mechanisms
-                    // For now, we'll be conservative and only mark as unresolvable
-                    // if both records are from the same perspective with equal weights
-                    if record_a.identity.perspective == record_b.identity.perspective {
-                        // Same perspective with equal weights - unresolvable
-                        return Some(ConflictResolution::Unresolvable);
-                    }
-                    // Different perspectives with equal weights - might be resolvable through other means
-                    // Let the normal clustering process handle this
-                    return None;
-                }
-                // If temporal intervals don't overlap, there's no conflict
-            }
-        }
-        // If only one record has a value for this strong identifier, that's not a conflict
-        // Records from different perspectives may have different strong identifier attributes
-    }
-    None
-}
-
-/// Get strong identifier descriptor (with temporal interval) for a record.
-fn get_strong_identifier_descriptor<'a>(
-    record: &'a Record,
-    strong_id: &crate::ontology::StrongIdentifier,
-) -> Option<&'a crate::model::Descriptor> {
-    record
-        .descriptors
-        .iter()
-        .find(|descriptor| descriptor.attr == strong_id.attribute)
-}
-
 /// Build a strong ID summary for a record based on ontology strong identifiers.
 pub fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSummary {
     let _guard = crate::profile::profile_scope("build_record_summary");
@@ -2469,18 +2542,6 @@ pub fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSum
     summary
 }
 
-/// Check if two temporal intervals overlap.
-fn temporal_intervals_overlap(
-    interval_a: &crate::temporal::Interval,
-    interval_b: &crate::temporal::Interval,
-) -> bool {
-    // Two intervals overlap if one starts before the other ends
-    // interval_a: [start_a, end_a]
-    // interval_b: [start_b, end_b]
-    // They overlap if: start_a < end_b && start_b < end_a
-    interval_a.start < interval_b.end && interval_b.start < interval_a.end
-}
-
 /// Check if merging would create conflicts in existing clusters.
 fn would_create_conflict_in_clusters(
     summaries: &LinkerState<RecordId, StrongIdSummary>,
@@ -2507,153 +2568,23 @@ fn would_create_conflict_in_clusters(
     false
 }
 
-/// Post-process clusters to split those with unresolvable conflicts.
-/// This is a heuristic fallback used to support specific conflict tests.
-fn split_clusters_with_unresolvable_conflicts(
-    store: &dyn RecordStore,
-    ontology: &Ontology,
-    clusters: Clusters,
-) -> Result<Clusters> {
-    let mut new_clusters = Vec::new();
-
-    for cluster in clusters.clusters {
-        // Check if this cluster has any unresolvable conflicts
-        let mut has_unresolvable_conflicts = false;
-        let mut conflicting_groups: Vec<Vec<RecordId>> = Vec::new();
-
-        // For each pair of records in the cluster, check for unresolvable conflicts
-        for i in 0..cluster.records.len() {
-            for j in (i + 1)..cluster.records.len() {
-                let record_a = cluster.records[i];
-                let record_b = cluster.records[j];
-
-                if let Some(ConflictResolution::Unresolvable) = check_strong_identifier_conflict(
-                    store,
-                    ontology,
-                    record_a,
-                    record_b,
-                    Interval::new(0, 1).unwrap(),
-                ) {
-                    has_unresolvable_conflicts = true;
-
-                    // Find which group each record belongs to, or create new groups
-                    let mut group_a = None;
-                    let mut group_b = None;
-
-                    for (group_idx, group) in conflicting_groups.iter().enumerate() {
-                        if group.contains(&record_a) {
-                            group_a = Some(group_idx);
-                        }
-                        if group.contains(&record_b) {
-                            group_b = Some(group_idx);
-                        }
-                    }
-
-                    match (group_a, group_b) {
-                        (Some(idx_a), Some(idx_b)) => {
-                            if idx_a != idx_b {
-                                // These records are in different groups but have an unresolvable conflict
-                                // This means each record should be in its own separate group
-                                // Remove both records from their current groups and create individual groups for them
-                                conflicting_groups[idx_a].retain(|&x| x != record_a);
-                                conflicting_groups[idx_b].retain(|&x| x != record_b);
-                                conflicting_groups.push(vec![record_a]);
-                                conflicting_groups.push(vec![record_b]);
-                            }
-                        }
-                        (Some(idx_a), None) => {
-                            // Record A is in a group, but B conflicts with A
-                            // Remove A from its current group and create separate groups for both
-                            conflicting_groups[idx_a].retain(|&x| x != record_a);
-                            conflicting_groups.push(vec![record_a]);
-                            conflicting_groups.push(vec![record_b]);
-                        }
-                        (None, Some(idx_b)) => {
-                            // Record B is in a group, but A conflicts with B
-                            // Remove B from its current group and create separate groups for both
-                            conflicting_groups[idx_b].retain(|&x| x != record_b);
-                            conflicting_groups.push(vec![record_a]);
-                            conflicting_groups.push(vec![record_b]);
-                        }
-                        (None, None) => {
-                            // Neither record is in a group yet, create separate groups for both
-                            conflicting_groups.push(vec![record_a]);
-                            conflicting_groups.push(vec![record_b]);
-                        }
-                    }
-                }
-            }
-        }
-
-        if has_unresolvable_conflicts {
-            // Split the cluster based on conflicting groups
-            let mut used_records = std::collections::HashSet::new();
-
-            // Create clusters for each conflicting group
-            for group in conflicting_groups {
-                for &record_id in &group {
-                    used_records.insert(record_id);
-                }
-                if !group.is_empty() {
-                    let cluster_id = ClusterId(new_clusters.len() as u32 + 1);
-                    new_clusters.push(crate::dsu::Cluster::new(cluster_id, group[0], group));
-                }
-            }
-
-            // Create individual clusters for records not in any conflicting group
-            for &record_id in &cluster.records {
-                if !used_records.contains(&record_id) {
-                    let cluster_id = ClusterId(new_clusters.len() as u32 + 1);
-                    new_clusters.push(crate::dsu::Cluster::new(
-                        cluster_id,
-                        record_id,
-                        vec![record_id],
-                    ));
-                }
-            }
-        } else {
-            // No unresolvable conflicts, keep the cluster as is
-            new_clusters.push(cluster);
-        }
+fn reconcile_cluster_members(
+    roots: &mut FxHashMap<RecordId, RecordId>,
+    members: &mut FxHashMap<RecordId, Vec<RecordId>>,
+    root_a: RecordId,
+    root_b: RecordId,
+    new_root: RecordId,
+) {
+    roots.insert(root_a, new_root);
+    roots.insert(root_b, new_root);
+    roots.insert(new_root, new_root);
+    let mut left = members.remove(&root_a).unwrap_or_default();
+    let mut right = members.remove(&root_b).unwrap_or_default();
+    if left.len() < right.len() {
+        std::mem::swap(&mut left, &mut right);
     }
-
-    Ok(Clusters {
-        clusters: new_clusters,
-    })
-}
-
-/// Determine if conflict splitting should be applied based on the scenario.
-/// This uses a narrow heuristic for known test fixtures.
-fn should_apply_conflict_splitting(store: &dyn RecordStore, ontology: &Ontology) -> bool {
-    let mut records = Vec::new();
-    store.for_each_record(&mut |record| records.push(record));
-
-    // Check if this looks like the indirect conflict test case
-    // (3 records with same identity key but conflicting strong identifiers from same perspective)
-    if records.len() == 3 {
-        let mut same_perspective_conflicts = 0;
-
-        for i in 0..records.len() {
-            for j in (i + 1)..records.len() {
-                if let Some(ConflictResolution::Unresolvable) = check_strong_identifier_conflict(
-                    store,
-                    ontology,
-                    records[i].id,
-                    records[j].id,
-                    Interval::new(0, 1).unwrap(),
-                ) {
-                    if records[i].identity.perspective == records[j].identity.perspective {
-                        same_perspective_conflicts += 1;
-                    }
-                }
-            }
-        }
-
-        // Apply conflict splitting if we have same-perspective unresolvable conflicts
-        return same_perspective_conflicts > 0;
-    }
-
-    false
+    left.extend(right);
+    members.insert(new_root, left);
 }
 
 fn cluster_summaries_conflict(a: &StrongIdSummary, b: &StrongIdSummary) -> bool {
@@ -2792,4 +2723,41 @@ fn has_overlapping_interval(a: &[Interval], b: &[Interval]) -> bool {
     }
 
     false
+}
+
+impl StreamingLinker {
+    /// Hydrate only local components of the requested canonical entities.
+    /// Global IDs are anchored to durable record IDs. Remote canonical entities
+    /// additionally reach local anchors through the sparse redirect map.
+    pub fn clusters_for_global_ids(&self, ids: &[GlobalClusterId]) -> Vec<crate::dsu::Cluster> {
+        let targets: HashSet<_> = ids
+            .iter()
+            .map(|id| self.resolve_global_cluster_id(*id))
+            .collect();
+        let mut anchors: HashSet<RecordId> = targets
+            .iter()
+            .filter(|id| id.shard_id == self.shard_id)
+            .map(|id| RecordId(id.local_id))
+            .collect();
+        for (alias, target) in &self.cross_shard_merges {
+            if alias.shard_id == self.shard_id
+                && targets.contains(&self.resolve_global_cluster_id(*target))
+            {
+                anchors.insert(RecordId(alias.local_id));
+            }
+        }
+        let mut roots = HashSet::new();
+        anchors
+            .into_iter()
+            .filter_map(|anchor| {
+                let root = self.root_for_record(anchor)?;
+                if !roots.insert(root)
+                    || !targets.contains(&self.global_cluster_id_for_readonly(anchor)?)
+                {
+                    return None;
+                }
+                self.cluster_for_record(anchor)
+            })
+            .collect()
+    }
 }

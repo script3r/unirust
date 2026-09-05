@@ -281,6 +281,17 @@ duplicates make startup fail closed for operator repair. The internal router and
 shard protocol is versioned, and mixed versions are rejected, so upgrades must
 replace the full cluster with one coordinated Unirust version before restarting
 the router. Shard gRPC ports are internal APIs; client ingest must use the router.
+
+The current live protocol is **6**. Protocol 5 routers, shards, and replicas must
+be stopped and upgraded together: older coordinators do not implement the
+component guards or canonical entity queries required by this release. This
+handshake change does not change WAL or checkpoint format version 1, record
+snapshot encoding, or durable source-reservation format version 5. Existing
+volumes, pending WAL batches, and coordinated checkpoints remain readable;
+valid version 5 reservation markers retain their original shard-count binding
+without another backfill. Internal ingest/import callers must send the current
+live protocol, while public router clients continue leaving that field unset.
+
 The persisted reservation directory is also bound to the configured shard count.
 Router startup rejects shard-count changes because the current import API cannot
 atomically move a record, update its reservation, and delete the old copy.

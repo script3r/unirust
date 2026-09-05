@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   msrv:
@@ -21,6 +25,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -46,6 +52,8 @@ jobs:
           components: rustfmt, clippy
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -58,9 +66,13 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Verify release package
+        run: cargo package --locked
       - name: Validate deployment manifests
         run: |
-          bash -n scripts/*.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
           docker compose -f compose.yaml config --quiet
 
   container-image:

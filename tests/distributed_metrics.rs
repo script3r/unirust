@@ -110,7 +110,7 @@ async fn metrics_report_requests() -> anyhow::Result<()> {
 
     router
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_input(
                 0,
                 "person",
