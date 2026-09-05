@@ -272,7 +272,8 @@ async fn distributed_conflict_presets_match_local() -> anyhow::Result<()> {
         if !inputs.is_empty() {
             client
                 .ingest_records(IngestRecordsRequest {
-                    internal_protocol_version: 5,
+                    internal_protocol_version:
+                        unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                     records: inputs.clone(),
                 })
                 .await

@@ -139,7 +139,7 @@ async fn distributed_rebalance_stream_rejects_cross_shard_copy() -> anyhow::Resu
     assert_eq!(records.len(), 2);
     router
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records,
         })
         .await?;

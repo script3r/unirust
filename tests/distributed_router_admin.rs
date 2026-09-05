@@ -136,7 +136,7 @@ async fn router_admin_rejects_non_atomic_cross_shard_copy() -> anyhow::Result<()
     assert_eq!(records.len(), 2);
     router
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records,
         })
         .await?;

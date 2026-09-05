@@ -3,9 +3,37 @@
 All notable changes to this project are documented here. This project follows
 Semantic Versioning.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-05
+
+### Added
+
+- Persistent distributed shards, streaming ingest, cross-shard reconciliation,
+  coordinated checkpoints, verified off-host backups, and synchronous replication.
+- Mutual TLS transport, semantic readiness checks, and fail-closed recovery for
+  partial reconciliation, interrupted ingestion, and inconsistent restores.
+- Enabled persistent regressions for the September correctness audit and query
+  equivalence across bridge merges, cache invalidation, and restart.
 
 ### Fixed
+
+- Transitive cross-shard merges now compare component-wide temporal strong IDs,
+  including observations from previous reconciliation rounds.
+- Distributed queries assemble complete canonical entities before temporal
+  conjunction and golden attribute mastering.
+- Occupied record IDs cannot overwrite durable records; rejected batches discard
+  staged records and partial resolution state before another request can commit.
+- Bounded interner caches preserve durable IDs after restart. Corrupt query
+  lookups fail explicitly instead of returning empty matches.
+- Repeated common keys and the memory-saver profile continue entity resolution.
+  Tiered index updates preserve complete buckets through eviction and recovery,
+  respect capacity settings, and propagate storage failures.
+- Persistent DSU cluster enumeration, deferred membership updates, and restored
+  query-label cache invalidation now use authoritative cluster state.
+- Unbounded temporal intervals no longer overflow duration calculations or
+  require enumerating every temporal bucket; Allen relations preserve orientation.
+- Rust 1.98 Clippy failures are resolved. Release publishing now depends on full
+  CI validation and a matching tag/package version, including package and image
+  builds. Shell validation checks every deployment script.
 
 - Ingest acknowledgement now waits for a synchronous RocksDB WAL flush. The
   external ingest WAL is removed only after records and entity-resolution state
@@ -51,7 +79,14 @@ Semantic Versioning.
 - Adopted Rust 2024 with a documented MSRV of Rust 1.88.
 - Updated the active gRPC, terminal UI, cache, and compression dependencies and
   removed unused direct HTTP, TOML, and protobuf-types dependencies.
-- The package version is now `0.2.0` in preparation for the next release.
+- The live distributed protocol is now 6. Upgrade routers, shards, and replicas
+  together; WAL/checkpoint version 1 and durable reservation format 5 remain
+  readable. Public router clients continue using the existing request contract.
+- Selective queries reuse resolved membership and master only candidate entities;
+  composite labels retain global prefix collision semantics. Shard requests run
+  concurrently with bounded fan-out and entity hydration batches.
+- Persistent ingestion lends staged records directly to parallel extraction,
+  avoiding record cloning and correctly resolving batches above 100,000 records.
 - The application lockfile is tracked for reproducible binary and container
   builds.
 - Distributed integration tests now use temporary persistent shard stores; the

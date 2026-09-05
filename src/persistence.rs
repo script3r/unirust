@@ -537,8 +537,8 @@ pub struct PersistentStore {
     inner: Store,
     db: Arc<DB>,
     cache: Mutex<LruCache<RecordId, Record>>,
-    staged_records: Mutex<Vec<Record>>,
-    staged_identities: Mutex<HashMap<RecordIdentity, RecordId>>,
+    staged_records: HashMap<RecordId, Record>,
+    staged_identities: HashMap<RecordIdentity, RecordId>,
     persisted_attr_id: u32,
     persisted_value_id: u32,
     record_count: u64,
@@ -592,8 +592,8 @@ impl PersistentStore {
             cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("cache capacity"),
             )),
-            staged_records: Mutex::new(Vec::new()),
-            staged_identities: Mutex::new(HashMap::new()),
+            staged_records: HashMap::new(),
+            staged_identities: HashMap::new(),
             persisted_attr_id,
             persisted_value_id,
             record_count,
@@ -748,14 +748,8 @@ impl PersistentStore {
         self.cluster_count = 0;
         self.conflict_summary_count = 0;
         self.read_fault.store(false, Ordering::Release);
-        self.staged_records
-            .get_mut()
-            .map_err(|_| anyhow!("staged records lock poisoned"))?
-            .clear();
-        self.staged_identities
-            .get_mut()
-            .map_err(|_| anyhow!("staged identities lock poisoned"))?
-            .clear();
+        self.staged_records.clear();
+        self.staged_identities.clear();
         self.cache
             .get_mut()
             .map_err(|_| anyhow!("record cache lock poisoned"))?
@@ -786,88 +780,67 @@ impl PersistentStore {
         Ok(())
     }
 
-    /// Stage a record for later batch write. Returns (record_id, inserted).
-    /// The record is added to cache immediately so it's readable, but not yet persisted to DB.
-    pub fn stage_record_if_absent(&mut self, mut record: Record) -> Result<(RecordId, bool)> {
-        <Self as RecordStore>::ensure_healthy(self)?;
-        if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
-            self.ensure_idempotent_record(existing, &record)?;
-            return Ok((existing, false));
+    /// Hydrate referenced durable IDs before the in-memory preparer validates them.
+    /// A bounded interner cache does not make a durable string ID invalid.
+    fn hydrate_record_interner(&mut self, record: &Record) -> Result<()> {
+        for descriptor in &record.descriptors {
+            if self.inner.interner().get_attr(descriptor.attr).is_none() {
+                if let Some(value) = self.lookup_interner_value(b'a', descriptor.attr.0) {
+                    self.inner
+                        .interner_mut()
+                        .insert_attr_with_id(descriptor.attr, value);
+                }
+            }
+            if self.inner.interner().get_value(descriptor.value).is_none() {
+                if let Some(value) = self.lookup_interner_value(b'v', descriptor.value.0) {
+                    self.inner
+                        .interner_mut()
+                        .insert_value_with_id(descriptor.value, value);
+                }
+            }
         }
-        <Self as RecordStore>::ensure_healthy(self)?;
+        self.ensure_healthy()
+    }
 
-        if let Some(existing) = self
-            .staged_identities
-            .lock()
-            .map_err(|_| anyhow!("staged identities lock poisoned"))?
-            .get(&record.identity)
-            .copied()
-        {
-            self.ensure_idempotent_record(existing, &record)?;
-            return Ok((existing, false));
+    fn ensure_record_id_available(&self, record_id: RecordId) -> Result<()> {
+        if self.get_record(record_id).is_some() {
+            anyhow::bail!("record ID {} already exists", record_id.0);
         }
+        self.ensure_healthy()
+    }
 
-        let record_id = self.inner.prepare_record(&mut record)?;
-        let identity = record.identity.clone();
-
-        // Add to cache immediately so it's readable
-        self.cache
-            .lock()
-            .map_err(|_| anyhow!("record cache lock poisoned"))?
-            .put(record_id, record.clone());
-
-        // Stage for later batch write
-        self.staged_records
-            .lock()
-            .map_err(|_| anyhow!("staged records lock poisoned"))?
-            .push(record);
-        self.staged_identities
-            .lock()
-            .map_err(|_| anyhow!("staged identities lock poisoned"))?
-            .insert(identity, record_id);
-
-        Ok((record_id, true))
+    /// Stage a record for later batch write. Pending records remain addressable
+    /// independently of the bounded cache used for already committed records.
+    pub fn stage_record_if_absent(&mut self, record: Record) -> Result<(RecordId, bool)> {
+        self.stage_record(record, false)
     }
 
     pub fn stage_record_with_explicit_id_if_absent(
         &mut self,
-        mut record: Record,
+        record: Record,
     ) -> Result<(RecordId, bool)> {
-        <Self as RecordStore>::ensure_healthy(self)?;
+        self.stage_record(record, true)
+    }
+
+    fn stage_record(&mut self, mut record: Record, preserve_id: bool) -> Result<(RecordId, bool)> {
+        self.ensure_healthy()?;
         if let Some(existing) = self.get_record_id_by_identity(&record.identity) {
             self.ensure_idempotent_record(existing, &record)?;
             return Ok((existing, false));
         }
-        <Self as RecordStore>::ensure_healthy(self)?;
-        if let Some(existing) = self
-            .staged_identities
-            .lock()
-            .map_err(|_| anyhow!("staged identities lock poisoned"))?
-            .get(&record.identity)
-            .copied()
-        {
-            self.ensure_idempotent_record(existing, &record)?;
-            return Ok((existing, false));
+        self.ensure_healthy()?;
+        if preserve_id || record.id.0 != 0 {
+            self.ensure_record_id_available(record.id)?;
         }
-        if self.get_record(record.id).is_some() {
-            anyhow::bail!("record ID {} already exists", record.id.0);
-        }
-        <Self as RecordStore>::ensure_healthy(self)?;
-
-        let record_id = self.inner.prepare_record_with_explicit_id(&mut record)?;
-        let identity = record.identity.clone();
-        self.cache
-            .lock()
-            .map_err(|_| anyhow!("record cache lock poisoned"))?
-            .put(record_id, record.clone());
-        self.staged_records
-            .lock()
-            .map_err(|_| anyhow!("staged records lock poisoned"))?
-            .push(record);
+        self.hydrate_record_interner(&record)?;
+        let record_id = if preserve_id {
+            self.inner.prepare_record_with_explicit_id(&mut record)?
+        } else {
+            self.inner.prepare_record(&mut record)?
+        };
         self.staged_identities
-            .lock()
-            .map_err(|_| anyhow!("staged identities lock poisoned"))?
-            .insert(identity, record_id);
+            .insert(record.identity.clone(), record_id);
+        self.staged_records.insert(record_id, record);
         Ok((record_id, true))
     }
 
@@ -886,13 +859,7 @@ impl PersistentStore {
     /// Flush all staged records to the database in a single batch write.
     pub fn flush_staged_records(&mut self) -> Result<usize> {
         <Self as RecordStore>::ensure_healthy(self)?;
-        let records = {
-            let mut staged = self
-                .staged_records
-                .lock()
-                .map_err(|_| anyhow!("staged records lock poisoned"))?;
-            std::mem::take(&mut *staged)
-        };
+        let records = std::mem::take(&mut self.staged_records);
 
         if records.is_empty() {
             return Ok(0);
@@ -908,7 +875,7 @@ impl PersistentStore {
                 .db
                 .cf_handle(CF_RECORDS)
                 .ok_or_else(|| anyhow!("missing records column family"))?;
-            for record in &records {
+            for record in records.values() {
                 let key = record.id.0.to_be_bytes();
                 with_record_bytes(record, |bytes| {
                     batch.put_cf(records_cf, key, bytes);
@@ -923,19 +890,18 @@ impl PersistentStore {
         let watermark = match write_result {
             Ok(watermark) => watermark,
             Err(error) => {
-                *self
-                    .staged_records
-                    .lock()
-                    .map_err(|_| anyhow!("staged records lock poisoned"))? = records;
+                self.staged_records = records;
                 return Err(error);
             }
         };
         self.commit_interner_watermark(watermark);
         self.record_count = next_count;
-        self.staged_identities
-            .lock()
-            .map_err(|_| anyhow!("staged identities lock poisoned"))?
-            .clear();
+        self.staged_identities.clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            for (id, record) in records {
+                cache.put(id, record);
+            }
+        }
 
         Ok(count)
     }
@@ -1017,6 +983,10 @@ impl RecordStore for PersistentStore {
     fn add_record(&mut self, record: Record) -> Result<RecordId> {
         self.ensure_healthy()?;
         let mut record = record;
+        if record.id.0 != 0 {
+            self.ensure_record_id_available(record.id)?;
+        }
+        self.hydrate_record_interner(&record)?;
         let record_id = self.inner.prepare_record(&mut record)?;
         let next_count = self.record_count.saturating_add(1);
         let mut batch = WriteBatch::default();
@@ -1047,8 +1017,8 @@ impl RecordStore for PersistentStore {
             return Ok(());
         }
 
-        let records_cf = self
-            .db
+        let db = Arc::clone(&self.db);
+        let records_cf = db
             .cf_handle(CF_RECORDS)
             .ok_or_else(|| anyhow!("missing records column family"))?;
 
@@ -1056,8 +1026,19 @@ impl RecordStore for PersistentStore {
         let mut prepared_records = Vec::with_capacity(records.len());
 
         // Prepare all records (assign IDs, intern strings) without writing
+        let mut pending_ids = std::collections::HashSet::with_capacity(records.len());
         for mut record in records {
+            if record.id.0 != 0 {
+                self.ensure_record_id_available(record.id)?;
+            }
+            self.hydrate_record_interner(&record)?;
             let record_id = self.inner.prepare_record(&mut record)?;
+            if !pending_ids.insert(record_id) {
+                anyhow::bail!(
+                    "record ID {} appears more than once in a batch",
+                    record_id.0
+                );
+            }
             let key = record_id.0.to_be_bytes();
             with_record_bytes(&record, |bytes| {
                 batch.put_cf(records_cf, key, bytes);
@@ -1143,8 +1124,8 @@ impl RecordStore for PersistentStore {
         }
 
         // Batch insert all new records
-        let records_cf = self
-            .db
+        let db = Arc::clone(&self.db);
+        let records_cf = db
             .cf_handle(CF_RECORDS)
             .ok_or_else(|| anyhow!("missing records column family"))?;
 
@@ -1152,8 +1133,19 @@ impl RecordStore for PersistentStore {
         let mut prepared_records = Vec::with_capacity(new_records.len());
         let mut assigned_ids = Vec::with_capacity(new_records.len());
 
+        let mut pending_ids = std::collections::HashSet::with_capacity(new_records.len());
         for mut record in new_records {
+            if record.id.0 != 0 {
+                self.ensure_record_id_available(record.id)?;
+            }
+            self.hydrate_record_interner(&record)?;
             let record_id = self.inner.prepare_record(&mut record)?;
+            if !pending_ids.insert(record_id) {
+                anyhow::bail!(
+                    "record ID {} appears more than once in a batch",
+                    record_id.0
+                );
+            }
             let key = record_id.0.to_be_bytes();
             with_record_bytes(&record, |bytes| {
                 batch.put_cf(records_cf, key, bytes);
@@ -1211,6 +1203,12 @@ impl RecordStore for PersistentStore {
 
     fn flush_staged_records(&mut self) -> Result<usize> {
         PersistentStore::flush_staged_records(self)
+    }
+
+    fn discard_staged_records(&mut self) -> Result<()> {
+        self.staged_records.clear();
+        self.staged_identities.clear();
+        Ok(())
     }
 
     fn reserve_source_records(
@@ -1335,7 +1333,14 @@ impl RecordStore for PersistentStore {
         Ok(())
     }
 
+    fn get_record_ref(&self, id: RecordId) -> Option<&Record> {
+        self.staged_records.get(&id)
+    }
+
     fn get_record(&self, id: RecordId) -> Option<Record> {
+        if let Some(record) = self.staged_records.get(&id) {
+            return Some(record.clone());
+        }
         if let Ok(mut cache) = self.cache.lock() {
             if let Some(record) = cache.get(&id) {
                 return Some(record.clone());
@@ -1400,6 +1405,9 @@ impl RecordStore for PersistentStore {
     }
 
     fn get_record_id_by_identity(&self, identity: &RecordIdentity) -> Option<RecordId> {
+        if let Some(id) = self.staged_identities.get(identity) {
+            return Some(*id);
+        }
         let identity_cf = match self.db.cf_handle(CF_INDEX_IDENTITY) {
             Some(cf) => cf,
             None => {
@@ -1726,12 +1734,30 @@ impl RecordStore for PersistentStore {
         self.inner.interner_mut()
     }
 
+    fn lookup_attr(&self, attr: &str) -> Option<crate::model::AttrId> {
+        self.inner.interner().get_attr_id(attr).or_else(|| {
+            self.lookup_interner_id(b'A', attr)
+                .map(crate::model::AttrId)
+        })
+    }
+
+    fn lookup_value(&self, value: &str) -> Option<crate::model::ValueId> {
+        self.inner.interner().get_value_id(value).or_else(|| {
+            self.lookup_interner_id(b'V', value)
+                .map(crate::model::ValueId)
+        })
+    }
+
     fn intern_attr(&mut self, attr: &str) -> crate::model::AttrId {
         if let Some(id) = self.inner.interner().get_attr_id(attr) {
             return id;
         }
         if let Some(id) = self.lookup_interner_id(b'A', attr) {
-            return crate::model::AttrId(id);
+            let id = crate::model::AttrId(id);
+            self.inner
+                .interner_mut()
+                .insert_attr_with_id(id, attr.to_owned());
+            return id;
         }
         self.inner.interner_mut().intern_attr(attr)
     }
@@ -1741,7 +1767,11 @@ impl RecordStore for PersistentStore {
             return id;
         }
         if let Some(id) = self.lookup_interner_id(b'V', value) {
-            return crate::model::ValueId(id);
+            let id = crate::model::ValueId(id);
+            self.inner
+                .interner_mut()
+                .insert_value_with_id(id, value.to_owned());
+            return id;
         }
         self.inner.interner_mut().intern_value(value)
     }
@@ -3211,6 +3241,25 @@ impl<'a> LinkerStatePersistence<'a> {
     /// Create a new linker state persistence helper.
     pub fn new(db: &'a DB) -> Self {
         Self { db }
+    }
+
+    /// Check the ID scheme without migrating metadata or removing old redirects.
+    pub fn has_stable_global_cluster_ids(&self) -> Result<bool> {
+        let cf = self
+            .db
+            .cf_handle(linker_cf::METADATA)
+            .ok_or_else(|| anyhow!("Column family {} not found", linker_cf::METADATA))?;
+        match self
+            .db
+            .get_cf(cf, linker_encoding::KEY_GLOBAL_CLUSTER_ID_SCHEME)?
+            .as_deref()
+        {
+            Some([linker_encoding::STABLE_RECORD_ANCHOR_SCHEME]) => Ok(true),
+            Some(value) => {
+                anyhow::bail!("unsupported global cluster ID scheme marker: {:?}", value)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Prepare replay-stable global IDs, removing redirects from the old

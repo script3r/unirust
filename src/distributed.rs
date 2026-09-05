@@ -9,7 +9,7 @@ use crate::persistence::{
     validate_prepared_cluster_checkpoint, ClusterCheckpointManifest, PersistentOpenOptions,
     CHECKPOINT_PROTOCOL_VERSION,
 };
-use crate::query::{QueryDescriptor, QueryOutcome};
+use crate::query::QueryOutcome;
 use crate::sharding::{BloomFilter, IdentityKeySignature, ReconciliationCandidates};
 use crate::store::{SourceRecordReservation, SourceReservationError, StoreMetrics};
 use crate::temporal::Interval;
@@ -68,7 +68,13 @@ struct IngestWal {
 const INGEST_WAL_MAGIC: &[u8; 8] = b"UNIRWAL\0";
 const INGEST_WAL_VERSION: u32 = 1;
 const INGEST_WAL_HEADER_LEN: usize = 24;
-pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 5;
+/// Live router/shard and primary/replica compatibility, independent of disk formats.
+pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 6;
+/// Version of durable source reservations; protocol 6 preserves the v5 layout.
+pub const SOURCE_RESERVATION_BACKFILL_VERSION: u32 = 5;
+const QUERY_FRAGMENT_PROTOCOL_VERSION: u32 = 1;
+const QUERY_SHARD_CONCURRENCY: usize = 16;
+const QUERY_ENTITY_CHUNK: usize = 1_000;
 const REPLICATION_TOKEN_HEADER: &str = "x-unirust-replication-token";
 
 #[allow(clippy::result_large_err)]
@@ -2636,7 +2642,10 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let mut unirust = write_unirust!(self);
         unirust
             .store_mut()
-            .mark_source_reservation_backfill(request.protocol_version, request.shard_count)
+            .mark_source_reservation_backfill(
+                SOURCE_RESERVATION_BACKFILL_VERSION,
+                request.shard_count,
+            )
             .map_err(|err| Status::internal(err.to_string()))?;
         let response = proto::MarkSourceReservationsBackfilledResponse {};
         local_attempt.finish();
@@ -2804,6 +2813,98 @@ impl proto::shard_service_server::ShardService for ShardNode {
         ))
     }
 
+    async fn query_entity_fragments(
+        &self,
+        request: Request<proto::QueryEntityFragmentsRequest>,
+    ) -> Result<Response<proto::QueryEntityFragmentsResponse>, Status> {
+        let _mutation_guard = self.mutation_gate.read().await;
+        self.ensure_no_pending_ingest()?;
+        let start = Instant::now();
+        let request = request.into_inner();
+        if request.protocol_version != QUERY_FRAGMENT_PROTOCOL_VERSION {
+            return Err(Status::failed_precondition(
+                "entity fragment query protocol mismatch",
+            ));
+        }
+        let interval = Interval::new(request.start, request.end)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let clusters = request
+            .clusters
+            .iter()
+            .map(|cluster| global_cluster_id_from_proto(cluster, "query cluster"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let unirust = read_unirust!(self);
+        let known = request
+            .descriptors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, descriptor)| {
+                unirust
+                    .lookup_query_descriptor(&descriptor.attr, &descriptor.value)
+                    .map(|descriptor| (index, descriptor))
+            })
+            .collect::<Vec<_>>();
+        let descriptors = known
+            .iter()
+            .map(|(_, descriptor)| *descriptor)
+            .collect::<Vec<_>>();
+        let fragments = unirust
+            .query_entity_fragments(&descriptors, interval, &clusters, request.strong_ids_only)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let fragments = fragments
+            .into_iter()
+            .map(|fragment| {
+                let mut descriptor_intervals = vec![
+                    proto::QueryDescriptorIntervals {
+                        intervals: Vec::new()
+                    };
+                    request.descriptors.len()
+                ];
+                for ((index, _), intervals) in known.iter().zip(fragment.descriptor_intervals) {
+                    descriptor_intervals[*index].intervals = intervals
+                        .into_iter()
+                        .map(|interval| proto::QueryInterval {
+                            start: interval.start,
+                            end: interval.end,
+                        })
+                        .collect();
+                }
+                proto::EntityFragment {
+                    cluster: Some(global_cluster_id_to_proto(fragment.global_id)),
+                    descriptor_intervals,
+                    golden: if request.strong_ids_only {
+                        Vec::new()
+                    } else {
+                        fragment
+                            .golden
+                            .into_iter()
+                            .map(|descriptor| proto::GoldenDescriptor {
+                                attr: descriptor.attr,
+                                value: descriptor.value,
+                                start: descriptor.interval.start,
+                                end: descriptor.interval.end,
+                            })
+                            .collect()
+                    },
+                    cluster_key: fragment.cluster_key.unwrap_or_default(),
+                    cluster_key_identity: fragment.cluster_key_identity.unwrap_or_default(),
+                    strong_ids: fragment
+                        .strong_ids
+                        .into_iter()
+                        .map(boundary_strong_id_to_proto)
+                        .collect(),
+                }
+            })
+            .collect();
+        if !request.strong_ids_only {
+            self.metrics
+                .record_query(start.elapsed().as_micros() as u64);
+        }
+        Ok(Response::new(proto::QueryEntityFragmentsResponse {
+            fragments,
+        }))
+    }
+
     async fn query_entities(
         &self,
         request: Request<proto::QueryEntitiesRequest>,
@@ -2819,11 +2920,24 @@ impl proto::shard_service_server::ShardService for ShardNode {
         let descriptors = request
             .descriptors
             .iter()
-            .map(|descriptor| QueryDescriptor {
-                attr: unirust.intern_attr(&descriptor.attr),
-                value: unirust.intern_value(&descriptor.value),
-            })
-            .collect::<Vec<_>>();
+            .map(|descriptor| unirust.lookup_query_descriptor(&descriptor.attr, &descriptor.value))
+            .collect::<Option<Vec<_>>>();
+
+        unirust
+            .ensure_store_healthy()
+            .map_err(|err| Status::internal(err.to_string()))?;
+
+        let Some(descriptors) = descriptors else {
+            self.metrics
+                .record_query(start.elapsed().as_micros() as u64);
+            return Ok(Response::new(proto::QueryEntitiesResponse {
+                outcome: Some(proto::query_entities_response::Outcome::Matches(
+                    proto::QueryMatches {
+                        matches: Vec::new(),
+                    },
+                )),
+            }));
+        };
 
         let outcome = unirust
             .query_master_entities(&descriptors, interval)
@@ -3008,6 +3122,7 @@ impl proto::shard_service_server::ShardService for ShardNode {
             .source_reservation_backfill()
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(proto::ConfigVersionResponse {
+            query_fragment_protocol_version: QUERY_FRAGMENT_PROTOCOL_VERSION,
             version: self.config_version.clone(),
             ontology_config: Some(to_proto_config(&ontology_config)),
             protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
@@ -3971,6 +4086,74 @@ impl proto::shard_service_server::ShardService for ShardNode {
 // ADAPTIVE RECONCILIATION
 // =============================================================================
 
+fn master_fragment_descriptors(
+    raw: Vec<proto::GoldenDescriptor>,
+) -> Result<Vec<proto::GoldenDescriptor>, Status> {
+    let mut attributes: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, Vec<Interval>>,
+    > = std::collections::BTreeMap::new();
+    for descriptor in raw {
+        let interval = Interval::new(descriptor.start, descriptor.end).map_err(|_| {
+            Status::data_loss("entity fragment contains an invalid attribute interval")
+        })?;
+        attributes
+            .entry(descriptor.attr)
+            .or_default()
+            .entry(descriptor.value)
+            .or_default()
+            .push(interval);
+    }
+    let mut golden = Vec::new();
+    for (attr, values) in attributes {
+        let values = values.into_iter().collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for (index, (_, intervals)) in values.iter().enumerate() {
+            for interval in crate::query::coalesce_intervals(intervals) {
+                events.push((interval.start, index, true));
+                events.push((interval.end, index, false));
+            }
+        }
+        events.sort_unstable();
+        let mut active: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut safe: Vec<Vec<Interval>> = vec![Vec::new(); values.len()];
+        let mut position = 0;
+        let mut previous = events.first().map(|event| event.0).unwrap_or_default();
+        while position < events.len() {
+            let time = events[position].0;
+            if previous < time && active.len() == 1 {
+                if let Some(index) = active.first().copied() {
+                    safe[index].push(Interval {
+                        start: previous,
+                        end: time,
+                    });
+                }
+            }
+            while position < events.len() && events[position].0 == time {
+                let (_, index, starts) = events[position];
+                if starts {
+                    active.insert(index);
+                } else {
+                    active.remove(&index);
+                }
+                position += 1;
+            }
+            previous = time;
+        }
+        for ((value, _), intervals) in values.into_iter().zip(safe) {
+            for interval in crate::query::coalesce_intervals(&intervals) {
+                golden.push(proto::GoldenDescriptor {
+                    attr: attr.clone(),
+                    value: value.clone(),
+                    start: interval.start,
+                    end: interval.end,
+                });
+            }
+        }
+    }
+    Ok(golden)
+}
+
 /// Configuration for adaptive reconciliation scheduling.
 #[derive(Debug, Clone)]
 pub struct AdaptiveReconciliationConfig {
@@ -4271,6 +4454,11 @@ impl RouterNode {
                 .map_err(|err| Status::unavailable(err.to_string()))?
                 .into_inner();
             validate_distributed_protocol(response.protocol_version)?;
+            if response.query_fragment_protocol_version != QUERY_FRAGMENT_PROTOCOL_VERSION {
+                return Err(Status::failed_precondition(
+                    "shard does not support canonical entity fragment queries; deploy one coordinated version",
+                ));
+            }
             validate_checkpoint_protocol(response.checkpoint_protocol_version)?;
             match proto::ShardRole::try_from(response.shard_role) {
                 Ok(proto::ShardRole::Standalone | proto::ShardRole::Primary) => {}
@@ -4347,7 +4535,7 @@ impl RouterNode {
                      same ontology used by every shard",
                 ));
             }
-            if response.source_reservation_backfill_version == DISTRIBUTED_PROTOCOL_VERSION
+            if response.source_reservation_backfill_version == SOURCE_RESERVATION_BACKFILL_VERSION
                 && response.source_reservation_shard_count != 0
                 && response.source_reservation_shard_count != expected_reservation_shard_count
             {
@@ -4359,7 +4547,7 @@ impl RouterNode {
                 )));
             }
             source_reservation_backfill_required.push(
-                response.source_reservation_backfill_version != DISTRIBUTED_PROTOCOL_VERSION
+                response.source_reservation_backfill_version != SOURCE_RESERVATION_BACKFILL_VERSION
                     || response.source_reservation_shard_count != expected_reservation_shard_count,
             );
             let metadata = client
@@ -5293,6 +5481,69 @@ impl RouterNode {
             candidates.extend(reconciler.reconciliation_candidates(&key_set));
             reconcile_elapsed += reconcile_started.elapsed();
         }
+        // Prior reconciliations can redirect a local fragment to a component
+        // whose strong IDs live only on another shard and another (clean) key.
+        // Hydrate only candidate components, preserving their guards across runs.
+        let guards_started = Instant::now();
+        for chunk in candidates.cluster_ids().chunks(QUERY_ENTITY_CHUNK) {
+            let fragments = self
+                .fetch_entity_fragments(proto::QueryEntityFragmentsRequest {
+                    descriptors: Vec::new(),
+                    start: i64::MIN,
+                    end: i64::MAX,
+                    clusters: chunk
+                        .iter()
+                        .copied()
+                        .map(global_cluster_id_to_proto)
+                        .collect(),
+                    protocol_version: QUERY_FRAGMENT_PROTOCOL_VERSION,
+                    strong_ids_only: true,
+                })
+                .await?;
+            let mut missing = chunk
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            for (_, fragment) in fragments {
+                let cluster = global_cluster_id_from_proto(
+                    fragment
+                        .cluster
+                        .as_ref()
+                        .ok_or_else(|| Status::data_loss("guard fragment has no cluster"))?,
+                    "guard fragment",
+                )?;
+                if !chunk.contains(&cluster) {
+                    return Err(Status::data_loss(
+                        "guard hydration returned an unrequested cluster",
+                    ));
+                }
+                missing.remove(&cluster);
+                let observations = fragment
+                    .strong_ids
+                    .into_iter()
+                    .map(|observation| {
+                        let interval =
+                            Interval::new(observation.interval_start, observation.interval_end)
+                                .map_err(|_| {
+                                    Status::data_loss("guard fragment contains an invalid interval")
+                                })?;
+                        Ok(crate::sharding::BoundaryStrongId {
+                            perspective: observation.perspective,
+                            attribute: observation.attribute,
+                            value: observation.value,
+                            interval,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?;
+                candidates.add_observations(cluster, observations);
+            }
+            if !missing.is_empty() {
+                return Err(Status::failed_precondition(
+                    "reconciliation candidate has no authoritative entity fragments",
+                ));
+            }
+        }
+        metadata_elapsed += guards_started.elapsed();
         let reconcile_started = Instant::now();
         let result = candidates.finish();
         reconcile_elapsed += reconcile_started.elapsed();
@@ -5318,6 +5569,218 @@ impl RouterNode {
         } else {
             0.0
         }
+    }
+
+    async fn fetch_entity_fragments(
+        &self,
+        request: proto::QueryEntityFragmentsRequest,
+    ) -> Result<Vec<(usize, proto::EntityFragment)>, Status> {
+        let requests = futures::stream::iter(self.shard_clients.iter().cloned().enumerate().map(
+            |(shard, mut client)| {
+                let request = request.clone();
+                async move {
+                    let response = client
+                        .query_entity_fragments(Request::new(request))
+                        .await?
+                        .into_inner();
+                    Ok::<_, Status>((shard, response.fragments))
+                }
+            },
+        ));
+        let mut requests = futures::StreamExt::buffer_unordered(requests, QUERY_SHARD_CONCURRENCY);
+        let mut fragments = Vec::new();
+        while let Some(response) = futures::StreamExt::next(&mut requests).await {
+            let (shard, received) = response?;
+            for fragment in received {
+                let cluster = fragment
+                    .cluster
+                    .as_ref()
+                    .ok_or_else(|| Status::data_loss("entity fragment has no cluster ID"))?;
+                if cluster.shard_id as usize >= self.shard_clients.len() {
+                    return Err(Status::data_loss(
+                        "entity fragment canonical shard is out of range",
+                    ));
+                }
+                global_cluster_id_from_proto(cluster, "entity fragment")?;
+                if fragment.descriptor_intervals.len() != request.descriptors.len() {
+                    return Err(Status::data_loss(
+                        "entity fragment descriptor count differs from request",
+                    ));
+                }
+                for descriptor in &fragment.descriptor_intervals {
+                    for interval in &descriptor.intervals {
+                        if interval.start < request.start
+                            || interval.end > request.end
+                            || interval.start >= interval.end
+                        {
+                            return Err(Status::data_loss(
+                                "entity fragment returned an invalid descriptor interval",
+                            ));
+                        }
+                    }
+                }
+                fragments.push((shard, fragment));
+            }
+        }
+        Ok(fragments)
+    }
+
+    async fn query_global_entities(
+        &self,
+        request: &proto::QueryEntitiesRequest,
+    ) -> Result<proto::QueryEntitiesResponse, Status> {
+        let interval = Interval::new(request.start, request.end)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let empty = || proto::QueryEntitiesResponse {
+            outcome: Some(proto::query_entities_response::Outcome::Matches(
+                proto::QueryMatches {
+                    matches: Vec::new(),
+                },
+            )),
+        };
+        if request.descriptors.is_empty() {
+            return Ok(empty());
+        }
+        let fragments = self
+            .fetch_entity_fragments(proto::QueryEntityFragmentsRequest {
+                descriptors: request.descriptors.clone(),
+                start: request.start,
+                end: request.end,
+                clusters: Vec::new(),
+                protocol_version: QUERY_FRAGMENT_PROTOCOL_VERSION,
+                strong_ids_only: false,
+            })
+            .await?;
+        let mut candidates: HashMap<GlobalClusterId, Vec<Vec<Interval>>> = HashMap::new();
+        for (_, fragment) in fragments {
+            let cluster = global_cluster_id_from_proto(
+                fragment
+                    .cluster
+                    .as_ref()
+                    .ok_or_else(|| Status::data_loss("entity fragment has no cluster"))?,
+                "entity fragment",
+            )?;
+            let intervals = candidates
+                .entry(cluster)
+                .or_insert_with(|| vec![Vec::new(); request.descriptors.len()]);
+            for (target, descriptor) in intervals.iter_mut().zip(fragment.descriptor_intervals) {
+                target.extend(descriptor.intervals.into_iter().map(|interval| Interval {
+                    start: interval.start,
+                    end: interval.end,
+                }));
+            }
+        }
+        let mut matches_by_cluster = HashMap::new();
+        for (cluster, descriptors) in candidates {
+            let mut matches = vec![interval];
+            for descriptor_intervals in descriptors {
+                matches = crate::query::intersect_interval_sets(
+                    &matches,
+                    &crate::query::coalesce_intervals(&descriptor_intervals),
+                );
+                if matches.is_empty() {
+                    break;
+                }
+            }
+            if !matches.is_empty() {
+                matches_by_cluster.insert(cluster, matches);
+            }
+        }
+        if matches_by_cluster.is_empty() {
+            return Ok(empty());
+        }
+        let mut cluster_ids = matches_by_cluster.keys().copied().collect::<Vec<_>>();
+        cluster_ids.sort_by_key(GlobalClusterId::to_u64);
+        let mut matches = Vec::new();
+        for chunk in cluster_ids.chunks(QUERY_ENTITY_CHUNK) {
+            let fragments = self
+                .fetch_entity_fragments(proto::QueryEntityFragmentsRequest {
+                    descriptors: Vec::new(),
+                    start: request.start,
+                    end: request.end,
+                    clusters: chunk
+                        .iter()
+                        .copied()
+                        .map(global_cluster_id_to_proto)
+                        .collect(),
+                    protocol_version: QUERY_FRAGMENT_PROTOCOL_VERSION,
+                    strong_ids_only: false,
+                })
+                .await?;
+            let mut hydrated: HashMap<GlobalClusterId, Vec<proto::GoldenDescriptor>> =
+                HashMap::new();
+            let mut keys: HashMap<GlobalClusterId, (usize, String, String)> = HashMap::new();
+            for (source, fragment) in fragments {
+                let cluster = global_cluster_id_from_proto(
+                    fragment
+                        .cluster
+                        .as_ref()
+                        .ok_or_else(|| Status::data_loss("entity fragment has no cluster"))?,
+                    "entity fragment",
+                )?;
+                if !chunk.contains(&cluster) {
+                    return Err(Status::unavailable(
+                        "entity membership changed during query hydration; retry the query",
+                    ));
+                }
+                hydrated.entry(cluster).or_default().extend(fragment.golden);
+                let priority = if source == usize::from(cluster.shard_id) {
+                    0
+                } else {
+                    source + 1
+                };
+                let key = (
+                    priority,
+                    fragment.cluster_key,
+                    fragment.cluster_key_identity,
+                );
+                if keys.get(&cluster).is_none_or(|existing| key < *existing) {
+                    keys.insert(cluster, key);
+                }
+            }
+            for cluster in chunk {
+                let raw = hydrated.remove(cluster).ok_or_else(|| {
+                    Status::unavailable(
+                        "entity membership changed during query hydration; retry the query",
+                    )
+                })?;
+                let golden = master_fragment_descriptors(raw)?;
+                let (_, cluster_key, cluster_key_identity) =
+                    keys.remove(cluster).unwrap_or_default();
+                for interval in &matches_by_cluster[cluster] {
+                    let golden = golden
+                        .iter()
+                        .filter_map(|descriptor| {
+                            let start = descriptor.start.max(interval.start);
+                            let end = descriptor.end.min(interval.end);
+                            (start < end).then(|| proto::GoldenDescriptor {
+                                attr: descriptor.attr.clone(),
+                                value: descriptor.value.clone(),
+                                start,
+                                end,
+                            })
+                        })
+                        .collect();
+                    matches.push(proto::QueryMatch {
+                        shard_id: u32::from(cluster.shard_id),
+                        cluster_id: cluster.local_id,
+                        start: interval.start,
+                        end: interval.end,
+                        cluster_key: cluster_key.clone(),
+                        cluster_key_identity: cluster_key_identity.clone(),
+                        golden,
+                    });
+                }
+            }
+        }
+        Ok(self.merge_query_responses(
+            &request.descriptors,
+            vec![proto::QueryEntitiesResponse {
+                outcome: Some(proto::query_entities_response::Outcome::Matches(
+                    proto::QueryMatches { matches },
+                )),
+            }],
+        ))
     }
 
     fn merge_query_responses(
@@ -5589,17 +6052,15 @@ impl proto::router_service_server::RouterService for RouterNode {
         self.ensure_cluster_consistent()?;
         let start = Instant::now();
         let request = request.into_inner();
-        let mut responses = Vec::with_capacity(self.shard_clients.len());
-        for client in &self.shard_clients {
-            let mut client = client.clone();
-            let response = client
-                .query_entities(Request::new(request.clone()))
-                .await
-                .map_err(|err| Status::unavailable(err.to_string()))?;
-            responses.push(response.into_inner());
-        }
-
-        let merged = self.merge_query_responses(&request.descriptors, responses);
+        let merged = if self.shard_clients.len() == 1 {
+            self.shard_clients[0]
+                .clone()
+                .query_entities(Request::new(request))
+                .await?
+                .into_inner()
+        } else {
+            self.query_global_entities(&request).await?
+        };
         self.metrics
             .record_query(start.elapsed().as_micros() as u64);
         Ok(Response::new(merged))
@@ -5669,10 +6130,11 @@ impl proto::router_service_server::RouterService for RouterNode {
     ) -> Result<Response<proto::ConfigVersionResponse>, Status> {
         let ontology_config = self.ontology_config.read().await;
         Ok(Response::new(proto::ConfigVersionResponse {
+            query_fragment_protocol_version: QUERY_FRAGMENT_PROTOCOL_VERSION,
             version: self.config_version.clone(),
             ontology_config: Some(to_proto_config(&ontology_config)),
             protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
-            source_reservation_backfill_version: DISTRIBUTED_PROTOCOL_VERSION,
+            source_reservation_backfill_version: SOURCE_RESERVATION_BACKFILL_VERSION,
             source_reservation_shard_count: self.shard_clients.len() as u32,
             checkpoint_protocol_version: CHECKPOINT_PROTOCOL_VERSION,
             restore_generation: self.restore_generation.clone().unwrap_or_default(),
@@ -6447,7 +6909,7 @@ mod wal_tests {
         ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 5,
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
                 records: vec![original.clone()],
             }),
         )
@@ -6459,7 +6921,7 @@ mod wal_tests {
         let error = ShardService::ingest_records(
             &shard,
             Request::new(proto::IngestRecordsRequest {
-                internal_protocol_version: 5,
+                internal_protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
                 records: vec![conflicting],
             }),
         )
@@ -6551,5 +7013,96 @@ mod wal_tests {
         .expect_err("a new shard must reject ingest from an old router");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(shard.unirust.read().record_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_lookup_corruption_cannot_return_successful_empty_matches() {
+        use proto::shard_service_server::ShardService;
+        let directory = tempfile::tempdir().expect("persistent query directory");
+        let shard = ShardNode::new_with_data_dir(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+            Some(directory.path().to_path_buf()),
+            false,
+            None,
+        )
+        .expect("persistent shard");
+        let db = shard
+            .unirust
+            .read()
+            .store()
+            .shared_db()
+            .expect("persistent DB");
+        let interner = db.cf_handle("interner").expect("interner column family");
+        db.put_cf(interner, b"Acorrupt-query-only-attr", b"bad")
+            .expect("inject invalid lookup ID");
+        let error = ShardService::query_entities(
+            &shard,
+            Request::new(proto::QueryEntitiesRequest {
+                descriptors: vec![proto::QueryDescriptor {
+                    attr: "corrupt-query-only-attr".into(),
+                    value: "unused".into(),
+                }],
+                start: 0,
+                end: 100,
+            }),
+        )
+        .await
+        .expect_err("durable lookup faults must not masquerade as an unknown descriptor");
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            ShardService::health_check(&shard, Request::new(proto::HealthCheckRequest {}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_upgrade_replays_existing_wal_and_keeps_v5_reservation_format() {
+        use proto::shard_service_server::ShardService;
+        let directory = tempfile::tempdir().expect("upgrade directory");
+        {
+            let mut store = PersistentStore::open(directory.path()).expect("v5 volume");
+            crate::store::RecordStore::mark_source_reservation_backfill(&mut store, 5, 1)
+                .expect("persist existing reservation-format marker");
+        }
+        // Protocol 5 already used this WAL format; wire versions are not embedded
+        // in its immutable record payload, so replay must not revalidate them.
+        assert_eq!(INGEST_WAL_VERSION, 1);
+        let wal = IngestWal::new(directory.path());
+        wal.write_batch(&[proto_from_wal_input(sample_wal_record())])
+            .expect("pending v1 WAL");
+        let shard = ShardNode::new_with_data_dir(
+            0,
+            DistributedOntologyConfig::empty(),
+            StreamingTuning::balanced(),
+            Some(directory.path().to_path_buf()),
+            false,
+            None,
+        )
+        .expect("upgrade and replay existing WAL");
+        let config = ShardService::get_config_version(
+            &shard,
+            Request::new(proto::ConfigVersionRequest {
+                include_durable_state_digest: false,
+            }),
+        )
+        .await
+        .expect("upgraded config")
+        .into_inner();
+        assert_eq!(config.protocol_version, 6);
+        assert_eq!(config.source_reservation_backfill_version, 5);
+        assert_eq!(config.source_reservation_shard_count, 1);
+        assert_eq!(
+            ShardService::get_stats(&shard, Request::new(proto::StatsRequest {}))
+                .await
+                .expect("replayed stats")
+                .into_inner()
+                .record_count,
+            1
+        );
+        assert!(!wal.has_pending());
+        shard.shutdown().await.expect("upgraded shutdown");
     }
 }

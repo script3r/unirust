@@ -44,12 +44,15 @@ struct ClusterIntervalList {
 }
 
 impl ClusterIntervalList {
-    fn add_interval(&mut self, interval: Interval) {
+    fn add_interval(&mut self, interval: Interval) -> bool {
         let mut start = interval.start;
         let mut end = interval.end;
         let mut idx = 0;
         while idx < self.intervals.len() {
             let current = self.intervals[idx];
+            if current.start <= start && end <= current.end {
+                return false;
+            }
             if end <= current.start {
                 break;
             }
@@ -62,6 +65,7 @@ impl ClusterIntervalList {
             self.intervals.remove(idx);
         }
         self.intervals.insert(idx, Interval { start, end });
+        true
     }
 
     fn extend_from(&mut self, other: &ClusterIntervalList) {
@@ -210,7 +214,9 @@ impl CandidateList {
     fn insert_cluster_interval(&mut self, root_id: RecordId, interval: Interval) {
         let list = self.cluster_intervals.entry(root_id).or_default();
         let prev_len = list.intervals.len();
-        list.add_interval(interval);
+        if !list.add_interval(interval) {
+            return;
+        }
         let new_len = list.intervals.len();
         self.active_intervals = self.active_intervals.saturating_sub(prev_len) + new_len;
         self.total_intervals = self.total_intervals.saturating_add(1);
@@ -287,6 +293,13 @@ impl CandidateList {
     }
 
     fn merge_cluster_intervals(&mut self, root_a: RecordId, root_b: RecordId, new_root: RecordId) {
+        // The incoming record is not indexed yet. Most duplicate merges keep the
+        // existing root, so its indexed intervals and tree need no replacement.
+        if (new_root == root_a && !self.cluster_intervals.contains_key(&root_b))
+            || (new_root == root_b && !self.cluster_intervals.contains_key(&root_a))
+        {
+            return;
+        }
         let mut merged = ClusterIntervalList::default();
         let mut removed = 0usize;
 
@@ -1073,72 +1086,80 @@ impl TieredIdentityKeyIndex {
         self.add_record_with_root(record, record.id, ontology)
     }
 
-    /// Add a record with a specific root
+    /// Add a record with a specific root.
     pub fn add_record_with_root(
         &mut self,
         record: &crate::model::Record,
         root_id: RecordId,
         ontology: &crate::ontology::Ontology,
-    ) -> anyhow::Result<()> {
-        let entity_type = &record.identity.entity_type;
-        let identity_keys = ontology.identity_keys_for_type(entity_type);
-
-        for identity_key in identity_keys {
-            // Use a temporary IdentityKeyIndex to extract key values
-            let temp_index = IdentityKeyIndex::new();
-            let key_values_with_intervals =
-                temp_index.extract_key_values_with_intervals(record, identity_key)?;
-
-            if !key_values_with_intervals.is_empty() {
-                for (key_values, interval) in key_values_with_intervals {
-                    let key = IdentityIndexKey {
-                        entity_type: entity_type.clone(),
-                        key_values,
-                    };
-
-                    // Always add to hot tier for new records
-                    let bucket = self.hot.entry(key.clone()).or_default();
-                    bucket.insert_record(record.id, interval);
-                    bucket.insert_cluster_interval(root_id, interval);
-
-                    // Update stats
-                    let stats = self.hot_stats.entry(key).or_default();
-                    stats.cardinality = stats.cardinality.saturating_add(1);
-                    stats.last_access = Self::current_time();
-                }
-
-                self.record_keys
-                    .entry(record.id)
-                    .or_default()
-                    .push(identity_key.clone());
-            }
-        }
-
-        // Run tier management periodically
-        self.maybe_manage_tiers();
-
-        Ok(())
+    ) -> Result<()> {
+        let keys = ontology
+            .identity_keys_for_type(&record.identity.entity_type)
+            .into_iter()
+            .map(|key| Ok((key, extract_key_values_from_record(record, key)?)))
+            .collect::<Result<Vec<_>>>()?;
+        self.add_record_with_cached_keys(record.id, root_id, &record.identity.entity_type, keys)
     }
 
-    /// Find matching clusters overlapping an interval
+    /// Load the complete bucket before reading or modifying a key. A new hot
+    /// fragment must never hide observations already stored in lower tiers.
+    fn promote_to_hot(&mut self, key: &IdentityIndexKey) -> Result<bool> {
+        if self.hot.contains_key(key) {
+            return Ok(true);
+        }
+        let compact = if let Some(bucket) = self.warm.pop(key) {
+            Some(bucket)
+        } else if let Some(db) = &self.db {
+            let cf = db
+                .cf_handle(self.cf_identity_keys)
+                .ok_or_else(|| anyhow::anyhow!("missing identity keys column family"))?;
+            let encoded = crate::persistence::index_encoding::encode_identity_key(
+                &key.entity_type,
+                &key.key_values,
+            );
+            db.get_cf(cf, encoded)?
+                .map(|bytes| {
+                    crate::persistence::index_encoding::decode_compact_bucket(&bytes)
+                        .map(CompactBucket::from_data)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let Some(compact) = compact else {
+            return Ok(false);
+        };
+        let mut bucket = KeyBucket::default();
+        for (id, start, end) in compact.record_intervals {
+            bucket.insert_record(RecordId(id), Interval::new(start, end)?);
+        }
+        for (id, start, end) in compact.cluster_intervals {
+            bucket.insert_cluster_interval(RecordId(id), Interval::new(start, end)?);
+        }
+        self.hot.insert(key.clone(), bucket);
+        let stats = self.warm_stats.remove(key).unwrap_or_default();
+        self.hot_stats.insert(key.clone(), stats);
+        Ok(true)
+    }
+
     pub fn find_matching_clusters_overlapping(
         &mut self,
         dsu: &mut DsuBackend,
         entity_type: &str,
         key_values: &[KeyValue],
         interval: Interval,
-    ) -> &[(RecordId, Interval)] {
-        self.find_matching_clusters_overlapping_limited(
-            dsu,
-            entity_type,
-            key_values,
-            interval,
-            usize::MAX,
-        )
-        .0
+    ) -> Result<&[(RecordId, Interval)]> {
+        Ok(self
+            .find_matching_clusters_overlapping_limited(
+                dsu,
+                entity_type,
+                key_values,
+                interval,
+                usize::MAX,
+            )?
+            .0)
     }
 
-    /// Find matching clusters with a limit
     pub fn find_matching_clusters_overlapping_limited(
         &mut self,
         dsu: &mut DsuBackend,
@@ -1146,106 +1167,37 @@ impl TieredIdentityKeyIndex {
         key_values: &[KeyValue],
         interval: Interval,
         max_tree_nodes: usize,
-    ) -> (&[(RecordId, Interval)], bool) {
-        let key = IdentityIndexKeyRef {
-            entity_type,
-            key_values,
-        };
-
-        self.cluster_overlap_buffer.clear();
-        self.cluster_seen.clear();
-
-        // Check hot tier first
-        if let Some(bucket) = self.hot.get_mut(&key) {
-            // Record access
-            if let Some(stats) = self.hot_stats.get_mut(&IdentityIndexKey {
-                entity_type: entity_type.to_string(),
-                key_values: key_values.to_vec(),
-            }) {
-                stats.access_count = stats.access_count.saturating_add(1);
-                stats.total_queries = stats.total_queries.saturating_add(1);
-                stats.last_access = Self::current_time();
-            }
-
-            let limit_reached = bucket
-                .record_candidates
-                .collect_overlapping_clusters_limited(
-                    dsu,
-                    interval,
-                    &mut self.cluster_overlap_buffer,
-                    &mut self.cluster_seen,
-                    max_tree_nodes,
-                );
-            return (self.cluster_overlap_buffer.as_slice(), limit_reached);
-        }
-
-        // Check warm tier
-        let owned_key = IdentityIndexKey {
+    ) -> Result<(&[(RecordId, Interval)], bool)> {
+        let key = IdentityIndexKey {
             entity_type: entity_type.to_string(),
             key_values: key_values.to_vec(),
         };
-
-        if let Some(compact) = self.warm.get(&owned_key) {
-            // Record access
-            if let Some(stats) = self.warm_stats.get_mut(&owned_key) {
-                stats.access_count = stats.access_count.saturating_add(1);
-                stats.total_queries = stats.total_queries.saturating_add(1);
-                stats.last_access = Self::current_time();
-            }
-
-            // Linear scan for warm tier
-            let results = compact.find_overlapping_clusters(interval);
-            for (root_id, cluster_interval) in results {
-                let root = dsu.find(root_id).unwrap_or(root_id);
-                if self.cluster_seen.insert(root) {
-                    self.cluster_overlap_buffer.push((root, cluster_interval));
-                }
-            }
-            return (self.cluster_overlap_buffer.as_slice(), false);
+        self.cluster_overlap_buffer.clear();
+        self.cluster_seen.clear();
+        if !self.promote_to_hot(&key)? {
+            return Ok((&[], false));
         }
-
-        // Check cold tier (RocksDB)
-        if let Some(db) = &self.db {
-            if let Some(cf) = db.cf_handle(self.cf_identity_keys) {
-                let key_bytes = crate::persistence::index_encoding::encode_identity_key(
-                    entity_type,
-                    key_values,
-                );
-                if let Ok(Some(data_bytes)) = db.get_cf(cf, &key_bytes) {
-                    if let Ok(data) =
-                        crate::persistence::index_encoding::decode_compact_bucket(&data_bytes)
-                    {
-                        let compact = CompactBucket::from_data(data);
-                        let results = compact.find_overlapping_clusters(interval);
-                        for (root_id, cluster_interval) in results {
-                            let root = dsu.find(root_id).unwrap_or(root_id);
-                            if self.cluster_seen.insert(root) {
-                                self.cluster_overlap_buffer.push((root, cluster_interval));
-                            }
-                        }
-
-                        // Promote to warm tier
-                        self.warm.put(owned_key.clone(), compact);
-                        self.warm_stats.insert(
-                            owned_key,
-                            KeyAccessStats {
-                                access_count: 1,
-                                last_access: Self::current_time(),
-                                total_queries: 1,
-                                cardinality: 0,
-                            },
-                        );
-
-                        return (self.cluster_overlap_buffer.as_slice(), false);
-                    }
-                }
-            }
+        if let Some(stats) = self.hot_stats.get_mut(&key) {
+            stats.access_count = stats.access_count.saturating_add(1);
+            stats.total_queries = stats.total_queries.saturating_add(1);
+            stats.last_access = Self::current_time();
         }
-
-        (&[], false)
+        let limited = self
+            .hot
+            .get_mut(&key)
+            .ok_or_else(|| anyhow::anyhow!("promoted identity bucket is unavailable"))?
+            .record_candidates
+            .collect_overlapping_clusters_limited(
+                dsu,
+                interval,
+                &mut self.cluster_overlap_buffer,
+                &mut self.cluster_seen,
+                max_tree_nodes,
+            );
+        self.maybe_manage_tiers()?;
+        Ok((self.cluster_overlap_buffer.as_slice(), limited))
     }
 
-    /// Merge clusters in the index
     pub fn merge_key_clusters(
         &mut self,
         entity_type: &str,
@@ -1253,131 +1205,118 @@ impl TieredIdentityKeyIndex {
         root_a: RecordId,
         root_b: RecordId,
         new_root: RecordId,
-    ) {
-        let key = IdentityIndexKeyRef {
-            entity_type,
-            key_values,
-        };
-
-        // Try hot tier
-        if let Some(bucket) = self.hot.get_mut(&key) {
-            bucket.merge_clusters(root_a, root_b, new_root);
-            return;
-        }
-
-        // Try warm tier - need to convert to hot for merge
-        let owned_key = IdentityIndexKey {
+    ) -> Result<()> {
+        let key = IdentityIndexKey {
             entity_type: entity_type.to_string(),
             key_values: key_values.to_vec(),
         };
-
-        if self.warm.contains(&owned_key) {
-            // Promote to hot for merge operation
-            if let Some(compact) = self.warm.pop(&owned_key) {
-                let mut bucket = KeyBucket::default();
-                // Convert compact back to full bucket
-                for (id, start, end) in compact.record_intervals {
-                    if let Ok(interval) = Interval::new(start, end) {
-                        bucket.insert_record(RecordId(id), interval);
-                    }
-                }
-                for (id, start, end) in compact.cluster_intervals {
-                    if let Ok(interval) = Interval::new(start, end) {
-                        bucket.insert_cluster_interval(RecordId(id), interval);
-                    }
-                }
+        if self.promote_to_hot(&key)? {
+            if let Some(bucket) = self.hot.get_mut(&key) {
                 bucket.merge_clusters(root_a, root_b, new_root);
-                self.hot.insert(owned_key, bucket);
             }
         }
+        self.maybe_manage_tiers()
     }
 
-    /// Run tier management if enough time has passed
-    fn maybe_manage_tiers(&mut self) {
-        let now = Self::current_time();
-        if now - self.last_tier_management < self.config.tier_management_interval_secs as i64 {
-            return;
+    /// Persist demotions before removing their hot copies. Warm LRU eviction is
+    /// then safe because every warm bucket has a complete durable backing copy.
+    fn maybe_manage_tiers(&mut self) -> Result<()> {
+        let capacity = self.config.hot_tier_capacity;
+        if self.hot.len() <= capacity {
+            return Ok(());
         }
+        let now = Self::current_time();
         self.last_tier_management = now;
-
-        // Only demote if hot tier is over capacity
-        if self.hot.len() <= self.config.hot_tier_capacity {
-            return;
-        }
-
-        self.demote_cold_keys();
-    }
-
-    /// Demote cold keys from hot to warm tier
-    fn demote_cold_keys(&mut self) {
-        let now = Self::current_time();
-        let max_card = self.config.max_hot_cardinality;
-
-        // Collect keys to demote
-        let mut to_demote: Vec<(IdentityIndexKey, f64)> = self
+        let mut keys = self
             .hot_stats
             .iter()
-            .map(|(key, stats)| (key.clone(), stats.tier_score(now, max_card)))
-            .filter(|(_, score)| *score < self.config.hot_threshold)
-            .collect();
-
-        // Sort by score ascending (coldest first)
-        to_demote.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Demote until under capacity
-        let to_remove = self.hot.len().saturating_sub(self.config.hot_tier_capacity);
-        for (key, _) in to_demote.into_iter().take(to_remove) {
-            if let Some(bucket) = self.hot.remove(&key) {
-                let compact = CompactBucket::from_key_bucket(&bucket);
-
-                if let Some(stats) = self.hot_stats.remove(&key) {
-                    // Move to warm tier
-                    self.warm.put(key.clone(), compact);
-                    self.warm_stats.insert(key, stats);
+            .map(|(key, stats)| {
+                (
+                    key.clone(),
+                    stats.tier_score(now, self.config.max_hot_cardinality),
+                )
+            })
+            .collect::<Vec<_>>();
+        keys.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Leave headroom so a full-sized index does not sort all keys per insert.
+        let mut count = self.hot.len().saturating_sub(capacity).max(capacity / 10);
+        if self.db.is_none() {
+            // Without durable storage we retain overflow rather than lose keys.
+            count = count.min(self.warm.cap().get().saturating_sub(self.warm.len()));
+        }
+        keys.truncate(count);
+        if let Some(db) = &self.db {
+            let cf = db
+                .cf_handle(self.cf_identity_keys)
+                .ok_or_else(|| anyhow::anyhow!("missing identity keys column family"))?;
+            let mut batch = rocksdb::WriteBatch::default();
+            for (key, _) in &keys {
+                if let Some(bucket) = self.hot.get(key) {
+                    let compact = CompactBucket::from_key_bucket(bucket);
+                    let encoded = crate::persistence::index_encoding::encode_identity_key(
+                        &key.entity_type,
+                        &key.key_values,
+                    );
+                    batch.put_cf(
+                        cf,
+                        encoded,
+                        crate::persistence::index_encoding::encode_compact_bucket(
+                            &compact.to_data(),
+                        )?,
+                    );
                 }
             }
+            db.write(batch)?;
         }
+        for (key, _) in keys {
+            if let Some(bucket) = self.hot.remove(&key) {
+                let compact = CompactBucket::from_key_bucket(&bucket);
+                if let Some((evicted, _)) = self.warm.push(key.clone(), compact) {
+                    self.warm_stats.remove(&evicted);
+                }
+                let stats = self.hot_stats.remove(&key).unwrap_or_default();
+                self.warm_stats.insert(key, stats);
+            }
+        }
+        Ok(())
     }
 
-    /// Flush warm tier to cold tier (RocksDB)
-    pub fn flush_warm_to_cold(&mut self) -> anyhow::Result<()> {
+    /// Checkpoint every resident bucket, including modified hot buckets.
+    pub fn flush_warm_to_cold(&mut self) -> Result<()> {
         let Some(db) = &self.db else {
             return Ok(());
         };
-
         let cf = db
             .cf_handle(self.cf_identity_keys)
             .ok_or_else(|| anyhow::anyhow!("missing identity keys column family"))?;
-
-        let stats_cf = db
-            .cf_handle(self.cf_key_stats)
-            .ok_or_else(|| anyhow::anyhow!("missing key stats column family"))?;
-
         let mut batch = rocksdb::WriteBatch::default();
-
-        // Only flush entries that are being evicted from warm tier
-        // For now, flush all warm entries to cold as backup
-        for (key, compact) in self.warm.iter() {
-            let key_bytes = crate::persistence::index_encoding::encode_identity_key(
+        for (key, bucket) in self.warm.iter() {
+            let encoded = crate::persistence::index_encoding::encode_identity_key(
                 &key.entity_type,
                 &key.key_values,
             );
-            let data = compact.to_data();
-            let data_bytes = crate::persistence::index_encoding::encode_compact_bucket(&data)?;
-            batch.put_cf(cf, &key_bytes, data_bytes);
-
-            // Also save stats
-            if let Some(stats) = self.warm_stats.get(key) {
-                let stats_bytes = crate::persistence::index_encoding::encode_key_stats(stats)?;
-                batch.put_cf(stats_cf, &key_bytes, stats_bytes);
-            }
+            batch.put_cf(
+                cf,
+                encoded,
+                crate::persistence::index_encoding::encode_compact_bucket(&bucket.to_data())?,
+            );
         }
-
+        for (key, bucket) in &self.hot {
+            let encoded = crate::persistence::index_encoding::encode_identity_key(
+                &key.entity_type,
+                &key.key_values,
+            );
+            let compact = CompactBucket::from_key_bucket(bucket);
+            batch.put_cf(
+                cf,
+                encoded,
+                crate::persistence::index_encoding::encode_compact_bucket(&compact.to_data())?,
+            );
+        }
         db.write(batch)?;
         Ok(())
     }
 
-    /// Get record keys for a record
     pub fn get_record_keys(&self, record_id: RecordId) -> Vec<IdentityKey> {
         self.record_keys
             .get(&record_id)
@@ -1385,7 +1324,6 @@ impl TieredIdentityKeyIndex {
             .unwrap_or_default()
     }
 
-    /// Get tier statistics
     pub fn tier_stats(&self) -> TieredIndexStats {
         TieredIndexStats {
             hot_keys: self.hot.len(),
@@ -1396,36 +1334,53 @@ impl TieredIdentityKeyIndex {
         }
     }
 
-    /// Build index from records (bulk load)
-    pub fn build(
-        &mut self,
-        records: &[crate::model::Record],
-        ontology: &crate::ontology::Ontology,
-    ) -> anyhow::Result<()> {
+    /// Clear derived state before replaying authoritative records. Old cold
+    /// buckets cannot be mixed with the partially reconstructed DSU and summaries.
+    pub fn clear(&mut self) -> Result<()> {
+        if let Some(db) = &self.db {
+            for name in [self.cf_identity_keys, self.cf_key_stats] {
+                let cf = db
+                    .cf_handle(name)
+                    .ok_or_else(|| anyhow::anyhow!("missing index column family {name}"))?;
+                let mut batch = rocksdb::WriteBatch::default();
+                for entry in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+                    let (key, _) = entry?;
+                    batch.delete_cf(cf, key);
+                    if batch.len() >= 4096 {
+                        db.write(std::mem::take(&mut batch))?;
+                    }
+                }
+                db.write(batch)?;
+            }
+        }
         self.hot.clear();
         self.hot_stats.clear();
         self.warm.clear();
         self.warm_stats.clear();
         self.record_keys.clear();
-
-        for record in records {
-            self.add_record(record, ontology)?;
-        }
-
         Ok(())
     }
 
-    /// Extract key values with intervals (delegates to IdentityKeyIndex helper)
+    pub fn build(
+        &mut self,
+        records: &[crate::model::Record],
+        ontology: &crate::ontology::Ontology,
+    ) -> Result<()> {
+        self.clear()?;
+        for record in records {
+            self.add_record(record, ontology)?;
+        }
+        Ok(())
+    }
+
     pub fn extract_key_values_with_intervals(
         &self,
         record: &crate::model::Record,
         identity_key: &crate::ontology::IdentityKey,
-    ) -> anyhow::Result<Vec<(Vec<KeyValue>, Interval)>> {
-        // Use the shared extraction logic
+    ) -> Result<Vec<(Vec<KeyValue>, Interval)>> {
         extract_key_values_from_record(record, identity_key)
     }
 
-    /// Add a record using pre-extracted key values (avoids duplicate extraction).
     #[allow(clippy::type_complexity)]
     pub fn add_record_with_cached_keys(
         &mut self,
@@ -1436,78 +1391,50 @@ impl TieredIdentityKeyIndex {
             &crate::ontology::IdentityKey,
             Vec<(Vec<KeyValue>, Interval)>,
         )>,
-    ) {
-        for (identity_key, key_values_with_intervals) in cached_keys {
-            if !key_values_with_intervals.is_empty() {
-                self.record_keys
-                    .entry(record_id)
-                    .or_default()
-                    .push(identity_key.clone());
-
-                for (key_values, interval) in key_values_with_intervals {
-                    let key = IdentityIndexKey {
-                        entity_type: entity_type.to_string(),
-                        key_values,
-                    };
-
-                    // Always add to hot tier
-                    let bucket = self.hot.entry(key.clone()).or_default();
-                    bucket.insert_record(record_id, interval);
-                    bucket.insert_cluster_interval(root_id, interval);
-
-                    // Update stats
-                    let stats = self.hot_stats.entry(key).or_default();
-                    stats.cardinality = stats.cardinality.saturating_add(1);
-                    stats.last_access = Self::current_time();
-                }
+    ) -> Result<()> {
+        for (identity_key, values) in cached_keys {
+            if values.is_empty() {
+                continue;
+            }
+            self.record_keys
+                .entry(record_id)
+                .or_default()
+                .push(identity_key.clone());
+            for (key_values, interval) in values {
+                let key = IdentityIndexKey {
+                    entity_type: entity_type.to_string(),
+                    key_values,
+                };
+                self.promote_to_hot(&key)?;
+                let bucket = self.hot.entry(key.clone()).or_default();
+                bucket.insert_record(record_id, interval);
+                bucket.insert_cluster_interval(root_id, interval);
+                let stats = self.hot_stats.entry(key).or_default();
+                stats.cardinality = stats.cardinality.saturating_add(1);
+                stats.last_access = Self::current_time();
             }
         }
+        self.maybe_manage_tiers()
     }
 
-    /// Find records that match a given identity key
     pub fn find_matching_records(
         &mut self,
         entity_type: &str,
         key_values: &[KeyValue],
-    ) -> &[(RecordId, Interval)] {
-        // First check warm tier and promote if needed (must happen before hot tier borrow)
-        let owned_key = IdentityIndexKey {
+    ) -> Result<&[(RecordId, Interval)]> {
+        let key = IdentityIndexKey {
             entity_type: entity_type.to_string(),
             key_values: key_values.to_vec(),
         };
-
-        // Promotion from warm to hot must happen before we borrow hot tier
-        if !self.hot.contains_key(&owned_key) && self.warm.contains(&owned_key) {
-            if let Some(compact) = self.warm.pop(&owned_key) {
-                let mut bucket = KeyBucket::default();
-                for (id, start, end) in compact.record_intervals {
-                    if let Ok(interval) = Interval::new(start, end) {
-                        bucket.insert_record(RecordId(id), interval);
-                    }
-                }
-                for (id, start, end) in compact.cluster_intervals {
-                    if let Ok(interval) = Interval::new(start, end) {
-                        bucket.insert_cluster_interval(RecordId(id), interval);
-                    }
-                }
-                self.hot.insert(owned_key.clone(), bucket);
-                if let Some(stats) = self.warm_stats.remove(&owned_key) {
-                    self.hot_stats.insert(owned_key, stats);
-                }
+        self.cluster_overlap_buffer.clear();
+        if self.promote_to_hot(&key)? {
+            if let Some(bucket) = self.hot.get_mut(&key) {
+                self.cluster_overlap_buffer
+                    .extend_from_slice(bucket.record_candidates.as_slice());
             }
         }
-
-        // Now check hot tier - use get_mut since as_slice() requires &mut self
-        let key = IdentityIndexKeyRef {
-            entity_type,
-            key_values,
-        };
-
-        if let Some(bucket) = self.hot.get_mut(&key) {
-            return bucket.record_candidates.as_slice();
-        }
-
-        &[]
+        self.maybe_manage_tiers()?;
+        Ok(self.cluster_overlap_buffer.as_slice())
     }
 }
 
@@ -1574,10 +1501,11 @@ impl IndexBackend {
             &crate::ontology::IdentityKey,
             Vec<(Vec<KeyValue>, Interval)>,
         )>,
-    ) {
+    ) -> Result<()> {
         match self {
             IndexBackend::InMemory(index) => {
-                index.add_record_with_cached_keys(record_id, root_id, entity_type, cached_keys)
+                index.add_record_with_cached_keys(record_id, root_id, entity_type, cached_keys);
+                Ok(())
             }
             IndexBackend::Tiered(index) => {
                 index.add_record_with_cached_keys(record_id, root_id, entity_type, cached_keys)
@@ -1593,15 +1521,15 @@ impl IndexBackend {
         key_values: &[KeyValue],
         interval: Interval,
         limit: usize,
-    ) -> (&[(RecordId, Interval)], bool) {
+    ) -> Result<(&[(RecordId, Interval)], bool)> {
         match self {
-            IndexBackend::InMemory(index) => index.find_matching_clusters_overlapping_limited(
+            IndexBackend::InMemory(index) => Ok(index.find_matching_clusters_overlapping_limited(
                 dsu,
                 entity_type,
                 key_values,
                 interval,
                 limit,
-            ),
+            )),
             IndexBackend::Tiered(index) => index.find_matching_clusters_overlapping_limited(
                 dsu,
                 entity_type,
@@ -1617,9 +1545,11 @@ impl IndexBackend {
         &mut self,
         entity_type: &str,
         key_values: &[KeyValue],
-    ) -> &[(RecordId, Interval)] {
+    ) -> Result<&[(RecordId, Interval)]> {
         match self {
-            IndexBackend::InMemory(index) => index.find_matching_records(entity_type, key_values),
+            IndexBackend::InMemory(index) => {
+                Ok(index.find_matching_records(entity_type, key_values))
+            }
             IndexBackend::Tiered(index) => index.find_matching_records(entity_type, key_values),
         }
     }
@@ -1632,14 +1562,25 @@ impl IndexBackend {
         root_a: RecordId,
         root_b: RecordId,
         new_root: RecordId,
-    ) {
+    ) -> Result<()> {
         match self {
             IndexBackend::InMemory(index) => {
-                index.merge_key_clusters(entity_type, key_values, root_a, root_b, new_root)
+                index.merge_key_clusters(entity_type, key_values, root_a, root_b, new_root);
+                Ok(())
             }
             IndexBackend::Tiered(index) => {
                 index.merge_key_clusters(entity_type, key_values, root_a, root_b, new_root)
             }
+        }
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        match self {
+            Self::InMemory(index) => {
+                *index = IdentityKeyIndex::new();
+                Ok(())
+            }
+            Self::Tiered(index) => index.clear(),
         }
     }
 
@@ -2089,12 +2030,14 @@ mod tests {
         }
 
         let key_values = vec![KeyValue::new(name_attr, ValueId(1))];
-        let results = index.find_matching_clusters_overlapping(
-            &mut dsu,
-            "person",
-            &key_values,
-            Interval::new(150, 175).unwrap(),
-        );
+        let results = index
+            .find_matching_clusters_overlapping(
+                &mut dsu,
+                "person",
+                &key_values,
+                Interval::new(150, 175).unwrap(),
+            )
+            .unwrap();
 
         assert_eq!(results.len(), 2);
     }

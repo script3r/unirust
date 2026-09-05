@@ -101,6 +101,17 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
         })
         .await?;
 
+    let response = client.query_entities(query.clone()).await?.into_inner();
+    match response.outcome {
+        Some(proto::query_entities_response::Outcome::Matches(matches)) => {
+            assert!(
+                matches.matches.is_empty(),
+                "new ontology must leave empty shards queryable"
+            );
+        }
+        _ => anyhow::bail!("expected empty matches immediately after applying ontology"),
+    }
+
     let record = RecordInput {
         index: 0,
         identity: Some(ProtoRecordIdentity {
@@ -118,7 +129,7 @@ async fn apply_ontology_enables_queries_distributed() -> anyhow::Result<()> {
 
     client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record],
         })
         .await?;

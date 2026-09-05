@@ -182,7 +182,7 @@ async fn distributed_ingest_and_query_unbounded_intervals() -> anyhow::Result<()
             .collect();
         let response = client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 5,
+                internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                 records,
             })
             .await?
@@ -264,7 +264,7 @@ async fn distributed_stream_and_query() -> anyhow::Result<()> {
 
     let response = client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_a.clone(), record_b.clone()],
         })
         .await?

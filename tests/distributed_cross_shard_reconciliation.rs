@@ -220,7 +220,7 @@ async fn cross_shard_conflict_detected_via_reconcile() -> anyhow::Result<()> {
 
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -251,7 +251,7 @@ async fn cross_shard_conflict_detected_via_reconcile() -> anyhow::Result<()> {
 
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -348,7 +348,7 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![shard0_rec1],
         })
         .await?;
@@ -368,7 +368,7 @@ async fn cross_shard_merge_succeeds_without_conflict() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![shard1_rec1],
         })
         .await?;
@@ -483,7 +483,7 @@ async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
 
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![shard0_rec1, shard0_rec2],
         })
         .await?;
@@ -514,7 +514,7 @@ async fn cross_shard_conflicts_propagated_to_shards() -> anyhow::Result<()> {
 
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![shard1_rec1, shard1_rec2],
         })
         .await?;
@@ -586,7 +586,7 @@ async fn cross_shard_merge_respects_strong_id_validity_intervals() -> anyhow::Re
 
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_input(
                 0,
                 "instrument",
@@ -602,7 +602,7 @@ async fn cross_shard_merge_respects_strong_id_validity_intervals() -> anyhow::Re
         .await?;
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_input(
                 1,
                 "instrument",
@@ -689,7 +689,7 @@ async fn cross_shard_reconciliation_preserves_identity_key_gaps() -> anyhow::Res
     // is valid only before and after the middle gap.
     let shard0_ingest = shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![
                 record_input(
                     0,
@@ -715,7 +715,7 @@ async fn cross_shard_reconciliation_preserves_identity_key_gaps() -> anyhow::Res
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record_input(
                 2,
                 "person",
@@ -797,7 +797,7 @@ async fn boundary_metadata_includes_perspective_strong_ids() -> anyhow::Result<(
 
     router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record1, record2],
         })
         .await?;
@@ -899,7 +899,7 @@ async fn dirty_boundary_keys_include_perspective_strong_ids() -> anyhow::Result<
 
     router_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![record1, record2],
         })
         .await?;
@@ -981,7 +981,7 @@ async fn dirty_boundary_keys_are_drained_in_bounded_pages() -> anyhow::Result<()
         let uid2 = format!("page_{index}_b");
         router_client
             .ingest_records(IngestRecordsRequest {
-                internal_protocol_version: 5,
+                internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
                 records: vec![
                     record_input(
                         index * 2,
@@ -1134,7 +1134,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![a1, a2],
         })
         .await?;
@@ -1166,7 +1166,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![b1, b2],
         })
         .await?;
@@ -1196,7 +1196,7 @@ async fn transitive_cross_shard_conflict_detected() -> anyhow::Result<()> {
     );
     shard2_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![c1, c2],
         })
         .await?;
@@ -1321,7 +1321,7 @@ async fn peic_many_entities_claim_same_identifier_across_shards() -> anyhow::Res
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![a1, a2],
         })
         .await?;
@@ -1352,7 +1352,7 @@ async fn peic_many_entities_claim_same_identifier_across_shards() -> anyhow::Res
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![b1, b2],
         })
         .await?;
@@ -1449,7 +1449,7 @@ async fn temporal_overlap_conflict_across_shards() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![a1, a2],
         })
         .await?;
@@ -1479,7 +1479,7 @@ async fn temporal_overlap_conflict_across_shards() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![b1, b2],
         })
         .await?;
@@ -1573,7 +1573,7 @@ async fn late_arriving_data_triggers_conflict() -> anyhow::Result<()> {
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![initial1, initial2],
         })
         .await?;
@@ -1618,7 +1618,7 @@ async fn late_arriving_data_triggers_conflict() -> anyhow::Result<()> {
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![late1, late2],
         })
         .await?;
@@ -1742,7 +1742,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard0
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![a1, a2],
         })
         .await?;
@@ -1772,7 +1772,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard1
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![b1, b2],
         })
         .await?;
@@ -1802,7 +1802,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard2
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![c1, c2],
         })
         .await?;
@@ -1827,7 +1827,7 @@ async fn multi_hop_chain_conflict_across_four_shards() -> anyhow::Result<()> {
     );
     shard3
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![d1, d2],
         })
         .await?;
@@ -1930,7 +1930,7 @@ async fn different_perspectives_no_false_positive_conflict() -> anyhow::Result<(
     );
     shard0_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![msci1, msci2],
         })
         .await?;
@@ -1960,7 +1960,7 @@ async fn different_perspectives_no_false_positive_conflict() -> anyhow::Result<(
     );
     shard1_client
         .ingest_records(IngestRecordsRequest {
-            internal_protocol_version: 5,
+            internal_protocol_version: unirust_rs::distributed::DISTRIBUTED_PROTOCOL_VERSION,
             records: vec![axioma1, axioma2],
         })
         .await?;

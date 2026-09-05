@@ -56,14 +56,13 @@ impl SimdHasher {
         let mut hasher = Self::new();
 
         // Process 8 bytes at a time
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in chunks.by_ref() {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            let word = u64::from_le_bytes(*chunk);
             hasher.hash_word(word);
         }
 
         // Process remaining bytes
-        let remainder = chunks.remainder();
         if !remainder.is_empty() {
             let mut word = 0u64;
             for (i, &byte) in remainder.iter().enumerate() {
