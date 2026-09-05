@@ -1,14 +1,18 @@
 //! # Performance Optimizations Module
 //!
-//! Low-latency optimizations for maximum throughput:
-//! - Lock-free DSU with atomic parent links
-//! - SIMD-accelerated key hashing
-//! - Zero-copy record passing
+//! Performance utilities with different integration and durability requirements:
+//! - Atomic parent links for a standalone DSU without temporal guards
+//! - Scalar and platform-specific batch hashing
+//! - Shared record slices
 //! - Cache-line aligned metrics
 //! - Lock-free ingest queue
-//! - Async WAL with write coalescing
-//! - Concurrent string interning
+//! - Experimental background batch-file writing
+//! - String interning with sharded locks
 //! - Bigtable-inspired caching (bloom filters, scan cache, block cache)
+//!
+//! These helpers are not all used by the production ingest path. In particular,
+//! [`AsyncWal`] is not the durable distributed ingest WAL, and [`AtomicDSU`] does
+//! not replace the temporally guarded linker DSU.
 
 pub mod aligned;
 pub mod async_wal;

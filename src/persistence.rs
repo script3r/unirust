@@ -1,3 +1,11 @@
+//! RocksDB record storage, durable interner mappings, and checkpoint utilities.
+//!
+//! Records and metadata use binary encodings. High-level engine ingestion performs
+//! entity resolution before committing staged records and synchronizing the store.
+//! Direct store insertion APIs provide storage only; they do not run entity resolution.
+//! Recovery reconstructs derived linker state from committed records. Coordinated
+//! cluster checkpoints also capture shard/WAL state through the distributed protocol.
+
 use crate::model::{GlobalClusterId, Record, RecordId, RecordIdentity, StringInterner};
 use crate::store::{
     records_have_same_payload, RecordStore, SourceRecordReservation, SourceReservationError, Store,
@@ -502,14 +510,14 @@ const DEFAULT_LEVEL_BASE_MB: u64 = 512;
 const DEFAULT_BLOOM_BITS_PER_KEY: f64 = 10.0;
 const DEFAULT_MEMTABLE_PREFIX_BLOOM_RATIO: f64 = 0.1;
 // Aggressive compaction deferral: favor ingest throughput over compaction
-// Default 20 MB/s rate limit ensures compaction doesn't starve ingest
+// Default 20 MB/s rate limit trades compaction progress against foreground I/O.
 const DEFAULT_RATE_LIMIT_MBPS: u64 = 20;
 // Reduce compaction threads to minimize CPU contention with ingest
 const DEFAULT_COMPACTION_THREADS: i32 = 1;
-// Keep flush threads higher to avoid write stalls
+// Reserve more flush threads than compaction threads; write stalls can still occur.
 const DEFAULT_FLUSH_THREADS: i32 = 2;
-// Disable auto compaction by default for maximum ingest throughput
-// Compaction runs during quiet periods or can be triggered manually
+// Automatic compaction is enabled by default. Disabling it requires explicit tuning
+// and can accumulate SST files and pending compaction work during sustained ingest.
 const DEFAULT_DISABLE_AUTO_COMPACTION: bool = false;
 // Soft limit before slowing writes (4GB default - very permissive)
 const DEFAULT_SOFT_PENDING_COMPACTION_GB: u64 = 4;
@@ -533,6 +541,10 @@ struct StorageManifest {
     app_version: String,
 }
 
+/// RocksDB-backed records with caches for committed data and retained pending records.
+///
+/// Staged records remain in memory until committed or discarded, so record-cache
+/// capacity does not bound pending-batch memory or the engine's full resolution state.
 pub struct PersistentStore {
     inner: Store,
     db: Arc<DB>,
@@ -562,6 +574,9 @@ pub struct PersistentOpenOptions {
 }
 
 impl PersistentStore {
+    /// Open or create a persistent store with automatic repair disabled.
+    /// Opening the store does not initialize entity resolution; attach it to an engine
+    /// with [`crate::Unirust::with_store`] and initialize or ingest through that engine.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, PersistentOpenOptions::default())
     }
@@ -2941,7 +2956,8 @@ pub mod index_encoding {
     use serde::{Deserialize, Serialize};
 
     /// Compact bucket format for warm/cold tier storage
-    /// Uses 16 bytes per interval vs 32+ for full IntervalTree node
+    /// Each interval tuple contains a u32 record ID and two i64 endpoints. Serialized
+    /// size and in-memory layout differ; the enclosing vectors also carry overhead.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct CompactBucketData {
         /// Record intervals: (record_id, start, end)

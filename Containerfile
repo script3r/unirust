@@ -1,13 +1,15 @@
 # Unirust Container Image
 #
-# Multi-stage build for efficient, minimal production image
+# Multi-stage Rust build with a Debian slim runtime and CLI tools
 #
 # Usage:
 #   podman build -t unirust -f Containerfile .
-#   podman run --rm -p 50061:50061 -v unirust-data:/data -v unirust-backup:/backup unirust shard
-#   podman run --rm -p 50060:50060 unirust router --shards shard-0:50061
+#   podman run --rm -p 127.0.0.1:50061:50061 -v unirust-data:/data -v unirust-backup:/backup unirust
+# The default command includes --data-dir /data and --backup-dir /backup.
+# Supplying an explicit command replaces those defaults; pass both paths to shard.
 #
-# Or use with compose.yaml for full cluster deployment
+# Use compose.yaml or scripts/podman_cluster.sh for a router/shard network.
+# Separate named data/backup volumes can still share one host or physical disk.
 
 FROM rust:1.88-bookworm AS builder
 

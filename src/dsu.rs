@@ -5,7 +5,7 @@
 //!
 //! This module provides two implementations:
 //! - `TemporalDSU`: In-memory implementation for smaller datasets
-//! - `PersistentTemporalDSU`: RocksDB-backed implementation for billion-scale datasets
+//! - `PersistentTemporalDSU`: RocksDB-backed entries with in-memory caches and write buffers
 
 use crate::model::{ClusterId, RecordId};
 use crate::temporal::Interval;
@@ -164,8 +164,8 @@ impl TemporalDSU {
     /// Find the root of a record (with path compression via path halving)
     /// Returns the record itself if not in DSU (treats untracked records as self-roots)
     ///
-    /// Uses a root cache for O(1) lookup of recently found roots, dramatically
-    /// improving performance when the same records are queried repeatedly.
+    /// A validated root-cache hit avoids walking the parent chain; stale entries
+    /// fall back to path traversal and compression.
     #[inline]
     pub fn find(&mut self, record_id: RecordId) -> RecordId {
         // Fast path: check root cache first (common in streaming)
@@ -522,13 +522,13 @@ impl Default for Clusters {
 /// Configuration for persistent DSU cache sizes
 #[derive(Debug, Clone)]
 pub struct PersistentDSUConfig {
-    /// Maximum entries in parent cache (default: 5M, ~80MB)
+    /// Maximum entries in parent cache (default: 5M).
     pub parent_cache_size: usize,
-    /// Maximum entries in rank cache (default: 1M, ~12MB)
+    /// Maximum entries in rank cache (default: 1M).
     pub rank_cache_size: usize,
-    /// Maximum entries in guards cache (default: 100K)
+    /// Maximum entries in guards cache (default: 500K); payload sizes vary.
     pub guards_cache_size: usize,
-    /// Size of dirty write buffer before flush (default: 100K)
+    /// Dirty-entry threshold before flush (default: 200K).
     pub dirty_buffer_size: usize,
     /// Enable path compression writes to disk (default: false for cold paths)
     pub persist_path_compression: bool,
@@ -539,7 +539,7 @@ impl Default for PersistentDSUConfig {
         Self {
             parent_cache_size: 5_000_000,
             rank_cache_size: 1_000_000,
-            guards_cache_size: 500_000, // Increased: ~50MB for 500K entries
+            guards_cache_size: 500_000, // Entry count, not a byte limit.
             dirty_buffer_size: 200_000, // Increased: fewer flushes
             persist_path_compression: false,
         }
@@ -570,16 +570,17 @@ impl PersistentDSUConfig {
     }
 }
 
-/// RocksDB-backed Disjoint Set Union for billion-scale entity resolution.
+/// RocksDB-backed Disjoint Set Union with cached entries and buffered writes.
 ///
 /// Uses LRU caches for hot paths with RocksDB for persistent storage.
-/// Memory usage: ~2GB instead of 60-80GB for 1B entities.
+/// Cache limits count entries, not total bytes. Memory also depends on buffered
+/// writes, guard payloads, RocksDB settings, and the caller's linker state.
 pub struct PersistentTemporalDSU {
     /// Reference to the RocksDB database
     db: Arc<DB>,
-    /// LRU cache for parent lookups (5M entries, ~80MB)
+    /// LRU cache for parent lookups, sized by the DSU configuration.
     parent_cache: LruCache<RecordId, RecordId>,
-    /// LRU cache for rank lookups (1M entries, ~12MB)
+    /// LRU cache for rank lookups, sized by the DSU configuration.
     rank_cache: LruCache<RecordId, u32>,
     /// LRU cache for guards
     guards_cache: LruCache<RecordId, Vec<TemporalGuard>>,
@@ -1239,7 +1240,7 @@ pub struct PersistentDSUStats {
 pub enum DsuBackend {
     /// In-memory DSU for smaller datasets (< 100M entities)
     InMemory(TemporalDSU),
-    /// Persistent DSU for billion-scale datasets (boxed to reduce enum size)
+    /// RocksDB-backed DSU (boxed to reduce enum size).
     Persistent(Box<PersistentTemporalDSU>),
 }
 

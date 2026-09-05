@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Local Podman cluster helper. The router's -p mapping uses Podman's default host
+# bind behavior; the "localhost" status text does not restrict published access.
+# Separate named backup volumes can share the data volumes' host/disk. Reset
+# deletes both sets. No TLS or passive replicas are configured by this helper.
+# Checkpoint retries reuse prepared snapshots; keep writers quiesced across the
+# attempt/retry sequence when a common capture point is required.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

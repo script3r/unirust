@@ -62,6 +62,10 @@ jobs:
           repo-token: ${{ github.token }}
       - name: Test
         run: cargo test --locked --all-features
+      - name: Build API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --all-features --no-deps
       - name: Check all targets
         run: cargo check --locked --all-targets --all-features
       - name: Format

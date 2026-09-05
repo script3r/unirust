@@ -84,7 +84,8 @@ impl Interval {
         self.start <= instant && instant < self.end
     }
 
-    /// Check if this interval is empty (should never happen with our validation)
+    /// Check whether start is at or after end. [`Self::new`] rejects such intervals,
+    /// but the public fields also permit constructing them directly.
     pub fn is_empty(&self) -> bool {
         self.start >= self.end
     }

@@ -4,10 +4,10 @@
 //!
 //! ## Parallelism Architecture
 //!
-//! The linker uses a phased parallelism approach:
-//! - **Phase 1 (Parallel)**: Extract key values and pre-compute candidates
-//! - **Phase 2 (Sequential)**: Merge clusters in DSU (requires exclusive access)
-//! - **Phase 3 (Parallel)**: Finalize cluster assignments
+//! Batch linking extracts key values and strong-ID summaries in parallel. It then
+//! processes records sequentially: find candidates, apply temporal guards and DSU
+//! merges, and index each record before linking the next. Cluster mappings, member
+//! lists, and guard summaries remain in memory even with persistent DSU/index backends.
 
 use crate::dsu::TemporalGuard;
 use crate::dsu::{Clusters, DsuBackend, MergeResult, TemporalDSU};
@@ -32,8 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, instrument, warn};
 
-/// Type alias for inline candidate storage - avoids heap allocation for typical cases
-/// 32 candidates covers 95%+ of queries based on production workload analysis
+/// Store up to 32 candidates inline; larger candidate sets allocate on the heap.
 type CandidateVec = SmallVec<[(RecordId, Interval); 32]>;
 
 struct StoreLookup<'a>(&'a dyn RecordStore);
@@ -252,8 +251,11 @@ struct ParallelExtractionResult {
     strong_id_summary: Option<StrongIdSummary>,
 }
 
-/// Wrapper for linker state that can use either HashMap (unlimited) or LruCache (bounded).
-/// This allows memory-bounded operation for billion-scale datasets.
+/// A map wrapper supporting either retained HashMap entries or evicting LRU entries.
+///
+/// The LRU variant has no durable spill path. [`StreamingLinker`] retains all
+/// correctness-critical mappings and summaries in HashMaps, regardless of requested
+/// linker-state cache limits.
 pub struct LinkerState<K: std::hash::Hash + Eq + Clone, V: Clone> {
     inner: LinkerStateInner<K, V>,
 }
@@ -421,23 +423,23 @@ pub struct StreamingLinker {
     dsu: DsuBackend,
     /// Index backend - can be in-memory or tiered
     identity_index: IndexBackend,
-    /// Cluster ID mappings (LRU-bounded when config provided)
+    /// Retained cluster ID mappings; size grows with resolution state.
     cluster_ids: LinkerState<RecordId, ClusterId>,
     next_cluster_id: u32,
-    /// Global cluster IDs for cross-shard tracking (LRU-bounded when config provided)
+    /// Retained global cluster IDs for cross-shard tracking.
     global_cluster_ids: LinkerState<RecordId, GlobalClusterId>,
     /// Minimum durable record ID in each local cluster, independent of replay order.
     global_cluster_anchors: LinkerState<RecordId, u32>,
     /// Shard ID for this linker (used in GlobalClusterId generation).
     shard_id: u16,
-    /// Strong ID summaries for conflict detection (LRU-bounded when config provided)
+    /// Retained strong ID summaries for conflict detection.
     strong_id_summaries: LinkerState<RecordId, StrongIdSummary>,
     /// Root aliases and member lists let queries hydrate only candidate clusters.
     member_roots: FxHashMap<RecordId, RecordId>,
     cluster_members: FxHashMap<RecordId, Vec<RecordId>>,
     /// Use FxHashSet for faster hashing (non-cryptographic, perfect for internal keys)
     tainted_identity_keys: FxHashSet<LinkerKeySignature>,
-    /// Record perspectives for same-perspective conflict detection (LRU-bounded when config provided)
+    /// Retained record perspectives for same-perspective conflict detection.
     record_perspectives: LinkerState<RecordId, String>,
     /// Use FxHashSet for faster hashing
     pending_keys: FxHashSet<LinkerKeySignature>,
@@ -487,7 +489,7 @@ impl StreamingLinker {
     }
 
     /// Initialize a streaming linker with a persistent DSU backend.
-    /// Use this for billion-scale deployments that need disk-backed DSU.
+    /// DSU entries use RocksDB and caches; other linker state still grows in memory.
     pub fn new_with_persistent_dsu(
         store: &dyn RecordStore,
         ontology: &Ontology,
@@ -519,7 +521,7 @@ impl StreamingLinker {
     }
 
     /// Initialize a streaming linker with a tiered index backend.
-    /// Use this for billion-scale deployments that need tiered index.
+    /// Index buckets can spill to RocksDB; other linker state still grows in memory.
     pub fn new_with_tiered_index(
         store: &dyn RecordStore,
         ontology: &Ontology,
@@ -1053,11 +1055,11 @@ impl StreamingLinker {
     ///
     /// This method uses a phased approach:
     /// - **Phase 1 (Parallel)**: Extract key values and build summaries for all records
-    /// - **Phase 2 (Sequential)**: Find candidates and merge clusters
-    /// - **Phase 3 (Sequential)**: Add records to index
+    /// - **Phase 2 (Sequential)**: For each record, find candidates, apply guarded
+    ///   merges, and index the record before linking the next one
     ///
-    /// This provides significant speedup (30-50%) for large batches by parallelizing
-    /// the CPU-intensive extraction work.
+    /// Extraction runs in parallel; cluster mutations remain ordered. The benefit
+    /// depends on batch size, key complexity, and candidate overlap.
     #[instrument(skip(self, records, ontology), level = "debug")]
     pub fn link_records_batch_parallel(
         &mut self,
@@ -2248,9 +2250,8 @@ mod tests {
 /// Identity key signature for linker deduplication.
 /// Distinct from sharding::IdentityKeySignature which uses a 32-byte hash.
 ///
-/// Uses precomputed hash for O(1) hash lookups instead of re-hashing on every access.
-/// This is critical for performance since LinkerKeySignature is used in hot-path
-/// FxHashSet/FxHashMap operations.
+/// Caches its hash to avoid re-hashing key values on every map access. Equality
+/// still compares the entity type and key values when hashes collide.
 #[derive(Debug, Clone)]
 pub struct LinkerKeySignature {
     entity_type: String,

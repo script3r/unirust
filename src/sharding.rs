@@ -88,7 +88,7 @@ impl BloomFilter {
         let num_u64s = size_bytes / 8;
         Self {
             bits: vec![0u64; num_u64s.max(1)],
-            num_hashes: 7, // Optimal for ~1% false positive rate
+            num_hashes: 7, // False-positive rate depends on bits per inserted key.
         }
     }
 
@@ -550,9 +550,9 @@ impl ReconciliationCandidates {
 
 /// Incremental reconciler for cross-shard cluster merges.
 ///
-/// Instead of loading all records from all shards (O(n)),
-/// this uses boundary indices to find and merge only clusters
-/// that share identity keys (O(k) where k = boundary keys).
+/// Uses boundary indices to find clusters that share identity keys without loading
+/// every shard's records. Work depends on signature count and candidate cluster pairs;
+/// many clusters sharing one key can still require pairwise comparisons.
 #[derive(Debug)]
 pub struct IncrementalReconciler {
     /// Boundary indices from all shards.

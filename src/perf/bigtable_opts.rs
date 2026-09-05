@@ -28,16 +28,16 @@ use std::time::Instant;
 /// Bloom filter optimized for identity key lookups.
 /// Reduces disk/index reads by filtering out keys that definitely don't exist.
 ///
-/// From Bigtable paper: "We also allow clients to create Bloom filters for
-/// SSTables in a particular locality group. A Bloom filter allows us to ask
-/// whether an SSTable might contain any data for a specified row/column pair."
+/// The current insertion implementation uses an unsynchronized raw-pointer cast
+/// to mutate shared storage. It has unresolved interior-mutability safety issues
+/// and is not suitable for concurrent mutation.
 #[derive(Debug)]
 pub struct IdentityBloomFilter {
     /// The underlying bloom filter
     filter: BloomFilter,
     /// Number of keys inserted
     key_count: AtomicU64,
-    /// False positive rate estimate (updated periodically)
+    /// Fixed initial false-positive estimate; currently not updated from occupancy.
     estimated_fpr: AtomicU64, // Stored as fpr * 1_000_000
 }
 
@@ -52,12 +52,12 @@ impl IdentityBloomFilter {
         }
     }
 
-    /// Create with default 64KB size (~500K keys at 1% FPR)
+    /// Create with 64 KiB of bit storage. False-positive rate grows with inserted keys.
     pub fn default_size() -> Self {
         Self::new(64)
     }
 
-    /// Create with large 256KB size (~2M keys at 1% FPR)
+    /// Create with 256 KiB of bit storage. False-positive rate grows with inserted keys.
     pub fn large() -> Self {
         Self::new(256)
     }
@@ -65,8 +65,8 @@ impl IdentityBloomFilter {
     /// Insert an identity key signature
     #[inline]
     pub fn insert(&self, signature: &IdentityKeySignature) {
-        // SAFETY: BloomFilter insert only sets bits, never clears them.
-        // Concurrent inserts may set the same bits multiple times but this is safe.
+        // This cast does not provide interior mutability or synchronize Vec<u64>
+        // updates. Setting bits monotonically is not a sufficient safety argument.
         unsafe {
             let filter_ptr = &self.filter as *const BloomFilter as *mut BloomFilter;
             (*filter_ptr).insert(signature);
@@ -87,7 +87,7 @@ impl IdentityBloomFilter {
         self.key_count.load(Ordering::Relaxed)
     }
 
-    /// Estimate current false positive rate
+    /// Return the initial estimate (0.001); this is not a measured or updated rate.
     pub fn estimated_fpr(&self) -> f64 {
         self.estimated_fpr.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
@@ -117,7 +117,7 @@ pub struct ScanCacheEntry {
 /// In our case, we cache the candidate records for each identity key signature,
 /// avoiding repeated index scans for hot keys.
 ///
-/// Uses RocksDB-inspired sharded LRU for 4-8x concurrent throughput improvement.
+/// Uses a sharded LRU to distribute cache operations across independent locks.
 pub struct ScanCache {
     /// Sharded LRU cache mapping identity key signatures to candidates
     /// Using 16 shards for good parallelism without overhead

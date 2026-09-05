@@ -1,7 +1,9 @@
 //! Streaming engine tuning configuration.
 //!
 //! These are internal tuning parameters for the entity resolution engine.
-//! Most users should select a `Profile` instead of tuning these directly.
+//! Select a [`TuningProfile`] for an embedded engine or [`super::Profile`] in node
+//! configuration before adjusting individual parameters. Presets are workload
+//! tradeoffs, not throughput or total-memory guarantees.
 
 use crate::conflicts::ConflictAlgorithm;
 use crate::dsu::PersistentDSUConfig;
@@ -19,10 +21,9 @@ pub struct StreamingTuning {
     pub adaptive_mid_cap: usize,
     pub deferred_reconciliation: bool,
     pub hot_key_threshold: usize,
-    /// Enable stochastic candidate sampling (SPER-inspired optimization).
-    /// When candidates exceed sampling_threshold, sample with probability
-    /// proportional to temporal overlap instead of hard cutoff.
-    /// This maintains expected match quality while reducing computation.
+    /// Enable deterministic, hash-based candidate sampling above `sampling_threshold`.
+    /// Selection is weighted by temporal overlap. Sampling can omit matching
+    /// candidates and affect resolution; it is not equivalent to exhaustive linking.
     pub stochastic_sampling: bool,
     /// Threshold above which stochastic sampling kicks in.
     pub sampling_threshold: usize,
@@ -30,19 +31,19 @@ pub struct StreamingTuning {
     pub sampling_target: usize,
     /// Configuration for persistent DSU (used when `use_persistent_dsu` is true)
     pub dsu_config: Option<PersistentDSUConfig>,
-    /// Whether to use persistent DSU for billion-scale datasets
+    /// Request a RocksDB-backed DSU when the store exposes a shared database.
     pub use_persistent_dsu: bool,
     /// Configuration for tiered index storage (used when `use_tiered_index` is true)
     pub tier_config: Option<TierConfig>,
-    /// Whether to use tiered index for billion-scale datasets
+    /// Request hot/warm index caches with RocksDB-backed cold buckets when available.
     pub use_tiered_index: bool,
     /// Shard ID for this node (used for boundary tracking in distributed mode)
     pub shard_id: u16,
     /// Whether to track boundary signatures for cross-shard reconciliation.
     /// Default false - enable only in distributed mode to reduce memory overhead.
     pub enable_boundary_tracking: bool,
-    /// Configuration for linker state memory management (LRU caches).
-    /// Default: None (uses HashMap, unlimited capacity).
+    /// Reserved linker-state cache configuration. Limits are currently not enforced;
+    /// supplying them emits a warning and retains correctness-critical state in memory.
     pub linker_state_config: Option<LinkerStateConfig>,
 }
 
@@ -50,14 +51,14 @@ pub struct StreamingTuning {
 #[derive(Debug, Clone)]
 pub struct ConflictTuning {
     /// The algorithm to use for conflict detection.
-    /// - `SweepLine`: O(n log n), best for diverse time boundaries
-    /// - `AtomicIntervals`: O(atoms × n), best for overlapping intervals
-    /// - `Auto`: Automatically select based on overlap ratio heuristic
+    /// - `SweepLine`: Sweep sorted temporal boundary events
+    /// - `AtomicIntervals`: Evaluate observations in atomic intervals
+    /// - `Auto`: Select using the fraction of distinct temporal boundaries
     pub algorithm: ConflictAlgorithmChoice,
 
     /// Threshold for auto-selection: if the ratio of unique boundaries
-    /// to total descriptors is below this, use AtomicIntervals.
-    /// Default: 0.5 (if < 50% unique boundaries, use atomic intervals)
+    /// to twice the descriptor count is below this, use AtomicIntervals.
+    /// Default: 0.5. Shared boundaries are a heuristic, not a runtime guarantee.
     pub auto_overlap_threshold: f64,
 }
 
@@ -83,7 +84,7 @@ impl Default for ConflictTuning {
 }
 
 impl ConflictTuning {
-    /// Create tuning optimized for high-overlap workloads (production default)
+    /// Select atomic intervals for workloads with many shared temporal boundaries.
     pub fn high_overlap() -> Self {
         Self {
             algorithm: ConflictAlgorithmChoice::AtomicIntervals,
@@ -116,17 +117,17 @@ impl ConflictTuning {
                     return ConflictAlgorithm::SweepLine;
                 }
 
-                // Ratio of unique boundaries to total descriptors
+                // Ratio of unique boundaries to all descriptor endpoints
                 // Each descriptor contributes 2 boundaries (start, end)
                 // If many share the same boundaries, the ratio is low
                 let max_boundaries = total_descriptors * 2;
                 let ratio = unique_boundaries as f64 / max_boundaries as f64;
 
                 if ratio < self.auto_overlap_threshold {
-                    // High overlap detected - atomic intervals is faster
+                    // Prefer atomic intervals when many boundaries are shared.
                     ConflictAlgorithm::AtomicIntervals
                 } else {
-                    // Low overlap - sweep line is faster
+                    // Prefer the sweep line when boundaries are more diverse.
                     ConflictAlgorithm::SweepLine
                 }
             }
@@ -142,9 +143,9 @@ pub enum TuningProfile {
     HighThroughput,
     BulkIngest,
     MemorySaver,
-    /// Optimized for billion-scale datasets with persistent DSU
+    /// Request persistent DSU and tiered index caches when the store supports them.
     BillionScale,
-    /// High-performance billion-scale with larger caches
+    /// Request persistent backends with larger caches and candidate budgets.
     BillionScaleHighPerformance,
 }
 
@@ -282,7 +283,8 @@ impl StreamingTuning {
         }
     }
 
-    /// Configuration optimized for billion-scale datasets with persistent DSU and tiered index
+    /// Request persistent DSU and tiered index backends with default cache sizes.
+    /// Correctness-critical linker maps remain in memory and grow with the dataset.
     pub fn billion_scale() -> Self {
         Self {
             candidate_cap: DEFAULT_CANDIDATE_CAP,
@@ -309,7 +311,8 @@ impl StreamingTuning {
         }
     }
 
-    /// High-performance configuration for billion-scale with larger caches
+    /// Request persistent backends with larger caches and candidate budgets.
+    /// The name does not imply a supported dataset size or total-memory bound.
     pub fn billion_scale_high_performance() -> Self {
         Self {
             candidate_cap: 4000,
@@ -354,15 +357,15 @@ impl StreamingTuning {
 /// retains unbounded state and emits a warning.
 #[derive(Debug, Clone)]
 pub struct LinkerStateConfig {
-    /// Maximum number of cluster ID mappings to keep in memory.
+    /// Requested cluster-ID mapping capacity; currently not enforced.
     pub cluster_ids_capacity: usize,
-    /// Maximum number of global cluster ID mappings to keep in memory.
+    /// Requested global-ID mapping capacity; currently not enforced.
     pub global_ids_capacity: usize,
-    /// Maximum number of strong ID summaries to keep in memory.
+    /// Requested strong-ID summary capacity; currently not enforced.
     pub summaries_capacity: usize,
-    /// Maximum number of record perspectives to keep in memory.
+    /// Requested record-perspective capacity; currently not enforced.
     pub perspectives_capacity: usize,
-    /// Size of dirty buffer before flushing to disk (if persistence enabled).
+    /// Reserved linker-state dirty-buffer threshold; currently unused.
     pub dirty_buffer_size: usize,
 }
 
@@ -379,8 +382,7 @@ impl Default for LinkerStateConfig {
 }
 
 impl LinkerStateConfig {
-    /// Configuration optimized for memory-constrained environments.
-    /// Uses smaller caches (~200MB total).
+    /// Smaller requested capacities; current linker implementations do not enforce them.
     pub fn memory_saver() -> Self {
         Self {
             cluster_ids_capacity: 500_000,
@@ -391,8 +393,7 @@ impl LinkerStateConfig {
         }
     }
 
-    /// Configuration optimized for high-performance environments.
-    /// Uses larger caches (~1GB total).
+    /// Larger requested capacities; current linker implementations do not enforce them.
     pub fn high_performance() -> Self {
         Self {
             cluster_ids_capacity: 20_000_000,
@@ -403,8 +404,8 @@ impl LinkerStateConfig {
         }
     }
 
-    /// Unlimited capacity (disables LRU eviction).
-    /// Only use for small datasets where everything fits in memory.
+    /// Set requested capacities to `usize::MAX`. Linker state is currently retained
+    /// regardless of these values because durable spill is not implemented.
     pub fn unlimited() -> Self {
         Self {
             cluster_ids_capacity: usize::MAX,

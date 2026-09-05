@@ -303,9 +303,10 @@ pub enum Profile {
     BulkIngest,
     /// Reduced memory footprint
     MemorySaver,
-    /// For billion-scale datasets with persistent storage
+    /// Request persistent DSU and tiered index caches when supported by the store.
     BillionScale,
-    /// For billion-scale datasets with larger caches (production default)
+    /// Larger persistent-backend caches and candidate budgets (node config default).
+    /// Correctness-critical linker state still grows in memory.
     #[default]
     BillionScaleHighPerformance,
 }

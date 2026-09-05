@@ -1,17 +1,20 @@
 # Unirust Cluster Compose Configuration
 #
 # Deploy a 3-shard cluster with router:
+# This configuration uses plaintext internal traffic and no replicas. Separate
+# named data/checkpoint volumes do not establish independent failure domains.
 #
 #   podman-compose up -d
 #   podman-compose logs -f router
 #
 # Run loadtest:
-#   podman-compose run --rm loadtest --router http://router:50060 --count 100000
+#   podman-compose run --rm loadtest loadtest --router http://router:50060 --count 100000 --headless
+# An explicit run command must retain the first "loadtest" entrypoint argument.
 #
 # Stop cluster while preserving data:
 #   podman-compose down
 #
-# Explicitly delete all shard data:
+# Explicitly delete shard data AND checkpoint volumes:
 #   podman-compose down -v
 
 services:

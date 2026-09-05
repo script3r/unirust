@@ -1648,18 +1648,28 @@ impl LoadTestMetrics {
             throughput / config.stream_count as f64
         ));
 
-        // Bottleneck analysis
-        report.push_str("\n## Bottleneck Analysis\n");
+        // Diagnostic prompts; these thresholds do not identify a root cause.
+        report.push_str("\n## Diagnostic Prompts\n");
         if throughput < 1000.0 {
-            report.push_str("  ⚠ Throughput < 1000 rec/sec - likely I/O bound\n");
-            report.push_str("    - Check RocksDB sync writes\n");
+            report.push_str(
+                "  ⚠ Throughput < 1000 rec/sec - investigate CPU, storage and RPC costs\n",
+            );
+            report.push_str(
+                "    - Measure RocksDB sync latency; preserve durable acknowledgements\n",
+            );
             report.push_str("    - Consider increasing batch size\n");
             report.push_str("    - Check disk I/O with iostat\n");
         }
         if batch_latency_avg > 500.0 {
-            report.push_str("  ⚠ RPC latency > 500ms - processing bottleneck\n");
-            report.push_str("    - Check conflict detection overhead\n");
-            report.push_str("    - Consider profiling with UNIRUST_PROFILE=1\n");
+            report.push_str(
+                "  ⚠ Average RPC latency > 500ms - inspect time spent across the request path\n",
+            );
+            report.push_str(
+                "    - Check routing, entity resolution, reconciliation and storage costs\n",
+            );
+            report.push_str(
+                "    - Use a CPU/I/O profiler; UNIRUST_PROFILE selects a named tuning preset\n",
+            );
         }
         let max_stream_latency = self
             .stream_stats
@@ -1675,7 +1685,9 @@ impl LoadTestMetrics {
             .unwrap_or(0);
         if max_stream_latency > min_stream_latency * 2 && min_stream_latency > 0 {
             report.push_str("  ⚠ Stream latency imbalance detected\n");
-            report.push_str("    - Uneven shard distribution or hot keys\n");
+            report.push_str(
+                "    - Check for uneven shard distribution, hot keys or scheduling delays\n",
+            );
         }
 
         report.push_str(

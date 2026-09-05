@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. This project follows
 Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- Authenticate protoc setup requests in CI to avoid unauthenticated GitHub API
+  rate limits (merged after the v0.2.0 tag).
+
+### Documentation
+
+- Align deployment, architecture, configuration and Rust API examples with the
+  persistent runtime; describe matching, memory and recovery limits explicitly.
+- Correct load-test diagnostic guidance: `UNIRUST_PROFILE` selects a tuning
+  preset and does not enable a profiler.
+- Build API documentation in CI with warnings treated as errors; compile the
+  crate quick-start example as a doctest.
+- Remove unsupported GPU projections and performance guarantees, and distinguish
+  measured local diagnostics from production capacity claims.
+
 ## [0.2.0] - 2026-09-05
 
 ### Added
@@ -92,5 +110,7 @@ Semantic Versioning.
 - Distributed integration tests now use temporary persistent shard stores; the
   in-memory store remains limited to unit tests.
 - Replaced the non-durable historical performance claim with a verified
-  five-shard, power-loss-durable baseline of 50,598 records/second for the
-  documented 10-million-record workload.
+  five-shard measurement reported at release preparation: 50,598 records/second
+  for a 10-million-record workload using synchronous durable ingestion. This
+  historical result is not a capacity guarantee or a physical power-cut test;
+  the later comparative audit used a separate one-million-record workload.

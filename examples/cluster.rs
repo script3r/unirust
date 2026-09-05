@@ -20,32 +20,25 @@
 //!
 //! ## Prerequisites
 //!
-//! Start the cluster first:
-//!
-//! ```bash
-//! # Option 1: Use the cluster script
-//! SHARDS=3 ./scripts/cluster.sh start
-//!
-//! # Option 2: Start manually
-//! ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /tmp/shard0 --backup-dir /tmp/shard0-backup
-//! ./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /tmp/shard1 --backup-dir /tmp/shard1-backup
-//! ./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /tmp/shard2 --backup-dir /tmp/shard2-backup
-//! ./target/release/unirust_router --listen 127.0.0.1:50060 \
-//!     --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063
-//! ```
+//! Use a dedicated, fresh persistent cluster: this example replaces its ontology
+//! and ingests sample records. Follow the local demonstration in README.md to
+//! start three shards and a router. Do not run against an existing dataset.
 //!
 //! ## Run It
 //!
 //! ```bash
-//! cargo run --example cluster
+//! cargo run --locked --example cluster -- http://127.0.0.1:50060
 //! ```
+//!
+//! The router URI is optional and defaults to the address above. The integer
+//! interval endpoints below are an application convention, not parsed dates.
 
 use unirust_rs::distributed::proto::query_entities_response::Outcome;
 use unirust_rs::distributed::proto::router_service_client::RouterServiceClient;
 use unirust_rs::distributed::proto::{
     ApplyOntologyRequest, ConstraintConfig, ConstraintKind, IdentityKeyConfig,
-    IngestRecordsRequest, OntologyConfig, QueryDescriptor, QueryEntitiesRequest, RecordDescriptor,
-    RecordIdentity, RecordInput, StatsRequest,
+    IngestRecordsRequest, OntologyConfig, QueryDescriptor, QueryEntitiesRequest, ReconcileRequest,
+    RecordDescriptor, RecordIdentity, RecordInput, StatsRequest,
 };
 
 #[tokio::main]
@@ -58,10 +51,12 @@ async fn main() -> anyhow::Result<()> {
     // Step 1: Connect to the Router
     // =========================================================================
 
-    let router_addr = "http://127.0.0.1:50060";
+    let router_addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "http://127.0.0.1:50060".to_string());
     println!("Connecting to router at {}...", router_addr);
 
-    let mut client = match RouterServiceClient::connect(router_addr).await {
+    let mut client = match RouterServiceClient::connect(router_addr.clone()).await {
         Ok(c) => {
             println!("  Connected successfully!\n");
             c
@@ -69,20 +64,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             eprintln!("\nError: Could not connect to router at {}", router_addr);
             eprintln!("  {}\n", e);
-            eprintln!("Please start the cluster first:");
-            eprintln!("  SHARDS=3 ./scripts/cluster.sh start\n");
-            eprintln!("Or manually:");
-            eprintln!(
-                "  ./target/release/unirust_shard --listen 127.0.0.1:50061 --shard-id 0 --data-dir /tmp/shard0 --backup-dir /tmp/shard0-backup"
-            );
-            eprintln!(
-                "  ./target/release/unirust_shard --listen 127.0.0.1:50062 --shard-id 1 --data-dir /tmp/shard1 --backup-dir /tmp/shard1-backup"
-            );
-            eprintln!(
-                "  ./target/release/unirust_shard --listen 127.0.0.1:50063 --shard-id 2 --data-dir /tmp/shard2 --backup-dir /tmp/shard2-backup"
-            );
-            eprintln!("  ./target/release/unirust_router --listen 127.0.0.1:50060 \\");
-            eprintln!("      --shards 127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063");
+            eprintln!("Start a fresh persistent demo cluster using the README instructions.");
             return Err(e.into());
         }
     };
@@ -128,8 +110,8 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     //
     // Records are automatically distributed across shards based on their
-    // identity key signatures. Records that might match end up on the same
-    // shard for efficient local resolution.
+    // identity key signatures. Placement favors local matches, while explicit
+    // reconciliation below resolves identities that span multiple shards.
 
     println!("Creating sample records...");
 
@@ -197,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                     RecordDescriptor {
                         attr: "phone".to_string(),
-                        value: format!("555-{:04}", i + 1000), // Different phone -> conflict
+                        value: format!("555-{:04}", i + 1000), // Different phone observation
                         start: 202406,
                         end: 202501,
                     },
@@ -250,6 +232,14 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     // Step 4: Query Entities
     // =========================================================================
+
+    // Ingestion resolves locally. Reconcile before expecting cross-shard
+    // fragments to appear as one canonical entity in the router query.
+    client
+        .reconcile(ReconcileRequest {
+            shard_metadata: Vec::new(),
+        })
+        .await?;
 
     println!("Querying for Person 0...");
 
@@ -309,7 +299,10 @@ async fn main() -> anyhow::Result<()> {
     let stats_response = client.get_stats(StatsRequest {}).await?.into_inner();
 
     println!("  - Total records: {}", stats_response.record_count);
-    println!("  - Total clusters: {}", stats_response.cluster_count);
+    println!(
+        "  - Sum of shard-local clusters: {}",
+        stats_response.cluster_count
+    );
     println!("  - Conflicts: {}", stats_response.conflict_count);
     println!("  - Graph nodes: {}", stats_response.graph_node_count);
     println!("  - Graph edges: {}", stats_response.graph_edge_count);
@@ -323,10 +316,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     println!("\n✓ Example completed successfully!");
-    println!("\nNext steps:");
-    println!("  - Scale up: SHARDS=5 ./scripts/cluster.sh start");
-    println!("  - Run loadtest: ./target/release/unirust_loadtest --count 1000000");
-    println!("  - Stop cluster: ./scripts/cluster.sh stop");
+    println!("Use the demo shell's cleanup instructions to stop its processes.");
+    println!("See README.md for benchmarking on a separate fresh dataset.");
 
     Ok(())
 }

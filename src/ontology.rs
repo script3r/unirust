@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-/// An identity key defines which attributes must match for records to be considered the same entity
+/// Attributes whose matching values generate entity-resolution candidates.
+/// Temporal overlap and strong-identifier guards still determine whether records merge.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdentityKey {
     /// The attributes that form the identity key (interned IDs for fast comparison)
@@ -67,7 +68,8 @@ impl IdentityKey {
         self.attributes.is_empty() && !self.attribute_names.is_empty()
     }
 
-    /// Check if this identity key matches another over an overlapping interval
+    /// Compare interned attribute membership and count, ignoring order.
+    /// The interval parameter is unused; this does not compare values or time validity.
     pub fn matches(&self, other: &IdentityKey, _interval: Interval) -> bool {
         if self.attributes.len() != other.attributes.len() {
             return false;
@@ -84,7 +86,8 @@ impl IdentityKey {
     }
 }
 
-/// A strong identifier defines attributes that must not conflict within the same cluster
+/// An attribute used to reject merges with overlapping, different strong-ID values
+/// within the same perspective. Values from different perspectives may coexist.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StrongIdentifier {
     /// The attribute that serves as a strong identifier

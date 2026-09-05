@@ -1,733 +1,357 @@
-# Unirust Architecture & Design
+# Unirust architecture and design
 
-This document describes the internal architecture, algorithms, and design decisions of Unirust. It serves as the authoritative reference for understanding how the system works.
+This document describes the implementation in this repository for v0.2.0. Source
+links identify the code behind each design choice. Configuration profiles and
+performance-oriented module names describe mechanisms, not capacity or latency
+guarantees.
 
-## Table of Contents
+## Runtime structure
 
-1. [System Overview](#system-overview)
-2. [Core Concepts](#core-concepts)
-3. [Entity Resolution Algorithm](#entity-resolution-algorithm)
-4. [Conflict Detection](#conflict-detection)
-5. [Distributed Architecture](#distributed-architecture)
-6. [Cross-Shard Reconciliation](#cross-shard-reconciliation)
-7. [Storage Layer](#storage-layer)
-8. [Performance Optimizations](#performance-optimizations)
-9. [Data Flow](#data-flow)
+The public Rust API is `Unirust`. A distributed deployment places a router in
+front of shards, each of which owns a `Unirust` instance and, when configured with
+a data directory, a `PersistentStore` backed by RocksDB.
 
----
-
-## System Overview
-
-Unirust is a temporal entity resolution engine that clusters records from multiple source systems into unified master entities. The system supports both single-node and distributed deployments.
-
-```
-                      ┌─────────────────┐
-                      │     Clients     │
-                      │   (gRPC/API)    │
-                      └────────┬────────┘
-                               │
-                      ┌────────▼────────┐
-                      │     Router      │
-                      │  (hash-based    │
-                      │   routing)      │
-                      └────────┬────────┘
-                               │
-          ┌────────────────────┼────────────────────┐
-          │                    │                    │
-  ┌───────▼───────┐   ┌───────▼───────┐   ┌───────▼───────┐
-  │   Shard 0     │   │   Shard 1     │   │   Shard N     │
-  │  ┌─────────┐  │   │  ┌─────────┐  │   │  ┌─────────┐  │
-  │  │ Linker  │  │   │  │ Linker  │  │   │  │ Linker  │  │
-  │  │   DSU   │  │   │  │   DSU   │  │   │  │   DSU   │  │
-  │  │  Index  │  │   │  │  Index  │  │   │  │  Index  │  │
-  │  │ RocksDB │  │   │  │ RocksDB │  │   │  │ RocksDB │  │
-  │  └─────────┘  │   │  └─────────┘  │   │  └─────────┘  │
-  └───────────────┘   └───────────────┘   └───────────────┘
+```mermaid
+flowchart TD
+    Client[Client] --> Router[Router: placement, source reservations, queries]
+    Router --> ShardA[Persistent shard A]
+    Router --> ShardB[Persistent shard B]
+    ShardA --> EngineA[Unirust: staged ingest and local resolution]
+    ShardB --> EngineB[Unirust: staged ingest and local resolution]
+    EngineA --> DBA[(RocksDB A)]
+    EngineB --> DBB[(RocksDB B)]
+    Router --> Reconciliation[Boundary exchange and component reconciliation]
+    Reconciliation --> ShardA
+    Reconciliation --> ShardB
 ```
 
----
-
-## Core Concepts
-
-### Records
-
-A **Record** represents a single observation from a source system:
-
-```rust
-struct Record {
-    id: RecordId,           // Unique within shard
-    identity: RecordIdentity,  // Entity type + perspective + UID
-    descriptors: Vec<Descriptor>,  // Attribute-value pairs with time intervals
-}
-
-struct RecordIdentity {
-    entity_type: String,    // e.g., "person", "company"
-    perspective: String,    // Source system, e.g., "crm", "erp"
-    uid: String,            // Source-unique identifier
-}
-
-struct Descriptor {
-    attr: AttrId,           // Interned attribute name
-    value: ValueId,         // Interned value
-    interval: Interval,     // [start, end) validity period
-}
-```
-
-### Ontology
-
-The **Ontology** defines matching rules:
-
-1. **Identity Keys**: Attribute combinations that identify the same entity
-   ```rust
-   // Records with matching (name, email) are considered the same entity
-   IdentityKey::new(vec![name_attr, email_attr], "name_email")
-   ```
-
-2. **Strong Identifiers**: Attributes that cannot conflict within a cluster
-   ```rust
-   // SSN must be unique - conflicting SSNs block merges
-   StrongIdentifier::new(ssn_attr, "ssn_unique")
-   ```
-
-3. **Constraints**: Validation rules
-   ```rust
-   Constraint::unique(email_attr, "unique_email")
-   Constraint::unique_within_perspective(account_id, "source_unique")
-   ```
-
-### Temporal Model
-
-All data has temporal validity. An **Interval** `[start, end)` defines when a descriptor is valid. Entity resolution respects these intervals:
-
-- Records only merge if their identity key values match during **overlapping time periods**
-- Conflicts are detected per-interval, not globally
-- Golden records are computed for each unique time period
-
----
-
-## Entity Resolution Algorithm
-
-### Streaming Linker
-
-The core algorithm uses **batch-parallel processing** for high throughput. Within each partition, records are processed in three phases:
-
-```
-Phase 1: Batch Store Insertion
-    │  All records added to store, collecting (index, record_id) pairs
-    ▼
-Phase 2: Parallel Extraction (Rayon)
-    │  Extract identity keys, strong ID summaries across all records
-    ▼
-Phase 3: Sequential Linking
-    │  DSU merges with temporal guards (serialized for correctness)
-    ▼
-Result: Cluster assignments returned in original batch order
-```
-
-Parallel extraction dominates compute time; DSU mutations are inherently sequential due to data dependencies but benefit from root caching.
-
-#### Phase 1: Key Extraction
-
-For each record, extract values for all identity keys defined in the ontology:
-
-```rust
-fn extract_key_values(record: &Record, ontology: &Ontology) -> Vec<KeyValue> {
-    ontology.identity_keys()
-        .iter()
-        .filter_map(|key| {
-            // Collect all attribute values for this identity key
-            let values: Vec<_> = key.attributes()
-                .iter()
-                .filter_map(|attr| record.value_for(*attr))
-                .collect();
-
-            // Only complete keys (all attributes present) form valid key values
-            if values.len() == key.attributes().len() {
-                Some(KeyValue::new(key.name(), values))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-```
-
-#### Phase 2: Candidate Discovery
-
-For each key value, query the identity index:
-
-```rust
-fn find_candidates(key_value: &KeyValue, index: &IdentityIndex) -> Vec<RecordId> {
-    let signature = hash_key_value(key_value);
-    index.get(&signature).unwrap_or_default()
-}
-```
-
-The identity index maps key value signatures to record IDs. This is the hot path, optimized with:
-- Bloom filters for fast negative lookups (16MB filter, <1% false positive rate)
-- Sharded caching to avoid lock contention
-- SIMD-accelerated hashing
-
-#### Phase 3: Cluster Merging
-
-The Disjoint Set Union (DSU) data structure tracks cluster membership. Merging follows these rules:
-
-```rust
-fn try_merge(dsu: &mut TemporalDSU, a: RecordId, b: RecordId,
-             store: &Store, ontology: &Ontology) -> MergeResult {
-    let root_a = dsu.find(a);
-    let root_b = dsu.find(b);
-
-    if root_a == root_b {
-        return MergeResult::AlreadySame;
-    }
-
-    // Check temporal guards
-    let guard = compute_temporal_guard(root_a, root_b, store, ontology);
-
-    match guard {
-        TemporalGuard::Allowed { reason, interval } => {
-            dsu.union_with_guard(root_a, root_b, guard);
-            MergeResult::Merged { interval }
-        }
-        TemporalGuard::Blocked { reason } => {
-            MergeResult::Conflict { reason }
-        }
-    }
-}
-```
-
-**Temporal Guards** validate merges:
-
-1. **Overlapping Intervals**: Records must have overlapping validity periods
-2. **Strong Identifier Agreement**: Strong identifiers must match during overlap
-3. **Constraint Satisfaction**: Uniqueness constraints must be satisfied
-
-#### Phase 4: Assignment Finalization
-
-Each record receives its final cluster ID:
-
-```rust
-fn finalize_assignment(record_id: RecordId, dsu: &TemporalDSU) -> ClusterId {
-    ClusterId(dsu.find(record_id).0)
-}
-```
-
-### Adaptive Candidate Capping
-
-To prevent pathological cases (e.g., very common names), candidate discovery uses adaptive capping:
-
-| Candidate Count | Cap Applied |
-|-----------------|-------------|
-| < 2,000 | No cap |
-| 2,000 - 10,000 | Cap at 1,000 |
-| > 10,000 | Cap at 500 |
-| > 50,000 | Early exit (hot key) |
-
-Additionally, **stochastic sampling** maintains match quality: when candidates exceed the threshold, random sampling weighted by temporal overlap preserves expected accuracy.
-
----
-
-## Conflict Detection
-
-Conflicts occur when records in the same cluster have incompatible values for the same attribute during overlapping time periods.
-
-### Detection Algorithms
-
-Unirust implements two conflict detection algorithms with automatic selection:
-
-#### 1. Sweep-Line Algorithm (O(n log n))
-
-Best for clusters with diverse time boundaries.
-
-```
-Events: [(t1, START, r1), (t2, END, r1), (t3, START, r2), ...]
-        sorted by time
-
-Active set: records currently "open"
-
-For each event:
-  if START: add to active set, check conflicts with all active
-  if END: remove from active set
-```
-
-#### 2. Atomic Intervals Algorithm (O(atoms × n))
-
-Best for clusters with high overlap (many records share same intervals).
-
-```
-1. Collect all unique time boundaries: {t1, t2, t3, ...}
-2. Create atomic intervals: [t1,t2), [t2,t3), [t3,t4), ...
-3. For each atomic interval:
-   - Find all records active during this interval
-   - Group by attribute
-   - If multiple values for same attribute → conflict
-```
-
-#### Auto-Selection Heuristic
-
-```rust
-fn select_algorithm(unique_boundaries: usize, total_descriptors: usize) -> Algorithm {
-    let max_boundaries = total_descriptors * 2;  // Each descriptor has start + end
-    let ratio = unique_boundaries as f64 / max_boundaries as f64;
-
-    if ratio < 0.5 {
-        // High overlap → atomic intervals is faster
-        Algorithm::AtomicIntervals
-    } else {
-        // Low overlap → sweep line is faster
-        Algorithm::SweepLine
-    }
-}
-```
-
-### Conflict Types
-
-1. **Direct Conflict**: Same attribute has different values in overlapping intervals
-   ```
-   Record A: email = "john@foo.com" [100, 200)
-   Record B: email = "john@bar.com" [150, 250)
-   → Conflict in [150, 200)
-   ```
-
-2. **Indirect Conflict**: Strong identifier violation
-   ```
-   Record A: ssn = "123-45-6789" [100, 200)
-   Record B: ssn = "987-65-4321" [150, 250)
-   → Blocked merge (strong identifier conflict)
-   ```
-
----
-
-## Distributed Architecture
-
-### Router
-
-The router provides the external API and routes requests to shards:
-
-```rust
-impl Router {
-    async fn ingest(&self, records: Vec<Record>) -> Vec<Assignment> {
-        // Group records by target shard
-        let mut shard_batches: HashMap<ShardId, Vec<Record>> = HashMap::new();
-
-        for record in records {
-            let shard_id = self.route(&record);
-            shard_batches.entry(shard_id).or_default().push(record);
-        }
-
-        // Fan out to shards in parallel
-        let futures: Vec<_> = shard_batches
-            .into_iter()
-            .map(|(shard_id, batch)| {
-                self.shards[shard_id].ingest(batch)
-            })
-            .collect();
-
-        // Collect results
-        join_all(futures).await.into_iter().flatten().collect()
-    }
-}
-```
-
-### Routing Strategy
-
-Records are routed by hashing their identity key values:
-
-```rust
-fn route(record: &Record, num_shards: usize) -> ShardId {
-    let key_values = extract_key_values(record);
-    let hash = hash_key_values(&key_values);
-    ShardId(hash % num_shards as u64)
-}
-```
-
-This ensures records that might need to merge are routed to the same shard.
-
-### Global Cluster IDs
-
-Each cluster has a globally unique ID:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    GlobalClusterId (64 bits)                 │
-├──────────────┬────────────────────┬──────────────────────────┤
-│  shard_id    │      version       │       local_id           │
-│  (16 bits)   │     (16 bits)      │      (32 bits)           │
-└──────────────┴────────────────────┴──────────────────────────┘
-```
-
-- **shard_id**: Owning shard (0-65535)
-- **version**: Merge version for conflict detection
-- **local_id**: Cluster ID within the shard
-
----
-
-## Cross-Shard Reconciliation
-
-### The Problem
-
-When records that should merge are routed to different shards, we need cross-shard reconciliation:
-
-```
-Shard 0                          Shard 1
-┌────────────┐                   ┌────────────┐
-│ Record A   │                   │ Record B   │
-│ name=John  │   Should merge    │ name=John  │
-│ email=j@x  │ ◄───────────────► │ email=j@x  │
-│ Cluster 0  │                   │ Cluster 5  │
-└────────────┘                   └────────────┘
-```
-
-### Boundary Tracking
-
-Each shard maintains a **Cluster Boundary Index** tracking identity keys that appear:
-
-```rust
-struct ClusterBoundaryIndex {
-    // Maps identity key signature → boundary entries
-    boundaries: HashMap<IdentityKeySignature, Vec<BoundaryEntry>>,
-    // Bloom filter for fast negative lookups
-    bloom: BloomFilter,
-    // Keys modified since last reconciliation
-    dirty_keys: HashSet<IdentityKeySignature>,
-}
-
-struct BoundaryEntry {
-    cluster_id: GlobalClusterId,
-    interval: Interval,
-    shard_id: ShardId,
-}
-```
-
-### Reconciliation Algorithm
-
-1. **Dirty Key Collection**: Each shard tracks keys modified since last reconciliation
-
-2. **Boundary Exchange**: Router collects dirty boundaries from all shards
-
-3. **Merge Detection**: For each key appearing on multiple shards:
-   ```rust
-   fn detect_cross_shard_merges(key: &IdentityKeySignature,
-                                 entries: &[BoundaryEntry]) -> Vec<ClusterMerge> {
-       let mut merges = Vec::new();
-
-       // Group by overlapping intervals
-       for (a, b) in entries.iter().tuple_combinations() {
-           if a.shard_id != b.shard_id && a.interval.overlaps(&b.interval) {
-               merges.push(ClusterMerge {
-                   primary: a.cluster_id,
-                   secondary: b.cluster_id,
-               });
-           }
-       }
-
-       merges
-   }
-   ```
-
-4. **Merge Application**: Each shard applies merges to its local DSU:
-   ```rust
-   fn apply_cross_shard_merge(&mut self, primary: GlobalClusterId,
-                               secondary: GlobalClusterId) -> usize {
-       // Update all records in secondary cluster to point to primary
-       let mut updated = 0;
-       for record_id in self.records_in_cluster(secondary) {
-           self.cluster_map.insert(record_id, primary);
-           updated += 1;
-       }
-       updated
-   }
-   ```
-
-5. **Key Clearing**: Successfully reconciled keys are removed from dirty set
-
-### Consistency Guarantees
-
-- **Eventual Consistency**: Cross-shard clusters converge after reconciliation
-- **No Data Loss**: Failed reconciliation retries on next cycle
-- **Conflict Preservation**: Cross-shard conflicts are detected and reported
-
----
-
-## Storage Layer
-
-### In-Memory Store
-
-For testing and small datasets:
-
-```rust
-struct Store {
-    records: FxHashMap<RecordId, Record>,
-    by_entity_type: FxHashMap<String, Vec<RecordId>>,
-    attr_interner: StringInterner,
-    value_interner: StringInterner,
-}
-```
-
-### Persistent Store (RocksDB)
-
-Production storage with column families:
-
-| Column Family | Key | Value | Purpose |
-|---------------|-----|-------|---------|
-| `records` | RecordId (4B) | Record (bincode) | Record storage |
-| `index_identity` | hash (8B) | RecordId list | Identity key index |
-| `index_attr_value` | attr:value | RecordId list | Attribute lookup |
-| `dsu_parent` | RecordId | Parent RecordId | DSU parent links |
-| `dsu_rank` | RecordId | u32 | DSU rank for balancing |
-| `dsu_guards` | (RecordId, RecordId) | TemporalGuard | Merge guards |
-| `cluster_assignments` | RecordId | ClusterId | Cluster membership |
-| `interner` | String | InternedId | String interning |
-| `metadata` | key | value | Manifest, counters |
-
-### Tuning Parameters
-
-```toml
-[storage]
-block_cache_mb = 512          # Read cache
-write_buffer_mb = 128         # Write buffer before flush
-max_background_jobs = 4       # Compaction threads
-rate_limit_mbps = 0           # I/O rate limiting (0 = unlimited)
-```
-
----
-
-## Performance Optimizations
-
-### Lock-Free Structures
-
-1. **Atomic DSU**: Lock-free parent updates using CAS operations
-   ```rust
-   fn find(&self, x: RecordId) -> RecordId {
-       let mut current = x;
-       loop {
-           let parent = self.parent[current].load(Ordering::Acquire);
-           if parent == current {
-               return current;
-           }
-           // Path compression with CAS
-           let grandparent = self.parent[parent].load(Ordering::Acquire);
-           let _ = self.parent[current].compare_exchange(
-               parent, grandparent, Ordering::Release, Ordering::Relaxed
-           );
-           current = parent;
-       }
-   }
-   ```
-
-2. **Sharded Caching**: 256 shards to minimize contention
-   ```rust
-   fn get_shard(&self, key: &K) -> &RwLock<LruCache<K, V>> {
-       let hash = hash(key);
-       &self.shards[hash as usize % 256]
-   }
-   ```
-
-### SIMD Hashing
-
-Identity key hashing uses SIMD for throughput:
-
-```rust
-fn simd_hash(data: &[u8]) -> u64 {
-    // Process 32 bytes at a time using AVX2
-    let mut state = _mm256_set1_epi64x(SEED);
-    for chunk in data.chunks_exact(32) {
-        let block = _mm256_loadu_si256(chunk.as_ptr() as *const _);
-        state = _mm256_xor_si256(state, block);
-        state = _mm256_mul_epi32(state, MULTIPLIER);
-    }
-    // Horizontal reduction
-    reduce_256_to_64(state)
-}
-```
-
-### Async WAL
-
-Write-ahead logging with coalescing:
-
-```rust
-struct AsyncWal {
-    tx: Sender<WalEntry>,      // Submit writes
-    writer_thread: JoinHandle, // Background writer
-}
-
-impl AsyncWal {
-    fn submit(&self, data: Vec<u8>) -> WalTicket {
-        let ticket = WalTicket::new();
-        self.tx.send(WalEntry { data, ticket: ticket.clone() });
-        ticket  // Caller can wait on ticket
-    }
-}
-
-// Writer thread coalesces multiple writes into single fsync
-fn wal_writer_loop(rx: Receiver<WalEntry>, config: WalConfig) {
-    let mut buffer = Vec::new();
-    loop {
-        match rx.recv_timeout(config.max_coalesce_delay) {
-            Ok(entry) => buffer.push(entry),
-            Err(Timeout) => {
-                if !buffer.is_empty() {
-                    flush_buffer(&mut buffer);  // Single fsync
-                }
-            }
-        }
-        if buffer.len() >= config.max_coalesce_records {
-            flush_buffer(&mut buffer);
-        }
-    }
-}
-```
-
-### Partitioned Processing
-
-For non-persistent shards, records can be partitioned by identity key hash for
-parallel processing. Each partition uses `process_batch_optimized()`:
-
-```
-                    ┌──────────────────────┐
-                    │   Incoming Records   │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  Partition by Hash   │  (identity_key_hash % partition_count)
-                    └──────────┬───────────┘
-                               │
-          ┌────────────────────┼────────────────────┐
-          │                    │                    │
-   ┌──────▼──────┐     ┌──────▼──────┐     ┌──────▼──────┐
-   │ Partition 0 │     │ Partition 1 │     │ Partition N │
-   │             │     │             │     │             │
-   │ 1. Batch    │     │ 1. Batch    │     │ 1. Batch    │
-   │    Insert   │     │    Insert   │     │    Insert   │
-   │ 2. Parallel │     │ 2. Parallel │     │ 2. Parallel │
-   │    Extract  │     │    Extract  │     │    Extract  │
-   │ 3. Seq Link │     │ 3. Seq Link │     │ 3. Seq Link │
-   └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-          │                    │                    │
-          └────────────────────┼────────────────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  Merge & Sort by     │
-                    │  Original Index      │
-                    └──────────────────────┘
-```
-
-Each partition runs independently with its own `Mutex<Partition>`. Rayon processes all partitions in parallel—no global lock contention.
-
-Partition stores are currently in-memory. A shard configured with `data_dir`
-therefore does not use this path: it routes every batch through the shard's
-`PersistentStore`, where records, indexes, and cluster assignments are durable
-and immediately available to queries. Enabling durable partition-local stores
-requires an explicit on-disk layout and recovery protocol; routing persistent
-traffic to in-memory partitions is not a valid optimization.
-
----
-
-## Data Flow
-
-### Ingest Path
-
-```
-1. Client sends RecordInput batch via gRPC
-2. Router hashes identity keys → partition records to shards
-3. Each shard receives its partition of the batch
-4. Non-persistent shards may route large batches to ParallelPartitionedUnirust
-5. On that path, records are partitioned again by identity_key_hash % partition_count
-6. Each partition (in parallel via Rayon):
-   a. Batch insert all records to store
-   b. Parallel extract: identity keys + strong ID summaries (Rayon)
-   c. Sequential link: DSU merges with temporal guards
-   d. Update identity index
-7. Persistent shards instead resolve through Unirust backed by PersistentStore
-8. Before resolution, write and fsync a versioned, checksummed binary ingest WAL
-9. Persist records, indexes, cluster assignments, and request metadata
-10. Sync the RocksDB WAL to stable storage
-11. Remove the ingest WAL and fsync its parent directory
-12. Update boundary indexes for cross-shard tracking
-13. Return cluster assignments
-```
-
-If a shard stops before step 11, restart replays the ingest WAL using source
-identity idempotency. If framing, length, or checksum validation fails, startup
-fails closed and preserves the corrupt file for operator recovery. Cross-shard
-merge redirects use the linker metadata column family and receive the same
-stable-storage barrier before their RPC reports success.
-
-### Query Path
-
-```
-1. Client sends QueryEntitiesRequest
-2. Router fans out to all shards (parallel)
-3. Each shard:
-   a. Looks up descriptors in attribute index
-   b. Filters by temporal interval
-   c. Resolves cluster IDs via DSU
-   d. Computes golden records (conflict-free values)
-4. Router aggregates results
-5. Returns QueryOutcome:
-   - If single cluster matches: QueryMatches
-   - If multiple clusters claim same identity: QueryConflict
-```
-
-### Reconciliation Cycle
-
-```
-1. Router triggers reconciliation (periodic or on-demand)
-2. Collect dirty boundary keys from all shards
-3. For each key appearing on multiple shards:
-   a. Check for overlapping intervals
-   b. If overlap found: create merge candidates
-4. Validate merges against temporal guards
-5. Apply merges to each shard
-6. Clear dirty keys
-7. Report reconciliation stats
-```
-
----
-
-## Appendix: Tuning Profiles
-
-| Profile | Candidate Cap | Hot Key Threshold | Use Case |
-|---------|---------------|-------------------|----------|
-| Balanced | 2,000 | 50,000 | General purpose |
-| LowLatency | 1,000 | 20,000 | Fast responses |
-| HighThroughput | 4,000 | 100,000 | Batch processing |
-| BulkIngest | 500 | 10,000 | Large loads; full resolution with lower candidate caps |
-| MemorySaver | 500 | 5,000 | Reduced memory |
-| BillionScale | 2,000 + persistent DSU | 100,000 | Huge datasets |
-
----
-
-## Appendix: Performance Characteristics
-
-### Verified Throughput (5-shard persistent cluster)
-
-The release audit on 2026-07-22 measured 50,598 records/sec for 10,000,000
-records, 16 streams, 5,000-record batches, and 10% overlap on an Apple M5 with
-32 GB RAM. All 10,000,000 records were acknowledged with zero stream errors.
-The measurement includes an `fsync` of the RocksDB WAL before each successful
-batch acknowledgement.
-
-Earlier 280K-500K figures measured an in-memory partition path that did not
-persist or expose its records through the shard's primary store. They are not
-valid production baselines. Performance work must preserve full entity
-resolution and acknowledge records only after durable storage.
-
-### Memory Usage
-
-| Component | Memory per Million Records |
-|-----------|---------------------------|
-| In-memory DSU | ~12 MB |
-| Persistent DSU | ~4 MB (cached) |
-| Identity Index | ~50 MB |
-| Record Storage | ~100 MB (compressed) |
-
-### Latency
-
-| Operation | P50 | P99 |
-|-----------|-----|-----|
-| Single record ingest | 0.5ms | 2ms |
-| Batch ingest (1000 records) | 10ms | 50ms |
-| Point query | 0.2ms | 1ms |
-| Range query (1000 results) | 5ms | 20ms |
+| Code | Responsibility |
+| --- | --- |
+| [`src/lib.rs`](src/lib.rs) | Public API, ingest lifecycle, backend selection, recovery, query execution |
+| [`src/linker.rs`](src/linker.rs) | Candidate linking, strong-ID summaries, local membership, global redirects |
+| [`src/dsu.rs`](src/dsu.rs) | Union-find backends and merge guards |
+| [`src/index.rs`](src/index.rs) | Temporal identity-key extraction and in-memory/tiered candidate indexes |
+| [`src/persistence.rs`](src/persistence.rs) | Durable records, indexes, string interning, metadata and checkpoints |
+| [`src/distributed.rs`](src/distributed.rs) | Router/shard services, ingest WAL, replication and distributed queries |
+| [`src/sharding.rs`](src/sharding.rs) | Boundary metadata and guarded component reconciliation |
+| [`src/query.rs`](src/query.rs), [`src/graph.rs`](src/graph.rs) | Query intervals, golden descriptors and display keys |
+| [`src/conflicts.rs`](src/conflicts.rs) | Conflict observations and summaries |
+| [`proto/unirust.proto`](proto/unirust.proto) | External and internal RPC contracts |
+
+A persistent shard explicitly disables the optional partitioned ingest path.
+`Partition` stores in [`src/partitioned.rs`](src/partitioned.rs) are in memory;
+routing durable traffic through them would bypass the shard's authoritative
+record store. The partitioned implementation remains a separate path available
+to non-persistent shards. It is not the persistent production ingest architecture.
+See `ShardNode::new_with_storage_paths` in [`distributed.rs`](src/distributed.rs).
+
+## Records, time and matching rules
+
+A record has a shard-local `RecordId`, a source identity
+`(entity_type, perspective, uid)`, and descriptors. Each descriptor contains an
+interned attribute ID, an interned value ID and a validity interval. Interned IDs
+are local to the store/interner; distributed requests and boundary strong-ID
+observations carry string values where agreement across stores is required.
+See [`model.rs`](src/model.rs) and [`ontology.rs`](src/ontology.rs).
+
+Intervals are half-open: `[start, end)`. Valid intervals require `start < end`;
+adjacent intervals do not overlap. `Interval` also provides unbounded interval
+constructors, represented with the extreme `i64` endpoints. Descriptor validity
+is separate from the time at which the record arrives. See
+[`temporal.rs`](src/temporal.rs).
+
+An identity key names attributes whose values must match during a shared time
+interval. Extraction coalesces equal values, intersects intervals across key
+attributes, and produces complete key tuples. Missing attributes do not form a
+complete identity key. Candidate buckets include the entity type, so records of
+different entity types are not matched through the same bucket. The current
+`Ontology::identity_keys_for_type` and `strong_identifiers_for_type` return the
+configured rule lists for every entity type; they do not implement independent
+per-type rule selection. Entity-specific `key_attributes` select display-key
+attributes, not separate matching rules.
+
+Strong-ID merge guards compare the accumulated observations of both clusters.
+A conflicting observation has the same perspective and attribute, a different
+value, and an overlapping validity interval. Thus two different SSNs reported
+by the same source during overlapping periods block a merge. Different sources
+may report different values without triggering this particular guard; values
+from the same source in disjoint periods can also coexist. The guard applies
+to cluster histories, including records that are not the immediate matching
+pair. See `build_record_summary`, `cluster_summaries_conflict` and
+`would_create_conflict_in_clusters` in [`linker.rs`](src/linker.rs).
+
+Declared constraints and conflict reporting are separate from these merge
+guards. [`conflicts.rs`](src/conflicts.rs) detects direct and indirect conflicts,
+including perspective-scoped constraints, using sweep-line and atomic-interval
+implementations. The selection heuristic is in
+[`config/tuning.rs`](src/config/tuning.rs). Their cost depends on overlap,
+cluster size and the observations produced; there is no universal linear-time
+bound for conflict detection.
+
+## Local resolution and identity
+
+New records enter the linker after staging. Large `Unirust` ingest batches use
+`link_records_batch_parallel_with_interner`: Rayon extracts keys and strong-ID
+summaries in parallel, then linking and index insertion proceed sequentially in
+record order. Smaller batches use `link_record`. Sequential DSU mutation lets
+later records observe earlier merges and updated summaries. Both paths perform
+entity resolution; `stream_records` omits graph construction and conflict
+report generation, not matching or strong-ID guards.
+
+The identity index finds overlapping intervals and resolves stored candidates
+to current DSU roots. Equal intervals already represented by a cluster do not
+need additional tree entries. A limited tree lookup that reaches its limit is
+retried without that limit. Candidate volume is not a strong-ID conflict and
+does not permanently disable a key. A genuine conflicting key can still limit
+cross-perspective linking. See `CandidateList` in [`index.rs`](src/index.rs) and
+the two linking paths in [`linker.rs`](src/linker.rs).
+
+The implementation also retains accuracy-affecting work limits:
+
+- Key extraction keeps at most eight coalesced value/interval alternatives per
+  attribute before constructing combinations.
+- The single-record path can apply deterministic, overlap-weighted stochastic
+  sampling and defer work according to candidate caps.
+- Deferred reconciliation has its own comparison cap. The parallel batch path
+  does not apply the same sampling/deferred-cap logic as the single-record path.
+
+These are not guarantees of exhaustive matching or identical results for every
+history, profile and batch shape. They must be considered when evaluating match
+quality. The exact controls are in [`config/tuning.rs`](src/config/tuning.rs),
+`extract_key_values_from_record` in [`index.rs`](src/index.rs), and
+`link_record`/`reconcile_pending` in [`linker.rs`](src/linker.rs).
+
+Three forms of identity serve different purposes:
+
+| Identifier | Meaning |
+| --- | --- |
+| `RecordId` | A record identifier within one shard/store |
+| `ClusterId` | An assignment maintained by the local linker; it is not simply a DSU root cast to an integer |
+| `GlobalClusterId` | A shard ID, local anchor ID and version field, with redirects resolving aliases to a canonical global entity |
+
+The packed global format is `(shard_id << 48) | (version << 32) | local_id`.
+Current linker-created IDs use version zero and anchor the local portion to a
+record ID; local merges retain the minimum anchor. The field named `version`
+is not an automatic conflict-resolution clock. Stable anchoring avoids using
+allocation-order cluster numbers as durable global identities.
+
+The linker maintains member vectors and root aliases alongside the DSU.
+Member vectors merge by size; root aliases follow the actual DSU winner.
+`cluster_for_record`, `clusters_readonly` and
+`global_cluster_id_for_readonly` expose authoritative membership without
+replaying records. Normal and deferred local merges update membership,
+strong-ID summaries, local IDs and global redirects together.
+
+A cross-shard canonical entity can contain several local clusters on one or
+more shards. Applying a global redirect does not physically move records or
+union remote records into a local DSU. Queries follow redirects and hydrate
+all relevant local components. See `reconcile_global_cluster_ids`,
+`apply_cross_shard_merges` and `clusters_for_global_ids` in
+[`linker.rs`](src/linker.rs).
+
+## Durable ingest and recovery
+
+For a persistent shard, the main ingest path is:
+
+1. The router validates source identities and reserves each source record's
+   payload digest and target shard. Placement uses a complete configured
+   identity key when possible, then constraint/source-identity fallbacks.
+   Reservations protect retries and prevent the same source identity from
+   silently acquiring a different payload or destination.
+2. The shard validates the batch and writes its binary ingest WAL before
+   dispatching work to an ingest worker.
+3. `process_ingest_batch` builds records and calls `Unirust::stream_records`.
+   Records are staged, resolved and assigned to clusters through the shard's
+   primary store.
+4. `PersistentStore::flush_staged_records` writes staged records, their indexes,
+   interner entries and record-count metadata in a RocksDB write batch. Cluster
+   assignments and cluster-count metadata are also written before success.
+5. `PersistentStore::sync` flushes the RocksDB WAL to stable storage. The shard
+   clears the ingest WAL only after the ingest worker succeeds, then returns
+   assignments.
+
+These steps are implemented in [`distributed.rs`](src/distributed.rs),
+[`lib.rs`](src/lib.rs) and [`persistence.rs`](src/persistence.rs). Ingest
+commit tasks continue after client cancellation once accepted into the shard's
+commit path. Successful acknowledgement is the durability boundary; a client
+that loses its response must retry idempotently.
+
+The ingest WAL is distinct from RocksDB's WAL. It contains bincode payloads
+with a magic value, format version, payload length and CRC32. Writing uses a
+synchronized temporary file followed by rename. File removal and rename also
+synchronize the containing directory on Unix; the non-Unix directory-sync
+helper is currently a no-op. Corrupt input is quarantined and startup fails
+instead of treating it as an empty batch. See `IngestWal` and
+`decode_wal_batch` in [`distributed.rs`](src/distributed.rs).
+
+An identical source-identity/payload retry returns the existing record instead
+of inserting and resolving a duplicate. Reusing the source identity with a
+different payload is rejected. On an ingest error, `run_ingest_batch` discards
+uncommitted staged records and drops derived linker/query/graph state so it
+can be rebuilt. This is not a transaction that reverses already completed disk
+writes or makes an entire router fan-out atomic. Shard mutation guards block
+traffic when a failed durable operation may have left uncertain state.
+
+Persistent shard startup initializes the linker from committed records in
+ascending record-ID order, in recovery batches, then replays a pending ingest
+WAL through the normal ingest path. When persistent DSU or tiered-index backends
+are selected, rebuildable derived state is cleared first. Cold candidate buckets
+must not be mixed with a partially reconstructed DSU and strong-ID summaries.
+Durable global redirects are restored separately; legacy allocation-order
+redirects are handled by the stable-ID migration logic. Recovery resolves
+historical strings through the persistent interner even when its caches are
+small.
+
+Recovery batches limit temporary record materialization, not total recovery
+work or total linker memory. Startup still processes the complete committed
+history. See `create_streaming_linker` in [`lib.rs`](src/lib.rs),
+`StreamingLinker::new_with_backends` in [`linker.rs`](src/linker.rs), and
+`clear_rebuildable_linker_state` in [`persistence.rs`](src/persistence.rs).
+
+## Distributed reconciliation
+
+Placement reduces some cross-shard matching work but cannot establish complete
+entity membership: records can match through different keys, and bridges can
+connect previously separate entities. Shards therefore track dirty boundary
+signatures, coalesced key intervals, global IDs and exact temporal strong-ID
+observations. Distributed shard construction enables boundary tracking.
+
+The router fetches authoritative dirty keys and boundary metadata in chunks.
+Candidate edges from all chunks accumulate in one reconciliation candidate set.
+Before joining components, the router also fetches strong-ID observations for
+the candidate canonical entities from their authoritative fragments. This
+includes observations on previously reconciled components and clean keys,
+which a current dirty-key page alone cannot describe.
+
+Component assembly checks accumulated cannot-link relationships and temporal
+strong-ID observations before each union. A bridge with no strong ID cannot
+join two components whose histories conflict. The resulting redirects map
+members to a canonical primary chosen by global-ID ordering. Shards persist
+applied redirects and conflict metadata; successfully reconciled dirty work is
+cleared under the router's mutation coordination. See
+`RouterNode::reconcile_dirty_keys` in [`distributed.rs`](src/distributed.rs)
+and `ReconciliationCandidates::finish` /
+`canonicalize_merges_with_observations` in [`sharding.rs`](src/sharding.rs).
+
+Reconciliation can be requested explicitly or scheduled by the adaptive
+coordinator. Cross-shard membership is incomplete until the required successful
+reconciliation has occurred. Failures are reported and consistency guards can
+block traffic; eventual convergence requires available shards and successful
+subsequent reconciliation, not just the passage of time.
+
+## Query execution and mastering
+
+A local query with an initialized linker uses the attribute/value/interval
+index to find candidate records, reads their authoritative local membership,
+and masters only those candidate clusters. It does not rerun entity resolution
+over the full store after every ingest. Query text lookup does not allocate new
+interner IDs. A `Unirust` queried before streaming initialization has a recovery/
+cache path instead; that first query can process the full store.
+
+Human-readable cluster keys are display labels, not canonical entity IDs.
+Single-token keys can be generated using candidates alone. Composite keys use
+the shortest unique token prefix across the complete local collision group;
+their cache therefore uses all authoritative local clusters and is invalidated
+by writes. Its rebuild can still read the full local history. See
+`query_master_entities` and `query_cluster_keys_for` in [`lib.rs`](src/lib.rs),
+and `cluster_keys_for_clusters` in [`graph.rs`](src/graph.rs).
+
+For a router with multiple shards, query execution has two phases:
+
+1. **Discover matching canonical entities.** Concurrent shard RPCs return
+   descriptor-match intervals grouped by canonical global ID. The router
+   coalesces intervals for each descriptor and intersects those sets across
+   all requested descriptors. Different predicates can therefore be satisfied
+   by different fragments of the same entity during overlapping periods.
+2. **Hydrate complete matching entities.** The router requests the matching
+   global IDs from all shards in chunks. Shards return their local fragments,
+   including members that did not independently satisfy the query predicates.
+   The router masters the combined raw descriptors and clips the golden result
+   to the matching intervals.
+
+Fan-out concurrency and hydration chunk size are explicitly bounded in
+[`distributed.rs`](src/distributed.rs); result size and total matching membership
+are not bounded by those controls. A one-shard router uses the shard's direct
+query endpoint. All participating fragment requests must succeed: shard errors
+and invalid protocol/fragments are not converted to empty matches. There is no
+cross-shard snapshot transaction spanning both phases; membership changes can
+produce a retryable hydration error.
+
+Golden descriptors retain values over intervals where those values are
+unambiguous. Conflicting values are trimmed over their overlapping portions;
+mastering is not simply concatenating each shard's independently filtered
+result. Multiple distinct canonical entities claiming the requested identity
+can produce `QueryConflict`. See [`query.rs`](src/query.rs),
+`golden_for_cluster` in [`graph.rs`](src/graph.rs), and
+`query_global_entities` in [`distributed.rs`](src/distributed.rs).
+
+## Storage, memory and work limits
+
+RocksDB stores binary records and metadata in separate column families. These
+include durable source identities, attribute/value and temporal indexes,
+cluster assignments, interner mappings, source reservations, optional DSU data,
+cold identity-key buckets and linker redirects. `index_identity` identifies
+source records; `index_identity_keys` is the tiered linker's cold candidate
+index. They serve different purposes. Serialization is bincode/protobuf and
+fixed binary encodings, not JSON data files or a JSON WAL. Ontology JSON is an
+external configuration format; graph JSON is an export format. Actual column
+families and codecs are defined in [`persistence.rs`](src/persistence.rs).
+
+The optional tiered identity index has hot tree buckets, compact warm LRU
+buckets and RocksDB cold buckets. Both ordinary and cached-key insertion run
+capacity maintenance. A bucket is persisted before hot demotion/warm eviction,
+and a read or update promotes the complete old bucket before modifying it.
+This prevents a new hot fragment from hiding older temporal observations.
+Failures to read, decode or persist a bucket propagate to callers. Without a
+database, the index retains overflow rather than discard authoritative keys.
+See `TieredIdentityKeyIndex` in [`index.rs`](src/index.rs).
+
+These tier and cache capacities do **not** bound total process memory. Local
+member vectors, root aliases, strong-ID summaries, ID mappings, record-key
+metadata and distributed boundary/redirect state still grow with the data.
+The linker deliberately uses unbounded authoritative state even when a bounded
+`LinkerStateConfig` is requested: that state does not yet have a safe durable
+spill/read-through mechanism. Persistent DSU caches and tiered candidate buckets
+do not change this limitation. `BillionScale` is a profile name, not a tested
+billion-record capacity guarantee.
+
+Work also depends on key cardinality, descriptor alternatives, temporal history,
+conflicting values, cluster sizes and reconciliation component sizes. Exact
+fallback scans, composite label-cache construction, golden mastering and
+complete startup replay can all be expensive. This document makes no fixed
+throughput, hardware, memory-per-record or latency claim. Measurements belong
+with their workload, storage mode, durability settings and recorded outputs;
+throughput from the in-memory partition path is not a persistent-shard baseline.
+
+## Operational boundaries and future work
+
+Configured primary/passive-replica pairs synchronously replicate mutations and
+validate compatibility and durable-state agreement. A replication divergence
+blocks traffic. This is not quorum consensus, automatic leader election,
+automatic failover or automatic replica bootstrap. Router/shard protocol checks
+require compatible deployments; live protocol versions and durable WAL/backup
+formats have separate versioning. See replication setup in
+[`distributed.rs`](src/distributed.rs) and the transport configuration in
+[`src/bin/unirust_shard.rs`](src/bin/unirust_shard.rs).
+
+The following are design gaps or future options, not shipped guarantees:
+
+- Durable partition-local stores with an explicit shared-query and recovery
+  contract before using partitioned ingest for persistent shards.
+- Durable spill/read-through for all authoritative linker state before claiming
+  bounded total memory.
+- Incremental composite-label collision metadata to avoid full label-cache
+  rebuilds after writes.
+- Explicit exhaustive matching modes and stronger guarantees across sampling,
+  alternative pruning, batching and candidate-cap settings.
+
+Relevant executable coverage includes
+[`resolution_capacity_regressions.rs`](tests/resolution_capacity_regressions.rs),
+[`durable_ingest_regressions.rs`](tests/durable_ingest_regressions.rs),
+[`selective_query_regressions.rs`](tests/selective_query_regressions.rs),
+[`distributed_entity_regressions.rs`](tests/distributed_entity_regressions.rs),
+[`linker_state_recovery.rs`](tests/linker_state_recovery.rs),
+[`process_crash_recovery.rs`](tests/process_crash_recovery.rs) and
+[`synchronous_replication.rs`](tests/synchronous_replication.rs). These tests
+exercise specific invariants and failure cases; they do not establish universal
+performance or availability guarantees.

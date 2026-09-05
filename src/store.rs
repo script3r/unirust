@@ -66,7 +66,8 @@ pub trait RecordStore: Send + Sync {
     /// Get a record by ID.
     fn get_record(&self, id: RecordId) -> Option<Record>;
 
-    /// Get a reference to a record by ID (avoids cloning). Default uses get_record.
+    /// Borrow a record when the backend can lend one without cloning.
+    /// The default returns `None`; callers can fall back to [`Self::get_record`].
     fn get_record_ref(&self, _id: RecordId) -> Option<&Record> {
         None // Default implementation returns None, callers should use get_record
     }
