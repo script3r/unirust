@@ -5,6 +5,7 @@ use crate::ontology::Ontology;
 use crate::store::RecordStore;
 use crate::temporal::Interval;
 use anyhow::Result;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -355,17 +356,46 @@ pub fn query_master_entities_with_cache_selective(
 }
 
 pub(crate) fn intersect_interval_sets(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let a = ordered_interval_set(a);
+    let b = ordered_interval_set(b);
     let mut overlaps = Vec::new();
-
-    for interval_a in a {
-        for interval_b in b {
-            if let Some(overlap) = crate::temporal::intersect(interval_a, interval_b) {
-                overlaps.push(overlap);
-            }
+    let (mut left, mut right) = (0, 0);
+    while left < a.len() && right < b.len() {
+        let interval_a = a[left];
+        let interval_b = b[right];
+        if let Some(overlap) = crate::temporal::intersect(&interval_a, &interval_b) {
+            overlaps.push(overlap);
+        }
+        // Once the earlier interval ends it cannot intersect a later interval
+        // on the opposite side. Equal ends advance both cursors.
+        if interval_a.end <= interval_b.end {
+            left += 1;
+        }
+        if interval_b.end <= interval_a.end {
+            right += 1;
         }
     }
+    overlaps
+}
 
-    coalesce_intervals(&overlaps)
+fn ordered_interval_set(intervals: &[Interval]) -> Cow<'_, [Interval]> {
+    if intervals.iter().all(|interval| !interval.is_empty())
+        && intervals.windows(2).all(|pair| pair[0].end < pair[1].start)
+    {
+        return Cow::Borrowed(intervals);
+    }
+    // The old all-pairs intersection never produced an overlap from an empty
+    // or reversed interval. Filter those before coalescing, which can otherwise
+    // combine malformed public Interval values with adjacent valid intervals.
+    let valid: Vec<_> = intervals
+        .iter()
+        .copied()
+        .filter(|interval| !interval.is_empty())
+        .collect();
+    Cow::Owned(coalesce_intervals(&valid))
 }
 
 pub(crate) fn coalesce_intervals(intervals: &[Interval]) -> Vec<Interval> {
@@ -583,6 +613,45 @@ mod tests {
     use crate::model::{Descriptor, Record, RecordIdentity};
     use crate::ontology::{IdentityKey, Ontology, StrongIdentifier};
     use crate::store::Store;
+
+    #[test]
+    fn interval_set_intersection_matches_pairwise_oracle() {
+        let endpoints = [
+            i64::MIN,
+            i64::MIN + 1,
+            -10,
+            -1,
+            0,
+            1,
+            10,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        let mut random = 0x28ca3915_u64;
+        for case in 0..200 {
+            let mut sides = [Vec::new(), Vec::new()];
+            for (side, intervals) in sides.iter_mut().enumerate() {
+                for _ in 0..(case * (side + 1) % 43) {
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    intervals.push(Interval {
+                        start: endpoints[(random as usize) % endpoints.len()],
+                        end: endpoints[((random >> 32) as usize) % endpoints.len()],
+                    });
+                }
+            }
+            let mut overlaps = Vec::new();
+            for left in &sides[0] {
+                for right in &sides[1] {
+                    if let Some(overlap) = crate::temporal::intersect(left, right) {
+                        overlaps.push(overlap);
+                    }
+                }
+            }
+            let expected = coalesce_intervals(&overlaps);
+            assert_eq!(intersect_interval_sets(&sides[0], &sides[1]), expected);
+            assert_eq!(intersect_interval_sets(&sides[1], &sides[0]), expected);
+        }
+    }
 
     #[test]
     fn query_respects_strong_identifier_conflicts() {

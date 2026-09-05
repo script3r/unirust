@@ -615,25 +615,21 @@ impl ConflictDetector {
         descs_a: &[(RecordId, Descriptor)],
         descs_b: &[(RecordId, Descriptor)],
     ) -> Vec<Interval> {
-        let mut overlaps = Vec::new();
-
-        for (_, desc_a) in descs_a {
-            for (_, desc_b) in descs_b {
-                if let Some(overlap) =
-                    crate::temporal::intersect(&desc_a.interval, &desc_b.interval)
-                {
-                    overlaps.push(overlap);
-                }
-            }
+        if descs_a.is_empty() || descs_b.is_empty() {
+            return Vec::new();
+        }
+        if descs_a.len() == 1 && descs_b.len() == 1 {
+            return crate::temporal::intersect(&descs_a[0].1.interval, &descs_b[0].1.interval)
+                .into_iter()
+                .collect();
         }
 
-        // Merge overlapping intervals
-        crate::temporal::coalesce_same_value(
-            &overlaps.into_iter().map(|i| (i, ())).collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(|(interval, _)| interval)
-        .collect()
+        // Constraint reporting needs the union of overlapping times, not every
+        // descriptor pair. Share the query interval sweep while retaining the
+        // existing value-pair and participant reporting semantics below.
+        let intervals_a = descs_a.iter().map(|(_, d)| d.interval).collect::<Vec<_>>();
+        let intervals_b = descs_b.iter().map(|(_, d)| d.interval).collect::<Vec<_>>();
+        crate::query::intersect_interval_sets(&intervals_a, &intervals_b)
     }
 
     fn detect_conflicts_from_value_intervals(

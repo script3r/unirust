@@ -8,10 +8,10 @@ use crate::dsu::Clusters;
 use crate::model::{AttrId, ClusterId, RecordId, ValueId};
 use crate::ontology::Ontology;
 use crate::store::RecordStore;
-use crate::temporal::{coalesce_same_value, difference, Interval};
+use crate::temporal::{coalesce_same_value, Interval};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// A SAME_AS edge in the knowledge graph
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -731,19 +731,78 @@ fn coalesce_intervals(intervals: &[Interval]) -> Vec<Interval> {
     .collect()
 }
 
-fn subtract_intervals(base: &[Interval], others: &[Interval]) -> Vec<Interval> {
-    if base.is_empty() {
-        return Vec::new();
+fn unambiguous_value_intervals(
+    candidates: &[(ValueId, Vec<Interval>)],
+) -> HashMap<ValueId, Vec<Interval>> {
+    if candidates
+        .iter()
+        .any(|(_, intervals)| intervals.iter().any(Interval::is_empty))
+    {
+        // Public Interval fields permit malformed intervals. Preserve the legacy
+        // subtraction/coalescing behavior for those inputs; normal valid temporal
+        // histories use the sweep below.
+        return candidates
+            .iter()
+            .filter_map(|(value, intervals)| {
+                let mut remaining = intervals.clone();
+                for (other_value, others) in candidates {
+                    if value != other_value {
+                        for other in others {
+                            remaining = remaining
+                                .into_iter()
+                                .flat_map(|interval| crate::temporal::difference(&interval, other))
+                                .collect();
+                        }
+                    }
+                }
+                let remaining = coalesce_intervals(&remaining);
+                (!remaining.is_empty()).then_some((*value, remaining))
+            })
+            .collect();
     }
-    let mut remaining = base.to_vec();
-    for other in others {
-        let mut next = Vec::new();
-        for segment in remaining {
-            next.extend(difference(&segment, other));
+    let mut events = Vec::new();
+    for (index, (_, intervals)) in candidates.iter().enumerate() {
+        // Intervals for each distinct value have already been coalesced, so a
+        // value can have at most one active interval at any time.
+        for interval in intervals {
+            events.push((interval.start, index, true));
+            events.push((interval.end, index, false));
         }
-        remaining = next;
     }
-    coalesce_intervals(&remaining)
+    events.sort_unstable_by_key(|event| event.0);
+
+    let mut active = BTreeSet::new();
+    let mut result: HashMap<ValueId, Vec<Interval>> = HashMap::new();
+    let mut position = 0;
+    while position < events.len() {
+        let start = events[position].0;
+        // Apply all events at a boundary before evaluating its following span.
+        // This preserves half-open intervals without endpoint arithmetic.
+        while position < events.len() && events[position].0 == start {
+            let (_, index, entering) = events[position];
+            if entering {
+                active.insert(index);
+            } else {
+                active.remove(&index);
+            }
+            position += 1;
+        }
+        if position == events.len() || active.len() != 1 {
+            continue;
+        }
+        if let Some(&index) = active.first() {
+            let end = events[position].0;
+            let intervals = result.entry(candidates[index].0).or_default();
+            if let Some(previous) = intervals.last_mut() {
+                if previous.end == start {
+                    previous.end = end;
+                    continue;
+                }
+            }
+            intervals.push(Interval { start, end });
+        }
+    }
+    result
 }
 
 pub fn golden_for_cluster(
@@ -796,23 +855,15 @@ pub fn golden_for_cluster(
             continue;
         }
 
-        for i in 0..candidates.len() {
-            let (value, intervals) = &candidates[i];
-            let others: Vec<Interval> = candidates
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| *idx != i)
-                .flat_map(|(_, (_, other_intervals))| other_intervals.clone())
-                .collect();
-            let safe = subtract_intervals(intervals, &others);
-            if safe.is_empty() {
-                continue;
-            }
+        // A golden value is valid exactly where it is the only distinct active
+        // value. One boundary sweep avoids subtracting every competing value
+        // from every candidate, which is quadratic for long attribute histories.
+        for (value, safe) in unambiguous_value_intervals(&candidates) {
             let attr_name = store
                 .resolve_attr(attr)
                 .unwrap_or_else(|| format!("attr_{}", attr.0));
             let value_str = store
-                .resolve_value(*value)
+                .resolve_value(value)
                 .unwrap_or_else(|| format!("value_{}", value.0));
             for interval in safe {
                 golden.push(GoldenDescriptor {
