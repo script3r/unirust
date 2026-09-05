@@ -90,12 +90,13 @@ impl Interval {
     }
 
     /// Get the duration of this interval in seconds
-    /// Returns None for intervals with infinite endpoints
+    /// Returns None for intervals with infinite endpoints. Finite durations that
+    /// exceed i64::MAX seconds saturate at i64::MAX.
     pub fn duration(&self) -> Option<i64> {
         if self.start == NEG_INF || self.end == POS_INF {
             None
         } else {
-            Some(self.end - self.start)
+            Some(self.end.saturating_sub(self.start))
         }
     }
 
@@ -107,13 +108,14 @@ impl Interval {
     }
 
     /// Calculate the overlap duration between this interval and another.
-    /// Returns 0 if the intervals don't overlap.
+    /// Returns 0 if the intervals don't overlap. Durations exceeding i64::MAX
+    /// seconds saturate at i64::MAX, including overlap across infinite endpoints.
     #[inline]
     pub fn overlap_duration(&self, other: &Interval) -> i64 {
         let overlap_start = self.start.max(other.start);
         let overlap_end = self.end.min(other.end);
         if overlap_start < overlap_end {
-            overlap_end - overlap_start
+            overlap_end.saturating_sub(overlap_start)
         } else {
             0
         }
@@ -164,7 +166,7 @@ impl Ord for Interval {
 /// All relations are mutually exclusive and collectively exhaustive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AllenRelation {
-    /// a precedes b: a.end <= b.start
+    /// a precedes b: a.end < b.start
     Precedes,
     /// a meets b: a.end == b.start (adjacent)
     Meets,
@@ -182,13 +184,13 @@ pub enum AllenRelation {
     StartedBy,
     /// a contains b: a.start < b.start && b.end < a.end
     Contains,
-    /// a finished by b: b.start < a.start && b.end == a.end
+    /// a finished by b: a.start < b.start && a.end == b.end
     FinishedBy,
     /// a overlapped by b: b.start < a.start && a.start < b.end < a.end
     OverlappedBy,
     /// a met by b: b.end == a.start
     MetBy,
-    /// a preceded by b: b.end <= a.start
+    /// a preceded by b: b.end < a.start
     PrecededBy,
 }
 
@@ -200,7 +202,7 @@ pub fn allen_relation(a: &Interval, b: &Interval) -> AllenRelation {
         (Ordering::Equal, Ordering::Equal) => Equals,
         (Ordering::Equal, Ordering::Less) => Starts,
         (Ordering::Equal, Ordering::Greater) => StartedBy,
-        (Ordering::Less, Ordering::Equal) => Finishes,
+        (Ordering::Less, Ordering::Equal) => FinishedBy,
         (Ordering::Less, Ordering::Less) => {
             if a.end < b.start {
                 Precedes
@@ -212,7 +214,7 @@ pub fn allen_relation(a: &Interval, b: &Interval) -> AllenRelation {
                 Contains
             }
         }
-        (Ordering::Greater, Ordering::Equal) => FinishedBy,
+        (Ordering::Greater, Ordering::Equal) => Finishes,
         (Ordering::Greater, Ordering::Greater) => {
             if b.end < a.start {
                 PrecededBy
@@ -431,14 +433,65 @@ mod tests {
 
     #[test]
     fn test_allen_relations() {
-        let a = Interval::new(100, 200).unwrap();
-        let b = Interval::new(150, 250).unwrap();
-        let c = Interval::new(200, 300).unwrap();
-        let d = Interval::new(50, 100).unwrap();
+        use AllenRelation::*;
 
-        assert_eq!(allen_relation(&a, &b), AllenRelation::Overlaps);
-        assert_eq!(allen_relation(&a, &c), AllenRelation::Meets);
-        assert_eq!(allen_relation(&a, &d), AllenRelation::MetBy); // d meets a, so a is met by d
+        let a = Interval::new(100, 200).unwrap();
+        for (start, end, expected, inverse) in [
+            (250, 300, Precedes, PrecededBy),
+            (200, 300, Meets, MetBy),
+            (150, 250, Overlaps, OverlappedBy),
+            (100, 250, Starts, StartedBy),
+            (50, 250, During, Contains),
+            (50, 200, Finishes, FinishedBy),
+            (100, 200, Equals, Equals),
+        ] {
+            let b = Interval::new(start, end).unwrap();
+            assert_eq!(allen_relation(&a, &b), expected);
+            assert_eq!(allen_relation(&b, &a), inverse);
+        }
+    }
+
+    #[test]
+    fn test_overlap_duration_extremes() {
+        let all = Interval::all_time();
+        for (a, b, expected) in [
+            (all, all, i64::MAX),
+            (all, Interval::from_start(-100), i64::MAX),
+            (all, Interval::until_end(100), i64::MAX),
+            (Interval::from_start(100), Interval::until_end(200), 100),
+            (all, Interval::new(-100, 100).unwrap(), 200),
+            (
+                Interval::new(0, 100).unwrap(),
+                Interval::new(50, 150).unwrap(),
+                50,
+            ),
+            (Interval::until_end(100), Interval::from_start(100), 0),
+            (Interval::until_end(100), Interval::from_start(200), 0),
+            (
+                Interval::new(i64::MIN + 1, i64::MAX - 1).unwrap(),
+                all,
+                i64::MAX,
+            ),
+        ] {
+            assert_eq!(a.overlap_duration(&b), expected, "{a} and {b}");
+            assert_eq!(b.overlap_duration(&a), expected, "{b} and {a}");
+        }
+    }
+
+    #[test]
+    fn test_duration_extremes() {
+        for interval in [
+            Interval::all_time(),
+            Interval::from_start(-100),
+            Interval::until_end(100),
+        ] {
+            assert_eq!(interval.duration(), None);
+            assert_eq!(interval.duration_or_zero(), 0);
+        }
+        let wide = Interval::new(i64::MIN + 1, i64::MAX - 1).unwrap();
+        assert_eq!(wide.duration(), Some(i64::MAX));
+        assert_eq!(wide.duration_or_zero(), i64::MAX);
+        assert_eq!(Interval::new(-100, 100).unwrap().duration(), Some(200));
     }
 
     #[test]

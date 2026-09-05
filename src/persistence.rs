@@ -489,6 +489,10 @@ const KEY_DSU_CLUSTER_COUNT: &[u8] = b"dsu_cluster_count";
 const STORAGE_FORMAT_VERSION: u32 = 1;
 const INDEX_FORMAT_VERSION: u32 = 2;
 const TEMPORAL_BUCKET_SECONDS: i64 = 86400;
+const MAX_TEMPORAL_BUCKETS: i64 = 4096;
+// No timestamp divided by TEMPORAL_BUCKET_SECONDS can produce this bucket.
+// Existing day-indexed records remain readable without rebuilding their indexes.
+const WIDE_TEMPORAL_BUCKET: i64 = i64::MIN;
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 const DEFAULT_BLOCK_CACHE_MB: u64 = 512;
 const DEFAULT_WRITE_BUFFER_MB: u64 = 128;
@@ -1598,6 +1602,9 @@ impl RecordStore for PersistentStore {
     }
 
     fn get_records_in_interval(&self, interval: crate::temporal::Interval) -> Vec<Record> {
+        if interval.is_empty() {
+            return Vec::new();
+        }
         let cf = match self.db.cf_handle(CF_INDEX_TEMPORAL_BUCKET) {
             Some(cf) => cf,
             None => {
@@ -1606,12 +1613,11 @@ impl RecordStore for PersistentStore {
             }
         };
         let mut candidates = std::collections::HashSet::new();
-        for bucket in buckets_for_interval(interval.start, interval.end) {
-            let prefix = bucket.to_be_bytes();
-            let iter = self
-                .db
-                .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
-            for entry in iter {
+        let buckets = buckets_for_interval(interval.start, interval.end);
+        if buckets == [WIDE_TEMPORAL_BUCKET] {
+            // A broad query must also find ordinary day-indexed records, including
+            // records written by older versions. Scan existing entries, not days.
+            for entry in self.db.iterator_cf(cf, IteratorMode::Start) {
                 let (key, _) = match entry {
                     Ok(pair) => pair,
                     Err(_) => {
@@ -1619,14 +1625,39 @@ impl RecordStore for PersistentStore {
                         break;
                     }
                 };
-                if !key.starts_with(&prefix) {
-                    break;
-                }
                 if let Some(record_id) = decode_temporal_record_id(&key) {
                     candidates.insert(record_id);
                 } else {
                     self.mark_read_fault();
                     break;
+                }
+            }
+        } else {
+            for bucket in buckets
+                .into_iter()
+                .chain(std::iter::once(WIDE_TEMPORAL_BUCKET))
+            {
+                let prefix = bucket.to_be_bytes();
+                let iter = self
+                    .db
+                    .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
+                for entry in iter {
+                    let (key, _) = match entry {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            self.mark_read_fault();
+                            break;
+                        }
+                    };
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    if let Some(record_id) = decode_temporal_record_id(&key) {
+                        candidates.insert(record_id);
+                    } else {
+                        self.mark_read_fault();
+                        break;
+                    }
                 }
             }
         }
@@ -2462,6 +2493,9 @@ fn buckets_for_interval(start: i64, end: i64) -> Vec<i64> {
     let mut buckets = Vec::new();
     let mut current = start.div_euclid(TEMPORAL_BUCKET_SECONDS);
     let end_bucket = (end - 1).div_euclid(TEMPORAL_BUCKET_SECONDS);
+    if end_bucket - current >= MAX_TEMPORAL_BUCKETS {
+        return vec![WIDE_TEMPORAL_BUCKET];
+    }
     while current <= end_bucket {
         buckets.push(current);
         current += 1;
@@ -3415,6 +3449,27 @@ mod tests {
         PERSISTENT_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn temporal_bucket_expansion_is_bounded() {
+        assert_eq!(buckets_for_interval(0, 0), Vec::<i64>::new());
+        assert_eq!(buckets_for_interval(-1, 1), vec![-1, 0]);
+        assert_eq!(buckets_for_interval(0, TEMPORAL_BUCKET_SECONDS), vec![0]);
+        assert_eq!(
+            buckets_for_interval(0, MAX_TEMPORAL_BUCKETS * TEMPORAL_BUCKET_SECONDS).len(),
+            MAX_TEMPORAL_BUCKETS as usize
+        );
+        assert_eq!(
+            buckets_for_interval(0, MAX_TEMPORAL_BUCKETS * TEMPORAL_BUCKET_SECONDS + 1),
+            vec![WIDE_TEMPORAL_BUCKET]
+        );
+        assert_eq!(
+            buckets_for_interval(i64::MIN, i64::MAX),
+            vec![WIDE_TEMPORAL_BUCKET]
+        );
+        assert_eq!(buckets_for_interval(i64::MIN, i64::MIN + 1).len(), 1);
+        assert_eq!(buckets_for_interval(i64::MAX - 1, i64::MAX).len(), 1);
     }
 
     #[test]

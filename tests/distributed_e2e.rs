@@ -159,6 +159,62 @@ fn normalize_remote_query(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distributed_ingest_and_query_unbounded_intervals() -> anyhow::Result<()> {
+    let config = support::build_iam_config();
+    let (shard0, shard0_handle) = spawn_shard(0, config.clone()).await?;
+    let (shard1, shard1_handle) = spawn_shard(1, config.clone()).await?;
+    let (router, router_handle) = spawn_router(vec![shard0, shard1], config).await?;
+    let mut client = RouterServiceClient::connect(format!("http://{router}")).await?;
+
+    // Exercise partitioned batch ingestion, then match a later batch against its
+    // persisted unbounded descriptors through the router.
+    for batch in 0..2 {
+        let records = (0..100)
+            .map(|index| {
+                record_input(
+                    index,
+                    "person",
+                    "crm",
+                    &format!("unbounded-{batch}-{index}"),
+                    vec![("email", "unbounded@example.com", i64::MIN, i64::MAX)],
+                )
+            })
+            .collect();
+        let response = client
+            .ingest_records(IngestRecordsRequest {
+                internal_protocol_version: 5,
+                records,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(response.assignments.len(), 100);
+    }
+
+    for (start, end) in [(0, 100), (i64::MIN, i64::MAX)] {
+        let response = client
+            .query_entities(proto::QueryEntitiesRequest {
+                descriptors: vec![proto::QueryDescriptor {
+                    attr: "email".into(),
+                    value: "unbounded@example.com".into(),
+                }],
+                start,
+                end,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            normalize_remote_query(response),
+            ("matches", 1, (start, end))
+        );
+    }
+
+    router_handle.abort();
+    shard0_handle.abort();
+    shard1_handle.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn distributed_stream_and_query() -> anyhow::Result<()> {
     let config = support::build_iam_config();
     let empty_config = DistributedOntologyConfig::empty();
