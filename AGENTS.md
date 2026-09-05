@@ -107,6 +107,8 @@ latency was approximately 1,585 versus 1,657 ms. These are observations, not
 performance guarantees. The old 410K records/second and 12 ms figures do not
 establish a durable production baseline. Workload details and limitations are in
 [the audit report](docs/critical-audit-2026-09-05.md).
+For the later algorithmic changes, consult the [performance analysis](docs/performance-analysis-2026-09-05.md)
+and use `scripts/benchmark_persistent.py` for isolated, repeated persistent comparisons.
 
 ### Hot Paths
 - `lib.rs:stream_records()` - persistent staging, resolution and commit

@@ -784,6 +784,9 @@ counts and request rates at the load balancer as well.
 
 ## Performance and Development
 
+See the [algorithmic performance analysis](docs/performance-analysis-2026-09-05.md)
+for measured workloads, complexity changes, correctness checks and remaining limits.
+
 Measure the actual release, dataset, ontology, persistent storage, and topology
 you intend to deploy. A record-throughput result is not evidence of query
 latency, crash-recovery time, match completeness, or survival of physical volume

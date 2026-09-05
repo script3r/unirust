@@ -5,6 +5,18 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Performance
+
+- Avoid global-ID/boundary scans when a local merge retains its canonical ID,
+  and incrementally merge normalized strong-ID histories while preserving the
+  legacy behavior of malformed public intervals.
+- Replace quadratic temporal candidate discovery with an exact cross-shard sweep
+  and dense-overlap path, retaining all candidates and component conflict guards.
+- Sweep golden-value boundaries and intersect normalized interval sets with two
+  pointers for queries and constraint overlap reporting.
+- Add persistent differential/recovery regressions and reproducible timing
+  diagnostics; see `docs/performance-analysis-2026-09-05.md` for measured scope.
+
 ### Fixed
 
 - Authenticate protoc setup requests in CI to avoid unauthenticated GitHub API
