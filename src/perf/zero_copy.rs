@@ -1,11 +1,11 @@
 //! # Zero-Copy Record Passing
 //!
-//! Eliminates unnecessary allocations and copies in the hot path.
+//! Share immutable record slices after constructing their backing allocation.
 //!
 //! ## Key Optimizations
 //! - `RecordSlice`: Shared ownership of record batches via Arc
-//! - `ZeroCopyBatch`: Pre-partitioned records without cloning
-//! - Inline storage for small batches
+//! - `ZeroCopyBatch`: Clones records into partition order, then shares partition slices
+//! - `SmallBatch`: Inline slots for up to eight records; record payloads may allocate
 
 use crate::model::{Record, RecordId};
 use std::ops::Deref;
@@ -87,16 +87,16 @@ impl Deref for RecordSlice {
     }
 }
 
-/// A batch of records pre-partitioned for zero-copy processing
+/// A batch that shares partition slices after cloning records into partition order.
 pub struct ZeroCopyBatch {
-    /// Original records (shared)
+    /// Reordered records (shared)
     records: RecordSlice,
     /// Partition assignments: (partition_id, start_idx, len)
     partitions: Vec<(usize, usize, usize)>,
 }
 
 impl ZeroCopyBatch {
-    /// Create a new batch and partition records
+    /// Clone records into contiguous partitions and create shared backing storage.
     ///
     /// The partition function receives a record and returns its partition ID.
     pub fn new<F>(records: Vec<Record>, partition_count: usize, partition_fn: F) -> Self

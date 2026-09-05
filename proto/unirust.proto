@@ -13,14 +13,14 @@ package unirust;
 message RecordIdentity {
   string entity_type = 1;  // e.g., "person", "company"
   string perspective = 2;  // Source system, e.g., "crm", "erp"
-  string uid = 3;          // Unique ID within perspective
+  string uid = 3;          // Source UID within this entity_type and perspective
 }
 
 message RecordDescriptor {
   string attr = 1;   // Attribute name, e.g., "email", "phone"
   string value = 2;  // Attribute value
-  int64 start = 3;   // Validity start (epoch or YYYYMM)
-  int64 end = 4;     // Validity end (exclusive)
+  int64 start = 3;   // Inclusive validity start in caller-consistent integer time units
+  int64 end = 4;     // Exclusive validity end; start must be less than end
 }
 
 message RecordInput {
@@ -40,8 +40,8 @@ message IngestAssignment {
   uint32 index = 1;       // Correlates to RecordInput.index
   uint32 shard_id = 2;    // Shard that owns this record
   uint32 record_id = 3;   // Assigned record ID
-  uint32 cluster_id = 4;  // Assigned cluster ID
-  string cluster_key = 5; // Human-readable cluster key
+  uint32 cluster_id = 4;  // Local ingest assignment, distinct from a canonical query ID
+  string cluster_key = 5; // Currently empty on ingest; display keys are derived on query
 }
 
 message IngestRecordsResponse {
@@ -69,6 +69,9 @@ message GoldenDescriptor {
 }
 
 message QueryMatch {
+  // Ordinary matches and multi-shard router conflicts use a canonical global
+  // shard and local record anchor. The legacy direct-shard conflict response
+  // uses local cluster IDs; a single-shard router forwards that response.
   uint32 shard_id = 1;
   uint32 cluster_id = 2;
   int64 start = 3;
@@ -145,7 +148,7 @@ message RecordRef {
 }
 
 message ConflictSummary {
-  string kind = 1;              // "direct" or "indirect"
+  string kind = 1;              // e.g. "direct", "indirect", "indirect_cross_shard"
   string attribute = 2;         // Conflicting attribute
   int64 start = 3;
   int64 end = 4;
@@ -244,13 +247,14 @@ service RouterService {
 
   // --- Advanced Operations ---
 
-  // Ingest from URL (bulk loading)
+  // Deprecated compatibility endpoint; currently returns UNIMPLEMENTED.
   rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
 
   // Get config version
   rpc GetConfigVersion(ConfigVersionRequest) returns (ConfigVersionResponse);
 
-  // Create checkpoint (for backup/restore)
+  // Prepare/finalize a checkpoint generation for backup/restore. Failed retries
+  // may reuse older shard snapshots; see CheckpointResponse.committed.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
 
   // Get detailed metrics
@@ -313,7 +317,7 @@ message ConfigVersionResponse {
   string restore_generation = 7;
   uint32 restore_shard_count = 8;
   ShardRole shard_role = 9;
-  // SHA-256 over every logical RocksDB column-family key/value pair.
+  // SHA-256 over the configured Unirust durable-state column-family key/value pairs.
   bytes durable_state_digest = 10;
   uint32 query_fragment_protocol_version = 11;
 }
@@ -350,6 +354,8 @@ message MarkSourceReservationsBackfilledResponse {}
 // --- Checkpoint ---
 
 message CheckpointRequest {
+  // Generation path relative to each shard's checkpoint root. The router chooses
+  // a generation when empty; this is not an arbitrary absolute filesystem path.
   string path = 1;
   // Internal router-to-shard coordination fields. External clients call the
   // router with these left at their zero values.
@@ -361,6 +367,9 @@ message CheckpointRequest {
 message CheckpointResponse {
   repeated string paths = 1;
   string generation = 2;
+  // Confirms finalization, not a common capture time after interrupted retries.
+  // Existing prepared shard snapshots are reused for the same generation; the
+  // router's mutation gate is released between failed attempts.
   bool committed = 3;
 }
 
@@ -461,9 +470,9 @@ message RouterImportRecordsRequest {
 // --- Cross-Shard Reconciliation ---
 
 message GlobalClusterId {
-  uint32 shard_id = 1;
-  uint32 local_id = 2;
-  uint32 version = 3;
+  uint32 shard_id = 1; // Validated to fit 16 bits
+  uint32 local_id = 2; // Durable local record anchor for linker-created IDs
+  uint32 version = 3;  // Validated to fit 16 bits; current linker-created IDs use zero
 }
 
 message IdentityKeySignature {
@@ -485,8 +494,8 @@ message ClusterBoundaryEntry {
   uint32 shard_id = 4;
   // Strong ID hashes per perspective for cross-shard conflict detection.
   // Key: perspective name hash, Value: hash of strong ID values.
-  // Two clusters conflict if they share a perspective but have different values.
-  // Deprecated: retained for rolling compatibility with pre-0.2 nodes.
+  // Legacy fallback lacks the exact temporal observations available below.
+  // Retained in the schema; live protocol checks reject incompatible nodes.
   map<uint64, uint64> perspective_strong_ids = 5;
   // Exact temporal observations used for authoritative merge guards.
   repeated BoundaryStrongId strong_ids = 6;
@@ -541,6 +550,8 @@ message ClearDirtyKeysResponse {
 }
 
 message ReconcileRequest {
+  // External callers leave this empty. The router rejects supplied metadata and
+  // fetches authoritative boundaries directly from shards.
   repeated BoundaryMetadata shard_metadata = 1;
 }
 
@@ -624,6 +635,7 @@ service ShardService {
   rpc MarkSourceReservationsBackfilled(MarkSourceReservationsBackfilledRequest) returns (MarkSourceReservationsBackfilledResponse);
   rpc IngestRecords(IngestRecordsRequest) returns (IngestRecordsResponse);
   rpc IngestRecordsStream(stream IngestRecordsChunk) returns (IngestRecordsResponse);
+  // Deprecated compatibility endpoint; currently returns UNIMPLEMENTED.
   rpc IngestRecordsFromUrl(IngestRecordsFromUrlRequest) returns (IngestRecordsResponse);
   rpc QueryEntities(QueryEntitiesRequest) returns (QueryEntitiesResponse);
   rpc QueryEntityFragments(QueryEntityFragmentsRequest) returns (QueryEntityFragmentsResponse);

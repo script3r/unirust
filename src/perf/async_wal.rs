@@ -1,9 +1,10 @@
-//! Async Write-Ahead Log with coalescing
+//! Experimental background batch-file writer.
 //!
-//! Removes WAL fsync from the critical path by:
-//! 1. Submitting writes to a background thread
-//! 2. Coalescing multiple writes into single fsync
-//! 3. Optional io_uring support for async disk I/O
+//! Submissions are coalesced by a background thread using blocking file I/O.
+//! Each flush replaces the file with the latest batch, and write/sync errors are
+//! not returned through tickets. Ticket completion therefore does not prove durable
+//! delivery. This utility is not the production distributed ingest WAL and must not
+//! be used as an append-only recovery log.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -24,7 +25,7 @@ pub struct AsyncWalConfig {
     pub max_coalesce_records: usize,
     /// Channel capacity for write requests
     pub channel_capacity: usize,
-    /// Whether to actually sync to disk (false for testing)
+    /// Whether to attempt file synchronization; errors are not reported to tickets.
     pub sync_enabled: bool,
 }
 
@@ -82,7 +83,8 @@ impl WalTicket {
         }
     }
 
-    /// Check if the write has been synced to disk
+    /// Check whether the writer finished processing the batch containing this ticket.
+    /// Completion does not report I/O success or guarantee synchronization.
     #[inline]
     pub fn is_complete(&self) -> bool {
         self.completed.load(Ordering::Acquire)
@@ -112,7 +114,7 @@ impl WalTicket {
     }
 }
 
-/// Async Write-Ahead Log
+/// Experimental coalescing batch writer; see module-level durability limitations.
 pub struct AsyncWal {
     /// Channel to send write requests
     tx: Sender<WalEntry>,

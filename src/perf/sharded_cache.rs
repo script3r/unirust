@@ -2,17 +2,11 @@
 //!
 //! RocksDB-inspired sharded LRU cache for high-concurrency workloads.
 //!
-//! From RocksDB Tuning Guide:
-//! "Both LRUCache and ClockCache are sharded to mitigate lock contention.
-//! Each shard maintains its own LRU list and hash table. Synchronization
-//! is done via a per-shard mutex."
+//! Hash-based shards maintain independent LRU lists and reader/writer locks.
+//! Operations on the same shard still contend; throughput depends on key distribution.
 //!
-//! Benefits:
-//! - 4-8x throughput improvement on concurrent cache operations
-//! - Reduced lock contention via hash-based sharding
-//! - Per-shard statistics for monitoring
-//!
-//! Default: 16 shards (2^4), minimum 512KB per shard
+//! Defaults use 16 shards and a minimum of 1024 entries per shard. Capacities count
+//! entries, not bytes; the per-shard minimum can exceed the requested total capacity.
 
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -23,12 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Configuration for sharded cache
 #[derive(Debug, Clone)]
 pub struct ShardedCacheConfig {
-    /// Total capacity across all shards
+    /// Requested total entry capacity; per-shard minimums may increase the actual total.
     pub total_capacity: usize,
     /// Number of shard bits (shards = 2^shard_bits)
     /// Default: 4 (16 shards)
     pub shard_bits: u8,
-    /// Minimum capacity per shard (prevents thrashing)
+    /// Minimum entry capacity per shard
     /// Default: 1024 entries
     pub min_shard_capacity: usize,
 }
@@ -48,12 +42,12 @@ impl ShardedCacheConfig {
     pub fn high_throughput(capacity: usize) -> Self {
         Self {
             total_capacity: capacity,
-            shard_bits: 6, // 64 shards for maximum parallelism
+            shard_bits: 6, // 64 independently locked shards
             min_shard_capacity: 512,
         }
     }
 
-    /// Memory-efficient configuration with fewer shards
+    /// Configuration with fewer shards and a larger per-shard minimum.
     pub fn memory_efficient(capacity: usize) -> Self {
         Self {
             total_capacity: capacity,

@@ -1,22 +1,20 @@
-//! # SIMD-Accelerated Hashing
+//! # Scalar and Platform-Specific Hashing
 //!
-//! High-performance batch hashing using SIMD instructions.
-//! Falls back to scalar FxHash on platforms without SIMD support.
-//!
-//! ## Performance
-//! - AVX2: ~8x throughput for batch hashing
-//! - NEON: ~4x throughput on ARM
-//! - Scalar fallback: Same as rustc_hash::FxHasher
+//! Fx-style scalar mixing with an AVX2 batch path selected at compile time on
+//! x86_64 builds enabling that feature. The byte-batch API uses scalar hashing on
+//! other builds. These hashes are not a portable storage or wire-format contract;
+//! platform paths are not guaranteed to produce identical outputs. Throughput is
+//! workload- and hardware-dependent.
 
 use std::hash::Hasher;
 
-/// SIMD-accelerated batch hasher
+/// Scalar hasher with a platform-specific byte-batch helper.
 pub struct SimdHasher {
     state: u64,
 }
 
 impl SimdHasher {
-    /// FxHash constant (good mixing properties)
+    /// Multiplicative mixing constant used by this implementation.
     const K: u64 = 0x517cc1b727220a95;
 
     /// Create a new hasher

@@ -2,16 +2,15 @@
 //!
 //! RocksDB-inspired write buffer management with backpressure.
 //!
-//! From RocksDB Write Buffer Manager:
-//! "Helps manage total memory consumed by memtables across multiple
-//! column families and DB instances, preventing memory bloat during
-//! heavy write loads."
-//!
 //! Key features:
-//! - Memory limit enforcement across multiple buffers
+//! - Accounting for caller-reported buffer reservations
 //! - Automatic flush triggers at configurable thresholds
 //! - Backpressure/stalling when memory exceeds limits
 //! - Statistics for monitoring memory pressure
+//!
+//! This is not RocksDB's native write-buffer manager or a hard process-memory cap.
+//! Concurrent reservations can overshoot the threshold, and accounting depends on
+//! callers reporting allocations and completing flushes.
 
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -21,7 +20,7 @@ use std::time::{Duration, Instant};
 /// Configuration for write buffer manager
 #[derive(Debug, Clone)]
 pub struct WriteBufferConfig {
-    /// Total memory limit for all buffers (bytes)
+    /// Reservation threshold in bytes; concurrent reservations can exceed it.
     pub memory_limit: usize,
     /// Trigger flush when mutable buffer reaches this ratio of limit
     /// Default: 0.9 (90%)
@@ -32,7 +31,7 @@ pub struct WriteBufferConfig {
     /// Allow stalling writers when memory exceeded
     /// Default: true
     pub allow_stall: bool,
-    /// Maximum stall duration before forcing through
+    /// Maximum stall duration before rejecting the reservation
     /// Default: 1 second
     pub max_stall_duration: Duration,
     /// Check interval for memory pressure

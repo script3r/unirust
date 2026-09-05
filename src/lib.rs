@@ -1,25 +1,41 @@
 //! # Unirust
 //!
-//! A simple, fast entity resolution engine with temporal awareness.
+//! Temporal entity resolution with persistent storage and distributed shard/router services.
 //!
 //! ## Quick Start
 //!
-//! ```ignore
-//! use unirust::{Unirust, Ontology, Record};
+//! This example embeds a persistent engine in one process. The [`distributed`] module
+//! provides the shard/router services used for distributed deployments.
 //!
-//! // Create engine with ontology (matching rules)
-//! let ontology = Ontology::new();
-//! let mut engine = Unirust::new(ontology);
+//! ```no_run
+//! use unirust_rs::{
+//!     Descriptor, Interval, Ontology, PersistentStore, QueryDescriptor, Record,
+//!     RecordId, RecordIdentity, Unirust,
+//! };
+//! use unirust_rs::ontology::IdentityKey;
 //!
-//! // Ingest records - returns assignments and detected conflicts
-//! let result = engine.ingest(records)?;
-//! println!("Assigned {} records to {} clusters", result.assignments.len(), result.cluster_count);
+//! # fn main() -> anyhow::Result<()> {
+//! let mut ontology = Ontology::new();
+//! ontology.add_identity_key(IdentityKey::from_names(vec!["email"], "email"));
+//! let store = PersistentStore::open("unirust-data")?;
+//! let mut engine = Unirust::with_store(ontology, store);
 //!
-//! // Query master entities
-//! let matches = engine.query(&[QueryDescriptor { attr, value }], interval)?;
+//! // Descriptor IDs belong to this store's interner.
+//! let attr = engine.intern_attr("email");
+//! let value = engine.intern_value("alice@example.com");
+//! let interval = Interval::new(0, 10)?;
+//! let record = Record::new(
+//!     RecordId(0), // Request an automatically allocated record ID.
+//!     RecordIdentity::new("person".into(), "crm".into(), "alice".into()),
+//!     vec![Descriptor::new(attr, value, interval)],
+//! );
 //!
-//! // Export knowledge graph
-//! let graph = engine.graph()?;
+//! let result = engine.ingest(vec![record])?;
+//! assert_eq!(result.assignments.len(), 1);
+//! let outcome = engine.query(&[QueryDescriptor { attr, value }], interval)?;
+//! println!("{outcome:?}");
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## API Design
@@ -29,7 +45,7 @@
 //! - `query()` - Find master entities by attributes
 //! - `clusters()` - Get all cluster assignments
 //! - `graph()` - Export knowledge graph
-//! - `checkpoint()` - Persist state to disk
+//! - `checkpoint()` - Synchronize the current persistent store
 //! - `stats()` - Get metrics and statistics
 
 pub mod backup;
@@ -118,7 +134,8 @@ pub struct Stats {
     pub record_count: usize,
     /// Number of clusters
     pub cluster_count: usize,
-    /// Records linked per second (recent average)
+    /// Legacy field containing the current linker's cumulative records-linked count
+    /// as a float; this is not normalized by elapsed time and is not a rate.
     pub records_per_second: f64,
     /// Number of merges performed
     pub merges_performed: u64,
@@ -216,7 +233,8 @@ struct QueryCache {
 }
 
 impl Unirust {
-    /// Create a new Unirust instance
+    /// Create an in-memory engine. Use [`Self::with_store`] with [`PersistentStore`]
+    /// for durable storage.
     pub fn new(ontology: Ontology) -> Self {
         Self::with_store(ontology, Store::new())
     }
@@ -338,17 +356,11 @@ impl Unirust {
     /// Ingest records and return cluster assignments with detected conflicts.
     ///
     /// This is the primary method for adding data to the engine. It:
-    /// 1. Adds records to the store
-    /// 2. Links them into clusters based on identity keys
-    /// 3. Detects conflicts within clusters
+    /// 1. Stages new records
+    /// 2. Links them using identity keys and temporal guards
+    /// 3. Detects conflicts, then commits records and synchronizes the store
     ///
-    /// # Example
-    /// ```ignore
-    /// let result = engine.ingest(records)?;
-    /// for assignment in result.assignments {
-    ///     println!("Record {} -> Cluster {}", assignment.record_id.0, assignment.cluster_id.0);
-    /// }
-    /// ```
+    /// See the crate-level example for persistent ingestion.
     pub fn ingest(&mut self, records: Vec<Record>) -> anyhow::Result<IngestResult> {
         self.ingest_internal(records, false)
     }
@@ -425,8 +437,8 @@ impl Unirust {
                 .iter()
                 .filter_map(|(id, inserted)| inserted.then_some(*id))
                 .collect();
-            // In-memory stores can lend records directly. Persistent stores return
-            // owned records from their cache for the parallel extraction phase.
+            // Built-in stores lend staged records directly. Custom stores that
+            // cannot lend them use the owned-record fallback below.
             let records_to_link: Vec<&Record> = staged_info
                 .iter()
                 .filter(|(_, inserted)| *inserted)
@@ -577,9 +589,11 @@ impl Unirust {
         Ok(graph)
     }
 
-    /// Persist all state to disk (for persistent stores).
+    /// Synchronize staged records and the available linker-ID snapshot to the store.
     ///
-    /// This flushes the linker state and any staged records.
+    /// This does not create a backup directory or coordinate a distributed checkpoint.
+    /// Successful high-level ingestion already synchronizes its committed records.
+    /// Use [`Self::checkpoint_linker_state`] to also flush the persistent DSU buffers.
     pub fn checkpoint(&mut self) -> anyhow::Result<()> {
         // Flush linker state if available
         if let Some(streaming) = &self.streaming {
@@ -594,15 +608,20 @@ impl Unirust {
         Ok(())
     }
 
-    /// Create a durable checkpoint at a specific path (advanced).
+    /// Create a store-level checkpoint of already-written state at a specific path.
     ///
-    /// For most cases, use `checkpoint()` instead.
+    /// This delegates to the storage backend without flushing staged records or
+    /// linker buffers. Distributed backups require the coordinated cluster checkpoint
+    /// protocol; a single store checkpoint does not capture the other shards or WALs.
     #[doc(hidden)]
     pub fn checkpoint_to_path(&self, path: &std::path::Path) -> anyhow::Result<()> {
         self.store.checkpoint(path)
     }
 
-    /// Get engine statistics and metrics.
+    /// Get store size and metrics from the current in-process linker.
+    ///
+    /// Linker counters include recovery replay work and reset when the linker is
+    /// rebuilt. Cluster count and linker counters are zero before initialization.
     pub fn stats(&self) -> Stats {
         let mut stats = Stats {
             record_count: self.store.len(),
@@ -620,7 +639,7 @@ impl Unirust {
             stats.conflicts_detected = snapshot.conflicts_detected;
             stats.hot_key_exits = snapshot.hot_key_exits;
             stats.records_per_second = if snapshot.records_linked > 0 {
-                snapshot.records_linked as f64 // Approximation
+                snapshot.records_linked as f64 // Legacy field reports a count, not a rate.
             } else {
                 0.0
             };
@@ -837,9 +856,9 @@ impl Unirust {
 
     /// Stream records and return the cluster assignment for each record.
     ///
-    /// Uses parallel extraction for batches >= 100 records, providing 20-40% better
-    /// scaling behavior at large dataset sizes. Falls back to sequential processing
-    /// for smaller batches where parallelism overhead isn't worth it.
+    /// Uses parallel key extraction when at least 100 records are newly inserted,
+    /// followed by sequential linking with temporal guards. Smaller batches use
+    /// sequential extraction and linking.
     pub fn stream_records(
         &mut self,
         records: Vec<Record>,
@@ -876,8 +895,8 @@ impl Unirust {
                 .iter()
                 .filter_map(|(id, inserted)| inserted.then_some(*id))
                 .collect();
-            // In-memory stores can lend records directly. Persistent stores return
-            // owned records from their cache for the parallel extraction phase.
+            // Built-in stores lend staged records directly. Custom stores that
+            // cannot lend them use the owned-record fallback below.
             let records_to_link: Vec<&Record> = staged_info
                 .iter()
                 .filter(|(_, inserted)| *inserted)
@@ -1618,8 +1637,8 @@ impl Unirust {
     }
 
     /// Apply a cross-shard cluster merge.
-    /// Records that records in `secondary` cluster should now be considered part of `primary`.
-    /// Returns the number of affected records.
+    /// Record that the `secondary` cluster should now be considered part of `primary`.
+    /// Returns the number of local global-ID mappings updated, not the member count.
     pub fn apply_cross_shard_merge(
         &mut self,
         primary: GlobalClusterId,
@@ -1742,9 +1761,11 @@ impl Unirust {
         self.streaming.as_ref().map(|s| s.next_cluster_id())
     }
 
-    /// Flush linker state to persistent storage.
-    /// This saves cluster_ids, global_cluster_ids, and next_cluster_id.
-    /// Call this periodically or before shutdown for restart recovery.
+    /// Write a snapshot of local/global cluster-ID mappings and the next local ID.
+    ///
+    /// This does not synchronize the store by itself. Normal recovery rebuilds the
+    /// linker from committed records; this optional snapshot supports explicit ID-map
+    /// restoration with [`Self::restore_linker_state`].
     /// Returns an error if streaming is not initialized or persistence is not available.
     pub fn flush_linker_state(&self) -> anyhow::Result<()> {
         let streaming = self.streaming.as_ref().ok_or_else(|| {
@@ -1760,8 +1781,10 @@ impl Unirust {
         streaming.flush_state(&persistence)
     }
 
-    /// Restore linker state from persistent storage.
-    /// Call this after enable_streaming() to recover cluster ID mappings.
+    /// Restore saved cluster-ID mappings after [`Self::initialize_streaming`].
+    ///
+    /// Normal initialization already rebuilds resolution state from committed records.
+    /// This additionally loads mappings saved by [`Self::flush_linker_state`].
     /// Returns the number of cluster_ids restored, or an error if persistence is not available.
     pub fn restore_linker_state(&mut self) -> anyhow::Result<usize> {
         // Restored IDs can differ from record-scan allocation order, including
@@ -1780,9 +1803,10 @@ impl Unirust {
         streaming.restore_state(&persistence)
     }
 
-    /// Flush all linker state and sync to disk.
-    /// This is a convenience method that flushes linker state and ensures
-    /// all data is synced to disk. Call before shutdown for complete recovery.
+    /// Initialize the linker, flush its DSU buffers and ID-map snapshot, then
+    /// commit staged records and synchronize the persistent store.
+    ///
+    /// This synchronizes the current database; it does not create a separate backup.
     pub fn checkpoint_linker_state(&mut self) -> anyhow::Result<()> {
         self.initialize_streaming()?;
         let db = self
@@ -1808,10 +1832,10 @@ impl Unirust {
         Ok(())
     }
 
-    /// Flush the bounded amount of dirty state required for graceful process exit.
+    /// Flush dirty DSU state and staged records, then synchronize the store for exit.
     ///
     /// Full linker-map snapshots grow with total record count and are not needed by
-    /// the authoritative record-scan recovery path.
+    /// the authoritative record-scan recovery path. Work depends on pending dirty state.
     #[doc(hidden)]
     pub fn checkpoint_for_shutdown(&mut self) -> anyhow::Result<()> {
         self.initialize_streaming()?;

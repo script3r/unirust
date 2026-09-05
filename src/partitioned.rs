@@ -1,24 +1,25 @@
 //! # Partitioned Processing Module
 //!
-//! Implements partition-local processing to eliminate lock contention.
-//! Each partition owns its data exclusively - no locks needed within a partition.
+//! In-memory partition-local processing. The parallel wrapper locks each partition
+//! during its batch, allowing independent partitions to run concurrently. Persistent
+//! shard services use a separate durable engine path, not these in-memory stores.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────┐
-//! │            Router (Consistent Hash)     │
+//! │            Partition Hash Dispatch     │
 //! └─────────────────────────────────────────┘
 //!           │         │         │
 //! ┌─────────┴─────────┴─────────┴─────────┐
 //! ▼                   ▼                   ▼
 //! Partition 0         Partition 1         Partition N
-//! (exclusive)         (exclusive)         (exclusive)
+//! (batch lock)        (batch lock)        (batch lock)
 //! └───────────────────┴───────────────────┘
 //!                     │
 //!           ┌─────────▼─────────┐
 //!           │  Merge Coordinator │
-//!           │  (async channel)   │
+//!           │ (bounded channel) │
 //!           └───────────────────┘
 //! ```
 
@@ -285,7 +286,8 @@ impl Partition {
     }
 
     /// Optimized batch processing with parallel extraction.
-    /// Uses link_records_batch_parallel for 3x throughput improvement.
+    /// Uses `link_records_batch_parallel` for parallel extraction and ordered,
+    /// temporally guarded linking. Throughput depends on the workload.
     ///
     /// Phase 1: Batch add all records to store
     /// Phase 2: Parallel extraction of key values and summaries
@@ -584,9 +586,9 @@ pub struct PartitionedUnirust {
     total_records: AtomicU64,
 }
 
-/// Thread-safe partitioned Unirust with per-partition locks for TRUE parallel processing
+/// In-memory engine with parallel batch dispatch and per-partition locks.
 pub struct ParallelPartitionedUnirust {
-    /// Each partition has its own Mutex - no global lock contention!
+    /// Each partition has its own mutex; work routed to that partition is serialized.
     partitions: Vec<parking_lot::Mutex<Partition>>,
     /// Configuration
     config: PartitionConfig,
@@ -710,9 +712,8 @@ impl PartitionedUnirust {
         // Phase 1: Partition records by primary key
         let partitioned = self.partition_records(records);
 
-        // Phase 2: Process each partition in parallel
-        // This is where we get the speedup - each partition processes independently
-        // We need to use indices because we can't parallelize over &mut references directly
+        // Phase 2: This wrapper processes partitions sequentially.
+        // ParallelPartitionedUnirust provides concurrent partition dispatch.
         let ontology = &self.ontology;
 
         // Collect results from each partition
@@ -812,12 +813,7 @@ impl PartitionedUnirust {
     }
 }
 
-/// Wrapper that provides lock-free access to PartitionedUnirust
-/// using interior mutability via UnsafeCell
-///
-/// SAFETY: This is safe because:
-/// 1. Each partition is only accessed by one thread at a time (partitioning ensures this)
-/// 2. Cross-partition communication uses thread-safe channels
+/// Synchronize access to [`PartitionedUnirust`] using a reader/writer lock.
 pub struct PartitionedUnirustHandle {
     inner: parking_lot::RwLock<PartitionedUnirust>,
 }
@@ -829,7 +825,7 @@ impl PartitionedUnirustHandle {
         }
     }
 
-    /// Ingest a batch with write lock (still faster than single-instance due to partitioning)
+    /// Ingest a batch while holding the wrapper's write lock.
     pub fn ingest_batch(&self, records: Vec<(u32, Record)>) -> Vec<PartitionIngestResult> {
         self.inner.write().ingest_batch(records)
     }
@@ -999,8 +995,8 @@ impl ParallelPartitionedUnirust {
         }
     }
 
-    /// Ingest a batch of records using TRUE parallel partition processing.
-    /// Each partition is processed independently with its own lock - no global contention!
+    /// Dispatch a batch across partitions using Rayon.
+    /// Each nonempty partition is processed under its own mutex.
     #[instrument(skip(self, records), level = "debug")]
     pub fn ingest_batch(&self, records: Vec<(u32, Record)>) -> Result<Vec<PartitionIngestResult>> {
         if records.is_empty() {
@@ -1015,7 +1011,7 @@ impl ParallelPartitionedUnirust {
         let partitioned = self.partition_records(records);
 
         // Phase 2: Process ALL partitions in PARALLEL using rayon
-        // Each partition has its own Mutex, so no global lock contention!
+        // Independent partitions can run concurrently; each mutex serializes its batch.
         let ontology = &self.ontology;
 
         let all_results: Result<Vec<Vec<PartitionIngestResult>>> = partitioned

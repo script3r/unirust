@@ -1,14 +1,14 @@
 //! # Concurrent Interner
 //!
-//! Thread-safe string interning using DashMap for lock-free concurrent access.
-//! Eliminates the need for write locks in the hot path.
+//! Thread-safe string interning using DashMap's sharded locks and atomic ID counters.
+//! Operations can contend on a map shard; there is no single lock around the interner.
 
 use crate::model::{AttrId, InternerLookup, ValueId};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Thread-safe concurrent interner for attributes and values.
-/// Uses DashMap for lock-free concurrent access.
+/// Uses DashMap's shard-level synchronization for concurrent access.
 pub struct ConcurrentInterner {
     /// Attribute string to ID mapping
     attr_to_id: DashMap<String, AttrId>,
@@ -38,7 +38,7 @@ impl ConcurrentInterner {
     }
 
     /// Intern an attribute string, returning its ID.
-    /// Thread-safe and lock-free.
+    /// Thread-safe; may acquire a DashMap shard lock.
     #[inline]
     pub fn intern_attr(&self, attr: &str) -> AttrId {
         // Fast path: check if already interned
@@ -61,7 +61,7 @@ impl ConcurrentInterner {
     }
 
     /// Intern a value string, returning its ID.
-    /// Thread-safe and lock-free.
+    /// Thread-safe; may acquire a DashMap shard lock.
     #[inline]
     pub fn intern_value(&self, value: &str) -> ValueId {
         // Fast path: check if already interned

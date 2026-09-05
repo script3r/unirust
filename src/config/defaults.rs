@@ -134,7 +134,7 @@ pub const DEFAULT_WAL_COALESCE_RECORDS: usize = 5000;
 pub const DEFAULT_WAL_CHANNEL_CAPACITY: usize = 5000;
 
 // =============================================================================
-// Linker State Cache Defaults (for billion-scale)
+// Reserved Linker State Cache Defaults (limits are not currently enforced)
 // =============================================================================
 
 /// Default cluster IDs cache capacity

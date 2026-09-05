@@ -856,20 +856,22 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Configuration for tiered index storage
+/// Configuration for bucket caches. Entry capacities do not bound bucket size,
+/// metadata maps, or total engine memory. Without RocksDB, overflow is retained
+/// rather than evicted when both resident tiers fill.
 #[derive(Debug, Clone)]
 pub struct TierConfig {
-    /// Maximum entries in hot tier (default: 100K keys, ~2GB)
+    /// Hot-key count that triggers demotion (default: 100K keys).
     pub hot_tier_capacity: usize,
-    /// Maximum entries in warm tier (default: 100K keys, ~2GB)
+    /// Warm LRU entry capacity (default: 100K keys).
     pub warm_tier_capacity: usize,
-    /// Score threshold for hot tier (default: 0.5)
+    /// Reserved hot-score threshold; current capacity-driven demotion does not use it.
     pub hot_threshold: f64,
-    /// Score threshold for warm tier (default: 0.2)
+    /// Reserved warm-score threshold; current capacity-driven demotion does not use it.
     pub warm_threshold: f64,
-    /// Maximum cardinality before forcing cold storage (default: 10K)
+    /// Cardinality input to the demotion score (default: 10K); not a hard bucket cap.
     pub max_hot_cardinality: u32,
-    /// Interval between tier management runs (seconds)
+    /// Reserved interval; current tier management runs when hot capacity is exceeded.
     pub tier_management_interval_secs: u64,
 }
 
@@ -887,7 +889,7 @@ impl Default for TierConfig {
 }
 
 impl TierConfig {
-    /// Memory-optimized configuration (~500MB total)
+    /// Smaller hot/warm entry capacities; total bytes depend on bucket contents.
     pub fn memory_saver() -> Self {
         Self {
             hot_tier_capacity: 20_000,
@@ -899,7 +901,7 @@ impl TierConfig {
         }
     }
 
-    /// High-performance configuration (~8GB total)
+    /// Larger hot/warm entry capacities and a higher cardinality scoring threshold.
     pub fn high_performance() -> Self {
         Self {
             hot_tier_capacity: 500_000,
@@ -1018,7 +1020,7 @@ impl CompactBucket {
 
 /// Tiered identity key index with hot/warm/cold storage
 pub struct TieredIdentityKeyIndex {
-    /// Hot tier: Full KeyBucket with IntervalTree for O(log n) queries
+    /// Hot tier: full KeyBucket with sorted interval indexes and overlap scans.
     hot: HashMap<IdentityIndexKey, KeyBucket>,
     /// Access statistics for hot tier keys
     hot_stats: HashMap<IdentityIndexKey, KeyAccessStats>,
@@ -1459,7 +1461,7 @@ pub struct TieredIndexStats {
 pub enum IndexBackend {
     /// In-memory index for smaller datasets
     InMemory(IdentityKeyIndex),
-    /// Tiered index with hot/warm/cold tiers for billion-scale
+    /// Hot/warm caches with RocksDB-backed cold buckets; metadata remains in memory.
     Tiered(Box<TieredIdentityKeyIndex>),
 }
 

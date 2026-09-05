@@ -1,12 +1,8 @@
 //! # Lock-Free Atomic DSU (Disjoint Set Union)
 //!
-//! High-performance union-find implementation using only atomic operations.
-//! No locks required - all operations use CAS (Compare-And-Swap).
-//!
-//! ## Performance Characteristics
-//! - find(): O(α(n)) amortized with path compression
-//! - union(): O(α(n)) amortized with union-by-rank
-//! - No lock contention under high concurrency
+//! Union-find using atomic parent/rank storage, compare-and-swap merges, and
+//! best-effort path compression. Contended updates can retry. This standalone
+//! utility does not implement the temporal guards required by the entity linker.
 //!
 //! ## Safety
 //! Uses atomic operations with appropriate memory ordering:
@@ -16,7 +12,7 @@
 use crate::model::RecordId;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
-/// Maximum number of records supported (configurable at compile time)
+/// Default number of slots; callers can supply a different capacity.
 const MAX_RECORDS: usize = 16_777_216; // 16M records per partition
 
 /// Lock-free DSU with atomic parent pointers

@@ -1,3 +1,5 @@
+# September 2026 correctness and performance audit
+
 Audit and repairs based on merged commit `3d99fe0d27d7344b08b3bd5b23bb05c75479f1bd`, September 5, 2026.
 
 Three parallel reviews covered entity resolution, persistence/recovery, and distributed correctness. All eight original defects were reproduced with persistent storage and have enabled regression coverage. Every accepted record still completes entity resolution before its record data commits.
@@ -46,7 +48,7 @@ The comparative ingest run used five persistent shards with the high-throughput 
 
 Ingest throughput was effectively unchanged in this single comparison; the small throughput and latency differences do not establish a statistically significant change. This workload measures durable ingest, not a universal cross-shard query or reconciliation latency. The selective-query improvement is measured separately above.
 
-CI now passes the Rust 1.98 lints that failed on main (`chunks_exact_to_as_chunks` and `manual_slice_fill`). PR validation explicitly installs native build dependencies and verifies the release package. Release publishing depends on the reusable complete CI workflow, including MSRV, tests, lint, manifests, and production image, and rejects tags that do not match the package version. Workflow syntax is checked with actionlint.
+CI now passes the Rust 1.98 lints that failed on main (`chunks_exact_to_as_chunks` and `manual_slice_fill`). PR validation explicitly installs native build dependencies and verifies the release package. Release publishing depends on the reusable complete CI workflow, including MSRV, tests, lint, manifests, and production image, and rejects tags that do not match the package version. Workflow syntax was checked locally with actionlint; the CI manifest step checks shell syntax and the Compose configuration.
 
 Validation commands:
 
@@ -59,4 +61,26 @@ cargo package --locked
 cargo test --release --test audit_performance -- --ignored --nocapture
 ```
 
-The correctness suites run by default. Only the manual timing diagnostic is ignored; it has no machine-dependent timing assertion. Distributed benchmarks now include persistent shard ingestion rather than treating the in-memory partition path as evidence of production throughput.
+The correctness suites run by default. Of the audit regression tests, only the manual timing diagnostic is ignored; it has no machine-dependent timing assertion. Distributed benchmarks now include persistent shard ingestion rather than treating the in-memory partition path as evidence of production throughput.
+
+
+## Release and measurement provenance
+
+The repairs shipped in v0.2.0 at commit
+`5899e3984e73d28f4dc28e0cd84282cfa0501ffa`. The tables above record local
+single-run audit diagnostics, not a controlled hardware benchmark or a claim
+that every measurement used the final immutable release artifact. The ingest
+comparison preceded the final query/recovery refinements. A final runtime-head
+query rerun measured first/warm/after-insert times of 0.057/0.006/0.018 ms at
+5,000 records, 0.028/0.006/0.009 ms at 20,000 records and 0.027/0.005/0.008 ms
+at 80,000 records. These samples support the removal of the selective query's
+full-record scan; they do not establish microsecond latency guarantees.
+
+Both benchmark clusters used local persistent storage. Synchronous WAL flushing
+was enabled, but neither the benchmark nor process-crash regressions constitute
+a physical power-cut test. Stable-storage guarantees depend on the operating
+system and storage honoring synchronization requests.
+
+The release passed CI and package publication. The subsequent CI-only commit
+`682477f` authenticated protoc downloads after a GitHub API rate limit during
+release validation; it is not part of the v0.2.0 crate artifact.

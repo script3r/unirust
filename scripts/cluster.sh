@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Local persistent cluster helper. BACKUP_DIR is a separate path, which may still
+# share the data directory's physical disk. Reset removes DATA_DIR, not BACKUP_DIR.
+# Automatic checkpoint retries reuse prepared snapshots; quiesce writers across
+# the complete attempt/retry sequence when a common capture point is required.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +42,7 @@ Environment:
     Default: $ROOT_DIR/examples/loadtest-ontology.json
   CONFIG_VERSION=optional-version-string
   CHECKPOINT_INTERVAL_SECS=0  Automatic coordinated checkpoint interval (0 disables)
-  PROFILE=balanced|low-latency|high-throughput|bulk-ingest|memory-saver|billion-scale
+  PROFILE=balanced|low-latency|high-throughput|bulk-ingest|memory-saver|billion-scale|billion-scale-high-performance
   REPAIR=0|1
   CARGO_FEATURES=comma-separated-cargo-features
   SHARD_WAIT_SECS=10

@@ -1,7 +1,8 @@
-//! Lock-free ingest queue for high-throughput throughput
+//! Bounded ingest-job queue and batch aggregation utilities.
 //!
-//! Replaces RwLock contention with bounded lock-free MPSC queue.
-//! Single aggregator thread processes batches with exclusive access.
+//! Uses a lock-free ArrayQueue, which supports multiple producers and consumers.
+//! A caller can use a single aggregator to collect jobs for exclusive processing.
+//! Queue capacity bounds jobs, not the records or bytes retained by each job.
 
 use crossbeam_queue::ArrayQueue;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,10 +13,11 @@ use tokio::sync::oneshot;
 /// Capacity for the lock-free ingest queue
 pub const QUEUE_CAPACITY: usize = 10_000;
 
-/// Maximum records per aggregated batch
+/// Record-count threshold at which an aggregator requests a flush.
+/// Whole jobs can exceed this threshold; it is not a hard batch-size limit.
 pub const MAX_BATCH_SIZE: usize = 5000;
 
-/// Maximum wait time before flushing partial batch
+/// Elapsed-time threshold checked by the aggregator; callers drive polling/flushing.
 pub const MAX_BATCH_WAIT: Duration = Duration::from_micros(2000);
 
 /// A job submitted to the ingest queue

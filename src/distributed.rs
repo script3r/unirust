@@ -1051,14 +1051,13 @@ fn boundary_index_from_metadata(
 #[derive(Clone)]
 pub struct ShardNode {
     shard_id: u32,
-    /// Uses parking_lot RwLock (faster for short critical sections than tokio's async RwLock)
+    /// Reader/writer lock protecting the main shard engine.
     unirust: Arc<parking_lot::RwLock<Unirust>>,
-    /// Partitioned Unirust for high-throughput parallel processing (optional)
-    /// Uses per-partition locks for TRUE parallel processing - no global lock!
-    /// Wrapped in RwLock to allow rebuilding when ontology changes
-    /// Inner Arc allows cloning for use across await points
+    /// Optional in-memory partition processor; persistent shards use the main engine.
+    /// A publication lock permits ontology replacement, while partition mutexes
+    /// serialize work within each partition. The inner Arc can span await points.
     partitioned: Arc<parking_lot::RwLock<Option<Arc<ParallelPartitionedUnirust>>>>,
-    /// Concurrent interner for lock-free record building
+    /// Interner with sharded locking for concurrent in-memory record building.
     concurrent_interner: Arc<ConcurrentInterner>,
     tuning: StreamingTuning,
     ontology_config: Arc<Mutex<DistributedOntologyConfig>>,
@@ -1095,8 +1094,8 @@ const RECONCILIATION_KEY_CHUNK: usize = 10_000;
 const MERGE_APPLICATION_CHUNK: usize = 50_000;
 const CONFLICT_APPLICATION_CHUNK: usize = 10_000;
 
-/// Check if partitioned processing is enabled (default: true)
-/// Set UNIRUST_PARTITIONED=0 to disable
+/// Check whether in-memory partition processing is requested (default: true).
+/// Set UNIRUST_PARTITIONED=0 to disable. Persistent shards do not use this path.
 fn is_partitioned_enabled() -> bool {
     std::env::var("UNIRUST_PARTITIONED")
         .map(|v| v != "0" && v.to_lowercase() != "false")
@@ -1414,8 +1413,7 @@ impl ShardNode {
             let recovered_cross_shard_conflicts = unirust.load_cross_shard_conflicts()?;
             let unirust = Arc::new(parking_lot::RwLock::new(unirust));
 
-            // Create partitioned processor if enabled - no RwLock needed!
-            // ParallelPartitionedUnirust has per-partition Mutexes for true parallelism
+            // The optional in-memory processor locks each partition during its batch.
             let partitioned = if use_partitioned {
                 let partition_config = PartitionConfig::for_cores(num_partitions);
                 let partitioned_unirust = ParallelPartitionedUnirust::new_with_interner(
@@ -1481,8 +1479,7 @@ impl ShardNode {
             tuning.clone(),
         )));
 
-        // Create partitioned processor if enabled - no RwLock needed!
-        // ParallelPartitionedUnirust has per-partition Mutexes for true parallelism
+        // The optional in-memory processor locks each partition during its batch.
         let partitioned = if use_partitioned {
             let partition_config = PartitionConfig::for_cores(num_partitions);
             let partitioned_unirust = ParallelPartitionedUnirust::new_with_interner(
@@ -2226,7 +2223,7 @@ fn ingest_worker_index(record: &proto::RecordInput, worker_count: usize) -> usiz
     (hasher.finish() as usize) % worker_count
 }
 
-/// Spawn ingest workers using parking_lot::RwLock for faster locking.
+/// Spawn ingest workers that acquire the main engine's write lock for each batch.
 fn spawn_ingest_workers(
     unirust: Arc<parking_lot::RwLock<Unirust>>,
     shard_id: u32,
@@ -2291,7 +2288,8 @@ async fn dispatch_ingest_records(
 }
 
 /// Compute partition ID for a record using the interner and ontology's identity keys.
-/// This ensures records with the same identity key values end up in the same partition.
+/// Hashes values for the first identity key in descriptor order, or falls back to UID.
+/// This routing heuristic does not guarantee colocation for every matching key.
 fn compute_partition_id_for_record(
     record: &Record,
     ontology: &crate::Ontology,
@@ -2338,13 +2336,9 @@ fn compute_partition_id_for_record(
     (hasher.finish() as usize) % partition_count
 }
 
-/// Dispatch records using the partitioned architecture for maximum throughput.
-/// This bypasses the worker queue entirely and processes partitions in parallel.
-///
-/// Performance architecture:
-/// High-performance dispatch with REAL entity resolution.
-/// Uses parallel partitioned processing for maximum throughput while
-/// maintaining full entity resolution correctness.
+/// Dispatch in-memory records directly to partition processing, bypassing the main
+/// engine's worker queue. Partitions run concurrently with per-partition locks,
+/// and every record still goes through the partition linker's entity resolution.
 async fn dispatch_ingest_partitioned(
     partitioned: &Arc<ParallelPartitionedUnirust>,
     interner: &Arc<ConcurrentInterner>,
@@ -2430,8 +2424,7 @@ fn process_ingest_batch(
         indices.push(record.index);
     }
 
-    // Fast path: stream_records skips graph updates and conflict detection
-    // This is 10x+ faster than stream_records_update_graph
+    // Resolve every record without materializing graph exports or conflict summaries.
     let cluster_assignments = unirust
         .stream_records(record_inputs)
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -6545,7 +6538,7 @@ impl proto::router_service_server::RouterService for RouterNode {
     }
 }
 
-/// RouterService implementation for Arc<RouterNode> to allow use with gRPC server
+/// RouterService implementation for `Arc<RouterNode>` to allow use with gRPC server.
 /// while returning Arc from connect methods for background task spawning.
 #[tonic::async_trait]
 impl proto::router_service_server::RouterService for Arc<RouterNode> {

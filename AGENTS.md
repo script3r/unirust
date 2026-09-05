@@ -10,10 +10,12 @@ Unirust is a distributed temporal entity resolution engine. The primary function
 
 ### Entity Resolution Must Always Happen
 
-Every ingested record MUST go through entity resolution. Never skip or bypass:
-- `linker.link_records_batch_parallel()` - batch links with parallel extraction
-- `partitioned.process_batch_optimized()` - optimized partition processing
-- `partitioned.ingest_batch()` - distributed batch processing
+Every newly accepted record MUST complete entity resolution before its record data
+commits. Valid retries of an already resolved source identity remain idempotent.
+Preserve the linker calls in every ingest path, including:
+- `Unirust::stream_records()` — persistent shard ingestion
+- `StreamingLinker::link_records_batch_parallel_with_interner()` — parallel extraction and sequential linking
+- `Partition::process_batch_optimized()` — the separate in-memory partition path
 
 Any optimization that skips entity resolution is incorrect and breaks the core value proposition.
 
@@ -53,17 +55,23 @@ src/
 
 ## Key Entry Points
 
-### Ingest Flow
-1. `distributed.rs:ShardNode::ingest_records()` - gRPC entry
-2. `distributed.rs:dispatch_ingest_partitioned()` - routes to partitioned processing
-3. `partitioned.rs:ParallelPartitionedUnirust::ingest_batch_with_partitions()` - parallel partition dispatch
-4. `partitioned.rs:Partition::process_batch_optimized()` - **hot path**: batch insert → parallel extract → sequential link
-5. `linker.rs:link_records_batch_parallel()` - parallel key extraction, sequential DSU merges
+### Persistent Ingest Flow
+1. `distributed.rs:RouterService::ingest_records()` — placement and source-identity reservations
+2. `distributed.rs:ShardNode::ingest_records()` — shard RPC and ingest WAL
+3. `distributed.rs:dispatch_ingest_records()` — worker dispatch
+4. `lib.rs:Unirust::stream_records()` — stage records, link, commit and flush
+5. `linker.rs:StreamingLinker` — key extraction, temporal guards and DSU merges
+
+Persistent shards disable partitioned ingestion. `dispatch_ingest_partitioned()`
+and `ParallelPartitionedUnirust` use in-memory partition stores and must never
+replace the persistent path.
 
 ### Query Flow
-1. `distributed.rs:RouterService::query_entities()` - gRPC entry
-2. `lib.rs:Unirust::query_master_entities()` - query execution
-3. `query.rs` - query planning and execution
+1. `distributed.rs:RouterService::query_entities()` — concurrent candidate discovery and canonical fragment hydration
+2. `lib.rs:Unirust::query_master_entities()` — local candidates and golden descriptors
+3. `query.rs` and `graph.rs` — temporal conjunction and mastering
+
+See [DESIGN.md](DESIGN.md) for recovery, reconciliation and matching limits.
 
 ## Testing Strategy
 
@@ -78,19 +86,31 @@ src/
 - Test distributed scenarios (router + shards)
 
 ### Load Testing
-- Use `unirust_loadtest` binary
-- Standard command: `./target/release/unirust_loadtest -r http://127.0.0.1:50060 -c 10000000 --streams 16 --batch 5000`
-- Baseline with 5 shards, 10% overlap: **~410K rec/sec, ~12ms batch latency**
+
+Build the load generator explicitly with `--features test-support` (see below).
+Use fresh persistent directories and a fixed ontology, topology, seed and workload
+for comparisons. Do not change the shard count of an existing dataset to run a
+benchmark; durable reservations bind it to its topology.
 
 ## Performance Considerations
 
 ### Do Not Regress
-After any change, verify performance with loadtest. Current baseline with 5 shards:
-- **~410K records/second** (10% overlap)
-- **~12ms batch latency**
+
+For runtime changes, compare persistent load tests before and after the change,
+including acknowledgement counts, failures, throughput and measured RPC latency.
+Use focused diagnostics for query or recovery changes. Documentation-only edits
+require checking their examples and claims rather than repeating throughput runs.
+
+The September audit measured approximately 43,415 versus 43,939 records/second
+on one local five-shard, one-million-record comparison (10% overlap); average RPC
+latency was approximately 1,585 versus 1,657 ms. These are observations, not
+performance guarantees. The old 410K records/second and 12 ms figures do not
+establish a durable production baseline. Workload details and limitations are in
+[the audit report](docs/critical-audit-2026-09-05.md).
 
 ### Hot Paths
-- `partitioned.rs:process_batch_optimized()` - batch insert + parallel extract + sequential link
+- `lib.rs:stream_records()` - persistent staging, resolution and commit
+- `partitioned.rs:process_batch_optimized()` - separate in-memory partition processing
 - `linker.rs:link_records_batch_parallel()` - parallel extraction, sequential DSU
 - `linker.rs:link_extracted_record()` - DSU merges with temporal guards
 - `dsu.rs:find()` - path compression with root cache
@@ -126,15 +146,17 @@ After any change, verify performance with loadtest. Current baseline with 5 shar
 
 ```bash
 # Development
-cargo test                          # Run all tests
-cargo clippy --all-targets          # Lint
-cargo fmt                           # Format
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo fmt --check
+cargo test --doc --locked --all-features
 
 # Benchmarks
-cargo bench --bench bench_quick     # Fast (~30s)
+cargo bench --bench bench_quick     # Focused benchmark suite
 cargo bench --bench bench_micro     # Component benchmarks
 
-# Start cluster (recommended)
+# Build the load generator; run the cluster on a fresh benchmark dataset
+cargo build --release --locked --features test-support --bin unirust_loadtest
 SHARDS=5 ./scripts/cluster.sh start
 
 # Load test (requires running cluster)
@@ -142,7 +164,7 @@ SHARDS=5 ./scripts/cluster.sh start
   --router http://127.0.0.1:50060 \
   --count 10000000 \
   --streams 16 \
-  --batch 5000
+  --batch 5000 --overlap 0.1 --seed 42
 
 # Stop cluster
 ./scripts/cluster.sh stop
@@ -150,7 +172,7 @@ SHARDS=5 ./scripts/cluster.sh start
 
 ## Style Guidelines
 
-- Use `Result<T, UniError>` for fallible operations
+- Follow existing error types: `anyhow::Result` for library operations and `tonic::Status` at gRPC boundaries
 - Prefer `&str` over `String` for parameters
 - Use `#[inline]` for small hot functions
 - Avoid `unwrap()` in library code

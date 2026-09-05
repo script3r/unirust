@@ -7,9 +7,10 @@ use crate::temporal::Interval;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-// use string_interner::{DefaultBackend, StringInterner as ExternalStringInterner};
 
-/// Compact identifier for records
+/// Compact record identifier, local to a store/shard.
+/// Normal ingestion treats zero as an allocation request; explicit snapshot restore
+/// can preserve zero. `u32::MAX` is reserved and cannot identify an ingested record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RecordId(pub u32);
 
@@ -31,20 +32,20 @@ impl fmt::Display for ClusterId {
 
 /// Global cluster identifier for distributed entity resolution.
 ///
-/// Encodes shard ownership, local cluster ID, and merge version in a single 64-bit value.
+/// Encodes an originating shard, local numeric component, and version in 64 bits.
 /// Format: `(shard_id << 48) | (version << 32) | local_id`
 ///
-/// This enables:
-/// - Tracking which shard owns a cluster
-/// - Detecting stale references after cross-shard merges
-/// - Efficient comparison and hashing
+/// Current distributed IDs use the minimum durable record ID in the local cluster
+/// as their local component, independent of allocation-order [`ClusterId`] values.
+/// Cross-shard merges are represented by durable redirects to a canonical global ID;
+/// callers must resolve redirects rather than infer freshness from the version field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GlobalClusterId {
-    /// The shard that owns this cluster
+    /// The originating shard of this ID; redirects can point to a different shard.
     pub shard_id: u16,
-    /// Local cluster ID within the shard
+    /// Local numeric component; current distributed IDs use a durable record anchor.
     pub local_id: u32,
-    /// Merge version (incremented on cross-shard merges)
+    /// Encoded version component; cross-shard merges do not automatically increment it.
     pub version: u16,
 }
 
@@ -58,7 +59,8 @@ impl GlobalClusterId {
         }
     }
 
-    /// Create from a local cluster ID on a specific shard
+    /// Copy a local cluster ID into the numeric component with version zero.
+    /// This conversion does not establish the durable record anchor used by the linker.
     pub fn from_local(shard_id: u16, local_id: ClusterId) -> Self {
         Self {
             shard_id,
@@ -92,12 +94,14 @@ impl GlobalClusterId {
         Self::from_u64(u64::from_be_bytes(bytes))
     }
 
-    /// Get the local cluster ID
+    /// Reinterpret the numeric local component as a [`ClusterId`].
+    /// For current distributed IDs this component is a record anchor, so it need
+    /// not identify the corresponding cluster in an in-process linker.
     pub fn local_cluster_id(&self) -> ClusterId {
         ClusterId(self.local_id)
     }
 
-    /// Create a new version of this cluster (after a merge)
+    /// Copy this ID with the supplied version; does not perform a merge or redirect.
     pub fn with_new_version(&self, new_version: u16) -> Self {
         Self {
             shard_id: self.shard_id,
@@ -106,7 +110,7 @@ impl GlobalClusterId {
         }
     }
 
-    /// Create with a new owner shard (for cross-shard merge)
+    /// Copy this ID with the supplied shard and version; does not move cluster data.
     pub fn with_new_owner(&self, new_shard_id: u16, new_version: u16) -> Self {
         Self {
             shard_id: new_shard_id,
@@ -139,7 +143,8 @@ impl From<u64> for GlobalClusterId {
     }
 }
 
-/// Compact identifier for attributes
+/// Compact attribute identifier belonging to one store's interner.
+/// Exchange attribute strings, not these IDs, between independently interned stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AttrId(pub u32);
 
@@ -149,7 +154,8 @@ impl fmt::Display for AttrId {
     }
 }
 
-/// Compact identifier for values
+/// Compact value identifier belonging to one store's interner.
+/// Exchange value strings, not these IDs, between independently interned stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub u32);
 

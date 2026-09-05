@@ -1,27 +1,19 @@
 //! # LZ4 Compression Module
 //!
-//! High-speed compression for records and WAL entries.
+//! LZ4 block compression helpers with a four-byte uncompressed-size prefix.
 //!
-//! From Bigtable paper (Section 6): "Many clients use a two-pass custom
-//! compression scheme. The first pass uses Bentley and McIlroy's scheme,
-//! which compresses long common strings across a large window. The second
-//! pass uses a fast compression algorithm that looks for repetitions in
-//! a small 16 KB window of the data."
-//!
-//! LZ4 provides similar characteristics:
-//! - Encode speed: 780+ MB/s
-//! - Decode speed: 4970+ MB/s
-//! - Compression ratio: ~2.1x for typical data
+//! Compression ratio and throughput depend on the data, batch size, and hardware.
 
 use std::io;
 
-/// Compression level for LZ4
+/// Reserved compression-level labels; the helpers currently use the same LZ4
+/// implementation and do not select an algorithm based on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionLevel {
-    /// Fastest compression (default)
+    /// Default label.
     #[default]
     Fast,
-    /// Higher compression ratio (slower)
+    /// Reserved higher-compression label; not implemented as a separate mode.
     High,
 }
 
@@ -44,14 +36,14 @@ pub fn decompress(compressed: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Compress data with a known maximum size hint for better performance.
+/// Compress data; the size hint is currently ignored.
 #[inline]
 pub fn compress_with_hint(data: &[u8], _size_hint: usize) -> Vec<u8> {
     // lz4_flex handles buffer sizing internally
     compress(data)
 }
 
-/// Decompress with a known output size for better performance.
+/// Decompress using the supplied output size when it matches the stored prefix.
 #[inline]
 pub fn decompress_with_size(compressed: &[u8], uncompressed_size: usize) -> io::Result<Vec<u8>> {
     // Skip the size prefix if present
