@@ -31,6 +31,7 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "24.x"
+          repo-token: ${{ github.token }}
       - name: Check all targets at MSRV
         run: cargo check --locked --all-targets --all-features
 
@@ -58,6 +59,7 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "24.x"
+          repo-token: ${{ github.token }}
       - name: Test
         run: cargo test --locked --all-features
       - name: Check all targets
