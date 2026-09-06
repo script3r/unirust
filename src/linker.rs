@@ -433,7 +433,7 @@ pub struct StreamingLinker {
     /// Shard ID for this linker (used in GlobalClusterId generation).
     shard_id: u16,
     /// Retained strong ID summaries for conflict detection.
-    strong_id_summaries: LinkerState<RecordId, StrongIdSummary>,
+    strong_id_summaries: LinkerState<RecordId, ClusterStrongIdSummary>,
     /// Root aliases and member lists let queries hydrate only candidate clusters.
     member_roots: FxHashMap<RecordId, RecordId>,
     cluster_members: FxHashMap<RecordId, Vec<RecordId>>,
@@ -686,7 +686,7 @@ impl StreamingLinker {
             .insert(record_id, record_perspective.clone());
         self.strong_id_summaries
             .entry_or_default(record_id)
-            .merge(build_record_summary(record, ontology));
+            .merge(build_record_summary(record, ontology).into());
 
         let entity_type = &record.identity.entity_type;
         let identity_keys = ontology.identity_keys_for_type(entity_type);
@@ -1175,7 +1175,7 @@ impl StreamingLinker {
         if let Some(summary) = extraction.strong_id_summary {
             self.strong_id_summaries
                 .entry_or_default(record_id)
-                .merge(summary);
+                .merge(summary.into());
         }
 
         // Process each key
@@ -2027,6 +2027,61 @@ pub struct StrongIdSummary {
     >,
 }
 
+/// Track the invariant needed for binary interval searches without rescanning
+/// accumulated history. Public Interval fields permit malformed observations;
+/// those clusters retain the general merge behavior instead of assuming validity.
+#[derive(Debug, Clone)]
+struct ClusterStrongIdSummary {
+    summary: StrongIdSummary,
+    intervals_valid: bool,
+}
+
+impl Default for ClusterStrongIdSummary {
+    fn default() -> Self {
+        Self {
+            summary: StrongIdSummary::default(),
+            intervals_valid: true,
+        }
+    }
+}
+
+impl From<StrongIdSummary> for ClusterStrongIdSummary {
+    fn from(summary: StrongIdSummary) -> Self {
+        // Called only for the newly built per-record summary, never a growing
+        // cluster summary. Coalescing alone does not validate public intervals.
+        let intervals_valid = summary
+            .by_perspective
+            .values()
+            .flat_map(|attrs| attrs.values())
+            .flat_map(|values| values.values())
+            .flatten()
+            .all(|interval| interval.start < interval.end);
+        Self {
+            summary,
+            intervals_valid,
+        }
+    }
+}
+
+impl std::ops::Deref for ClusterStrongIdSummary {
+    type Target = StrongIdSummary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
+impl ClusterStrongIdSummary {
+    fn merge(&mut self, other: Self) {
+        self.intervals_valid &= other.intervals_valid;
+        if self.intervals_valid {
+            self.summary.merge_normalized(other.summary);
+        } else {
+            self.summary.merge(other.summary);
+        }
+    }
+}
+
 impl StrongIdSummary {
     /// Merge another summary into this one, combining intervals by perspective/attr/value.
     pub fn merge(&mut self, other: StrongIdSummary) {
@@ -2038,6 +2093,41 @@ impl StrongIdSummary {
                     value_entry.entry(value).or_default().extend(intervals);
                 }
                 coalesce_value_intervals(value_entry);
+            }
+        }
+    }
+
+    /// Called only for valid, sorted, coalesced internal summaries. The private
+    /// wrapper tracks validity; `merge` stays general for public-field inputs.
+    fn merge_normalized(&mut self, other: StrongIdSummary) {
+        use std::collections::hash_map::Entry;
+
+        for (perspective, attrs) in other.by_perspective {
+            let entry = match self.by_perspective.entry(perspective) {
+                Entry::Vacant(entry) => {
+                    entry.insert(attrs);
+                    continue;
+                }
+                Entry::Occupied(entry) => entry.into_mut(),
+            };
+            for (attr, values) in attrs {
+                let value_entry = match entry.entry(attr) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(values);
+                        continue;
+                    }
+                    Entry::Occupied(entry) => entry.into_mut(),
+                };
+                for (value, intervals) in values {
+                    match value_entry.entry(value) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(intervals);
+                        }
+                        Entry::Occupied(mut entry) => {
+                            merge_coalesced_intervals(entry.get_mut(), intervals);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2120,6 +2210,141 @@ mod tests {
     use crate::model::{Descriptor, RecordIdentity};
     use crate::ontology::IdentityKey;
     use crate::store::Store;
+
+    #[test]
+    fn malformed_summary_history_retains_general_merge_behavior() {
+        let mut expected = StrongIdSummary::default();
+        let mut actual = ClusterStrongIdSummary::default();
+        for observations in [
+            vec![
+                Interval { start: 0, end: 100 },
+                Interval {
+                    start: 200,
+                    end: -10,
+                },
+            ],
+            vec![Interval { start: 50, end: 60 }],
+            vec![
+                Interval {
+                    start: -30,
+                    end: -20,
+                },
+                Interval {
+                    start: 300,
+                    end: 300,
+                },
+            ],
+            vec![Interval {
+                start: -50,
+                end: 400,
+            }],
+            vec![Interval {
+                start: 450,
+                end: 500,
+            }],
+        ] {
+            let mut fragment = StrongIdSummary::default();
+            fragment
+                .by_perspective
+                .entry("crm".into())
+                .or_default()
+                .entry(crate::model::AttrId(0))
+                .or_default()
+                .insert(crate::model::ValueId(0), observations);
+            // Per-record summaries are coalesced before entering linker state.
+            let mut normalized = StrongIdSummary::default();
+            normalized.merge(fragment);
+            expected.merge(normalized.clone());
+            actual.merge(normalized.into());
+            assert!(!actual.intervals_valid);
+            assert_eq!(actual.by_perspective, expected.by_perspective);
+        }
+    }
+
+    #[test]
+    fn normalized_summary_merge_matches_general_merge() {
+        let mut expected = StrongIdSummary::default();
+        let mut actual = StrongIdSummary::default();
+        let mut state = 17_u64;
+        let extremes = [
+            (i64::MIN, i64::MIN + 1),
+            (i64::MIN + 1, i64::MIN + 2),
+            (i64::MAX - 1, i64::MAX),
+            (i64::MAX - 2, i64::MAX - 1),
+            (-10, 0),
+            (0, 10),
+            (-5, 5),
+            (-100, 100),
+        ];
+        for step in 0..256 {
+            let mut fragment = StrongIdSummary::default();
+            for offset in 0..=step % 5 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let start = (state % 160) as i64 - 80;
+                let (start, end) = if step < extremes.len() {
+                    extremes[step]
+                } else {
+                    (start, start + (state % 19) as i64 + 1)
+                };
+                fragment
+                    .by_perspective
+                    .entry(format!("source-{}", step % 3))
+                    .or_default()
+                    .entry(crate::model::AttrId((step % 2) as u32))
+                    .or_default()
+                    .entry(crate::model::ValueId((offset % 3) as u32))
+                    .or_default()
+                    .push(Interval::new(start, end).unwrap());
+            }
+            expected.merge(fragment.clone());
+            let mut normalized = StrongIdSummary::default();
+            normalized.merge(fragment);
+            actual.merge_normalized(normalized);
+            assert_eq!(
+                actual.by_perspective, expected.by_perspective,
+                "step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_interval_union_matches_general_coalescing() {
+        let histories = [
+            vec![(0, 1), (4, 5), (8, 9)],
+            vec![(8, 9), (4, 5), (0, 1)],
+            vec![(0, 1), (8, 9), (4, 5), (1, 8)],
+            vec![(0, 10), (2, 3), (-5, 0), (10, 15)],
+            vec![(i64::MIN, 0), (0, i64::MAX)],
+        ];
+        for history in histories {
+            let mut actual = Vec::new();
+            let mut all = Vec::new();
+            for (start, end) in history {
+                let interval = Interval::new(start, end).unwrap();
+                all.push((interval, ()));
+                merge_coalesced_intervals(&mut actual, vec![interval]);
+                let expected = crate::temporal::coalesce_same_value(&all)
+                    .into_iter()
+                    .map(|(interval, ())| interval)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+        let left = vec![Interval::new(0, 1).unwrap(), Interval::new(8, 9).unwrap()];
+        let right = vec![Interval::new(-5, -4).unwrap(), Interval::new(1, 8).unwrap()];
+        let all = left
+            .iter()
+            .chain(&right)
+            .map(|interval| (*interval, ()))
+            .collect::<Vec<_>>();
+        let mut actual = left;
+        merge_coalesced_intervals(&mut actual, right);
+        let expected = crate::temporal::coalesce_same_value(&all)
+            .into_iter()
+            .map(|(interval, ())| interval)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn parallel_link_tracks_boundary_keys() {
@@ -2440,6 +2665,13 @@ fn reconcile_global_cluster_ids(
             cross_shard_merges.insert(*id, canonical);
         }
     }
+    // A new record usually joins a cluster whose canonical ID stays unchanged.
+    // In that case every matching map assignment below would be id := id, and
+    // the boundary update predicate cannot match. Avoid scanning unrelated state.
+    if ids.len() == 1 {
+        global_cluster_ids.insert(new_root, canonical);
+        return;
+    }
     for (_, global_id) in global_cluster_ids.iter_mut() {
         if ids.contains(global_id) {
             *global_id = canonical;
@@ -2464,7 +2696,7 @@ fn reconcile_global_cluster_ids(
 }
 
 fn reconcile_cluster_summaries(
-    summaries: &mut LinkerState<RecordId, StrongIdSummary>,
+    summaries: &mut LinkerState<RecordId, ClusterStrongIdSummary>,
     root_a: RecordId,
     root_b: RecordId,
     new_root: RecordId,
@@ -2545,7 +2777,7 @@ pub fn build_record_summary(record: &Record, ontology: &Ontology) -> StrongIdSum
 
 /// Check if merging would create conflicts in existing clusters.
 fn would_create_conflict_in_clusters(
-    summaries: &LinkerState<RecordId, StrongIdSummary>,
+    summaries: &LinkerState<RecordId, ClusterStrongIdSummary>,
     dsu: &mut DsuBackend,
     record_a: RecordId,
     record_b: RecordId,
@@ -2616,7 +2848,7 @@ fn cluster_summaries_conflict(a: &StrongIdSummary, b: &StrongIdSummary) -> bool 
 }
 
 fn same_perspective_conflict_for_clusters(
-    summaries: &LinkerState<RecordId, StrongIdSummary>,
+    summaries: &LinkerState<RecordId, ClusterStrongIdSummary>,
     root_a: RecordId,
     root_b: RecordId,
     perspective: &str,
@@ -2679,12 +2911,13 @@ fn same_perspective_conflict_for_clusters(
 }
 
 fn get_cluster_summary(
-    summaries: &LinkerState<RecordId, StrongIdSummary>,
+    summaries: &LinkerState<RecordId, ClusterStrongIdSummary>,
     root: RecordId,
 ) -> &StrongIdSummary {
     static EMPTY: std::sync::OnceLock<StrongIdSummary> = std::sync::OnceLock::new();
     summaries
         .peek(&root)
+        .map(|summary| &summary.summary)
         .unwrap_or_else(|| EMPTY.get_or_init(StrongIdSummary::default))
 }
 
@@ -2704,6 +2937,71 @@ fn coalesce_value_intervals(values: &mut HashMap<crate::model::ValueId, Vec<Inte
             .map(|(interval, _)| interval)
             .collect();
     }
+}
+
+/// Union two sorted, coalesced interval lists without re-sorting old history.
+fn merge_coalesced_intervals(existing: &mut Vec<Interval>, incoming: Vec<Interval>) {
+    if incoming.is_empty() {
+        return;
+    }
+    let Some(last) = existing.last_mut() else {
+        *existing = incoming;
+        return;
+    };
+    if incoming[0].start >= last.start {
+        // Chronological observations and repeated current values touch only the
+        // tail. Appending disjoint history is amortized O(incoming.len()).
+        for interval in incoming {
+            append_coalesced_interval(existing, interval);
+        }
+        return;
+    }
+    if incoming.len() == 1 {
+        let interval = incoming[0];
+        // Endpoints are strictly increasing in a coalesced list. Locate just
+        // the affected range; insertion may still shift a Vec suffix.
+        let first = existing.partition_point(|old| old.end < interval.start);
+        let after = existing.partition_point(|old| old.start <= interval.end);
+        if first == after {
+            existing.insert(first, interval);
+        } else {
+            existing[first] = Interval {
+                start: existing[first].start.min(interval.start),
+                end: existing[after - 1].end.max(interval.end),
+            };
+            existing.drain(first + 1..after);
+        }
+        return;
+    }
+
+    // Interleaved cluster histories need a linear merge, preserving all gaps.
+    let old = std::mem::take(existing);
+    existing.reserve(old.len() + incoming.len());
+    let mut left = old.into_iter().peekable();
+    let mut right = incoming.into_iter().peekable();
+    while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+        let next = if a.start <= b.start {
+            left.next()
+        } else {
+            right.next()
+        };
+        if let Some(interval) = next {
+            append_coalesced_interval(existing, interval);
+        }
+    }
+    for interval in left.chain(right) {
+        append_coalesced_interval(existing, interval);
+    }
+}
+
+fn append_coalesced_interval(intervals: &mut Vec<Interval>, interval: Interval) {
+    if let Some(last) = intervals.last_mut() {
+        if interval.start <= last.end {
+            last.end = last.end.max(interval.end);
+            return;
+        }
+    }
+    intervals.push(interval);
 }
 
 fn has_overlapping_interval(a: &[Interval], b: &[Interval]) -> bool {

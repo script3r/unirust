@@ -285,6 +285,28 @@ can produce `QueryConflict`. See [`query.rs`](src/query.rs),
 `golden_for_cluster` in [`graph.rs`](src/graph.rs), and
 `query_global_entities` in [`distributed.rs`](src/distributed.rs).
 
+## Algorithmic work reduction
+
+Ordinary local merges that retain their canonical global ID avoid scanning
+unrelated ID mappings and boundary entries. Internal strong-ID summaries merge
+only changed values and append chronological history without sorting old
+intervals again. Private validity metadata retains the general merge path for
+malformed public intervals; the public summary type and durable formats are
+unchanged.
+
+Reconciliation enumerates overlapping cross-shard intervals with a temporal
+sweep grouped by physical shard. A common intersection permits direct pair
+enumeration for dense histories. Every actual pair and component guard remains;
+dense output can still be quadratic. Query conjunction intersects normalized
+interval lists with two pointers, and golden mastering emits the spans where
+exactly one distinct attribute value is active. Constraint overlap reporting
+shares the interval intersection helper.
+
+See [the performance analysis](docs/performance-analysis-2026-09-05.md) for
+complexity boundaries, malformed-input compatibility, measurements and remaining
+costs. These mechanisms do not establish universal latency or match-completeness
+guarantees.
+
 ## Storage, memory and work limits
 
 RocksDB stores binary records and metadata in separate column families. These

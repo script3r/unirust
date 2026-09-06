@@ -11,8 +11,9 @@ use crate::ClusterAssignment;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
@@ -686,64 +687,57 @@ impl IncrementalReconciler {
                 continue;
             }
 
-            // Count as matched if entries from multiple shards
-            let shard_count: HashSet<_> = entries.iter().map(|e| e.shard_id).collect();
-            if shard_count.len() > 1 {
-                keys_matched += 1;
+            if !entries
+                .iter()
+                .any(|entry| entry.shard_id != entries[0].shard_id)
+            {
+                continue;
             }
+            keys_matched += 1;
 
-            // Check all pairs for cross-shard merges
-            for i in 0..entries.len() {
-                for j in (i + 1)..entries.len() {
-                    let e1 = entries[i];
-                    let e2 = entries[j];
+            for_each_cross_shard_overlap(&entries, |i, j| {
+                let e1 = entries[i];
+                let e2 = entries[j];
+                merge_candidates += 1;
 
-                    // Only merge if from different shards and intervals overlap
-                    if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval) {
-                        merge_candidates += 1;
-
-                        // Check for same-perspective conflicts before proposing merge
-                        if let Some(conflict_detail) = detect_cross_shard_conflict(e1, e2) {
-                            // Record the conflict and skip this merge
-                            conflicts_blocked += 1;
-
-                            detected_conflicts.push(CrossShardConflict {
-                                identity_key_signature: *sig,
-                                cluster1: e1.cluster_id,
-                                cluster2: e2.cluster_id,
-                                interval: conflict_detail.interval,
-                                perspective_hash: conflict_detail.perspective_hash,
-                                strong_id_hash1: conflict_detail.strong_id_hash1,
-                                strong_id_hash2: conflict_detail.strong_id_hash2,
-                            });
-                            continue;
-                        }
-
-                        // Merge into the lower shard_id for consistency
-                        let (primary, secondary) = if e1.shard_id < e2.shard_id {
-                            (e1.cluster_id, e2.cluster_id)
-                        } else {
-                            (e2.cluster_id, e1.cluster_id)
-                        };
-                        if primary == secondary {
-                            continue;
-                        }
-                        for entry in [e1, e2] {
-                            observations
-                                .entry(entry.cluster_id)
-                                .or_default()
-                                .extend(entry.strong_ids.iter().cloned());
-                        }
-                        merges.push((primary, secondary));
-                        let edge = if primary.to_u64() < secondary.to_u64() {
-                            (primary, secondary)
-                        } else {
-                            (secondary, primary)
-                        };
-                        merge_signatures.insert(edge, *sig);
-                    }
+                // Pair orientation remains the original entry order, even though
+                // the sweep visits pairs in temporal order.
+                if let Some(conflict_detail) = detect_cross_shard_conflict(e1, e2) {
+                    conflicts_blocked += 1;
+                    detected_conflicts.push(CrossShardConflict {
+                        identity_key_signature: *sig,
+                        cluster1: e1.cluster_id,
+                        cluster2: e2.cluster_id,
+                        interval: conflict_detail.interval,
+                        perspective_hash: conflict_detail.perspective_hash,
+                        strong_id_hash1: conflict_detail.strong_id_hash1,
+                        strong_id_hash2: conflict_detail.strong_id_hash2,
+                    });
+                    return;
                 }
-            }
+
+                let (primary, secondary) = if e1.shard_id < e2.shard_id {
+                    (e1.cluster_id, e2.cluster_id)
+                } else {
+                    (e2.cluster_id, e1.cluster_id)
+                };
+                if primary == secondary {
+                    return;
+                }
+                for entry in [e1, e2] {
+                    observations
+                        .entry(entry.cluster_id)
+                        .or_default()
+                        .extend(entry.strong_ids.iter().cloned());
+                }
+                merges.push((primary, secondary));
+                let edge = if primary.to_u64() < secondary.to_u64() {
+                    (primary, secondary)
+                } else {
+                    (secondary, primary)
+                };
+                merge_signatures.insert(edge, *sig);
+            });
         }
 
         ReconciliationCandidates {
@@ -765,6 +759,104 @@ impl IncrementalReconciler {
             all_dirty.extend(boundary.dirty_keys.iter().copied());
         }
         all_dirty
+    }
+}
+
+/// Enumerate every overlapping cross-shard pair without scanning disjoint or
+/// same-shard pairs. Expiry uses half-open intervals, so touching endpoints do
+/// not match. For valid intervals, B entries and P matching pairs require
+/// O(B log B + P) work,
+/// including dense cases where emitting P candidates is itself quadratic.
+fn for_each_cross_shard_overlap(entries: &[&BoundaryEntry], mut visit: impl FnMut(usize, usize)) {
+    if entries.len() < 2
+        || !entries
+            .iter()
+            .any(|entry| entry.shard_id != entries[0].shard_id)
+    {
+        return;
+    }
+    // BoundaryEntry and Interval can be constructed directly by library users.
+    // Preserve the historical overlap predicate even for empty/reversed intervals,
+    // whose semantics do not satisfy the sweep's ordering proof.
+    if entries
+        .iter()
+        .any(|entry| entry.interval.start >= entry.interval.end)
+    {
+        for i in 0..entries.len() {
+            for j in (i + 1)..entries.len() {
+                if entries[i].shard_id != entries[j].shard_id
+                    && is_overlapping(&entries[i].interval, &entries[j].interval)
+                {
+                    visit(i, j);
+                }
+            }
+        }
+        return;
+    }
+    if entries.len() == 2 {
+        if is_overlapping(&entries[0].interval, &entries[1].interval) {
+            visit(0, 1);
+        }
+        return;
+    }
+    let (latest_start, earliest_end) = entries.iter().fold(
+        (i64::MIN, i64::MAX),
+        |(latest_start, earliest_end), entry| {
+            (
+                latest_start.max(entry.interval.start),
+                earliest_end.min(entry.interval.end),
+            )
+        },
+    );
+    if latest_start < earliest_end {
+        // A common intersection proves that every pair overlaps. Enumerating
+        // shard groups directly avoids tree traversal for dense current histories.
+        let mut shards: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            shards.entry(entry.shard_id).or_default().push(index);
+        }
+        let shards = shards.into_values().collect::<Vec<_>>();
+        for (position, left) in shards.iter().enumerate() {
+            for right in shards.iter().skip(position + 1) {
+                for &left in left {
+                    for &right in right {
+                        visit(left.min(right), left.max(right));
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut ordered = (0..entries.len()).collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|&index| (entries[index].interval.start, index));
+    let mut expiry: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    let mut active: BTreeMap<u16, BTreeSet<usize>> = BTreeMap::new();
+
+    for index in ordered {
+        let entry = entries[index];
+        while let Some(&Reverse((end, expired))) = expiry.peek() {
+            if end > entry.interval.start {
+                break;
+            }
+            expiry.pop();
+            let shard = entries[expired].shard_id;
+            if let Some(indices) = active.get_mut(&shard) {
+                indices.remove(&expired);
+                if indices.is_empty() {
+                    active.remove(&shard);
+                }
+            }
+        }
+        for (&shard, indices) in &active {
+            if shard == entry.shard_id {
+                continue;
+            }
+            for &other in indices {
+                visit(index.min(other), index.max(other));
+            }
+        }
+        active.entry(entry.shard_id).or_default().insert(index);
+        expiry.push(Reverse((entry.interval.end, index)));
     }
 }
 
@@ -1298,6 +1390,343 @@ mod tests {
     use crate::model::{Descriptor, RecordIdentity};
     use crate::perf::ConcurrentInterner;
     use crate::Interval;
+
+    fn quadratic_candidates(
+        reconciler: &IncrementalReconciler,
+        keys: &HashSet<IdentityKeySignature>,
+    ) -> ReconciliationCandidates {
+        let mut merges = Vec::new();
+        let mut merge_candidates = 0;
+        let mut conflicts_blocked = 0usize;
+        let mut keys_matched = 0;
+        let mut detected_conflicts = Vec::new();
+        let mut observations: HashMap<GlobalClusterId, HashSet<BoundaryStrongId>> = HashMap::new();
+        let mut merge_signatures = HashMap::new();
+
+        // For each dirty key, collect entries from all shards
+        for sig in keys {
+            let mut entries: Vec<&BoundaryEntry> = Vec::new();
+
+            for boundary in &reconciler.shard_boundaries {
+                if let Some(boundary_entries) = boundary.boundary_keys.get(sig) {
+                    entries.extend(boundary_entries.iter());
+                }
+            }
+
+            if entries.len() < 2 {
+                continue;
+            }
+
+            // Count as matched if entries from multiple shards
+            let shard_count: HashSet<_> = entries.iter().map(|e| e.shard_id).collect();
+            if shard_count.len() > 1 {
+                keys_matched += 1;
+            }
+
+            // Check all pairs for cross-shard merges
+            for i in 0..entries.len() {
+                for j in (i + 1)..entries.len() {
+                    let e1 = entries[i];
+                    let e2 = entries[j];
+
+                    // Only merge if from different shards and intervals overlap
+                    if e1.shard_id != e2.shard_id && is_overlapping(&e1.interval, &e2.interval) {
+                        merge_candidates += 1;
+
+                        // Check for same-perspective conflicts before proposing merge
+                        if let Some(conflict_detail) = detect_cross_shard_conflict(e1, e2) {
+                            // Record the conflict and skip this merge
+                            conflicts_blocked += 1;
+
+                            detected_conflicts.push(CrossShardConflict {
+                                identity_key_signature: *sig,
+                                cluster1: e1.cluster_id,
+                                cluster2: e2.cluster_id,
+                                interval: conflict_detail.interval,
+                                perspective_hash: conflict_detail.perspective_hash,
+                                strong_id_hash1: conflict_detail.strong_id_hash1,
+                                strong_id_hash2: conflict_detail.strong_id_hash2,
+                            });
+                            continue;
+                        }
+
+                        // Merge into the lower shard_id for consistency
+                        let (primary, secondary) = if e1.shard_id < e2.shard_id {
+                            (e1.cluster_id, e2.cluster_id)
+                        } else {
+                            (e2.cluster_id, e1.cluster_id)
+                        };
+                        if primary == secondary {
+                            continue;
+                        }
+                        for entry in [e1, e2] {
+                            observations
+                                .entry(entry.cluster_id)
+                                .or_default()
+                                .extend(entry.strong_ids.iter().cloned());
+                        }
+                        merges.push((primary, secondary));
+                        let edge = if primary.to_u64() < secondary.to_u64() {
+                            (primary, secondary)
+                        } else {
+                            (secondary, primary)
+                        };
+                        merge_signatures.insert(edge, *sig);
+                    }
+                }
+            }
+        }
+
+        ReconciliationCandidates {
+            merges,
+            observations,
+            merge_signatures,
+            keys_checked: keys.len(),
+            keys_matched,
+            merge_candidates,
+            conflicts_blocked,
+            detected_conflicts,
+        }
+    }
+
+    fn quadratic_overlaps(entries: &[&BoundaryEntry], mut visit: impl FnMut(usize, usize)) {
+        for i in 0..entries.len() {
+            for j in (i + 1)..entries.len() {
+                if entries[i].shard_id != entries[j].shard_id
+                    && is_overlapping(&entries[i].interval, &entries[j].interval)
+                {
+                    visit(i, j);
+                }
+            }
+        }
+    }
+
+    fn normalize_conflicts(conflicts: &mut [CrossShardConflict]) {
+        conflicts.sort_by_key(|entry| {
+            (
+                entry.identity_key_signature,
+                entry.cluster1,
+                entry.cluster2,
+                entry.interval.start,
+                entry.interval.end,
+                entry.perspective_hash,
+                entry.strong_id_hash1,
+                entry.strong_id_hash2,
+            )
+        });
+    }
+
+    #[test]
+    fn temporal_boundary_sweep_matches_quadratic_candidates_and_component_guards() {
+        for seed in 0..128u64 {
+            let mut random = seed + 1;
+            let mut next = || {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                random
+            };
+            let mut reconciler = IncrementalReconciler::new();
+            let mut keys = HashSet::new();
+            for shard in 0..4u16 {
+                let mut boundary = ClusterBoundaryIndex::new_small(shard);
+                for record in 0..24u32 {
+                    let signature = IdentityKeySignature::from_bytes([(next() % 3) as u8; 32]);
+                    keys.insert(signature);
+                    let (start, end) = if seed.is_multiple_of(4) {
+                        ((next() % 10) as i64, 50 + (next() % 10) as i64)
+                    } else {
+                        let start = (next() % 80) as i64 - 40;
+                        (start, start + (next() % 20 + 1) as i64)
+                    };
+                    let strong_ids = if next().is_multiple_of(4) {
+                        Vec::new()
+                    } else {
+                        vec![BoundaryStrongId {
+                            perspective: "source".into(),
+                            attribute: "ssn".into(),
+                            value: (next() % 3).to_string(),
+                            interval: Interval::new(-100, 100).unwrap(),
+                        }]
+                    };
+                    boundary.register_boundary_key_with_conflict_data(
+                        signature,
+                        GlobalClusterId::new(shard, record, 0),
+                        Interval::new(start, end).unwrap(),
+                        HashMap::new(),
+                        strong_ids,
+                    );
+                }
+                reconciler.add_shard_boundary(boundary);
+            }
+            let mut actual = reconciler.reconciliation_candidates(&keys);
+            let mut expected = quadratic_candidates(&reconciler, &keys);
+            actual.merges.sort_unstable();
+            expected.merges.sort_unstable();
+            assert_eq!(actual.merges, expected.merges, "seed {seed}");
+            assert_eq!(actual.observations, expected.observations, "seed {seed}");
+            assert_eq!(
+                actual.merge_signatures, expected.merge_signatures,
+                "seed {seed}"
+            );
+            normalize_conflicts(&mut actual.detected_conflicts);
+            normalize_conflicts(&mut expected.detected_conflicts);
+            assert_eq!(
+                actual.detected_conflicts, expected.detected_conflicts,
+                "seed {seed}"
+            );
+            let mut actual = actual.finish();
+            let mut expected = expected.finish();
+            normalize_conflicts(&mut actual.detected_conflicts);
+            normalize_conflicts(&mut expected.detected_conflicts);
+            assert_eq!(
+                actual.merged_clusters, expected.merged_clusters,
+                "seed {seed}"
+            );
+            assert_eq!(
+                actual.merges_performed, expected.merges_performed,
+                "seed {seed}"
+            );
+            assert_eq!(
+                actual.merge_candidates, expected.merge_candidates,
+                "seed {seed}"
+            );
+            assert_eq!(actual.keys_checked, expected.keys_checked, "seed {seed}");
+            assert_eq!(actual.keys_matched, expected.keys_matched, "seed {seed}");
+            assert_eq!(
+                actual.conflicts_blocked, expected.conflicts_blocked,
+                "seed {seed}"
+            );
+            assert_eq!(
+                actual.detected_conflicts, expected.detected_conflicts,
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_boundary_sweep_preserves_nested_adjacent_and_duplicate_pairs() {
+        let entries = [
+            (0, -10, 0),
+            (1, 0, 10),
+            (0, 0, 10),
+            (1, 0, 10),
+            (2, -20, 20),
+            (2, -5, 5),
+            (1, 10, 11),
+            (0, 5, 9),
+            (0, i64::MIN, i64::MIN + 1),
+            (1, i64::MIN, i64::MAX),
+            (2, i64::MAX - 1, i64::MAX),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (shard, start, end))| BoundaryEntry {
+            cluster_id: GlobalClusterId::new(shard, index as u32, 0),
+            interval: Interval::new(start, end).unwrap(),
+            shard_id: shard,
+            perspective_strong_ids: HashMap::new(),
+            strong_ids: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+        let references = entries.iter().collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        quadratic_overlaps(&references, |left, right| expected.push((left, right)));
+        let mut actual = Vec::new();
+        for_each_cross_shard_overlap(&references, |left, right| actual.push((left, right)));
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn temporal_boundary_sweep_preserves_public_malformed_interval_behavior() {
+        let entries = [(0, 8, 20), (1, 10, 5), (2, 10, 10), (0, -10, 50)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (shard, start, end))| BoundaryEntry {
+                cluster_id: GlobalClusterId::new(shard, index as u32, 0),
+                interval: Interval { start, end },
+                shard_id: shard,
+                perspective_strong_ids: HashMap::new(),
+                strong_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let references = entries.iter().collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        quadratic_overlaps(&references, |left, right| expected.push((left, right)));
+        let mut actual = Vec::new();
+        for_each_cross_shard_overlap(&references, |left, right| actual.push((left, right)));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "manual comparison of exact sweep and quadratic baseline; use release mode"]
+    fn boundary_pair_sweep_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for (case, sizes) in [
+            ("sparse", &[1_000usize, 4_000, 16_000][..]),
+            ("dense", &[10usize, 100, 1_000, 4_000][..]),
+            ("dense-windowed", &[1_000usize, 4_000][..]),
+            ("single-shard", &[1_000usize, 4_000, 16_000][..]),
+        ] {
+            for &size in sizes {
+                let entries = (0..size)
+                    .map(|index| {
+                        let start = match case {
+                            "sparse" => (index / 2) as i64 * 10,
+                            "dense-windowed" => index as i64,
+                            _ => 0,
+                        };
+                        let width = if case == "dense-windowed" {
+                            (size / 2) as i64
+                        } else {
+                            5
+                        };
+                        let shard = if case == "single-shard" {
+                            0
+                        } else {
+                            (index % 3) as u16
+                        };
+                        BoundaryEntry {
+                            cluster_id: GlobalClusterId::new(shard, index as u32, 0),
+                            interval: Interval::new(start, start + width).unwrap(),
+                            shard_id: shard,
+                            perspective_strong_ids: HashMap::new(),
+                            strong_ids: Vec::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let references = entries.iter().collect::<Vec<_>>();
+                let mut timings = Vec::new();
+                for quadratic in [true, false] {
+                    let mut best = std::time::Duration::MAX;
+                    let mut final_count = 0usize;
+                    for _ in 0..3 {
+                        let mut count = 0usize;
+                        let start = Instant::now();
+                        let mut visit = |left, right| {
+                            black_box((left, right));
+                            count += 1;
+                        };
+                        if quadratic {
+                            quadratic_overlaps(black_box(&references), &mut visit);
+                        } else {
+                            for_each_cross_shard_overlap(black_box(&references), &mut visit);
+                        }
+                        best = best.min(start.elapsed());
+                        final_count = count;
+                    }
+                    timings.push((best, final_count));
+                }
+                assert_eq!(timings[0].1, timings[1].1);
+                println!(
+                    "case={case} entries={size} candidates={} quadratic_ms={:.3} sweep_ms={:.3}",
+                    timings[0].1,
+                    timings[0].0.as_secs_f64() * 1000.0,
+                    timings[1].0.as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
 
     #[test]
     fn text_identity_signature_has_a_stable_protocol_vector() {
